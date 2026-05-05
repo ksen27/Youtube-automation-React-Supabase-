@@ -30,7 +30,8 @@ interface PreviewCandidate {
   channelTitle: string;
   durationSeconds: number;
   thumbnailUrl: string;
-  score: number;
+  score: number;          // raw score (can exceed 100 in theory)
+  displayScore: number;   // 0–100 normalized for the UI bar
   reasons: string[];
   rejected: boolean;
   rejectReason?: string;
@@ -517,7 +518,8 @@ function SegmentPanel({
                       title={c.title}
                       channel={c.channelTitle}
                       durationSec={c.durationSeconds}
-                      score={c.score}
+                      score={c.displayScore}
+                      rawScore={c.score}
                       reasons={c.reasons}
                       selected={selectedIds.has(c.videoId)}
                       onToggle={() => onToggleVideo(c.videoId)}

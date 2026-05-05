@@ -9,7 +9,8 @@ export interface VideoCardProps {
   title: string;
   channel: string;
   durationSec: number;
-  score?: number;
+  score?: number;          // 0–100 percentage to render in the bar
+  rawScore?: number;       // raw ranker score, shown in the tooltip
   selected: boolean;
   reasons?: string[];
   onToggle?: () => void;
@@ -22,6 +23,7 @@ export function VideoCard({
   channel,
   durationSec,
   score,
+  rawScore,
   selected,
   reasons,
   onToggle,
@@ -59,7 +61,7 @@ export function VideoCard({
       <div className="p-3 space-y-1.5">
         <p className="line-clamp-2 text-sm font-medium leading-snug text-fg">{title}</p>
         <p className="truncate text-xs text-fg-muted">{channel}</p>
-        {score != null && <ConfidencePip value={score} />}
+        {score != null && <ConfidencePip value={score} rawScore={rawScore} />}
         {reasons && reasons.length > 0 && (
           <p className="text-[11px] text-fg-subtle line-clamp-1">{reasons.join(" · ")}</p>
         )}
@@ -68,11 +70,15 @@ export function VideoCard({
   );
 }
 
-function ConfidencePip({ value }: { value: number }) {
-  const pct = Math.max(0, Math.min(100, Math.round(value * 100)));
+function ConfidencePip({ value, rawScore }: { value: number; rawScore?: number }) {
+  // `value` is already a 0–100 percentage. The previous version multiplied by
+  // 100, which saturated every bar at full because raw scores >= 1 became
+  // 100% — that's why every preview card looked identical.
+  const pct = Math.max(0, Math.min(100, Math.round(value)));
   const tone = pct >= 75 ? "bg-emerald-500" : pct >= 50 ? "bg-amber-500" : "bg-slate-500";
+  const tooltip = rawScore != null ? `Raw: ${Math.round(rawScore)} · ${pct}%` : `${pct}%`;
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-1.5" title={tooltip}>
       <div className="h-1 flex-1 rounded-full bg-bg-elevated overflow-hidden">
         <div className={cn("h-full transition-[width] duration-500", tone)} style={{ width: `${pct}%` }} />
       </div>

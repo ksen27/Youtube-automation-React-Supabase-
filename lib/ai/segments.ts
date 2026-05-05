@@ -90,6 +90,13 @@ function buildSegment(index: number, text: string, priorWords: number, words: nu
 // Per-segment understanding
 // ---------------------------------------------------------------------------
 
+// "talking_head" = interview/host speaking direct to camera (long-form OK).
+// "broll"        = visual filler — places, objects, action, archival montages
+//                  (often <2 min on YouTube; the duration filter must be loose).
+// "archival"     = older news/event footage tied to a specific moment in time.
+export const IntentType = z.enum(["talking_head", "broll", "archival"]);
+export type IntentType = z.infer<typeof IntentType>;
+
 export const SegmentUnderstandingSchema = z.object({
   mainTopic: z.string().min(1),
   people: z.array(z.string()).default([]),
@@ -100,6 +107,7 @@ export const SegmentUnderstandingSchema = z.object({
   searchIntents: z.array(z.object({
     label: z.string().min(1),       // human-friendly: "Searching for early life interviews"
     query: z.string().min(1),       // raw query passed to YouTube
+    intentType: IntentType.default("talking_head"),
   })).min(1).max(6),
 });
 export type SegmentUnderstanding = z.infer<typeof SegmentUnderstandingSchema>;
@@ -117,7 +125,8 @@ Return STRICT JSON ONLY in this shape:
   "relatedKeywords": ["3-8 short phrases a viewer would say to describe the visuals"],
   "searchIntents": [
     { "label": "human-friendly description of what we are searching for",
-      "query": "concrete YouTube search query, no quotes, max 8 words" }
+      "query": "concrete YouTube search query, no quotes, max 8 words",
+      "intentType": "talking_head | broll | archival" }
   ]
 }
 
@@ -126,6 +135,31 @@ Rules:
 - Provide 2 to 4 searchIntents that together cover the visual story of THIS section.
 - Skip the section's narration tone and writing style. Focus on what should appear on screen.
 - Skip duplicates. Skip empty arrays — return [] if you have nothing.
+- Classify each intent's "intentType":
+  * "talking_head" — interviews, host shots, podcasts (long-form, 4–25 min videos)
+  * "broll" — places, locations, objects, scenery, action shots (often short clips)
+  * "archival" — old news footage, vintage events, historical moments tied to a year
+  Prefer "broll" or "archival" when the script mentions a place, event, year, or visual moment.
+
+Query construction rules — these matter most. YouTube indexes against the
+literal query string, so abstract or editorial words pull in the wrong videos:
+- Every "query" MUST contain at least one proper noun: a person's name, a place
+  name, a 4-digit year, or a specific event name. If you can't anchor the query
+  to a proper noun, drop the intent — don't pad with filler.
+- NEVER use these editorial framing words in a query (they don't appear in real
+  YouTube titles): institution, powerful, iconic, legendary, legacy, modern,
+  classic, important, significant, historic, beautiful, stunning, ultimate,
+  amazing, incredible, story, journey.
+- For "archival" intents, the query MUST include one of: a 4-digit year,
+  "newsreel", "archive footage", "original footage", or "vintage".
+- For "broll" intents, prefer plural concrete nouns ("royal guards", "London
+  streets") over singular abstractions ("the monarchy", "the city").
+- Keep queries 3–8 words. If you only have 3 words of real signal, leave it at
+  3 — do not add adjectives just to reach 8.
+- Bad: "Buckingham Palace exterior royal guards institution"
+  Good: "Buckingham Palace royal guards changing"
+- Bad: "Princess Diana powerful early royal life"
+  Good: "Princess Diana Charles wedding 1981"
 
 SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
 """${segment.text.slice(0, 8000)}"""`;
@@ -148,7 +182,31 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     }));
     return fallbackUnderstanding(segment);
   }
-  return safe.data;
+  // Belt-and-suspenders: even with the prompt rules, Gemini occasionally slips
+  // an editorial word into a query. Strip them here so YouTube never sees them.
+  return {
+    ...safe.data,
+    searchIntents: safe.data.searchIntents.map((it) => ({
+      ...it,
+      query: sanitizeQuery(it.query),
+    })),
+  };
+}
+
+// Words that describe how the writer feels about a subject but never appear in
+// real YouTube titles. Keep in sync with the prompt rules above.
+const FORBIDDEN_QUERY_WORDS = new Set([
+  "institution","powerful","iconic","legendary","legacy","modern","classic",
+  "important","significant","historic","beautiful","stunning","ultimate",
+  "amazing","incredible","story","journey",
+]);
+
+export function sanitizeQuery(raw: string): string {
+  const tokens = raw.split(/\s+/).filter(Boolean);
+  const kept = tokens.filter((t) => !FORBIDDEN_QUERY_WORDS.has(t.toLowerCase().replace(/[^a-z0-9]/g, "")));
+  // If sanitizing emptied the query, return the original — better to search
+  // something than nothing, and the ranker will reject irrelevant hits.
+  return kept.length ? kept.join(" ") : raw;
 }
 
 function fallbackUnderstanding(segment: RawSegment): SegmentUnderstanding {
@@ -157,6 +215,6 @@ function fallbackUnderstanding(segment: RawSegment): SegmentUnderstanding {
     mainTopic: firstSentence || `Part ${segment.index + 1}`,
     people: [], places: [], events: [], topics: [],
     relatedKeywords: [],
-    searchIntents: [{ label: "Looking for relevant background footage", query: firstSentence }],
+    searchIntents: [{ label: "Looking for relevant background footage", query: firstSentence, intentType: "talking_head" }],
   };
 }

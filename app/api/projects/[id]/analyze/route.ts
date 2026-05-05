@@ -10,6 +10,7 @@ import {
 } from "@/lib/ai/segments";
 import { planTimeline } from "@/lib/ai/timeline-plan";
 import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
+import { extractEntities } from "@/lib/ai/gemini";
 
 // Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
 // a YouTube preview search. No FFmpeg, no yt-dlp, no downloads. The user
@@ -47,7 +48,8 @@ interface PreviewCandidate {
   channelTitle: string;
   durationSeconds: number;
   thumbnailUrl: string;
-  score: number;
+  score: number;          // raw score
+  displayScore: number;   // 0–100 normalized for the UI bar
   reasons: string[];
   rejected: boolean;
   rejectReason?: string;
@@ -122,18 +124,38 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       totalBlocks: plan.totalBlocks,
     });
 
-    // 1) Per-segment understanding (parallel — Gemini calls are independent)
+    // 1a) Project-level entity extraction. We need this BEFORE segment work
+    // so the search ranker knows who the main celebrity is — `related_person`
+    // (co-stars, family) is a different bucket and was being mis-used here.
+    const projectEntities = await extractEntities(transcript).catch(async (e) => {
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.extract_entities.failed", { err: (e as Error).message });
+      return [] as Awaited<ReturnType<typeof extractEntities>>;
+    });
+    const mainCelebrity = projectEntities.find((e) => e.type === "celebrity")?.value;
+    await logJob({ projectId: id, jobId: mediaJobId }, "analyze.main_celebrity", {
+      mainCelebrity: mainCelebrity ?? null,
+      celebrityCount: projectEntities.filter((e) => e.type === "celebrity").length,
+      totalEntities: projectEntities.length,
+    });
+
+    // 1b) Per-segment understanding (parallel — Gemini calls are independent)
     const understandings = await Promise.all(segments.map((seg) => analyzeSegment(seg)));
     await setMediaJob(mediaJobId, { progress: 35 });
 
     // Persist a flat entity list for the existing matchProcessor / workspace UI.
     const entityRows: Array<{ project_id: string; type: string; value: string; confidence: number; metadata: Record<string, unknown> }> = [];
     const seenEntity = new Set<string>();
-    function pushEntity(type: string, value: string, segIdx: number) {
+    function pushEntity(type: string, value: string, segIdx: number, confidence = 0.8) {
       const key = `${type}:${value.toLowerCase()}`;
       if (seenEntity.has(key)) return;
       seenEntity.add(key);
-      entityRows.push({ project_id: id, type, value, confidence: 0.8, metadata: { segment_index: segIdx } });
+      entityRows.push({ project_id: id, type, value, confidence, metadata: { segment_index: segIdx } });
+    }
+    // Project-level entities first (segIdx -1 = "applies to whole script").
+    // We persist celebrity/movie/tv_show/song/company/year/age too so other
+    // surfaces (lower-thirds, future entity-driven matching) can use them.
+    for (const e of projectEntities) {
+      pushEntity(e.type, e.value, -1, e.confidence);
     }
     understandings.forEach((u, segIdx) => {
       u.people.forEach((v) => pushEntity("related_person", v, segIdx));
@@ -150,8 +172,6 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     // still attribute the best score to a single segment for the preview UI.
     await setProjectStatus(id, "searching");
     const { approved, blocked } = await loadChannelRules();
-    const allKeywords = Array.from(new Set(understandings.flatMap((u) => u.relatedKeywords)));
-    const mainCelebrity = entityRows.find((e) => e.type === "related_person")?.value;
 
     const seenVideo = new Set<string>();
     const segmentAnalyses: SegmentAnalysis[] = [];
@@ -160,7 +180,12 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       const seg = segments[i];
       const u = understandings[i];
       const segCandidates: PreviewCandidate[] = [];
+      // Per-segment keywords give the ranker a tight signal — long generic
+      // documentaries shouldn't outrank a focused b-roll clip just because
+      // they hit more of the project's overall keyword bag.
+      const segKeywords = Array.from(new Set([...(u.relatedKeywords ?? []), u.mainTopic].filter(Boolean)));
       for (const intent of u.searchIntents) {
+        const intentType = intent.intentType ?? "talking_head";
         let cands: Awaited<ReturnType<typeof searchYoutube>> = [];
         try {
           cands = await searchYoutube({ query: intent.query, maxResults: PER_INTENT_RESULTS });
@@ -173,8 +198,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         for (const c of cands) {
           if (seenVideo.has(c.videoId)) continue;
           const ranked = rankCandidate({
-            candidate: c, mainCelebrity, keywords: allKeywords,
+            candidate: c, mainCelebrity, keywords: segKeywords,
             approvedChannelIds: approved, blockedChannelIds: blocked,
+            intentType,
           });
           if (ranked.rejected) continue;     // keep the preview clean
           seenVideo.add(c.videoId);
@@ -186,6 +212,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
             durationSeconds: c.durationSeconds,
             thumbnailUrl: `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`,
             score: ranked.score,
+            displayScore: ranked.displayScore,
             reasons: ranked.reasons,
             rejected: false,
           });
@@ -237,6 +264,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           segment_index: s.index,
           thumbnail_url: c.thumbnailUrl,
           reasons: c.reasons,
+          display_score: c.displayScore,
         },
       }))
     );

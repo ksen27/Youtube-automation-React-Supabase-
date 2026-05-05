@@ -134,67 +134,115 @@ export function parseISO8601Duration(iso: string): number {
 // Ranking
 // ---------------------------------------------------------------------------
 
+export type IntentType = "talking_head" | "broll" | "archival";
+
 export interface RankInput {
   candidate: YoutubeCandidate;
   mainCelebrity?: string;
   keywords: string[];
   approvedChannelIds: Set<string>;
   blockedChannelIds: Set<string>;
+  intentType?: IntentType;
 }
 
 export interface RankedCandidate extends YoutubeCandidate {
-  score: number;
+  score: number;          // raw score, can be negative or above 100
+  displayScore: number;   // 0–100 normalized for the UI bar
   reasons: string[];
   rejected: boolean;
   rejectReason?: string;
 }
 
-const MIN_DURATION = 120;     // 2 minutes
-const MAX_DURATION = 1500;    // 25 minutes
+// Theoretical max raw score: 40 (celebrity) + 40 (token cap) + 25 (approved
+// channel) + 10 (sweet-spot duration). Used to normalize for the UI so a
+// duration-only +10 hit doesn't render as a full bar.
+export const MAX_RANK_SCORE = 115;
+
+// Duration windows per intent. b-roll and archival often surface as short
+// clips (30–120s) on YouTube — applying the talking-head floor would reject
+// exactly the visuals we need for places, events, and historical moments.
+const DURATION_WINDOWS: Record<IntentType, { min: number; max: number; sweetMin: number; sweetMax: number }> = {
+  talking_head: { min: 120, max: 1500, sweetMin: 240, sweetMax: 900 },
+  broll:        { min: 20,  max: 1200, sweetMin: 30,  sweetMax: 240 },
+  archival:     { min: 20,  max: 1500, sweetMin: 60,  sweetMax: 600 },
+};
+
+// Stopwords + min token length keep the keyword matcher from being dominated
+// by filler words ("the", "of", "and") that appear in every YouTube title.
+const RANK_STOPWORDS = new Set([
+  "the","a","an","of","and","or","to","in","on","for","with","at","by","from",
+  "as","is","are","was","were","be","been","this","that","these","those","it",
+  "its","into","about","over","after","before","early","late","new","old",
+]);
+
+export function tokenizeKeyword(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3 && !RANK_STOPWORDS.has(t));
+}
 
 export function rankCandidate(input: RankInput): RankedCandidate {
   const c = input.candidate;
   const reasons: string[] = [];
+  const intentType: IntentType = input.intentType ?? "talking_head";
+  const window = DURATION_WINDOWS[intentType];
 
   if (input.blockedChannelIds.has(c.channelId)) {
-    return { ...c, score: 0, reasons: [], rejected: true, rejectReason: "blocked channel" };
+    return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: "blocked channel" };
   }
-  if (c.isLive) return { ...c, score: 0, reasons: [], rejected: true, rejectReason: "live broadcast" };
+  if (c.isLive) return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: "live broadcast" };
   if (c.privacyStatus !== "public") {
-    return { ...c, score: 0, reasons: [], rejected: true, rejectReason: `privacy=${c.privacyStatus}` };
+    return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: `privacy=${c.privacyStatus}` };
   }
-  if (c.durationSeconds < MIN_DURATION) {
-    return { ...c, score: 0, reasons: [], rejected: true, rejectReason: "too short" };
+  if (c.durationSeconds < window.min) {
+    return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: `too short for ${intentType}` };
   }
-  if (c.durationSeconds > MAX_DURATION) {
-    return { ...c, score: 0, reasons: [], rejected: true, rejectReason: "too long" };
+  if (c.durationSeconds > window.max) {
+    return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: `too long for ${intentType}` };
   }
 
   let score = 0;
   const titleLower = c.title.toLowerCase();
   const descLower = c.description.toLowerCase();
 
-  if (input.mainCelebrity && titleLower.includes(input.mainCelebrity.toLowerCase())) {
+  const celebrityHit = !!(
+    input.mainCelebrity && titleLower.includes(input.mainCelebrity.toLowerCase())
+  );
+  if (celebrityHit) {
     score += 40;
     reasons.push("title contains main celebrity");
   }
-  let kwHits = 0;
-  for (const kw of input.keywords) {
-    const kwLower = kw.toLowerCase();
-    if (titleLower.includes(kwLower)) { kwHits += 2; reasons.push(`title:${kw}`); }
-    else if (descLower.includes(kwLower)) { kwHits += 1; reasons.push(`desc:${kw}`); }
-  }
-  score += Math.min(kwHits * 5, 30);
 
-  if (input.approvedChannelIds.has(c.channelId)) {
+  // Tokenize keywords across the whole bag, dedupe, then count distinct token
+  // hits. Substring-matching the full keyword string ("Princess Diana Prince
+  // Charles wedding early royal life") never matched real titles, so kwHits
+  // stayed at 0 and ranking collapsed to the duration tie-breaker.
+  const tokenSet = new Set<string>();
+  for (const kw of input.keywords) for (const t of tokenizeKeyword(kw)) tokenSet.add(t);
+  // Don't double-count tokens that are part of the celebrity name we already
+  // scored above.
+  if (input.mainCelebrity) {
+    for (const t of tokenizeKeyword(input.mainCelebrity)) tokenSet.delete(t);
+  }
+  let titleHits = 0;
+  let descHits = 0;
+  for (const t of tokenSet) {
+    if (titleLower.includes(t)) { titleHits++; reasons.push(`title:${t}`); }
+    else if (descLower.includes(t)) { descHits++; reasons.push(`desc:${t}`); }
+  }
+  score += Math.min(titleHits * 6 + descHits * 2, 40);
+
+  const approvedChannelHit = input.approvedChannelIds.has(c.channelId);
+  if (approvedChannelHit) {
     score += 25;
     reasons.push("approved channel");
   }
 
-  // Sweet spot: 4–15 minutes
-  if (c.durationSeconds >= 240 && c.durationSeconds <= 900) {
+  // Sweet spot varies by intent type.
+  if (c.durationSeconds >= window.sweetMin && c.durationSeconds <= window.sweetMax) {
     score += 10;
-    reasons.push("sweet-spot duration");
+    reasons.push(`sweet-spot duration (${intentType})`);
   }
 
   // Penalize obvious junk
@@ -202,7 +250,20 @@ export function rankCandidate(input: RankInput): RankedCandidate {
     if (titleLower.includes(bad)) { score -= 10; reasons.push(`-junk:${bad}`); }
   }
 
-  return { ...c, score, reasons, rejected: false };
+  // Require at least one real content signal. Duration alone (+10) used to
+  // wave through tourist clips and unrelated paparazzi videos because the
+  // ranker had nothing else to weigh — they passed the duration window and
+  // rendered as "100" in the UI. Approved channel counts as a signal too.
+  const hasContentSignal = celebrityHit || titleHits > 0 || descHits > 0 || approvedChannelHit;
+  if (!hasContentSignal) {
+    return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "no keyword or celebrity match" };
+  }
+
+  // Normalize for the UI bar. Clamp to [0, 100] so the rare junk-penalized
+  // negative score and the (very rare) over-max score still render sanely.
+  const displayScore = Math.max(0, Math.min(100, Math.round((score / MAX_RANK_SCORE) * 100)));
+
+  return { ...c, score, displayScore, reasons, rejected: false };
 }
 
 export async function loadChannelRules(): Promise<{ approved: Set<string>; blocked: Set<string> }> {

@@ -11,6 +11,7 @@ import {
   type JobsResp,
   type ProjectResp,
   type TimelineRow,
+  type WorkspacePhase,
 } from "./_shared";
 import { ProjectHeader } from "./_components/project-header";
 import { IntakeScreen } from "./_components/intake-screen";
@@ -44,7 +45,7 @@ export function ProjectWorkspace({
     refetchInterval: 8000,
   });
 
-  const [phaseOverride, setPhaseOverride] = useState<"export" | null>(null);
+  const [phaseOverride, setPhaseOverride] = useState<WorkspacePhase | null>(null);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
 
   if (projectQ.isLoading) {
@@ -70,8 +71,19 @@ export function ProjectWorkspace({
   const jobs = jobsQ.data;
   const timelineCount = timelineQ.data?.items.length ?? 0;
   const derived = derivePhase(project, jobs, timelineCount);
-  const phase = phaseOverride ?? derived;
+  const PHASE_ORDER: WorkspacePhase[] = ["intake", "analysis", "processing", "editor", "export"];
+  const derivedIdx = PHASE_ORDER.indexOf(derived);
+  const overrideIdx = phaseOverride ? PHASE_ORDER.indexOf(phaseOverride) : -1;
+  // Only honor the override if it points to a phase the user has already reached.
+  const phase: WorkspacePhase =
+    phaseOverride && overrideIdx >= 0 && overrideIdx <= derivedIdx ? phaseOverride : derived;
   const canExport = derived === "editor" || derived === "export";
+
+  const onPhaseSelect = (target: WorkspacePhase) => {
+    const targetIdx = PHASE_ORDER.indexOf(target);
+    if (targetIdx < 0 || targetIdx > derivedIdx) return;
+    setPhaseOverride(targetIdx === derivedIdx ? null : target);
+  };
 
   return (
     <WorkspaceLayout
@@ -79,9 +91,11 @@ export function ProjectWorkspace({
         <ProjectHeader
           project={project.project}
           phase={phase}
+          derivedPhase={derived}
           jobs={jobs}
           exportDisabled={!canExport}
           onExport={() => setPhaseOverride("export")}
+          onPhaseSelect={onPhaseSelect}
         />
       }
       right={

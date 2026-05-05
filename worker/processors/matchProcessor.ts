@@ -1,7 +1,7 @@
 import type { MatchJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
-import { matchClipsToSections, type ClipForMatch } from "@/lib/ai/gemini";
+import { scoreClipsForSections, type ClipForMatch, type SectionScore } from "@/lib/ai/gemini";
 import {
   buildBlockSequence,
   planTimeline,
@@ -10,6 +10,12 @@ import {
   type PlannedBlock,
 } from "@/lib/ai/timeline-plan";
 import { estimateDurationSeconds } from "@/lib/ai/segments";
+
+// Below this score (0–100), Gemini judged the clip a poor visual fit for the
+// section. We'd rather downgrade the block to an image placeholder than burn
+// a low-relevance clip there — that's exactly the failure mode that produced
+// the "every block shows the same face" screenshot.
+const MIN_RELEVANT_SCORE = 25;
 
 // Splits a transcript into ~sentence/paragraph sections. Cheap MVP heuristic.
 export function splitTranscript(transcript: string): string[] {
@@ -83,13 +89,60 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     labels: Array.isArray(c.labels) ? c.labels as string[] : [],
   }));
 
-  let matches: { section_index: number; clip_id: string | null }[] = [];
+  // Score every (section, clip) pair so we can pick the best UNUSED clip per
+  // section instead of falling back to insertion order when a top pick is
+  // already consumed.
+  let sectionScores: SectionScore[] = [];
+  let geminiFailed = false;
   try {
-    matches = await matchClipsToSections(sections, clipsForMatch);
+    sectionScores = await scoreClipsForSections(sections, clipsForMatch);
   } catch (e) {
+    geminiFailed = true;
     await logJob({ projectId, jobId: mediaJobId }, "match.gemini.failed", { err: (e as Error).message });
   }
   await setMediaJob(mediaJobId, { progress: 40 });
+
+  // Index scores by section for O(1) lookup during assignment.
+  const scoresBySection = new Map<number, SectionScore["candidates"]>();
+  for (const s of sectionScores) {
+    scoresBySection.set(s.section_index, s.candidates);
+  }
+
+  // Diagnostic: how many clips have empty labels? Empty labels mean the
+  // Vision labeler failed during clipProcessor and Gemini has nothing to
+  // score against — this is the most common cause of "every score is 0".
+  const clipsWithLabels = clipsForMatch.filter((c) => (c.labels?.length ?? 0) > 0).length;
+
+  // Diagnostic: distribution of scores so we can see whether scoring
+  // produced data but everything fell below MIN_RELEVANT_SCORE.
+  const scoreBuckets = { gte75: 0, gte50: 0, gte25: 0, gte1: 0, zero: 0 };
+  for (const s of sectionScores) {
+    for (const cand of s.candidates) {
+      if (cand.score >= 75) scoreBuckets.gte75++;
+      else if (cand.score >= 50) scoreBuckets.gte50++;
+      else if (cand.score >= 25) scoreBuckets.gte25++;
+      else if (cand.score >= 1) scoreBuckets.gte1++;
+      else scoreBuckets.zero++;
+    }
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.scores", {
+    sectionsScored: sectionScores.length,
+    totalSections: sections.length,
+    totalClips: clips.length,
+    clipsWithLabels,
+    clipsWithoutLabels: clips.length - clipsWithLabels,
+    avgCandidatesPerSection: sectionScores.length
+      ? Math.round((sectionScores.reduce((n, s) => n + s.candidates.length, 0) / sectionScores.length) * 10) / 10
+      : 0,
+    scoreBuckets,
+    geminiThrew: geminiFailed,
+    // If geminiThrew is false AND sectionsScored is 0, scoring returned []
+    // through one of the silent failure paths in lib/ai/gemini.ts (parse
+    // error or schema validation failure). That's an invisible degradation.
+    silentScoringFailure: !geminiFailed && sectionScores.length === 0 && clips.length > 0,
+    minRelevantScore: MIN_RELEVANT_SCORE,
+  });
 
   // Build a plan + block sequence sized to the voiceover.
   const plan = planTimeline(voiceoverSeconds);
@@ -106,32 +159,62 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   });
 
   // ---- Clip assignment (each clip used at most once) ---------------------
-  // Order Gemini's matches by section index so earlier sections (where the
-  // first clip choice tends to be the strongest) get priority.
-  const matchOrder = [...matches]
-    .filter((m) => !!m.clip_id)
-    .sort((a, b) => a.section_index - b.section_index)
-    .map((m) => m.clip_id as string);
-
-  // Followed by any clips Gemini didn't reference — keeps us from running
-  // out when the model returns fewer matches than blocks.
-  const unmatchedClipIds = clips
-    .map((c) => c.id as string)
-    .filter((id) => !matchOrder.includes(id));
-
-  const clipQueue: string[] = [...new Set([...matchOrder, ...unmatchedClipIds])];
+  // For each footage block (in order), pick the highest-scoring unused clip
+  // for that block's section. If no scored candidate clears MIN_RELEVANT_SCORE
+  // we downgrade to an image placeholder — a clean image beats a misleading
+  // shot of the wrong subject.
   const usedClipIds = new Set<string>();
 
-  // If there are far fewer clips than footage slots, downgrade the surplus
-  // footage blocks to image blocks (with longer durations) — per spec, prefer
-  // more image blocks over duplicating clips.
+  // Tracks WHY each block got the clip it did, so the post-run log can tell
+  // us whether scoring is working or whether everything fell to the fallback.
+  const pickSourceCounts = {
+    scored_top: 0,            // Gemini-scored clip cleared MIN_RELEVANT_SCORE
+    scored_below_threshold: 0, // had a scored candidate but score < threshold
+    no_scores_for_section: 0,  // section had no scored candidates at all
+    intro_fallback_any: 0,     // intro reached pickAnyUnusedClip (insertion order)
+    downgraded_to_image: 0,    // footage block downgraded
+  };
+
+  function pickClipForSection(sectionIdx: number): { clipId: string | null; score: number; reason?: string; source: "scored_top" | "scored_below_threshold" | "no_scores_for_section" } {
+    // 1) Try scored candidates first, in score order.
+    const scored = scoresBySection.get(sectionIdx) ?? [];
+    if (scored.length === 0) {
+      return { clipId: null, score: 0, source: "no_scores_for_section" };
+    }
+    for (const cand of scored) {
+      if (usedClipIds.has(cand.clip_id)) continue;
+      if (cand.score < MIN_RELEVANT_SCORE) break;     // sorted desc; rest are worse
+      return { clipId: cand.clip_id, score: cand.score, reason: cand.reason, source: "scored_top" };
+    }
+    // Had scored candidates but none cleared the threshold (or all used).
+    return { clipId: null, score: 0, source: "scored_below_threshold" };
+  }
+
+  function pickAnyUnusedClip(): string | null {
+    // Last-resort fallback for the intro block: prefer high-scoring clips
+    // (across any section) before falling through to arbitrary clip order.
+    const seen = new Set<string>();
+    for (const s of sectionScores) {
+      for (const cand of s.candidates) {
+        if (seen.has(cand.clip_id) || usedClipIds.has(cand.clip_id)) continue;
+        seen.add(cand.clip_id);
+        return cand.clip_id;
+      }
+    }
+    for (const c of clips) {
+      if (!usedClipIds.has(c.id as string)) return c.id as string;
+    }
+    return null;
+  }
+
+  // If we have far fewer clips than footage slots, pre-downgrade the surplus
+  // footage blocks to image blocks. We leave the intro alone so the video
+  // still opens with motion when possible.
   const footageBlockIdxs: number[] = blocks
     .map((b, i) => (b.type === "footage" || b.type === "intro" ? i : -1))
     .filter((i) => i >= 0);
-  const surplus = footageBlockIdxs.length - clipQueue.length;
+  const surplus = footageBlockIdxs.length - clips.length;
   if (surplus > 0) {
-    // Convert the LAST `surplus` footage blocks into image blocks. We leave
-    // the intro alone so the video still opens with motion when possible.
     const convertibles = footageBlockIdxs.filter((i) => blocks[i].type !== "intro");
     const toConvert = convertibles.slice(-surplus);
     for (const idx of toConvert) {
@@ -147,13 +230,28 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const items: Array<Record<string, unknown>> = [];
   let position = 0;
   let sectionCursor = 0;
+  let assignedFootageCount = 0;
+  let downgradedCount = 0;
 
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
 
     if (block.type === "intro") {
-      const introClipId = clipQueue.shift();
+      // Intro: try the section-0 best pick first, then any unused clip so the
+      // video opens with motion even if the score was low.
+      const picked = pickClipForSection(0);
+      let introClipId = picked.clipId;
+      let pickSource: string = picked.source;
+      if (!introClipId) {
+        introClipId = pickAnyUnusedClip();
+        if (introClipId) pickSource = "intro_fallback_any";
+      }
       if (introClipId) usedClipIds.add(introClipId);
+      // Record diagnostics
+      if (picked.source === "scored_top") pickSourceCounts.scored_top++;
+      else if (picked.source === "scored_below_threshold") pickSourceCounts.scored_below_threshold++;
+      else pickSourceCounts.no_scores_for_section++;
+      if (pickSource === "intro_fallback_any") pickSourceCounts.intro_fallback_any++;
       items.push({
         project_id: projectId,
         clip_id: introClipId ?? null,
@@ -162,25 +260,47 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         duration: block.duration,
         script_text: sections[0] ?? null,
         overlay_text: null,
-        metadata: { planned: true },
+        metadata: {
+          planned: true,
+          match_score: picked.clipId ? picked.score : 0,
+          match_reason: picked.reason ?? null,
+          pick_source: pickSource,
+        },
         approved: false,
       });
+      if (introClipId) assignedFootageCount++;
       continue;
     }
 
     if (block.type === "footage") {
-      // Pull the next unused clip from the queue.
-      let clipId: string | null = null;
-      while (clipQueue.length) {
-        const candidate = clipQueue.shift()!;
-        if (!usedClipIds.has(candidate)) {
-          clipId = candidate;
-          usedClipIds.add(candidate);
-          break;
-        }
-      }
-      if (!clipId) {
-        // Ran out — degrade to an image placeholder rather than duplicating.
+      const picked = pickClipForSection(sectionCursor);
+      // Record diagnostics regardless of outcome
+      if (picked.source === "scored_top") pickSourceCounts.scored_top++;
+      else if (picked.source === "scored_below_threshold") pickSourceCounts.scored_below_threshold++;
+      else pickSourceCounts.no_scores_for_section++;
+      if (picked.clipId) {
+        usedClipIds.add(picked.clipId);
+        items.push({
+          project_id: projectId,
+          clip_id: picked.clipId,
+          type: "footage",
+          position: position++,
+          duration: block.duration,
+          script_text: sections[sectionCursor] ?? null,
+          overlay_text: null,
+          metadata: {
+            planned: true,
+            match_score: picked.score,
+            match_reason: picked.reason ?? null,
+            pick_source: picked.source,
+            section_index: sectionCursor,
+          },
+          approved: false,
+        });
+        assignedFootageCount++;
+      } else {
+        pickSourceCounts.downgraded_to_image++;
+        // No relevant clip → image placeholder (better than a misleading shot).
         items.push({
           project_id: projectId,
           clip_id: null,
@@ -189,21 +309,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           duration: pickDuration("image"),
           script_text: sections[sectionCursor] ?? null,
           overlay_text: null,
-          metadata: { placeholder: true, planned: true, downgraded_from: "footage" },
+          metadata: {
+            placeholder: true,
+            planned: true,
+            downgraded_from: "footage",
+            downgrade_reason: picked.source === "no_scores_for_section"
+              ? "section had no scored candidates"
+              : "no clip cleared MIN_RELEVANT_SCORE",
+            pick_source: picked.source,
+            section_index: sectionCursor,
+          },
           approved: false,
         });
-      } else {
-        items.push({
-          project_id: projectId,
-          clip_id: clipId,
-          type: "footage",
-          position: position++,
-          duration: block.duration,
-          script_text: sections[sectionCursor] ?? null,
-          overlay_text: null,
-          metadata: { planned: true },
-          approved: false,
-        });
+        downgradedCount++;
       }
       sectionCursor = Math.min(sections.length - 1, sectionCursor + 1);
       continue;
@@ -241,6 +359,18 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
+  // Diagnostic summary: tells us at a glance whether the matcher is using
+  // Gemini scores or silently degrading to insertion-order fallback. If
+  // pickSourceCounts.scored_top is 0 and the others are non-zero, scoring
+  // is broken — check match.scores log entry for the cause.
+  await logJob({ projectId, jobId: mediaJobId }, "match.assignment", {
+    pickSourceCounts,
+    assignedFootageCount,
+    downgradedCount,
+    uniqueClipsUsed: usedClipIds.size,
+    totalFootageBlocks: footageBlockIdxs.length,
+  });
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
@@ -259,6 +389,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       bucket: plan.bucket,
       plannedDurationSum: plannedSum,
       uniqueClipsUsed: usedClipIds.size,
+      assignedFootageCount,
+      downgradedCount,
     },
   });
   await setProjectStatus(projectId, "ready_for_review");

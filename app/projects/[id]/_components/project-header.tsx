@@ -21,15 +21,19 @@ const PHASE_ORDER: WorkspacePhase[] = ["intake", "analysis", "processing", "edit
 export function ProjectHeader({
   project,
   phase,
+  derivedPhase,
   jobs,
   onExport,
   exportDisabled,
+  onPhaseSelect,
 }: {
   project: ProjectResp["project"] | undefined;
   phase: WorkspacePhase;
+  derivedPhase?: WorkspacePhase;
   jobs: JobsResp | undefined;
   onExport?: () => void;
   exportDisabled?: boolean;
+  onPhaseSelect?: (phase: WorkspacePhase) => void;
 }) {
   const busy = jobsBusy(jobs);
   const statusTone = project ? statusToTone(project.status) : "default";
@@ -74,7 +78,11 @@ export function ProjectHeader({
           </div>
         </div>
 
-        <PhasePill current={phase} />
+        <PhasePill
+          current={phase}
+          maxReached={derivedPhase ?? phase}
+          onSelect={onPhaseSelect}
+        />
 
         <Button
           variant="gradient"
@@ -89,25 +97,42 @@ export function ProjectHeader({
   );
 }
 
-function PhasePill({ current }: { current: WorkspacePhase }) {
+function PhasePill({
+  current,
+  maxReached,
+  onSelect,
+}: {
+  current: WorkspacePhase;
+  maxReached: WorkspacePhase;
+  onSelect?: (phase: WorkspacePhase) => void;
+}) {
   const idx = PHASE_ORDER.indexOf(current);
+  const maxIdx = PHASE_ORDER.indexOf(maxReached);
   return (
     <div className="hidden lg:flex items-center gap-1 rounded-full border border-border bg-surface p-1">
       {PHASE_ORDER.map((p, i) => {
         const done = i < idx;
         const active = i === idx;
+        const reachable = i <= maxIdx;
+        const clickable = !!onSelect && reachable && !active;
         return (
-          <span
+          <button
             key={p}
+            type="button"
+            onClick={clickable ? () => onSelect!(p) : undefined}
+            disabled={!clickable}
+            aria-current={active ? "step" : undefined}
             className={cn(
               "px-2.5 h-6 inline-flex items-center rounded-full text-[11px] font-medium transition-colors",
               active && "gradient-brand text-white shadow-sm",
               done && !active && "text-fg-muted",
               !done && !active && "text-fg-subtle",
+              clickable && "cursor-pointer hover:bg-surface-hover hover:text-fg",
+              !clickable && !active && "cursor-not-allowed",
             )}
           >
             {PHASE_LABEL[p]}
-          </span>
+          </button>
         );
       })}
     </div>

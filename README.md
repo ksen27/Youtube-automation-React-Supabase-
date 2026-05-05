@@ -86,7 +86,8 @@ Hard caps (configurable in `.env.local`):
 - `MAX_CLIPS_PER_VIDEO` — default 20
 - `MAX_SOURCE_DURATION_SECONDS` — default 1500 (25 min)
 - `WORKER_CONCURRENCY` — default 2
-- Project-wide cap: 100 clips total (in code: `MAX_TOTAL_CLIPS_PER_PROJECT`)
+- `CLIP_OVERSAMPLING_FACTOR` — default 2 (clips per footage block; project-wide cap = `footageBlocks × oversampling`, bounded by `MIN_CLIP_CAP`/`MAX_CLIP_CAP`)
+- `MIN_CLIP_CAP` / `MAX_CLIP_CAP` — defaults 20 / 400
 
 ## Scripts
 
