@@ -5,28 +5,82 @@ import { scoreClipsForSections, type ClipForMatch, type SectionScore } from "@/l
 import {
   buildBlockSequence,
   planTimeline,
-  pickDuration,
   sumDurations,
   type PlannedBlock,
 } from "@/lib/ai/timeline-plan";
 import { estimateDurationSeconds } from "@/lib/ai/segments";
 
 // Below this score (0–100), Gemini judged the clip a poor visual fit for the
-// section. We'd rather downgrade the block to an image placeholder than burn
-// a low-relevance clip there — that's exactly the failure mode that produced
-// the "every block shows the same face" screenshot.
+// block's spoken words. We'd rather downgrade the block to an image
+// placeholder than burn a low-relevance clip there — that's exactly the
+// failure mode that produced the "every block shows the same face"
+// screenshot.
 const MIN_RELEVANT_SCORE = 25;
 
-// Splits a transcript into ~sentence/paragraph sections. Cheap MVP heuristic.
+// Splits a transcript into ~sentence/paragraph sections. Retained for
+// backward-compatibility / test imports; the matcher itself no longer uses
+// section-cursor logic. See buildBlockTexts() below for the time-aligned
+// approach that replaced it.
 export function splitTranscript(transcript: string): string[] {
   const cleaned = transcript.replace(/\s+/g, " ").trim();
   if (!cleaned) return [];
-  // Try paragraph splits first
   const paras = transcript.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
   if (paras.length >= 4) return paras;
-  // Otherwise sentence-ish split
   const sents = cleaned.split(/(?<=[.!?])\s+(?=[A-Z0-9"'])/).filter(Boolean);
   return sents.length ? sents : [cleaned];
+}
+
+// For each timeline block, return the words of the voiceover that are
+// (approximately) being spoken during that block's wall-clock window.
+//
+// Why this exists:
+//   The old matcher split the transcript into sentences and walked a
+//   sectionCursor that incremented per block — regardless of how long
+//   each section actually took to read aloud. A 3-word sentence and a
+//   60-word paragraph both consumed one block, so visuals drifted out
+//   of sync with audio. Image blocks also incremented the cursor,
+//   silently skipping sections.
+//
+// How it works:
+//   We assume the voiceover narrates at a steady pace (words spread
+//   uniformly across the duration). For each block's time window
+//   [blockStart, blockEnd], we slice the proportional word range out
+//   of the transcript and join. This is cheap, deterministic, and
+//   gives the matcher exactly the right text to score against.
+//
+//   When word-level timestamps from Deepgram become available, swap
+//   the proportional slicing for actual word boundaries — the
+//   surrounding interface stays identical.
+export function buildBlockTexts(
+  transcript: string,
+  blocks: PlannedBlock[],
+  voiceoverSeconds: number,
+): string[] {
+  const cleaned = transcript.replace(/\s+/g, " ").trim();
+  const words = cleaned.length ? cleaned.split(" ") : [];
+  if (words.length === 0 || voiceoverSeconds <= 0) return blocks.map(() => "");
+  const wordsPerSecond = words.length / voiceoverSeconds;
+
+  let acc = 0;
+  const out: string[] = [];
+  for (const block of blocks) {
+    const blockStart = acc;
+    const blockEnd = acc + block.duration;
+    acc = blockEnd;
+    const startWord = Math.max(0, Math.floor(blockStart * wordsPerSecond));
+    const endWord = Math.min(words.length, Math.ceil(blockEnd * wordsPerSecond));
+    // Pad each window slightly so very short blocks (4-6s) don't get
+    // degenerate 1-2 word strings that score poorly. ±1s of padding
+    // gives the scorer real context without bleeding across many blocks.
+    const paddedStart = Math.max(0, Math.floor((blockStart - 1) * wordsPerSecond));
+    const paddedEnd = Math.min(words.length, Math.ceil((blockEnd + 1) * wordsPerSecond));
+    const slice = words.slice(
+      Math.min(paddedStart, startWord),
+      Math.max(paddedEnd, endWord),
+    );
+    out.push(slice.join(" "));
+  }
+  return out;
 }
 
 export async function processMatchJob(data: MatchJobData): Promise<void> {
@@ -42,7 +96,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .eq("id", projectId)
     .single();
   const transcript = project?.transcript ?? "";
-  const sections = splitTranscript(transcript);
 
   // Voiceover duration drives the whole plan. Prefer the probed audio length;
   // fall back to a word-count estimate if the audio wasn't probed.
@@ -89,123 +142,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     labels: Array.isArray(c.labels) ? c.labels as string[] : [],
   }));
 
-  // Score every (section, clip) pair so we can pick the best UNUSED clip per
-  // section instead of falling back to insertion order when a top pick is
-  // already consumed.
-  let sectionScores: SectionScore[] = [];
-  let geminiFailed = false;
-  try {
-    sectionScores = await scoreClipsForSections(sections, clipsForMatch);
-  } catch (e) {
-    geminiFailed = true;
-    await logJob({ projectId, jobId: mediaJobId }, "match.gemini.failed", { err: (e as Error).message });
-  }
-  await setMediaJob(mediaJobId, { progress: 40 });
+  // Load all extracted entities for this project. We use them to bias the
+  // scorer so that when a block's text mentions a place / event / movie /
+  // song / company / TV show / age, the matched clip's labels SHOULD match
+  // that specific entity — not just be generic celebrity B-roll.
+  // (Phase A of the entity-aware matching feature.)
+  const { data: entityRows } = await sb
+    .from("project_entities")
+    .select("type, value")
+    .eq("project_id", projectId);
+  const allEntities: Array<{ type: string; value: string }> = (entityRows ?? [])
+    .map((e) => ({ type: e.type as string, value: String(e.value ?? "") }))
+    .filter((e) => e.value.trim().length > 0);
 
-  // Index scores by section for O(1) lookup during assignment.
-  const scoresBySection = new Map<number, SectionScore["candidates"]>();
-  for (const s of sectionScores) {
-    scoresBySection.set(s.section_index, s.candidates);
-  }
-
-  // Diagnostic: how many clips have empty labels? Empty labels mean the
-  // Vision labeler failed during clipProcessor and Gemini has nothing to
-  // score against — this is the most common cause of "every score is 0".
-  const clipsWithLabels = clipsForMatch.filter((c) => (c.labels?.length ?? 0) > 0).length;
-
-  // Diagnostic: distribution of scores so we can see whether scoring
-  // produced data but everything fell below MIN_RELEVANT_SCORE.
-  const scoreBuckets = { gte75: 0, gte50: 0, gte25: 0, gte1: 0, zero: 0 };
-  for (const s of sectionScores) {
-    for (const cand of s.candidates) {
-      if (cand.score >= 75) scoreBuckets.gte75++;
-      else if (cand.score >= 50) scoreBuckets.gte50++;
-      else if (cand.score >= 25) scoreBuckets.gte25++;
-      else if (cand.score >= 1) scoreBuckets.gte1++;
-      else scoreBuckets.zero++;
-    }
-  }
-
-  await logJob({ projectId, jobId: mediaJobId }, "match.scores", {
-    sectionsScored: sectionScores.length,
-    totalSections: sections.length,
-    totalClips: clips.length,
-    clipsWithLabels,
-    clipsWithoutLabels: clips.length - clipsWithLabels,
-    avgCandidatesPerSection: sectionScores.length
-      ? Math.round((sectionScores.reduce((n, s) => n + s.candidates.length, 0) / sectionScores.length) * 10) / 10
-      : 0,
-    scoreBuckets,
-    geminiThrew: geminiFailed,
-    // If geminiThrew is false AND sectionsScored is 0, scoring returned []
-    // through one of the silent failure paths in lib/ai/gemini.ts (parse
-    // error or schema validation failure). That's an invisible degradation.
-    silentScoringFailure: !geminiFailed && sectionScores.length === 0 && clips.length > 0,
-    minRelevantScore: MIN_RELEVANT_SCORE,
-  });
-
-  // Build a plan + block sequence sized to the voiceover.
+  // ---- Build the block plan first ---------------------------------------
+  // The block sequence is the unit of matching now. Each block's wall-clock
+  // window determines what voiceover words it covers; clips are scored
+  // against THAT text, not against arbitrary pre-split sections.
   const plan = planTimeline(voiceoverSeconds);
   const blocks = buildBlockSequence(plan);
-
-  await logJob({ projectId, jobId: mediaJobId }, "match.plan", {
-    voiceoverSeconds,
-    avgBlockSeconds: plan.avgBlockSeconds,
-    totalBlocks: plan.totalBlocks,
-    footageBlocks: plan.footageBlocks,
-    imageBlocks: plan.imageBlocks,
-    bucket: plan.bucket,
-    plannedDurationSum: Math.round(sumDurations(blocks) * 10) / 10,
-  });
-
-  // ---- Clip assignment (each clip used at most once) ---------------------
-  // For each footage block (in order), pick the highest-scoring unused clip
-  // for that block's section. If no scored candidate clears MIN_RELEVANT_SCORE
-  // we downgrade to an image placeholder — a clean image beats a misleading
-  // shot of the wrong subject.
-  const usedClipIds = new Set<string>();
-
-  // Tracks WHY each block got the clip it did, so the post-run log can tell
-  // us whether scoring is working or whether everything fell to the fallback.
-  const pickSourceCounts = {
-    scored_top: 0,            // Gemini-scored clip cleared MIN_RELEVANT_SCORE
-    scored_below_threshold: 0, // had a scored candidate but score < threshold
-    no_scores_for_section: 0,  // section had no scored candidates at all
-    intro_fallback_any: 0,     // intro reached pickAnyUnusedClip (insertion order)
-    downgraded_to_image: 0,    // footage block downgraded
-  };
-
-  function pickClipForSection(sectionIdx: number): { clipId: string | null; score: number; reason?: string; source: "scored_top" | "scored_below_threshold" | "no_scores_for_section" } {
-    // 1) Try scored candidates first, in score order.
-    const scored = scoresBySection.get(sectionIdx) ?? [];
-    if (scored.length === 0) {
-      return { clipId: null, score: 0, source: "no_scores_for_section" };
-    }
-    for (const cand of scored) {
-      if (usedClipIds.has(cand.clip_id)) continue;
-      if (cand.score < MIN_RELEVANT_SCORE) break;     // sorted desc; rest are worse
-      return { clipId: cand.clip_id, score: cand.score, reason: cand.reason, source: "scored_top" };
-    }
-    // Had scored candidates but none cleared the threshold (or all used).
-    return { clipId: null, score: 0, source: "scored_below_threshold" };
-  }
-
-  function pickAnyUnusedClip(): string | null {
-    // Last-resort fallback for the intro block: prefer high-scoring clips
-    // (across any section) before falling through to arbitrary clip order.
-    const seen = new Set<string>();
-    for (const s of sectionScores) {
-      for (const cand of s.candidates) {
-        if (seen.has(cand.clip_id) || usedClipIds.has(cand.clip_id)) continue;
-        seen.add(cand.clip_id);
-        return cand.clip_id;
-      }
-    }
-    for (const c of clips) {
-      if (!usedClipIds.has(c.id as string)) return c.id as string;
-    }
-    return null;
-  }
 
   // If we have far fewer clips than footage slots, pre-downgrade the surplus
   // footage blocks to image blocks. We leave the intro alone so the video
@@ -218,112 +173,364 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const convertibles = footageBlockIdxs.filter((i) => blocks[i].type !== "intro");
     const toConvert = convertibles.slice(-surplus);
     for (const idx of toConvert) {
-      const newDur = pickDuration("image");
-      blocks[idx] = { type: "image", duration: newDur };
+      // Preserve the footage duration on conversion so we don't inflate
+      // total slideshow time when clip supply is tight.
+      blocks[idx] = { type: "image", duration: blocks[idx].duration };
     }
+  }
+
+  // For each block, derive the voiceover text spoken during that window.
+  // The scorer treats each block as a "section" — same prompt, but the
+  // text now lines up with the block's actual moment in the audio.
+  const blockTexts = buildBlockTexts(transcript, blocks, voiceoverSeconds);
+
+  // For each block, find which entities are mentioned in its spoken text.
+  // We do a case-insensitive substring search on each entity value. This is
+  // intentionally simple — Gemini does the actual semantic ranking; this
+  // step just tells the scorer which named entities are in play for the
+  // moment so it can prioritize visually-specific clips over generic ones.
+  const blockEntities: Array<Array<{ type: string; value: string }>> = blockTexts.map((text) => {
+    if (!text) return [];
+    const lower = text.toLowerCase();
+    const out: Array<{ type: string; value: string }> = [];
+    const seen = new Set<string>();
+    for (const ent of allEntities) {
+      const key = `${ent.type}:${ent.value.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      if (lower.includes(ent.value.toLowerCase())) {
+        out.push(ent);
+        seen.add(key);
+      }
+    }
+    return out;
+  });
+
+  // Entity diagnostics: how many blocks have at least one entity, and the
+  // total number of (block, entity) pairs across the timeline. If this is
+  // 0, the entity-aware matching has nothing to bias on and Phase A is
+  // effectively inert — usually because extractEntities returned [] or
+  // the entity values don't appear verbatim in the transcript words.
+  const blocksWithEntities = blockEntities.filter((e) => e.length > 0).length;
+  const totalEntityHits = blockEntities.reduce((n, e) => n + e.length, 0);
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.plan", {
+    voiceoverSeconds,
+    avgBlockSeconds: plan.avgBlockSeconds,
+    totalBlocks: plan.totalBlocks,
+    footageBlocks: plan.footageBlocks,
+    imageBlocks: plan.imageBlocks,
+    bucket: plan.bucket,
+    plannedDurationSum: Math.round(sumDurations(blocks) * 10) / 10,
+    blockTextSampleHead: blockTexts[0]?.slice(0, 100) ?? "",
+    blockTextSampleMid: blockTexts[Math.floor(blocks.length / 2)]?.slice(0, 100) ?? "",
+    entitiesLoaded: allEntities.length,
+    blocksWithEntities,
+    totalEntityHits,
+  });
+
+  // Score only the blocks that actually need a clip (footage + intro). We
+  // skip image/split blocks here because we never assign clips to them —
+  // sending them to Gemini would burn tokens for nothing.
+  const scorableBlockIdxs: number[] = [];
+  const scorableTexts: string[] = [];
+  const scorableEntities: Array<Array<{ type: string; value: string }>> = [];
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type === "footage" || blocks[i].type === "intro") {
+      scorableBlockIdxs.push(i);
+      scorableTexts.push(blockTexts[i]);
+      scorableEntities.push(blockEntities[i]);
+    }
+  }
+
+  let blockScores: SectionScore[] = [];
+  let geminiFailed = false;
+  try {
+    // topN=8 — each block needs enough alternatives that "my top 3 are
+    // already used by earlier blocks" doesn't immediately downgrade us.
+    // With 72 blocks and ~110 clips, narrow candidate pools (topN=3) cause
+    // clip starvation: late blocks find every option already assigned.
+    blockScores = await scoreClipsForSections(scorableTexts, clipsForMatch, 8, scorableEntities);
+  } catch (e) {
+    geminiFailed = true;
+    await logJob({ projectId, jobId: mediaJobId }, "match.gemini.failed", { err: (e as Error).message });
+  }
+  await setMediaJob(mediaJobId, { progress: 40 });
+
+  // Translate scorer's local section_index back to the block index in `blocks`.
+  // (scoreClipsForSections returns indices into its own input array, which
+  // is `scorableTexts`. We map those to absolute block indices.)
+  const scoresByBlock = new Map<number, SectionScore["candidates"]>();
+  for (const s of blockScores) {
+    const blockIdx = scorableBlockIdxs[s.section_index];
+    if (blockIdx === undefined) continue;
+    scoresByBlock.set(blockIdx, s.candidates);
+  }
+
+  const clipsWithLabels = clipsForMatch.filter((c) => (c.labels?.length ?? 0) > 0).length;
+  const scoreBuckets = { gte75: 0, gte50: 0, gte25: 0, gte1: 0, zero: 0 };
+  for (const s of blockScores) {
+    for (const cand of s.candidates) {
+      if (cand.score >= 75) scoreBuckets.gte75++;
+      else if (cand.score >= 50) scoreBuckets.gte50++;
+      else if (cand.score >= 25) scoreBuckets.gte25++;
+      else if (cand.score >= 1) scoreBuckets.gte1++;
+      else scoreBuckets.zero++;
+    }
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.scores", {
+    blocksScored: blockScores.length,
+    totalScorableBlocks: scorableBlockIdxs.length,
+    totalBlocks: blocks.length,
+    totalClips: clips.length,
+    clipsWithLabels,
+    clipsWithoutLabels: clips.length - clipsWithLabels,
+    avgCandidatesPerBlock: blockScores.length
+      ? Math.round((blockScores.reduce((n, s) => n + s.candidates.length, 0) / blockScores.length) * 10) / 10
+      : 0,
+    scoreBuckets,
+    geminiThrew: geminiFailed,
+    silentScoringFailure: !geminiFailed && blockScores.length === 0 && clips.length > 0,
+    minRelevantScore: MIN_RELEVANT_SCORE,
+  });
+
+  // ---- Tier 1: Gemini-scored global assignment -------------------------
+  // Greedy-by-best-score across all (block, clip) pairs that cleared
+  // MIN_RELEVANT_SCORE. Walk triples by score desc; assign each pair to its
+  // block IF both block and clip are still free. Each clip used at most
+  // once. This produces all the high-confidence matches.
+  type Triple = { blockIdx: number; clipId: string; score: number; reason?: string };
+  const triples: Triple[] = [];
+  for (const [blockIdx, cands] of scoresByBlock) {
+    for (const c of cands) {
+      if (c.score < MIN_RELEVANT_SCORE) continue;
+      triples.push({ blockIdx, clipId: c.clip_id, score: c.score, reason: c.reason });
+    }
+  }
+  triples.sort((a, b) => b.score - a.score);
+
+  type Assignment = { clipId: string; score: number; reason?: string; tier: "scored" | "filler" };
+  const blockAssignments = new Map<number, Assignment>();
+  const usedClipIds = new Set<string>();
+  for (const t of triples) {
+    if (blockAssignments.has(t.blockIdx)) continue;
+    if (usedClipIds.has(t.clipId)) continue;
+    blockAssignments.set(t.blockIdx, {
+      clipId: t.clipId, score: t.score, reason: t.reason, tier: "scored",
+    });
+    usedClipIds.add(t.clipId);
+  }
+
+  // ---- Tier 2: Label-overlap fill for unassigned footage blocks --------
+  // Per the user spec: keep 60/40 video:image ratio by filling every
+  // footage block with SOMETHING. When Gemini didn't score a usable clip,
+  // pick the unused clip whose labels best overlap with the block's text.
+  // Each clip still used at most once. If the unused-pool runs out, the
+  // remaining blocks downgrade to image (logged as a warning so we know
+  // the project under-provisioned clips for its voiceover length).
+  //
+  // Token-overlap is cheap and deterministic — Jaccard-ish: count the
+  // distinct tokens in clip.labels that appear in the block's words.
+  // Better than random/round-robin because it gives Tier 2 fills SOME
+  // topical relevance even when Gemini couldn't score them.
+  const STOP = new Set([
+    "the","a","an","of","and","or","to","in","on","for","with","at","by","from",
+    "as","is","are","was","were","be","been","this","that","these","those",
+  ]);
+  function tokenize(s: string): Set<string> {
+    const out = new Set<string>();
+    for (const t of s.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (t.length >= 3 && !STOP.has(t)) out.add(t);
+    }
+    return out;
+  }
+  // Pre-tokenize each clip's labels once. The label set already includes
+  // primarySubject and setting prefixes from clipProcessor.
+  const clipTokens = new Map<string, Set<string>>();
+  for (const c of clipsForMatch) {
+    clipTokens.set(c.id, tokenize((c.labels ?? []).join(" ")));
+  }
+
+  function pickFillerForBlock(blockIdx: number): { clipId: string; overlap: number } | null {
+    const blockText = blockTexts[blockIdx] ?? "";
+    if (!blockText) {
+      // No words to compare against — fall back to first unused clip.
+      for (const c of clipsForMatch) {
+        if (!usedClipIds.has(c.id)) return { clipId: c.id, overlap: 0 };
+      }
+      return null;
+    }
+    const blockToks = tokenize(blockText);
+    let best: { clipId: string; overlap: number } | null = null;
+    for (const c of clipsForMatch) {
+      if (usedClipIds.has(c.id)) continue;
+      const labels = clipTokens.get(c.id) ?? new Set();
+      let overlap = 0;
+      for (const t of labels) if (blockToks.has(t)) overlap++;
+      if (!best || overlap > best.overlap) {
+        best = { clipId: c.id, overlap };
+      }
+    }
+    return best;
+  }
+
+  for (const blockIdx of scorableBlockIdxs) {
+    if (blockAssignments.has(blockIdx)) continue;
+    const filler = pickFillerForBlock(blockIdx);
+    if (!filler) continue;     // pool exhausted → handled in render loop
+    blockAssignments.set(blockIdx, {
+      clipId: filler.clipId,
+      score: 0,
+      reason: filler.overlap > 0 ? `filler: ${filler.overlap} label tokens` : "filler: no overlap",
+      tier: "filler",
+    });
+    usedClipIds.add(filler.clipId);
+  }
+
+  // Diagnostic counters — track the new tier as well so logs reveal
+  // whether scoring or filling was carrying the timeline.
+  const pickSourceCounts = {
+    scored_top: 0,          // Tier 1: Gemini-scored ≥ MIN_RELEVANT_SCORE
+    filler_overlap: 0,      // Tier 2: label-token overlap ≥ 1
+    filler_any: 0,          // Tier 2: any unused clip (overlap = 0)
+    intro_fallback_any: 0,  // Intro had no scored or filler clip; took any unused
+    pool_exhausted: 0,      // Tier 2 found no unused clips → block downgraded
+  };
+
+  // Intro fallback — if the intro didn't get a scored OR filler clip
+  // (which shouldn't happen unless the pool is empty), take any unused.
+  function pickAnyUnusedClip(): string | null {
+    for (const c of clips) {
+      if (!usedClipIds.has(c.id as string)) return c.id as string;
+    }
+    return null;
   }
 
   // Wipe old draft for this project (so re-runs work).
   await sb.from("timeline_items").delete().eq("project_id", projectId);
 
-  // ---- Build timeline_items rows ----------------------------------------
   const items: Array<Record<string, unknown>> = [];
   let position = 0;
-  let sectionCursor = 0;
   let assignedFootageCount = 0;
   let downgradedCount = 0;
 
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
+    const assigned = blockAssignments.get(i);
+    const blockText = blockTexts[i] ?? "";
 
     if (block.type === "intro") {
-      // Intro: try the section-0 best pick first, then any unused clip so the
-      // video opens with motion even if the score was low.
-      const picked = pickClipForSection(0);
-      let introClipId = picked.clipId;
-      let pickSource: string = picked.source;
-      if (!introClipId) {
-        introClipId = pickAnyUnusedClip();
-        if (introClipId) pickSource = "intro_fallback_any";
+      let clipId = assigned?.clipId ?? null;
+      const score = assigned?.score ?? 0;
+      const reason = assigned?.reason ?? null;
+      let pickSource: string;
+      if (clipId && assigned) {
+        if (assigned.tier === "scored") {
+          pickSourceCounts.scored_top++;
+          pickSource = "scored_top";
+        } else {
+          // Tier 2 fill on the intro
+          if ((assigned.reason ?? "").startsWith("filler: ") && !(assigned.reason ?? "").endsWith("no overlap")) {
+            pickSourceCounts.filler_overlap++;
+            pickSource = "filler_overlap";
+          } else {
+            pickSourceCounts.filler_any++;
+            pickSource = "filler_any";
+          }
+        }
+      } else {
+        clipId = pickAnyUnusedClip();
+        if (clipId) {
+          usedClipIds.add(clipId);
+          pickSourceCounts.intro_fallback_any++;
+          pickSource = "intro_fallback_any";
+        } else {
+          pickSourceCounts.pool_exhausted++;
+          pickSource = "pool_exhausted";
+        }
       }
-      if (introClipId) usedClipIds.add(introClipId);
-      // Record diagnostics
-      if (picked.source === "scored_top") pickSourceCounts.scored_top++;
-      else if (picked.source === "scored_below_threshold") pickSourceCounts.scored_below_threshold++;
-      else pickSourceCounts.no_scores_for_section++;
-      if (pickSource === "intro_fallback_any") pickSourceCounts.intro_fallback_any++;
       items.push({
         project_id: projectId,
-        clip_id: introClipId ?? null,
+        clip_id: clipId,
         type: "intro",
         position: position++,
         duration: block.duration,
-        script_text: sections[0] ?? null,
+        script_text: blockText || null,
         overlay_text: null,
         metadata: {
           planned: true,
-          match_score: picked.clipId ? picked.score : 0,
-          match_reason: picked.reason ?? null,
+          match_score: score,
+          match_reason: reason,
           pick_source: pickSource,
+          block_index: i,
         },
         approved: false,
       });
-      if (introClipId) assignedFootageCount++;
+      if (clipId) assignedFootageCount++;
       continue;
     }
 
     if (block.type === "footage") {
-      const picked = pickClipForSection(sectionCursor);
-      // Record diagnostics regardless of outcome
-      if (picked.source === "scored_top") pickSourceCounts.scored_top++;
-      else if (picked.source === "scored_below_threshold") pickSourceCounts.scored_below_threshold++;
-      else pickSourceCounts.no_scores_for_section++;
-      if (picked.clipId) {
-        usedClipIds.add(picked.clipId);
+      if (assigned) {
+        // Tier 1 (scored) or Tier 2 (filler) — both keep the block as
+        // footage. The 60/40 ratio holds because the footage block stays
+        // a footage block; only the SOURCE of the clip differs.
+        let pickSource: string;
+        if (assigned.tier === "scored") {
+          pickSourceCounts.scored_top++;
+          pickSource = "scored_top";
+        } else if ((assigned.reason ?? "").startsWith("filler: ") && !(assigned.reason ?? "").endsWith("no overlap")) {
+          pickSourceCounts.filler_overlap++;
+          pickSource = "filler_overlap";
+        } else {
+          pickSourceCounts.filler_any++;
+          pickSource = "filler_any";
+        }
         items.push({
           project_id: projectId,
-          clip_id: picked.clipId,
+          clip_id: assigned.clipId,
           type: "footage",
           position: position++,
           duration: block.duration,
-          script_text: sections[sectionCursor] ?? null,
+          script_text: blockText || null,
           overlay_text: null,
           metadata: {
             planned: true,
-            match_score: picked.score,
-            match_reason: picked.reason ?? null,
-            pick_source: picked.source,
-            section_index: sectionCursor,
+            match_score: assigned.score,
+            match_reason: assigned.reason ?? null,
+            pick_source: pickSource,
+            block_index: i,
           },
           approved: false,
         });
         assignedFootageCount++;
       } else {
-        pickSourceCounts.downgraded_to_image++;
-        // No relevant clip → image placeholder (better than a misleading shot).
+        // Pool exhausted — the unused-clip pool ran dry before every
+        // footage block could be filled. This means clip generation
+        // didn't produce enough usable clips for the voiceover length;
+        // fix by raising MAX_CLIPS_PER_VIDEO or relaxing the junk filter.
+        pickSourceCounts.pool_exhausted++;
         items.push({
           project_id: projectId,
           clip_id: null,
           type: "image",
           position: position++,
-          duration: pickDuration("image"),
-          script_text: sections[sectionCursor] ?? null,
+          duration: block.duration,
+          script_text: blockText || null,
           overlay_text: null,
           metadata: {
             placeholder: true,
             planned: true,
             downgraded_from: "footage",
-            downgrade_reason: picked.source === "no_scores_for_section"
-              ? "section had no scored candidates"
-              : "no clip cleared MIN_RELEVANT_SCORE",
-            pick_source: picked.source,
-            section_index: sectionCursor,
+            downgrade_reason: "unused-clip pool exhausted",
+            pick_source: "pool_exhausted",
+            block_index: i,
+            preserved_footage_duration: true,
           },
           approved: false,
         });
         downgradedCount++;
       }
-      sectionCursor = Math.min(sections.length - 1, sectionCursor + 1);
       continue;
     }
 
@@ -334,12 +541,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       type: block.type,
       position: position++,
       duration: block.duration,
-      script_text: sections[sectionCursor] ?? null,
+      script_text: blockText || null,
       overlay_text: null,
-      metadata: { placeholder: true, planned: true },
+      metadata: { placeholder: true, planned: true, block_index: i },
       approved: false,
     });
-    sectionCursor = Math.min(sections.length - 1, sectionCursor + 1);
   }
 
   // Lower-third overlays for the first few celebrity / year / place entities.

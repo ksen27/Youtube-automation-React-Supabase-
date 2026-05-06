@@ -18,7 +18,7 @@ export async function processDownloadJob(
 ): Promise<void> {
   const env = getEnv();
   const sb = getServerSupabase();
-  const { projectId, mediaJobId, youtubeVideoId, youtubeUrl } = data;
+  const { projectId, mediaJobId, youtubeVideoId, youtubeUrl, title } = data;
   const attemptsMade = attempt?.attemptsMade ?? 1;
   const attemptsAllowed = attempt?.attemptsAllowed ?? 1;
   const isFinalAttempt = attemptsMade >= attemptsAllowed;
@@ -48,12 +48,16 @@ export async function processDownloadJob(
     return;
   }
 
-  // 2) Upsert a video_source row (status=downloading)
+  // 2) Upsert a video_source row (status=downloading). Include the title from
+  // the search result so the UI has something readable while the download is
+  // in flight — without this, the processing screen falls back to "Unknown
+  // video" until ffprobe completes (and even then we never populated title).
   const { data: vs, error: vsErr } = await sb.from("video_sources").upsert(
     {
       project_id: projectId,
       youtube_video_id: safeId,
       youtube_url: youtubeUrl,
+      title: title ?? null,
       status: "downloading",
       error: null,
     },

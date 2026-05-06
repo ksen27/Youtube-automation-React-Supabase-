@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCheck, Plus, Sparkles } from "lucide-react";
+import { CheckCheck, Plus, RefreshCw, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -56,6 +56,18 @@ export function BlockEditorScreen({
       return r.json();
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project-timeline", projectId] }),
+  });
+
+  const rematch = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/rematch`, { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
+      return r.json();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["project-timeline", projectId] });
+      qc.invalidateQueries({ queryKey: ["project-jobs", projectId] });
+    },
   });
 
   function reorder(itemId: string, dir: -1 | 1) {
@@ -137,6 +149,20 @@ export function BlockEditorScreen({
             <Plus className="h-3.5 w-3.5" /> Add scene
           </Button>
           <Button
+            variant="outline"
+            size="sm"
+            disabled={rematch.isPending}
+            onClick={() => {
+              if (confirm("Re-run matching against the current clips? Your draft scenes will be replaced.")) {
+                rematch.mutate();
+              }
+            }}
+            title="Re-run Gemini matching against the current clip set. Useful when a previous match degraded."
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5", rematch.isPending && "animate-spin")} />
+            Re-match
+          </Button>
+          <Button
             variant="gradient"
             size="sm"
             disabled={allApproved || patch.isPending}
@@ -146,6 +172,11 @@ export function BlockEditorScreen({
             Approve all
           </Button>
         </div>
+        {rematch.isError && (
+          <p className="basis-full text-xs text-danger">
+            {(rematch.error as Error).message}
+          </p>
+        )}
       </div>
 
       <ol className="space-y-2" onDragOver={(e) => e.preventDefault()}>

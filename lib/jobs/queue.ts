@@ -12,7 +12,7 @@ export const QUEUE_NAMES = {
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
 export interface SearchJobData    { projectId: string; mediaJobId: string; }
-export interface DownloadJobData  { projectId: string; mediaJobId: string; youtubeVideoId: string; youtubeUrl: string; }
+export interface DownloadJobData  { projectId: string; mediaJobId: string; youtubeVideoId: string; youtubeUrl: string; title?: string | null; }
 export interface ClipJobData      { projectId: string; mediaJobId: string; videoSourceId: string; }
 export interface MatchJobData     { projectId: string; mediaJobId: string; }
 export interface RenderJobData    { projectId: string; mediaJobId: string; renderJobId: string; }

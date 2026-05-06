@@ -36,6 +36,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     const youtubeVideoId = typeof md.youtube_video_id === "string" ? md.youtube_video_id : null;
     const youtubeUrl = typeof md.youtube_url === "string" ? md.youtube_url : null;
     if (!youtubeVideoId || !youtubeUrl) continue;
+    const title = typeof md.title === "string" ? md.title : null;
 
     const newJobId = await createMediaJob({
       projectId: id,
@@ -47,6 +48,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       mediaJobId: newJobId,
       youtubeVideoId,
       youtubeUrl,
+      title,
     });
     requeued++;
   }

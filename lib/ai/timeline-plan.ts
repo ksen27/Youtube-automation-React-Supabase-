@@ -48,10 +48,21 @@ export function pickAvgBlockSeconds(voiceoverSeconds: number): {
 export function planTimeline(voiceoverSeconds: number): TimelinePlan {
   const safeVo = Math.max(1, Math.round(voiceoverSeconds));
   const { avg, bucket } = pickAvgBlockSeconds(safeVo);
-  const totalBlocks = Math.max(2, Math.ceil(safeVo / avg));
-  // 60/40 footage:image split — ceil both so the planner never undershoots.
-  const footageBlocks = Math.ceil(totalBlocks * 0.6);
-  const imageBlocks   = Math.ceil(totalBlocks * 0.4);
+  // 60/40 split is on TIME ON SCREEN, not block count. Footage uses 4–6s
+  // windows; images hold 8–12s. A count-based split made images dominate
+  // visual time (35 × 10s = 350s vs 52 × 5s = 260s = 57% slideshow), which
+  // breaks "60% celebrity footage" and increases copyright-claim risk
+  // because long static stretches between rare footage shots stand out.
+  // Computing block counts from target seconds instead gives ~60% footage
+  // ON SCREEN — which is what users actually mean by "60% footage."
+  const targetFootageSec = safeVo * 0.6;
+  const targetImageSec   = safeVo * 0.4;
+  // Footage uses the bucket's avg as its target; images hold ~10s.
+  const footageAvg = (DURATION_RANGES.footage.min + DURATION_RANGES.footage.max) / 2;   // 5
+  const imageAvg   = (DURATION_RANGES.image.min   + DURATION_RANGES.image.max)   / 2;   // 10
+  const footageBlocks = Math.max(1, Math.round(targetFootageSec / footageAvg));
+  const imageBlocks   = Math.max(1, Math.round(targetImageSec / imageAvg));
+  const totalBlocks = footageBlocks + imageBlocks;
   return {
     voiceoverSeconds: safeVo,
     avgBlockSeconds: avg,
@@ -107,6 +118,13 @@ export function buildBlockSequence(
   // The intro consumed one slot from the footage budget conceptually.
   if (footageLeft > 0) footageLeft--;
 
+  // Hard cap on consecutive image blocks. 3+ images in a row = a long
+  // slideshow stretch with no motion — visually dead AND a copyright-risk
+  // concentration (the surrounding footage blocks get more attention from
+  // automated systems when they stand out from a static background).
+  const MAX_CONSECUTIVE_IMAGES = 2;
+  let consecutiveImages = 0;
+
   while (acc + 0.5 < plan.voiceoverSeconds) {
     // Pick footage vs image based on remaining budget — if one is exhausted,
     // use the other. Otherwise weight by remaining count.
@@ -114,6 +132,7 @@ export function buildBlockSequence(
     if (footageLeft <= 0 && imageLeft <= 0) {
       // Out of budgeted slots but we still need to fill — keep going with
       // images (longer holds → fewer extra blocks → less pacing churn).
+      // The MAX_CONSECUTIVE_IMAGES guard below still applies.
       type = "image";
     } else if (footageLeft <= 0) {
       type = "image";
@@ -123,8 +142,21 @@ export function buildBlockSequence(
       const total = footageLeft + imageLeft;
       type = rand() < footageLeft / total ? "footage" : "image";
     }
-    if (type === "footage") footageLeft--;
-    else imageLeft--;
+
+    // Override if we'd be emitting a third image in a row. Force footage
+    // when we still have it, otherwise keep going with image — but at
+    // least we tried.
+    if (type === "image" && consecutiveImages >= MAX_CONSECUTIVE_IMAGES && footageLeft > 0) {
+      type = "footage";
+    }
+
+    if (type === "footage") {
+      footageLeft--;
+      consecutiveImages = 0;
+    } else {
+      imageLeft--;
+      consecutiveImages++;
+    }
 
     const dur = pickDuration(type, rand);
     blocks.push({ type, duration: dur });

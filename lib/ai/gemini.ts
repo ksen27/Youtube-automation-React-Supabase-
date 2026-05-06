@@ -14,6 +14,129 @@ function getModel() {
 }
 
 // ---------------------------------------------------------------------------
+// Retry helper
+// ---------------------------------------------------------------------------
+
+// 503 (UNAVAILABLE) and 429 (RESOURCE_EXHAUSTED) are the dominant failure
+// modes during Gemini "high demand" spikes. 500 is rarer but also transient.
+// Anything else (400/401/permission/quota-of-day) won't recover with retries.
+function isRetryableGeminiError(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? String(err);
+  return (
+    msg.includes("503") ||
+    msg.includes("429") ||
+    msg.includes("500") ||
+    /UNAVAILABLE/i.test(msg) ||
+    /RESOURCE_EXHAUSTED/i.test(msg) ||
+    /high demand/i.test(msg)
+  );
+}
+
+// Exponential backoff with full jitter. 1s → 3s → 9s by default — total
+// worst-case wait is ~13s before giving up, which is acceptable inside the
+// clip job (label runs alongside upload) and the match job (one batch out
+// of many, run with bounded concurrency).
+async function withGeminiRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  opts: { attempts?: number; baseMs?: number } = {},
+): Promise<T> {
+  const attempts = opts.attempts ?? 3;
+  const baseMs = opts.baseMs ?? 1000;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i === attempts - 1 || !isRetryableGeminiError(e)) throw e;
+      const delay = Math.round(baseMs * Math.pow(3, i) * (0.5 + Math.random()));
+      console.warn(JSON.stringify({
+        msg: "gemini.retry",
+        op: label,
+        attempt: i + 1,
+        nextDelayMs: delay,
+        err: (e as Error).message?.slice(0, 200),
+      }));
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency limiter — caps simultaneous Gemini calls inside one process so
+// we don't fan out 10+ batches against a model that's already throwing 503s.
+// ---------------------------------------------------------------------------
+
+function makeLimit(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  const next = () => {
+    active--;
+    const w = waiters.shift();
+    if (w) w();
+  };
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= max) {
+      await new Promise<void>((resolve) => waiters.push(resolve));
+    }
+    active++;
+    try {
+      return await fn();
+    } finally {
+      next();
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Truncated-JSON salvage — Gemini sometimes returns a partial response when a
+// 503 hits mid-stream. We've seen `responseLength: 357` for a batch that
+// should be ~3000 bytes. Try to close braces/brackets so we still get the
+// completed candidates instead of dropping the whole batch.
+// ---------------------------------------------------------------------------
+
+function trySalvageTruncatedJson(raw: string): unknown | null {
+  // Walk the string and remember the position where we just finished closing
+  // a complete candidate object inside `candidates`. The expected nesting is:
+  //
+  //   { sections: [ { section_index, candidates: [ { ... } ] } ] }
+  //   ^outer     ^secArr  ^secObj            ^candArr ^candObj
+  //
+  // A candidate object closes when we transition from depthBrace 3 → 2 while
+  // depthBracket is 2. After truncating to that point, we close: candArr (]),
+  // secObj (}), secArr (]), outer (}). When the truncation falls *between*
+  // sections (the response cut after the inner `]}` but before the next
+  // section's `{`), only the candidates we already captured will be in the
+  // first section — that's still better than dropping the whole batch.
+  let depthBrace = 0;
+  let depthBracket = 0;
+  let lastSafeEnd = -1;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\" && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{") depthBrace++;
+    else if (c === "}") {
+      const before = depthBrace;
+      depthBrace--;
+      // Just closed a candidate object: was at depth 3, now at 2, inside
+      // the candidates array (bracket depth 2).
+      if (before === 3 && depthBracket === 2) lastSafeEnd = i;
+    } else if (c === "[") depthBracket++;
+    else if (c === "]") depthBracket--;
+  }
+  if (lastSafeEnd < 0) return null;
+  const trimmed = raw.slice(0, lastSafeEnd + 1) + "]}]}";
+  try { return JSON.parse(trimmed); } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
 // Entity extraction
 // ---------------------------------------------------------------------------
 
@@ -49,11 +172,19 @@ Allowed types: celebrity, related_person, movie, tv_show, song, company, place, 
 SCRIPT:
 """${transcript.slice(0, 12000)}"""`;
 
-  const res = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-  });
-  const txt = res.response.text();
+  let txt: string;
+  try {
+    const res = await withGeminiRetry("extractEntities", () =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      })
+    );
+    txt = res.response.text();
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "extractEntities.gemini_failed", err: (e as Error).message }));
+    return [];
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(txt);
@@ -161,12 +292,32 @@ const SectionScoresSchema = z.object({
 // Per-clip visual labeling (Gemini Vision on the thumbnail)
 // ---------------------------------------------------------------------------
 
+// Visual category buckets. "content" is everything we can use as B-roll.
+// Anything else is "junk" — title cards, end screens, blank/black frames,
+// pure-text overlays — and gets dropped before reaching the matcher. Drops
+// here cut storage cost AND keep the scorer's signal-to-noise high.
+export const VISUAL_CATEGORIES = [
+  "content",
+  "title_card",
+  "logo",
+  "subscribe_screen",
+  "credits",
+  "blank",
+  "text_only",
+] as const;
+export type VisualCategory = (typeof VISUAL_CATEGORIES)[number];
+
 const ClipLabelsSchema = z.object({
   labels: z.array(z.string().min(1)).min(1).max(8),
   primarySubject: z.string().optional().default(""),
   setting: z.string().optional().default(""),
+  visualCategory: z.enum(VISUAL_CATEGORIES).default("content"),
 });
 export type ClipLabels = z.infer<typeof ClipLabelsSchema>;
+
+export function isJunkCategory(c: VisualCategory): boolean {
+  return c !== "content";
+}
 
 /**
  * Ask Gemini Vision to describe what's visible in a clip's thumbnail. Returns
@@ -198,7 +349,8 @@ Return STRICT JSON ONLY in this shape:
 {
   "labels": ["3 to 8 short visual descriptors, each 1–4 words"],
   "primarySubject": "the main thing in frame (a person's role, an object, a place)",
-  "setting": "the environment (e.g. 'studio interview', 'red carpet', 'palace exterior', 'archival news')"
+  "setting": "the environment (e.g. 'studio interview', 'red carpet', 'palace exterior', 'archival news')",
+  "visualCategory": "one of: content | title_card | logo | subscribe_screen | credits | blank | text_only"
 }
 
 Rules:
@@ -206,20 +358,33 @@ Rules:
 - Prefer concrete nouns: "iron palace gates", "wedding dress", "press photographers", "archival newspaper headline".
 - If a person is recognizable from the source title, you may name them; otherwise describe their role ("woman in white dress", "elderly man at podium").
 - Avoid vague labels like "scene", "moment", "image", "footage".
-- Skip duplicates.`;
+- Skip duplicates.
+
+How to choose visualCategory:
+- "content" — any usable B-roll: people, places, action, events, objects, archival footage. DEFAULT to this when in doubt.
+- "title_card" — opening title screen with the video name centered over a background. Usually the first frame of a video.
+- "logo" — a channel/network logo on a plain background, or a watermark filling most of the frame.
+- "subscribe_screen" — YouTube end-card "subscribe" / "more videos" / "click here" overlay, often with circular avatars or video thumbnails arranged in a grid.
+- "credits" — a list of names/roles scrolling or static at the end of a video.
+- "blank" — solid black, white, or near-uniform color frame; no recognizable subject.
+- "text_only" — a frame whose primary content is words (a quote card, a chyron-only shot with no visible subject behind it). NOT for normal lower-third overlays where a subject is also visible.
+
+When visualCategory is anything other than "content", labels can be a single short item like ["title card"] or ["channel logo"] — we won't use the clip.`;
 
   let txt: string;
   try {
-    const res = await model.generateContent({
-      contents: [{
-        role: "user",
-        parts: [
-          { text: prompt },
-          { inlineData: { mimeType: "image/jpeg", data: base64 } },
-        ],
-      }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-    });
+    const res = await withGeminiRetry("labelClip", () =>
+      model.generateContent({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: "image/jpeg", data: base64 } },
+          ],
+        }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      })
+    );
     txt = res.response.text();
   } catch (e) {
     console.error(JSON.stringify({ msg: "labelClip.gemini_failed", err: (e as Error).message }));
@@ -248,7 +413,12 @@ Rules:
     seen.add(k);
     return true;
   });
-  return { labels, primarySubject: safe.data.primarySubject, setting: safe.data.setting };
+  return {
+    labels,
+    primarySubject: safe.data.primarySubject,
+    setting: safe.data.setting,
+    visualCategory: safe.data.visualCategory,
+  };
 }
 
 /**
@@ -264,13 +434,105 @@ Rules:
  *   - With Vision-extracted labels, scoring per pair lets us re-rank when a
  *     section's first choice is already used by an earlier section.
  */
+// Sections per Gemini call. Down to 1 because at 3-per-batch we still saw
+// finishReason: MAX_TOKENS on most batches in production logs — the model
+// produced ~400-byte truncated JSON for a budget that should have fit
+// comfortably. With 1 section per call, each response is small enough that
+// truncation is essentially impossible. Costs more API calls but each is
+// faster, and the concurrency limiter keeps wall-time reasonable.
+const SECTIONS_PER_BATCH = 1;
+
+// Hard ceiling on the model's output for a single batch. Generous so we don't
+// silently truncate from our side — we'd rather know about a runaway from
+// finishReason than have it look like network truncation.
+const MAX_OUTPUT_TOKENS_PER_BATCH = 4096;
+
+/**
+ * Score every (section, clip) pair so the assignment step can pick the
+ * highest-scoring UNUSED clip per section and break ties properly.
+ *
+ * Sections are batched across multiple parallel Gemini calls because asking
+ * for 100+ sections in one response routinely exceeds the output token cap
+ * and truncates the JSON mid-string — which fails parsing, returns [], and
+ * silently degrades the matcher to insertion-order fallback.
+ */
+// Per-section entity hints. When a section's text mentions a celebrity, place,
+// movie, song, etc., the matcher should prefer clips whose labels match that
+// specific entity over generic celebrity B-roll. Phase A of entity-aware
+// matching: the scorer is told which entities are in play per section.
+export interface SectionEntity {
+  type: string;
+  value: string;
+}
+
 export async function scoreClipsForSections(
   sections: string[],
   clips: ClipForMatch[],
-  topN = 5,
+  topN = 3,
+  sectionEntities?: SectionEntity[][],
 ): Promise<SectionScore[]> {
   if (clips.length === 0 || sections.length === 0) return [];
+
+  // Build batches that each cover SECTIONS_PER_BATCH consecutive sections.
+  // We send absolute section indices so merging back is trivial — Gemini is
+  // told to use them verbatim in `section_index`.
+  const batches: { startIndex: number; sections: string[]; entities: SectionEntity[][] }[] = [];
+  for (let i = 0; i < sections.length; i += SECTIONS_PER_BATCH) {
+    batches.push({
+      startIndex: i,
+      sections: sections.slice(i, i + SECTIONS_PER_BATCH),
+      entities: (sectionEntities ?? []).slice(i, i + SECTIONS_PER_BATCH),
+    });
+  }
+
+  // Cap concurrent Gemini calls. Firing 10+ batches simultaneously during a
+  // "high demand" spike is exactly how every single batch ends up 503ing —
+  // we reproduced that in the worker logs (10/10 batches failed in one run).
+  // 3 in flight is enough to keep latency reasonable while leaving headroom
+  // for the labeler/extractor to share quota.
+  const limit = makeLimit(3);
+  const results = await Promise.all(
+    batches.map((b) => limit(() => scoreSectionBatch(b.startIndex, b.sections, clips, topN, b.entities))),
+  );
+
+  const validIds = new Set(clips.map((c) => c.id));
+  const merged: SectionScore[] = [];
+  for (const batch of results) {
+    for (const s of batch) {
+      merged.push({
+        section_index: s.section_index,
+        candidates: s.candidates
+          .filter((c) => validIds.has(c.clip_id))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, topN),
+      });
+    }
+  }
+  // Sort by section index so downstream lookups are deterministic.
+  merged.sort((a, b) => a.section_index - b.section_index);
+  return merged;
+}
+
+async function scoreSectionBatch(
+  startIndex: number,
+  batchSections: string[],
+  clips: ClipForMatch[],
+  topN: number,
+  batchEntities: SectionEntity[][] = [],
+): Promise<SectionScore[]> {
   const model = getModel();
+
+  // Build the SECTIONS block. When a section has named entities, we list
+  // them inline so Gemini can prefer entity-specific clips over generic
+  // ones. Format: [N] (entities: place=St Paul's, event=marriage) text...
+  const sectionLines = batchSections.map((s, i) => {
+    const ents = batchEntities[i] ?? [];
+    const entStr = ents.length
+      ? ` (entities: ${ents.map((e) => `${e.type}=${e.value}`).join(", ")})`
+      : "";
+    return `[${startIndex + i}]${entStr} ${s.slice(0, 280)}`;
+  }).join("\n");
+
   const prompt = `You are scoring B-roll clips against sections of a celebrity video script.
 For each section, return up to ${topN} clip_ids ranked by visual fit, with a 0–100 score.
 
@@ -279,52 +541,99 @@ How to score:
 - source_title is shared across many clips from the same documentary — it tells you the topic of the source video, not the visual content of THIS clip. Use it only as a weak tiebreaker.
 - A clip whose labels match the section's subject (people, places, events, objects) is high score.
 - A clip with generic labels (close-up, talking head, studio backdrop) gets a low score unless the section is itself about an interview.
+- ENTITY MATCHING is the strongest signal. When a section lists "(entities: ...)", a clip whose labels reference that specific person, place, movie, TV show, song, company, or event scores HIGHER than a generic celebrity B-roll clip. For example:
+    - section entity "place=St Paul's Cathedral" → clip with labels containing "cathedral", "church wedding", "St Paul's" wins over a red-carpet clip.
+    - section entity "event=car crash" → clip with labels referencing wreckage, accident, ambulance wins over a studio interview.
+    - section entity "company=Apple" → a clip showing the Apple logo or storefront beats a generic tech-event clip.
+    - section entity "tv_show=Match Game" → a clip from that game show (or labels like "game show set", "panel buzzer") beats a generic talking-head.
 - score = 0 means "wrong fit" and the clip should not be considered.
+- DO NOT include a "reason" field. We do not use it. Output only clip_id and score.
 
-Return STRICT JSON in this shape:
-{ "sections": [ { "section_index": 0, "candidates": [ { "clip_id": "abc", "score": 85, "reason": "..." } ] } ] }
+Return STRICT MINIMAL JSON in this shape:
+{ "sections": [ { "section_index": 0, "candidates": [ { "clip_id": "abc", "score": 85 } ] } ] }
+
+The "section_index" you return MUST be the absolute index from the SECTIONS list below — use the bracketed number verbatim.
 
 SECTIONS:
-${sections.map((s, i) => `[${i}] ${s.slice(0, 280)}`).join("\n")}
+${sectionLines}
 
 CLIPS (id | labels | source_title):
 ${clips.map((c) => `${c.id} | ${(c.labels ?? []).join(", ")} | ${c.source_title ?? "?"}`).join("\n")}`;
 
   let txt: string;
+  let finishReason: string | undefined;
   try {
-    const res = await model.generateContent({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-    });
+    const res = await withGeminiRetry(`scoreClips[${startIndex}]`, () =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.2,
+          maxOutputTokens: MAX_OUTPUT_TOKENS_PER_BATCH,
+          // Disable thinking-mode for this call. gemini-2.5-flash burns
+          // most of its output budget on internal reasoning tokens before
+          // producing any visible JSON — that's why every batch hit
+          // MAX_TOKENS at ~315 bytes regardless of how high we set the
+          // output cap. We don't need chain-of-thought for "rank these
+          // 100 clips by label match" — the labels already encode the
+          // signal. Setting thinkingBudget: 0 returns the full output
+          // budget to actual JSON.
+          thinkingConfig: { thinkingBudget: 0 },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      })
+    );
     txt = res.response.text();
+    finishReason = res.response.candidates?.[0]?.finishReason;
   } catch (e) {
-    console.error(JSON.stringify({ msg: "scoreClips.gemini_failed", err: (e as Error).message }));
+    console.error(JSON.stringify({
+      msg: "scoreClips.gemini_failed",
+      batchStartIndex: startIndex,
+      batchSize: batchSections.length,
+      err: (e as Error).message,
+    }));
     return [];
   }
 
   let parsed: unknown;
   try { parsed = JSON.parse(txt); } catch {
-    console.error(JSON.stringify({ msg: "scoreClips.parse_failed", raw: txt.slice(0, 300) }));
-    return [];
+    // Try to recover any fully-formed candidates before giving up. Truncation
+    // happens when the API cuts the response mid-stream — usually MAX_TOKENS
+    // (then we should lower SECTIONS_PER_BATCH) or model-side throttling
+    // during 503 spikes.
+    const salvaged = trySalvageTruncatedJson(txt);
+    if (salvaged) {
+      console.warn(JSON.stringify({
+        msg: "scoreClips.parse_salvaged",
+        batchStartIndex: startIndex,
+        batchSize: batchSections.length,
+        responseLength: txt.length,
+        finishReason,
+      }));
+      parsed = salvaged;
+    } else {
+      console.error(JSON.stringify({
+        msg: "scoreClips.parse_failed",
+        batchStartIndex: startIndex,
+        batchSize: batchSections.length,
+        responseLength: txt.length,
+        finishReason,
+        raw: txt.slice(0, 300),
+      }));
+      return [];
+    }
   }
   const safe = SectionScoresSchema.safeParse(parsed);
   if (!safe.success) {
     console.error(JSON.stringify({
       msg: "scoreClips.schema_failed",
+      batchStartIndex: startIndex,
       raw: txt.slice(0, 300),
       issues: safe.error.flatten(),
     }));
     return [];
   }
-  // Filter to known clip_ids (Gemini sometimes hallucinates) and sort desc.
-  const validIds = new Set(clips.map((c) => c.id));
-  return safe.data.sections.map((s) => ({
-    section_index: s.section_index,
-    candidates: s.candidates
-      .filter((c) => validIds.has(c.clip_id))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topN),
-  }));
+  return safe.data.sections;
 }
 
 /** @deprecated Use {@link scoreClipsForSections} instead. */

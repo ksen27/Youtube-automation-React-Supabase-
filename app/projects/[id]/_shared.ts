@@ -28,6 +28,16 @@ export interface ProjectResp {
   }>;
 }
 
+export interface JobSourceRow {
+  id: string;
+  youtube_video_id: string;
+  title: string | null;
+  status: string;
+  error: string | null;
+  duration_seconds: number | null;
+  clip_count: number;
+}
+
 export interface JobsResp {
   project_status: string | null;
   media_jobs: Array<{
@@ -47,6 +57,7 @@ export interface JobsResp {
     error: string | null;
     created_at: string;
   }>;
+  video_sources: JobSourceRow[];
 }
 
 export interface TimelineRow {

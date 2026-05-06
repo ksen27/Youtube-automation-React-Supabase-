@@ -27,10 +27,26 @@ export async function setMediaJob(
 ): Promise<void> {
   const sb = getServerSupabase();
   // Bump attempts on transition to "running" to mirror BullMQ retries.
+  // Also merge metadata instead of replacing it: callers commonly write a
+  // partial patch (e.g. just { currentClip }) and used to silently wipe
+  // earlier fields like videoSourceId, title, youtube_video_id — which is
+  // why the UI was rendering "Unknown video" rows after the first progress
+  // update on a download.
+  const needsRead = patch.status === "running" || patch.metadata != null;
   const update: Record<string, unknown> = { ...patch };
-  if (patch.status === "running") {
-    const { data: cur } = await sb.from("media_jobs").select("attempts").eq("id", id).single();
-    update.attempts = (cur?.attempts ?? 0) + 1;
+  if (needsRead) {
+    const { data: cur } = await sb
+      .from("media_jobs")
+      .select("attempts, metadata")
+      .eq("id", id)
+      .single();
+    if (patch.status === "running") {
+      update.attempts = (cur?.attempts ?? 0) + 1;
+    }
+    if (patch.metadata != null) {
+      const prior = (cur?.metadata as Record<string, unknown> | null) ?? {};
+      update.metadata = { ...prior, ...patch.metadata };
+    }
   }
   const { error } = await sb.from("media_jobs").update(update).eq("id", id);
   if (error) throw new Error(`setMediaJob: ${error.message}`);

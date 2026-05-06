@@ -77,6 +77,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       mediaJobId: childJobId,
       youtubeVideoId: c.youtube_video_id,
       youtubeUrl: url,
+      title: c.title,
     });
   }
 
