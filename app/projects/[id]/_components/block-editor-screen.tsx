@@ -182,6 +182,11 @@ export function BlockEditorScreen({
       <ol className="space-y-2" onDragOver={(e) => e.preventDefault()}>
         {items.map((it, i) => {
           const clip = it.clip_id ? clipById.get(it.clip_id) : null;
+          // Image blocks have no clip_id but may carry a fetched image_url
+          // populated by the matcher's image-pool step. Prefer the clip
+          // thumbnail when present (footage/intro), otherwise fall back to
+          // the image-block's own image_url.
+          const thumbnail = clip?.thumbnail_url ?? it.image_url ?? null;
           return (
             <li
               key={it.id}
@@ -201,7 +206,7 @@ export function BlockEditorScreen({
             >
               <SceneBlock
                 index={i}
-                thumbnail={clip?.thumbnail_url}
+                thumbnail={thumbnail}
                 scriptText={it.script_text}
                 overlayText={it.overlay_text}
                 durationSec={it.duration}

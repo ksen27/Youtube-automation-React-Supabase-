@@ -44,6 +44,22 @@ export async function uploadBuffer(
   return { path: destPath, publicUrl: data.publicUrl };
 }
 
+// Best-effort delete. Used by the clip pipeline to remove just-uploaded
+// objects when the labeler decides the frame was junk after the upload
+// already started. Errors are swallowed because cleanup failure should
+// never break a clip job — leftover storage is acceptable, lost work
+// from a thrown error is not.
+export async function removeFiles(destPaths: string[]): Promise<void> {
+  if (destPaths.length === 0) return;
+  const env = getEnv();
+  const sb = getServerSupabase();
+  try {
+    await sb.storage.from(env.SUPABASE_STORAGE_BUCKET).remove(destPaths);
+  } catch {
+    /* ignore — best-effort cleanup */
+  }
+}
+
 export async function downloadToFile(
   storagePath: string,
   destLocalPath: string

@@ -9,6 +9,11 @@ const ServerEnvSchema = z.object({
   SUPABASE_STORAGE_BUCKET: z.string().default("video-automation"),
   YOUTUBE_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
+  // Google Programmable Search (Custom Search JSON API). Separate from the
+  // Gemini key — Cloud Console → enable Custom Search API → create key. The
+  // CX is the Programmable Search Engine ID from programmablesearchengine.google.com.
+  GOOGLE_SEARCH_API_KEY: z.string().optional(),
+  GOOGLE_SEARCH_CX: z.string().optional(),
   GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
   DEEPGRAM_API_KEY: z.string().optional(),
   DEEPGRAM_MODEL: z.string().default("nova-3"),
@@ -22,6 +27,12 @@ const ServerEnvSchema = z.object({
   MIN_SUCCESSFUL_VIDEOS_PER_PROJECT: z.coerce.number().int().nonnegative().default(2),
   MAX_FALLBACK_PROMOTIONS_PER_PROJECT: z.coerce.number().int().nonnegative().default(5),
   MAX_CLIPS_PER_VIDEO: z.coerce.number().int().positive().default(20),
+  // Per-clip pipeline concurrency inside one source. Each "lane" runs
+  // cut+thumbnail+label+upload for one clip. Bumping this from 1 (serial)
+  // to 4 cuts wall-time roughly proportionally because the steps are
+  // I/O- or Gemini-bound, not CPU-bound. Drop to 2 on machines with
+  // limited CPU/RAM if ffmpeg starts losing the race.
+  CLIP_PIPELINE_CONCURRENCY: z.coerce.number().int().positive().default(4),
   // How many candidate clips to generate per footage block in the timeline.
   // Higher = matcher has more options to pick from = better matches, but more
   // storage/processing. 1 = no choice, 2 = balanced, 3+ = quality-first.

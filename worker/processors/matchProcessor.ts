@@ -9,6 +9,7 @@ import {
   type PlannedBlock,
 } from "@/lib/ai/timeline-plan";
 import { estimateDurationSeconds } from "@/lib/ai/segments";
+import { fetchImages } from "@/lib/images/fetch";
 
 // Below this score (0–100), Gemini judged the clip a poor visual fit for the
 // block's spoken words. We'd rather downgrade the block to an image
@@ -149,11 +150,110 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // (Phase A of the entity-aware matching feature.)
   const { data: entityRows } = await sb
     .from("project_entities")
-    .select("type, value")
+    .select("type, value, confidence")
     .eq("project_id", projectId);
   const allEntities: Array<{ type: string; value: string }> = (entityRows ?? [])
     .map((e) => ({ type: e.type as string, value: String(e.value ?? "") }))
     .filter((e) => e.value.trim().length > 0);
+
+  // ---- Intro clip selection --------------------------------------------
+  // Pick a clip showing the main celebrity in an interview-like setting.
+  // The intro plays before the planned timeline with the source's ORIGINAL
+  // audio (re-downloaded by the render step) — voiceover starts after.
+  // Reserved before global assignment so it isn't reused elsewhere.
+  const mainCelebrity = (entityRows ?? [])
+    .filter((e) => e.type === "celebrity")
+    .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))[0]?.value as string | undefined;
+
+  const INTERVIEW_SETTING_RE = /interview|sit[- ]?down|talk show|podcast|conversation|host/i;
+  const INTERVIEW_LABEL_RE = /interview|talking|speaking|microphone|host/i;
+  const STAGED_SETTING_RE = /studio|stage|set\b/i;
+  // A frame must visibly contain a person to qualify as a usable intro
+  // clip. Without this gate, a car-grille close-up from a Dave Kindig
+  // interview source gets labeled as "subject: Dave Kindig" by the
+  // title-context-prone Vision labeler, scores 110/110 on intro
+  // criteria, and ships as the intro — even though no person is in
+  // the frame. The PERSON_VISIBLE_RE check forces real human content.
+  const PERSON_VISIBLE_RE = /\b(face|person|man|woman|host|interviewee|guest|portrait|headshot|smiling|talking head|speaker|shoulders|sitting|standing|wearing)\b/i;
+  // Hard exclusions — labels that strongly suggest the frame is NOT a
+  // person shot, even if the labeler also hallucinated a celebrity name.
+  const NOT_PERSON_RE = /\b(grille|engine|wheel|hood|bumper|dashboard|tire|exhaust|paint|garage floor|shop floor|tool|wrench|chassis|product|logo only)\b/i;
+
+  function scoreIntroCandidate(c: { id: string; labels?: string[]; source_title: string | null }): number {
+    const labelStr = (c.labels ?? []).join(" ").toLowerCase();
+    // Gate 1: hard reject if labels suggest no-person object content.
+    if (NOT_PERSON_RE.test(labelStr)) return 0;
+    // Gate 2: must have at least one person-visible token. Prevents
+    // hallucinated celebrity-name labels from passing on object frames.
+    if (!PERSON_VISIBLE_RE.test(labelStr)) return 0;
+
+    let score = 0;
+    if (mainCelebrity) {
+      const cel = mainCelebrity.toLowerCase();
+      // Celebrity name in labels still scores, but only after the
+      // person-visible gate passed — so we know an actual person IS
+      // in the frame. The +50 is "labels say it's the celebrity AND
+      // a person is visible" not "labels say it's the celebrity."
+      if (labelStr.includes(cel)) score += 50;
+      if ((c.source_title ?? "").toLowerCase().includes(cel)) score += 10;
+    }
+    // Setting check — grab the `setting: ...` label entry if present.
+    const settingLabel = (c.labels ?? []).find((l) => l.toLowerCase().startsWith("setting:")) ?? "";
+    if (INTERVIEW_SETTING_RE.test(settingLabel)) score += 30;
+    else if (STAGED_SETTING_RE.test(settingLabel)) score += 10;
+    if (INTERVIEW_LABEL_RE.test(labelStr)) score += 20;
+    return score;
+  }
+
+  // Tiered intro selection. We pick the highest-scoring clip; if everything
+  // scores 0 the intro is skipped (rendered without one).
+  let introClipId: string | null = null;
+  let introClipScore = 0;
+  let introClipDuration = 0;
+  let introSelectionTier: "celebrity_interview" | "celebrity_any" | "source_title_match" | "skipped" = "skipped";
+  {
+    const ranked = clipsForMatch
+      .map((c) => ({ c, score: scoreIntroCandidate(c) }))
+      .sort((a, b) => b.score - a.score);
+
+    const best = ranked[0];
+    if (best && best.score > 0) {
+      introClipId = best.c.id;
+      introClipScore = best.score;
+      // Find the original clip row so we know its duration. We clamp to
+      // 5–6s; the YouTube clip is usually 5s already, so this is mostly a
+      // safety net for any longer clips that slipped through.
+      const fullClip = clips.find((cc) => cc.id === best.c.id);
+      const cutDuration = fullClip
+        ? Math.max(0, (Number(fullClip.end_time) || 0) - (Number(fullClip.start_time) || 0))
+        : 5.5;
+      introClipDuration = Math.min(6, Math.max(5, cutDuration || 5.5));
+      // Classify which tier won. Used only for diagnostics.
+      if (best.score >= 70) introSelectionTier = "celebrity_interview";
+      else if (best.score >= 50) introSelectionTier = "celebrity_any";
+      else introSelectionTier = "source_title_match";
+    }
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.intro", {
+    mainCelebrity: mainCelebrity ?? null,
+    introClipId,
+    introClipScore,
+    introClipDuration,
+    tier: introSelectionTier,
+    candidatesScored: clipsForMatch.length,
+  });
+
+  // Persist the intro selection on the project. Render step picks it up.
+  // intro_audio_url + intro_duration_seconds get filled by the renderer
+  // after yt-dlp + ffmpeg cut the matching audio segment.
+  await sb.from("projects").update({
+    intro_clip_id: introClipId,
+    intro_duration_seconds: introClipDuration || null,
+    // Clear any stale audio URL from a previous run — the renderer will
+    // re-download to match the newly-selected intro clip.
+    intro_audio_url: null,
+  }).eq("id", projectId);
 
   // ---- Build the block plan first ---------------------------------------
   // The block sequence is the unit of matching now. Each block's wall-clock
@@ -312,6 +412,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   type Assignment = { clipId: string; score: number; reason?: string; tier: "scored" | "filler" };
   const blockAssignments = new Map<number, Assignment>();
   const usedClipIds = new Set<string>();
+  // Reserve the intro clip so the regular matcher can't re-use it inside
+  // the timeline. The intro plays as a prefix segment, not as a timeline block.
+  if (introClipId) usedClipIds.add(introClipId);
   for (const t of triples) {
     if (blockAssignments.has(t.blockIdx)) continue;
     if (usedClipIds.has(t.clipId)) continue;
@@ -387,24 +490,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     usedClipIds.add(filler.clipId);
   }
 
-  // Diagnostic counters — track the new tier as well so logs reveal
-  // whether scoring or filling was carrying the timeline.
+  // Diagnostic counters — track the tier so logs reveal whether scoring
+  // or filling was carrying the timeline.
   const pickSourceCounts = {
     scored_top: 0,          // Tier 1: Gemini-scored ≥ MIN_RELEVANT_SCORE
     filler_overlap: 0,      // Tier 2: label-token overlap ≥ 1
     filler_any: 0,          // Tier 2: any unused clip (overlap = 0)
-    intro_fallback_any: 0,  // Intro had no scored or filler clip; took any unused
     pool_exhausted: 0,      // Tier 2 found no unused clips → block downgraded
   };
-
-  // Intro fallback — if the intro didn't get a scored OR filler clip
-  // (which shouldn't happen unless the pool is empty), take any unused.
-  function pickAnyUnusedClip(): string | null {
-    for (const c of clips) {
-      if (!usedClipIds.has(c.id as string)) return c.id as string;
-    }
-    return null;
-  }
 
   // Wipe old draft for this project (so re-runs work).
   await sb.from("timeline_items").delete().eq("project_id", projectId);
@@ -414,62 +507,43 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let assignedFootageCount = 0;
   let downgradedCount = 0;
 
+  // Prepend the intro as a UI-only timeline item. The renderer ignores
+  // type='intro' rows (it pulls intro_clip_id directly from the projects
+  // table) — this row exists so the matcher UI can show the intro card
+  // at the top of the list. The script_text is intentionally NOT a
+  // voiceover slice; the intro plays the celebrity's source audio with
+  // voiceover silent for the first 5–6s.
+  if (introClipId) {
+    const introCaption = mainCelebrity
+      ? `Intro — ${mainCelebrity} speaking (${introClipDuration}s, original audio)`
+      : `Intro — celebrity speaking (${introClipDuration}s, original audio)`;
+    items.push({
+      project_id: projectId,
+      clip_id: introClipId,
+      type: "intro",
+      position: position++,
+      duration: introClipDuration,
+      script_text: introCaption,
+      overlay_text: null,
+      metadata: {
+        is_intro: true,
+        match_score: introClipScore,
+        intro_tier: introSelectionTier,
+        plays_source_audio: true,
+        ui_only: true,    // renderer must skip this item
+      },
+      approved: false,
+    });
+  }
+
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
     const assigned = blockAssignments.get(i);
     const blockText = blockTexts[i] ?? "";
 
-    if (block.type === "intro") {
-      let clipId = assigned?.clipId ?? null;
-      const score = assigned?.score ?? 0;
-      const reason = assigned?.reason ?? null;
-      let pickSource: string;
-      if (clipId && assigned) {
-        if (assigned.tier === "scored") {
-          pickSourceCounts.scored_top++;
-          pickSource = "scored_top";
-        } else {
-          // Tier 2 fill on the intro
-          if ((assigned.reason ?? "").startsWith("filler: ") && !(assigned.reason ?? "").endsWith("no overlap")) {
-            pickSourceCounts.filler_overlap++;
-            pickSource = "filler_overlap";
-          } else {
-            pickSourceCounts.filler_any++;
-            pickSource = "filler_any";
-          }
-        }
-      } else {
-        clipId = pickAnyUnusedClip();
-        if (clipId) {
-          usedClipIds.add(clipId);
-          pickSourceCounts.intro_fallback_any++;
-          pickSource = "intro_fallback_any";
-        } else {
-          pickSourceCounts.pool_exhausted++;
-          pickSource = "pool_exhausted";
-        }
-      }
-      items.push({
-        project_id: projectId,
-        clip_id: clipId,
-        type: "intro",
-        position: position++,
-        duration: block.duration,
-        script_text: blockText || null,
-        overlay_text: null,
-        metadata: {
-          planned: true,
-          match_score: score,
-          match_reason: reason,
-          pick_source: pickSource,
-          block_index: i,
-        },
-        approved: false,
-      });
-      if (clipId) assignedFootageCount++;
-      continue;
-    }
-
+    // The intro is handled OUTSIDE the timeline (projects.intro_clip_id +
+    // render-step prefix segment). buildBlockSequence no longer emits an
+    // intro block, so block.type can only be "footage" / "image" / "split_*".
     if (block.type === "footage") {
       if (assigned) {
         // Tier 1 (scored) or Tier 2 (filler) — both keep the block as
@@ -547,6 +621,105 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       approved: false,
     });
   }
+
+  // ---- Build a project-level image pool, then assign to image blocks ----
+  // Strategy change (vs. per-block voiceover-substring matching):
+  //   The transcript already produced a list of named entities at analysis
+  //   time. Instead of scanning each block's words for entity mentions and
+  //   firing one image search per hit, we fetch a small batch of images per
+  //   useful entity ONCE, dedupe URLs, and assign them in order to image
+  //   blocks. Each fetched image appears at most once in the final video.
+  //
+  //   Why: most narrative blocks don't contain a verbatim entity name, so
+  //   the old approach left ~70% of image blocks empty. The pool approach
+  //   reuses the project's pre-extracted entities — the same set we've
+  //   already vetted as relevant — for every image slot.
+  //
+  // Source priority: Wikipedia first (free, rights-clean) then Google CSE
+  // for variety. YouTube thumbnails are no longer used at all.
+  //
+  // Skipped entity types: "year" and "age" produce nonsense image searches
+  // (a bare "2021" returns whatever YouTube/CSE thinks is relevant for that
+  // string — usually unrelated). Skip them; "place" / "event" / "company"
+  // tend to produce on-topic imagery.
+  const POOL_SKIP_TYPES = new Set(["year", "age"]);
+  const ENTITY_TYPE_PRIORITY: string[] = [
+    "celebrity", "related_person", "company", "tv_show",
+    "movie", "song", "place", "event",
+  ];
+  const IMAGES_PER_ENTITY = 5;
+
+  const imageBlockCount = items.filter((it) => it.type === "image").length;
+
+  // Sort entities by priority then confidence so the most-relevant pictures
+  // land at the head of the pool. This matters when the pool is shorter
+  // than the image-block count — the head fills the early blocks first.
+  const poolEntities = (entityRows ?? [])
+    .map((e) => ({
+      type: e.type as string,
+      value: String(e.value ?? "").trim(),
+      confidence: Number(e.confidence ?? 0.8),
+    }))
+    .filter((e) => e.value.length > 0 && !POOL_SKIP_TYPES.has(e.type))
+    .sort((a, b) => {
+      const pa = ENTITY_TYPE_PRIORITY.indexOf(a.type);
+      const pb = ENTITY_TYPE_PRIORITY.indexOf(b.type);
+      const ranka = pa < 0 ? 999 : pa;
+      const rankb = pb < 0 ? 999 : pb;
+      if (ranka !== rankb) return ranka - rankb;
+      return b.confidence - a.confidence;
+    });
+
+  type PoolImage = { url: string; source: string; query: string; entityType: string };
+  const pool: PoolImage[] = [];
+  const poolUrlSet = new Set<string>();
+  const poolFetchStats = { entitiesQueried: 0, entitiesFailed: 0 };
+
+  for (const ent of poolEntities) {
+    if (pool.length >= imageBlockCount) break;       // already have enough
+    poolFetchStats.entitiesQueried++;
+    try {
+      const fetched = await fetchImages(ent.value, IMAGES_PER_ENTITY, { entityType: ent.type });
+      if (fetched.length === 0) {
+        poolFetchStats.entitiesFailed++;
+        continue;
+      }
+      for (const f of fetched) {
+        if (poolUrlSet.has(f.url)) continue;          // dedupe across entities
+        pool.push({ url: f.url, source: f.source, query: ent.value, entityType: ent.type });
+        poolUrlSet.add(f.url);
+        if (pool.length >= imageBlockCount) break;
+      }
+    } catch (e) {
+      poolFetchStats.entitiesFailed++;
+      void logJob({ projectId, jobId: mediaJobId },
+        "match.image_fetch.failed", { query: ent.value, err: (e as Error).message });
+    }
+  }
+
+  // Assign pool images to image blocks in timeline order. Each image is
+  // consumed at most once. When the pool runs out, remaining blocks stay
+  // blank — the renderer skips blocks without an image_url, which is what
+  // the user requested ("each image only appears once, no duplicates").
+  let poolIdx = 0;
+  for (const item of items) {
+    if (item.type !== "image") continue;
+    if (poolIdx >= pool.length) break;
+    const next = pool[poolIdx++];
+    item.image_query = next.query;
+    item.image_url = next.url;
+    item.image_source = next.source;
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.image_fetch", {
+    totalImageBlocks: imageBlockCount,
+    poolSize: pool.length,
+    assigned: Math.min(pool.length, imageBlockCount),
+    leftBlank: Math.max(0, imageBlockCount - pool.length),
+    entitiesAvailable: poolEntities.length,
+    entitiesQueried: poolFetchStats.entitiesQueried,
+    entitiesFailed: poolFetchStats.entitiesFailed,
+  });
 
   // Lower-third overlays for the first few celebrity / year / place entities.
   // These don't consume timeline duration in the renderer (they're overlays),

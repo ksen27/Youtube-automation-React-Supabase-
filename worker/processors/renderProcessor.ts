@@ -4,7 +4,8 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, normalizeClip } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo } from "@/lib/media/ffmpeg";
+import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
 
 const VALIDATION_FAILED_MSG =
@@ -26,7 +27,16 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     .eq("project_id", projectId)
     .order("position", { ascending: true });
   if (itemsErr) throw new Error(`load timeline: ${itemsErr.message}`);
-  const renderable = (items ?? []).filter((it) => !!it.clip_id);
+  // Renderable items: footage clips OR image blocks with a fetched image.
+  // Intro rows are UI-only and rendered separately as a prefix segment.
+  // Image blocks without image_url are skipped (no still to hold) — the
+  // timeline shrinks by their duration rather than holding a black frame.
+  const renderable = (items ?? []).filter((it) => {
+    if (it.type === "intro") return false;
+    if (it.clip_id) return true;
+    if (it.type === "image" && it.image_url) return true;
+    return false;
+  });
   if (renderable.length === 0) {
     await setMediaJob(mediaJobId, { status: "failed", error: "no renderable timeline items" });
     await sb.from("render_jobs").update({ status: "failed", error: "no renderable timeline items" }).eq("id", renderJobId);
@@ -34,17 +44,19 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     throw new Error("no renderable timeline items");
   }
 
-  // Defense-in-depth: enforce unique clip ids inside the worker too.
-  const renderableClipIds = renderable.map((it) => String(it.clip_id));
-  if (new Set(renderableClipIds).size !== renderableClipIds.length) {
+  // Defense-in-depth: enforce unique clip ids among footage items. Image
+  // blocks have clip_id=null, so they don't participate in this check.
+  const footageClipIds = renderable.map((it) => it.clip_id as string | null).filter(Boolean) as string[];
+  if (new Set(footageClipIds).size !== footageClipIds.length) {
     await setMediaJob(mediaJobId, { status: "failed", error: VALIDATION_FAILED_MSG });
     await sb.from("render_jobs").update({ status: "failed", error: VALIDATION_FAILED_MSG }).eq("id", renderJobId);
     await setProjectStatus(projectId, "failed");
     throw new Error(VALIDATION_FAILED_MSG);
   }
 
-  const clipIds = renderable.map((it) => it.clip_id as string);
-  const { data: clipRows } = await sb.from("video_clips").select("id, clip_url").in("id", clipIds);
+  const { data: clipRows } = footageClipIds.length
+    ? await sb.from("video_clips").select("id, clip_url").in("id", footageClipIds)
+    : { data: [] };
   const clipUrlById = new Map<string, string | null>(
     (clipRows ?? []).map((c) => [c.id as string, (c.clip_url as string | null) ?? null])
   );
@@ -52,65 +64,181 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   const tmp = await ensureTmp(`render/${projectId}`);
   const downloaded: string[] = [];
   const normalized: string[] = [];
+  let imageRendered = 0;
+  let imageFailed = 0;
 
   try {
-    // 1) Download each clip from public URL to local tmp
+    // 1) Process each item in order. Footage items are downloaded then
+    //    trimmed+normalized; image items fetch the URL, save locally, and
+    //    build a still video segment of the block's duration. Both feed
+    //    into `normalized[]` in timeline order.
     for (let i = 0; i < renderable.length; i++) {
       const it = renderable[i];
-      const url = clipUrlById.get(it.clip_id as string);
-      if (!url) throw new Error(`clip ${it.clip_id} has no clip_url`);
-      const local = path.join(tmp, `in_${String(i).padStart(3, "0")}.mp4`);
-      await downloadHttp(url, local);
-      downloaded.push(local);
-      await setMediaJob(mediaJobId, { progress: 5 + Math.floor(((i + 1) / renderable.length) * 30) });
-      await sb.from("render_jobs").update({ progress: 5 + Math.floor(((i + 1) / renderable.length) * 30) }).eq("id", renderJobId);
-    }
-
-    // 2) Trim each clip to its planned duration, then normalize.
-    //    Source clips on disk are CLIP_DURATION_SECONDS long but the planner
-    //    asks for varied 4–6s footage holds — re-cut so the final video
-    //    actually matches the timeline length we validated.
-    for (let i = 0; i < downloaded.length; i++) {
-      const it = renderable[i];
       const plannedDur = Math.max(0.5, Number(it.duration) || 0);
-      const trimmed = path.join(tmp, `cut_${String(i).padStart(3, "0")}.mp4`);
-      try {
-        await cutClip({
-          inputPath: downloaded[i],
-          outputPath: trimmed,
-          startSeconds: 0,
-          durationSeconds: plannedDur,
-        });
-      } catch (e) {
-        await logJob({ projectId, jobId: mediaJobId },
-          "render.trim.failed", { idx: i, err: (e as Error).message });
-        await setMediaJob(mediaJobId, { progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) });
-        continue;
+      const idx = String(i).padStart(3, "0");
+      const out = path.join(tmp, `norm_${idx}.mp4`);
+
+      if (it.type === "image" && it.image_url) {
+        // Image block: download the image, build a still-video segment.
+        try {
+          const localImg = path.join(tmp, `img_${idx}`);
+          await downloadHttp(it.image_url as string, localImg);
+          await buildStillVideo({
+            inputImagePath: localImg,
+            outputPath: out,
+            durationSeconds: plannedDur,
+            width: 1280, height: 720, fps: 30,
+          });
+          normalized.push(out);
+          imageRendered++;
+          await safeUnlink(localImg);
+        } catch (e) {
+          imageFailed++;
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.image.failed", { idx: i, url: it.image_url, err: (e as Error).message });
+        }
+      } else if (it.clip_id) {
+        // Footage block: download → trim → normalize.
+        const url = clipUrlById.get(it.clip_id as string);
+        if (!url) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.clip.missing_url", { idx: i, clipId: it.clip_id });
+          continue;
+        }
+        const local = path.join(tmp, `in_${idx}.mp4`);
+        const trimmed = path.join(tmp, `cut_${idx}.mp4`);
+        try {
+          await downloadHttp(url, local);
+          downloaded.push(local);
+          await cutClip({
+            inputPath: local, outputPath: trimmed,
+            startSeconds: 0, durationSeconds: plannedDur,
+          });
+          await normalizeClip({
+            inputPath: trimmed, outputPath: out,
+            width: 1280, height: 720, fps: 30,
+          });
+          normalized.push(out);
+          await safeUnlink(trimmed);
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.clip.failed", { idx: i, err: (e as Error).message });
+        }
       }
 
-      const out = path.join(tmp, `norm_${String(i).padStart(3, "0")}.mp4`);
-      try {
-        await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30 });
-        normalized.push(out);
-      } catch (e) {
-        await logJob({ projectId, jobId: mediaJobId },
-          "render.normalize.failed", { idx: i, err: (e as Error).message });
-        // Skip the bad one — continue rendering the rest
-      }
-      await safeUnlink(trimmed);
-      await setMediaJob(mediaJobId, { progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) });
-      await sb.from("render_jobs").update({ progress: 35 + Math.floor(((i + 1) / downloaded.length) * 30) }).eq("id", renderJobId);
+      const pct = 5 + Math.floor(((i + 1) / renderable.length) * 60);
+      await setMediaJob(mediaJobId, { progress: pct });
+      await sb.from("render_jobs").update({ progress: pct }).eq("id", renderJobId);
     }
 
-    if (normalized.length === 0) throw new Error("all clips failed normalization");
+    if (normalized.length === 0) throw new Error("all timeline items failed to render");
 
-    // 3) Optional voiceover from project
-    const { data: project } = await sb.from("projects").select("voiceover_url, title").eq("id", projectId).single();
+    await logJob({ projectId, jobId: mediaJobId }, "render.segments", {
+      total: renderable.length,
+      built: normalized.length,
+      imageRendered,
+      imageFailed,
+    });
+
+    // 3) Optional voiceover from project + intro clip selection
+    const { data: project } = await sb.from("projects")
+      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds")
+      .eq("id", projectId).single();
     let voiceoverLocal: string | undefined;
     if (project?.voiceover_url) {
       voiceoverLocal = path.join(tmp, "voiceover.audio");
       try { await downloadHttp(project.voiceover_url, voiceoverLocal); }
       catch { voiceoverLocal = undefined; }
+    }
+
+    // 3b) Build the intro segment (best-effort — failures fall back to a
+    // render without an intro). The intro plays BEFORE the planned timeline:
+    //   - Its silent video gets prepended to `normalized[]`
+    //   - Its source audio is re-downloaded via yt-dlp and cut to the
+    //     [start_time, end_time] window
+    //   - concatNormalizedClips uses introAudioPath + crossfade to mix in
+    //     the source audio for the intro window, voiceover for the rest.
+    let introAudioPath: string | undefined;
+    let introDurationActual = 0;
+    if (project?.intro_clip_id) {
+      try {
+        const introClipId = project.intro_clip_id as string;
+        const { data: introClip } = await sb
+          .from("video_clips")
+          .select("id, clip_url, start_time, end_time, video_source_id")
+          .eq("id", introClipId).single();
+        if (!introClip) throw new Error("intro clip row not found");
+        const { data: introSource } = await sb
+          .from("video_sources")
+          .select("youtube_video_id, youtube_url")
+          .eq("id", introClip.video_source_id as string).single();
+        if (!introSource) throw new Error("intro clip's source row not found");
+
+        const declaredDur = Number(project.intro_duration_seconds)
+          || (Number(introClip.end_time) - Number(introClip.start_time))
+          || 5.5;
+        // Hard-clamp to 5–6 s per spec.
+        introDurationActual = Math.min(6, Math.max(5, declaredDur));
+
+        // (a) Download silent intro video, trim, normalize, prepend to list.
+        const introVideoLocal = path.join(tmp, "intro_in.mp4");
+        await downloadHttp(introClip.clip_url as string, introVideoLocal);
+        const introTrimmed = path.join(tmp, "intro_trim.mp4");
+        await cutClip({
+          inputPath: introVideoLocal,
+          outputPath: introTrimmed,
+          startSeconds: 0,
+          durationSeconds: introDurationActual,
+        });
+        const introNormalized = path.join(tmp, "intro_norm.mp4");
+        await normalizeClip({
+          inputPath: introTrimmed, outputPath: introNormalized,
+          width: 1280, height: 720, fps: 30,
+        });
+        normalized.unshift(introNormalized);   // prepend
+        await safeUnlink(introVideoLocal);
+        await safeUnlink(introTrimmed);
+
+        // (b) yt-dlp the audio for the intro source, cut to [start, end].
+        const introTmp = path.join(tmp, "intro_audio");
+        await fs.mkdir(introTmp, { recursive: true });
+        const audioDl = await downloadYoutubeAudio({
+          url: introSource.youtube_url as string,
+          outputDir: introTmp,
+          videoId: introSource.youtube_video_id as string,
+        });
+        const introAudioCut = path.join(tmp, "intro_audio_cut.m4a");
+        await cutAudio({
+          inputPath: audioDl.outputPath,
+          outputPath: introAudioCut,
+          startSeconds: Number(introClip.start_time) || 0,
+          durationSeconds: introDurationActual,
+        });
+        await safeUnlink(audioDl.outputPath);
+        introAudioPath = introAudioCut;
+
+        // (c) Persist the cut audio URL on the project for traceability.
+        const audioDest = `projects/${projectId}/intro/audio_${Date.now()}.m4a`;
+        const audioUp = await uploadFile(introAudioCut, audioDest, "audio/mp4");
+        await sb.from("projects").update({
+          intro_audio_url: audioUp.publicUrl,
+          intro_duration_seconds: introDurationActual,
+        }).eq("id", projectId);
+
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.intro.ready", {
+            introClipId,
+            introDurationActual,
+            introAudioUrl: audioUp.publicUrl,
+          });
+      } catch (e) {
+        // Intro is best-effort. Render without it on any failure — log so
+        // the operator knows the project shipped without the planned intro.
+        introAudioPath = undefined;
+        introDurationActual = 0;
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.intro.failed", { err: (e as Error).message });
+      }
     }
 
     // 4) Concat
@@ -120,6 +248,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       outputPath: finalLocal,
       voiceoverPath: voiceoverLocal,
       voiceoverGain: 1.0,
+      introAudioPath,
+      introDurationSeconds: introDurationActual || undefined,
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);

@@ -21,7 +21,12 @@ export interface DurationRange {
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
   footage: { min: 4,  max: 6  },
-  image:   { min: 8,  max: 12 },
+  // Image holds shortened from 8–12s to 5–8s. Long static holds were dead
+  // air when image content was a placeholder; even with auto-fetched images,
+  // 10s of held content feels long. 5–8s gives the viewer time to process
+  // the visual without dragging pacing. Slightly longer than footage so the
+  // hold still reads as "pause to look" vs the constant motion of footage.
+  image:   { min: 5,  max: 8  },
   split_2: { min: 6,  max: 8  },
   split_4: { min: 6,  max: 8  },
 };
@@ -57,9 +62,10 @@ export function planTimeline(voiceoverSeconds: number): TimelinePlan {
   // ON SCREEN — which is what users actually mean by "60% footage."
   const targetFootageSec = safeVo * 0.6;
   const targetImageSec   = safeVo * 0.4;
-  // Footage uses the bucket's avg as its target; images hold ~10s.
+  // Footage avg ~5s, image avg ~6.5s — slightly longer than footage so a
+  // held still reads as "pause to look" without dragging the pacing.
   const footageAvg = (DURATION_RANGES.footage.min + DURATION_RANGES.footage.max) / 2;   // 5
-  const imageAvg   = (DURATION_RANGES.image.min   + DURATION_RANGES.image.max)   / 2;   // 10
+  const imageAvg   = (DURATION_RANGES.image.min   + DURATION_RANGES.image.max)   / 2;   // 6.5
   const footageBlocks = Math.max(1, Math.round(targetFootageSec / footageAvg));
   const imageBlocks   = Math.max(1, Math.round(targetImageSec / imageAvg));
   const totalBlocks = footageBlocks + imageBlocks;
@@ -104,19 +110,21 @@ export function buildBlockSequence(
   plan: TimelinePlan,
   rand: RandomFn = Math.random,
 ): PlannedBlock[] {
+  // The timeline contains ONLY footage and image blocks. The intro segment
+  // (5–6s of celebrity-interview audio + video) is a separate prefix
+  // assembled at render time using projects.intro_clip_id and
+  // projects.intro_audio_url. It is NOT a block in this sequence.
+  //
+  // Why this matters: the timeline's block durations sum to voiceoverSeconds.
+  // The intro plays its own audio for the first 5–6s of the final video,
+  // BEFORE this timeline starts. So the first footage/image block here
+  // corresponds to the first words of the voiceover, not to the intro.
   const blocks: PlannedBlock[] = [];
   let acc = 0;
 
-  const intro: PlannedBlock = { type: "intro", duration: pickDuration("intro", rand) };
-  blocks.push(intro);
-  acc += intro.duration;
-
-  // Pre-compute a footage/image pattern to hit the 60/40 ratio over the
-  // remaining blocks. We just walk a counter — exact ordering is fine.
+  // Pre-compute a footage/image pattern to hit the 60/40 ratio.
   let footageLeft = plan.footageBlocks;
   let imageLeft = plan.imageBlocks;
-  // The intro consumed one slot from the footage budget conceptually.
-  if (footageLeft > 0) footageLeft--;
 
   // Hard cap on consecutive image blocks. 3+ images in a row = a long
   // slideshow stretch with no motion — visually dead AND a copyright-risk

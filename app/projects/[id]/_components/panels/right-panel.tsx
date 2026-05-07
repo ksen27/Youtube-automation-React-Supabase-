@@ -243,12 +243,16 @@ function BlockInspector({
     ? (clipsQ.data?.clips ?? []).find((c) => c.id === item.clip_id)
     : null;
 
+  // Image blocks have no clip_id; their thumbnail comes from the row's
+  // image_url (fetched into the project pool at match time).
+  const inspectorThumb = clip?.thumbnail_url ?? item.image_url ?? null;
+
   return (
     <BlockInspectorForm
       key={item.id}
       projectId={projectId}
       item={item}
-      clipThumb={clip?.thumbnail_url ?? null}
+      clipThumb={inspectorThumb}
     />
   );
 }

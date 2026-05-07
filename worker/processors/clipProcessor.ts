@@ -5,7 +5,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { maybeEnqueueMatch } from "./_shared";
 import { cutClip, generateThumbnail } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps, pickFromScenes } from "@/lib/media/scenes";
-import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
+import { ensureTmp, removeFiles, safeUnlink, uploadFile } from "@/lib/storage";
 import { CLIP_DURATION_SECONDS, computeProjectClipCap, getEnv } from "@/lib/env";
 import { labelClipFromThumbnail, isJunkCategory } from "@/lib/ai/gemini";
 
@@ -129,6 +129,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   let succeeded = 0;
   let failed = 0;
   let droppedJunk = 0;
+  let processed = 0;
   const junkCategoryCounts: Record<string, number> = {};
 
   // Pin the source on the job up front so the UI can attribute "currently
@@ -137,35 +138,44 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
     metadata: { videoSourceId, totalClips: timestamps.length },
   });
 
-  for (let i = 0; i < timestamps.length; i++) {
-    const start = timestamps[i];
+  // Per-clip pipeline. Each invocation is independent — runs cut + thumbnail
+  // + label + upload for one timestamp. Multiple invocations run concurrently
+  // (CLIP_PIPELINE_CONCURRENCY) to overlap ffmpeg / Gemini / storage I/O. The
+  // labeler runs in parallel with upload so the slow Gemini call doesn't
+  // block the upload from starting; if the labeler decides the frame is junk
+  // we delete the just-uploaded objects (cheap, rare).
+  async function processOne(i: number, start: number): Promise<void> {
     const dur = CLIP_DURATION_SECONDS;
     const idx = String(i).padStart(3, "0");
     const clipLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}.mp4`);
     const thumbLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}.jpg`);
-
-    await setMediaJob(mediaJobId, {
-      metadata: {
-        videoSourceId,
-        totalClips: timestamps.length,
-        currentClip: { index: i + 1, total: timestamps.length, startSeconds: start },
-      },
-    });
+    const clipDest  = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}.mp4`;
+    const thumbDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}.jpg`;
 
     try {
-      await cutClip({ inputPath: vs.local_path, outputPath: clipLocal, startSeconds: start, durationSeconds: dur });
-      await generateThumbnail({ inputPath: vs.local_path, outputPath: thumbLocal, atSeconds: start + 1 });
+      // ffmpeg cut + thumbnail in parallel — both read the same source file
+      // (input-side seek, no decoding overlap), and on a typical machine the
+      // pair finishes faster than running them serially.
+      await Promise.all([
+        cutClip({ inputPath: vs.local_path, outputPath: clipLocal, startSeconds: start, durationSeconds: dur }),
+        generateThumbnail({ inputPath: vs.local_path, outputPath: thumbLocal, atSeconds: start + 1 }),
+      ]);
 
-      // Label first, BEFORE uploading. Junk frames (title cards, subscribe
-      // screens, blank frames) get dropped here — no storage cost, no
-      // matcher noise. Labeling failures fall through as null and are
-      // treated as "content" so a transient Gemini hiccup doesn't trash
-      // an otherwise-good clip.
-      const visionLabels = await labelClipFromThumbnail(thumbLocal, vs.title ?? null).catch((e) => {
+      // Kick off labeling and upload in parallel. Labeling is the slow leg
+      // (Gemini Vision, retries on 503); upload is bandwidth-bound. They
+      // share no state — once both files exist on disk, both are safe to
+      // start. Labeling failures degrade gracefully to null.
+      const labelPromise = labelClipFromThumbnail(thumbLocal, vs.title ?? null).catch((e) => {
         void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
           "clip.label.failed", { start, err: (e as Error).message });
         return null;
       });
+      const uploadPromise = Promise.all([
+        uploadFile(clipLocal, clipDest, "video/mp4"),
+        uploadFile(thumbLocal, thumbDest, "image/jpeg"),
+      ]);
+
+      const [visionLabels, [clipUp, thumbUp]] = await Promise.all([labelPromise, uploadPromise]);
 
       if (visionLabels && isJunkCategory(visionLabels.visualCategory)) {
         droppedJunk++;
@@ -177,15 +187,12 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
             visualCategory: visionLabels.visualCategory,
             primarySubject: visionLabels.primarySubject,
           });
-        continue;     // skip upload + insert; finally{} cleans up local files
+        // The clip and thumbnail were uploaded in parallel with labeling;
+        // now that we know it's junk, remove the storage objects so we
+        // don't pay to keep frames the matcher will never use.
+        await removeFiles([clipDest, thumbDest]);
+        return;
       }
-
-      const clipDest  = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}.mp4`;
-      const thumbDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}.jpg`;
-      const [clipUp, thumbUp] = await Promise.all([
-        uploadFile(clipLocal, clipDest, "video/mp4"),
-        uploadFile(thumbLocal, thumbDest, "image/jpeg"),
-      ]);
 
       // Fold primarySubject + setting into the labels list — the matcher
       // only reads `labels`, and these two are the most useful descriptors.
@@ -216,11 +223,33 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
     } finally {
       await safeUnlink(clipLocal);
       await safeUnlink(thumbLocal);
+      processed++;
       await setMediaJob(mediaJobId, {
-        progress: 5 + Math.floor(((i + 1) / timestamps.length) * 90),
+        progress: 5 + Math.floor((processed / timestamps.length) * 90),
+        metadata: {
+          videoSourceId,
+          totalClips: timestamps.length,
+          currentClip: { index: processed, total: timestamps.length, startSeconds: start },
+        },
       });
     }
   }
+
+  // Lane-based concurrency: each lane pulls the next index off a shared
+  // cursor, so a slow clip on one lane doesn't hold up the others. This
+  // is the dominant speedup — under serial execution the slowest step
+  // (usually labeling on a 503 spike) gates everything.
+  const concurrency = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, timestamps.length));
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= timestamps.length) return;
+        await processOne(i, timestamps[i]);
+      }
+    }),
+  );
 
   if (succeeded === 0 && failed > 0) {
     await sb.from("video_sources").update({ status: "failed", error: "all clip cuts failed" }).eq("id", videoSourceId);

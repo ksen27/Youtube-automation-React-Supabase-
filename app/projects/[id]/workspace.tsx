@@ -74,14 +74,24 @@ export function ProjectWorkspace({
   const PHASE_ORDER: WorkspacePhase[] = ["intake", "analysis", "processing", "editor", "export"];
   const derivedIdx = PHASE_ORDER.indexOf(derived);
   const overrideIdx = phaseOverride ? PHASE_ORDER.indexOf(phaseOverride) : -1;
-  // Only honor the override if it points to a phase the user has already reached.
-  const phase: WorkspacePhase =
-    phaseOverride && overrideIdx >= 0 && overrideIdx <= derivedIdx ? phaseOverride : derived;
+  // Export is reachable from editor — derivePhase only returns "export" once a
+  // render job exists, so without this special-case the user can't navigate to
+  // the export screen to start the first render. Allow override to "export"
+  // whenever the timeline is ready (derived === "editor" or beyond).
+  const editorReached = derivedIdx >= PHASE_ORDER.indexOf("editor");
+  const overrideAllowed =
+    phaseOverride !== null &&
+    overrideIdx >= 0 &&
+    (overrideIdx <= derivedIdx || (phaseOverride === "export" && editorReached));
+  const phase: WorkspacePhase = overrideAllowed ? phaseOverride! : derived;
   const canExport = derived === "editor" || derived === "export";
 
   const onPhaseSelect = (target: WorkspacePhase) => {
     const targetIdx = PHASE_ORDER.indexOf(target);
-    if (targetIdx < 0 || targetIdx > derivedIdx) return;
+    if (targetIdx < 0) return;
+    // Same export special-case as above: allow jumping to export once editor
+    // is reached, even though derivedPhase still says "editor".
+    if (targetIdx > derivedIdx && !(target === "export" && editorReached)) return;
     setPhaseOverride(targetIdx === derivedIdx ? null : target);
   };
 

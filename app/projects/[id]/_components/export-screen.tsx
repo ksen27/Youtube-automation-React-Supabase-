@@ -116,10 +116,12 @@ export function ExportScreen({
           )}
           {isDone ? "Render again" : isRunning ? "Rendering…" : "Start render"}
         </Button>
-        {startRender.error && (
-          <p className="text-xs text-danger">{(startRender.error as Error).message}</p>
-        )}
       </div>
+      {startRender.error && (
+        <div className="rounded-[10px] border border-danger/40 bg-danger/10 p-3 text-sm text-danger">
+          {(startRender.error as Error).message}
+        </div>
+      )}
     </div>
   );
 }

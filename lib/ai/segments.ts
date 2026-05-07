@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
+import { withGeminiRetry, isRetryableGeminiError } from "@/lib/ai/gemini";
 
 // Segment-aware analysis used by the "Analyze & Search" UX.
 // We split a transcript into ~5-minute spoken chunks, then ask Gemini for a
@@ -164,11 +165,28 @@ literal query string, so abstract or editorial words pull in the wrong videos:
 SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
 """${segment.text.slice(0, 8000)}"""`;
 
-  const res = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
-  });
-  const txt = res.response.text();
+  let txt: string;
+  try {
+    const res = await withGeminiRetry(`analyzeSegment[${segment.index}]`, () =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
+      })
+    );
+    txt = res.response.text();
+  } catch (e) {
+    // 503/429 spikes on gemini-2.5-flash were taking down the entire analyze
+    // request because Promise.all rejects on the first failure. Falling back
+    // to a heuristic understanding keeps the pipeline running — the search
+    // step is still useful with just the section's first sentence as a query.
+    console.error(JSON.stringify({
+      msg: "analyzeSegment.gemini_failed",
+      segment: segment.index,
+      retryable: isRetryableGeminiError(e),
+      err: (e as Error).message?.slice(0, 200),
+    }));
+    return fallbackUnderstanding(segment);
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(txt); } catch {
     return fallbackUnderstanding(segment);

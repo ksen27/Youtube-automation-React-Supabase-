@@ -69,6 +69,9 @@ export interface TimelineRow {
   script_text: string | null;
   overlay_text: string | null;
   approved: boolean;
+  image_url: string | null;
+  image_source: string | null;
+  image_query: string | null;
 }
 
 export interface ClipRow {

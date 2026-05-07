@@ -20,7 +20,7 @@ function getModel() {
 // 503 (UNAVAILABLE) and 429 (RESOURCE_EXHAUSTED) are the dominant failure
 // modes during Gemini "high demand" spikes. 500 is rarer but also transient.
 // Anything else (400/401/permission/quota-of-day) won't recover with retries.
-function isRetryableGeminiError(err: unknown): boolean {
+export function isRetryableGeminiError(err: unknown): boolean {
   const msg = (err as Error)?.message ?? String(err);
   return (
     msg.includes("503") ||
@@ -36,7 +36,7 @@ function isRetryableGeminiError(err: unknown): boolean {
 // worst-case wait is ~13s before giving up, which is acceptable inside the
 // clip job (label runs alongside upload) and the match job (one batch out
 // of many, run with bounded concurrency).
-async function withGeminiRetry<T>(
+export async function withGeminiRetry<T>(
   label: string,
   fn: () => Promise<T>,
   opts: { attempts?: number; baseMs?: number } = {},
@@ -343,7 +343,7 @@ export async function labelClipFromThumbnail(
   const model = getModel();
 
   const prompt = `You are describing a single thumbnail frame from a celebrity-focused B-roll clip so a video editor can decide where to place it.
-The clip's source video title is: "${sourceTitle ?? "unknown"}"
+The clip's source video title is: "${sourceTitle ?? "unknown"}" — use this ONLY as weak context. The frame itself is the source of truth.
 
 Return STRICT JSON ONLY in this shape:
 {
@@ -356,7 +356,9 @@ Return STRICT JSON ONLY in this shape:
 Rules:
 - Describe what is VISIBLY in the frame. Don't guess things you can't see.
 - Prefer concrete nouns: "iron palace gates", "wedding dress", "press photographers", "archival newspaper headline".
-- If a person is recognizable from the source title, you may name them; otherwise describe their role ("woman in white dress", "elderly man at podium").
+- NEVER name a person unless you can clearly see a face or full person in the frame. If the source title mentions a celebrity but the frame shows only an object, vehicle, building, or scenery, do NOT include the celebrity's name in labels or primarySubject. The title provides context, not visual content.
+- "primarySubject" must describe what is actually visible: e.g. "car grille close-up", "engine compartment", "shop floor", NOT the title's subject. Only use a person's name when the person is visible in frame.
+- "setting" must describe the visible environment, not the source video's overall theme. A car-detail close-up's setting is "shop interior" or "garage"; it is NOT "interview" just because the source video happens to be an interview.
 - Avoid vague labels like "scene", "moment", "image", "footage".
 - Skip duplicates.
 
@@ -373,8 +375,14 @@ When visualCategory is anything other than "content", labels can be a single sho
 
   let txt: string;
   try {
-    const res = await withGeminiRetry("labelClip", () =>
-      model.generateContent({
+    // Tighter retry budget than the default. Labeling runs on the clip-cut
+    // hot path (one call per clip × dozens of clips per source); the default
+    // 1s→3s→9s ladder turns a Gemini 503 spike into ~13s of dead time per
+    // failing clip. We'd rather drop the label and let the clip ship without
+    // one — the matcher's Tier-2 filler tolerates label-less clips.
+    const res = await withGeminiRetry(
+      "labelClip",
+      () => model.generateContent({
         contents: [{
           role: "user",
           parts: [
@@ -383,7 +391,8 @@ When visualCategory is anything other than "content", labels can be a single sho
           ],
         }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-      })
+      }),
+      { attempts: 2, baseMs: 400 },
     );
     txt = res.response.text();
   } catch (e) {

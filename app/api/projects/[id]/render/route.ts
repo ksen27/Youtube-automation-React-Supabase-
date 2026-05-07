@@ -12,9 +12,13 @@ export const dynamic = "force-dynamic";
 // little slack for rounding noise across many blocks.
 const DURATION_TOLERANCE_SECONDS = 1.5;
 
-// Block types that consume timeline duration (overlays don't).
+// Block types that consume timeline duration (overlays don't). The intro is
+// rendered as a separate prefix segment by the renderer (see renderProcessor —
+// it pulls intro_clip_id from the projects table directly), and the matcher
+// inserts a UI-only intro row whose duration overlaps that prefix. Including
+// it here would double-count the intro and push the timeline outside the
+// ±1.5s tolerance, blocking the render with no clear feedback.
 const DURATION_BEARING_TYPES = new Set([
-  "intro",
   "footage",
   "image",
   "split_2",

@@ -57,6 +57,43 @@ export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlp
   return { outputPath: path.join(opts.outputDir, found) };
 }
 
+// Audio-only download. Used by the intro pipeline: the intro clip plays its
+// source's original audio (the celebrity speaking) while voiceover is silent
+// for the first ~5–6s. We download just the audio track to keep this fast
+// and small (~1–3 MB for a 10-min source vs. 30–80 MB for the video).
+//
+// Output is .m4a (AAC) regardless of source codec — uniform ext keeps the
+// downstream ffmpeg-cut step simple.
+export async function downloadYoutubeAudio(opts: YtDlpRunOptions): Promise<YtDlpDownloadResult> {
+  const env = getEnv();
+  await fs.mkdir(opts.outputDir, { recursive: true });
+  const outputTemplate = path.join(opts.outputDir, `${opts.videoId}.%(ext)s`);
+  const args = [
+    "-f", "bestaudio[ext=m4a]/bestaudio",
+    "-x",                          // extract audio
+    "--audio-format", "m4a",
+    "--audio-quality", "5",        // 0=best, 9=worst; 5 is plenty for narration
+    "--no-playlist",
+    "--no-warnings",
+    "--no-progress",
+    "--no-part",
+    "--restrict-filenames",
+    "--socket-timeout", "30",
+    "--retries", "2",
+    "--fragment-retries", "2",
+    "--js-runtimes", "node",
+    "--remote-components", "ejs:github",
+    "-o", outputTemplate,
+    opts.url,
+  ];
+  await runYtDlp(env.YTDLP_PATH, args, env.YTDLP_TIMEOUT_SECONDS, opts.signal, opts.onLog);
+  const entries = await fs.readdir(opts.outputDir);
+  const found = entries.find((f) => f.startsWith(opts.videoId) && f.endsWith(".m4a"))
+    ?? entries.find((f) => f.startsWith(opts.videoId));
+  if (!found) throw new Error(`yt-dlp audio finished but no output file found for ${opts.videoId}`);
+  return { outputPath: path.join(opts.outputDir, found) };
+}
+
 function runYtDlp(
   bin: string,
   args: string[],
