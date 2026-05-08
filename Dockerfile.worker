@@ -1,0 +1,47 @@
+FROM node:20-bookworm-slim
+
+# ffmpeg + yt-dlp + redis. Redis runs in the same container as the worker
+# so we don't pay for a separate Upstash plan or Fly Redis VM. State is
+# written to /data which is a Fly volume — survives container restarts.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    python3 \
+    ca-certificates \
+    curl \
+    redis-server \
+ && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+      -o /usr/local/bin/yt-dlp \
+ && chmod +x /usr/local/bin/yt-dlp \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev=false
+
+COPY . .
+
+# AOF (appendonly) keeps queue state durable across restarts; noeviction is
+# required for BullMQ (silent eviction would lose in-flight jobs). REDIS_URL
+# is set as a Fly secret (must include the password and the public Fly host).
+ENV NODE_ENV=production \
+    FFMPEG_PATH=ffmpeg \
+    FFPROBE_PATH=ffprobe \
+    YTDLP_PATH=yt-dlp \
+    TMP_DIR=/tmp/work
+
+# Start Redis as a daemon, then exec the worker as PID 1 so SIGTERM from
+# Fly reaches the worker and triggers its graceful shutdown handler.
+# --bind 0.0.0.0 lets the Vercel app reach Redis over the public internet
+# (port exposed via fly.toml [[services]]). --requirepass enforces auth.
+# Password is read at runtime from REDIS_PASSWORD env (Fly secret).
+CMD mkdir -p /data \
+ && redis-server --daemonize yes \
+      --dir /data \
+      --appendonly yes \
+      --maxmemory-policy noeviction \
+      --bind 0.0.0.0 \
+      --protected-mode no \
+      --requirepass "$REDIS_PASSWORD" \
+ && exec npx tsx worker/index.ts

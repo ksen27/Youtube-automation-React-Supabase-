@@ -57,9 +57,37 @@ function startWorker<T>(
   }, {
     connection: getRedisConnection(),
     concurrency: c,
+    // Polling tuning — cuts idle Redis traffic ~5× without affecting job
+    // pickup latency (the blocking pop wakes the instant a job arrives).
+    // drainDelay: 30 is BullMQ's hard maximum.
+    drainDelay: 30,
+    // lockDuration must exceed the longest blocking subprocess we await.
+    // The processor only heartbeats between awaits, so a single ffmpeg or
+    // yt-dlp call that runs longer than lockDuration trips "stalled more
+    // than allowable limit" and BullMQ re-queues the job. With ffmpeg's
+    // hard timeout at 240s and yt-dlp at 300s, we set the lock to 360s
+    // so even a near-timeout subprocess still updates before we lose the
+    // lock. stalledInterval matches — the recovery checker only needs to
+    // run once per lock window.
+    stalledInterval: 360_000,
+    lockDuration: 360_000,
   });
 
-  w.on("error", (err) => console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, msg: "worker.error", err: err.message })));
+  // Transient Redis disconnects (ECONNRESET, ETIMEDOUT) get auto-recovered
+  // by ioredis; logging them as errors creates noise that looks like real
+  // worker failures. Demote those to a single-line info log; everything else
+  // still goes to stderr so it shows up in `fly logs` filters.
+  w.on("error", (err) => {
+    const m = (err as Error).message || "";
+    const isTransient = /ECONNRESET|ETIMEDOUT|EPIPE|read ECONNRESET/i.test(m);
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      queue: name,
+      msg: isTransient ? "worker.redis_transient" : "worker.error",
+      err: m,
+    });
+    if (isTransient) console.log(line); else console.error(line);
+  });
   w.on("failed", (job, err) => console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job?.id, msg: "job.failed.event", err: err.message })));
   return w;
 }

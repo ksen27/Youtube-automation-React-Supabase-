@@ -19,6 +19,8 @@ export interface Project {
   transcript: string | null;
   voiceover_url: string | null;
   voiceover_duration_seconds: number | null;
+  bg_music_url: string | null;
+  bg_music_gain: number;
   status: ProjectStatus;
   created_at: string;
   updated_at: string;

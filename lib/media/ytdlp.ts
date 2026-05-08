@@ -10,6 +10,35 @@ export interface YtDlpDownloadResult {
   outputPath: string;
 }
 
+// Parse YTDLP_PROXIES once on first read, then cache. Each entry is
+// `ip:port:user:pass` (Webshare's list-export format). Returns the proxies
+// as ready-to-pass --proxy URLs. If env is unset/empty, returns []. We pick
+// a random entry per yt-dlp invocation so load is spread across the pool —
+// reduces the chance any single residential IP gets rate-limited by YouTube.
+let cachedProxies: string[] | null = null;
+function getProxyPool(): string[] {
+  if (cachedProxies) return cachedProxies;
+  const raw = getEnv().YTDLP_PROXIES;
+  if (!raw) return (cachedProxies = []);
+  cachedProxies = raw
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [host, port, user, pass] = line.split(":");
+      if (!host || !port || !user || !pass) return null;
+      return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${host}:${port}`;
+    })
+    .filter((v): v is string => v !== null);
+  return cachedProxies;
+}
+
+function pickProxy(): string | null {
+  const pool = getProxyPool();
+  if (pool.length === 0) return null;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 export interface YtDlpRunOptions {
   url: string;
   outputDir: string;
@@ -28,6 +57,7 @@ export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlp
   // Video-only: the final render uses the project's voiceover; source audio is
   // never used. Skipping audio dramatically reduces failure rate (no separate
   // audio fetch, no ffmpeg merge step) and shrinks the on-disk cache.
+  const proxy = pickProxy();
   const args = [
     "-f", `bestvideo[height<=${maxH}]/best[height<=${maxH}]/bestvideo/best`,
     "--no-playlist",
@@ -43,6 +73,7 @@ export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlp
     // misleading "video not available" error.
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
+    ...(proxy ? ["--proxy", proxy] : []),
     "-o", outputTemplate,
     opts.url,
   ];
@@ -68,6 +99,7 @@ export async function downloadYoutubeAudio(opts: YtDlpRunOptions): Promise<YtDlp
   const env = getEnv();
   await fs.mkdir(opts.outputDir, { recursive: true });
   const outputTemplate = path.join(opts.outputDir, `${opts.videoId}.%(ext)s`);
+  const proxy = pickProxy();
   const args = [
     "-f", "bestaudio[ext=m4a]/bestaudio",
     "-x",                          // extract audio
@@ -83,6 +115,7 @@ export async function downloadYoutubeAudio(opts: YtDlpRunOptions): Promise<YtDlp
     "--fragment-retries", "2",
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
+    ...(proxy ? ["--proxy", proxy] : []),
     "-o", outputTemplate,
     opts.url,
   ];
@@ -101,8 +134,14 @@ function runYtDlp(
   signal: AbortSignal | undefined,
   onLog?: (line: string) => void
 ): Promise<void> {
+  // Mirror the ffmpeg approach: nice down yt-dlp on Linux so its JS-runtime
+  // and remote-component fetches don't starve Redis on shared-CPU hosts.
+  const niceLevel = getEnv().NICE_LEVEL;
+  const useNice = niceLevel > 0 && process.platform === "linux";
+  const finalBin = useNice ? "nice" : bin;
+  const finalArgs = useNice ? ["-n", String(niceLevel), bin, ...args] : args;
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(finalBin, finalArgs, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let timedOut = false;
     const timer = setTimeout(() => {

@@ -140,15 +140,29 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       imageFailed,
     });
 
-    // 3) Optional voiceover from project + intro clip selection
+    // 3) Optional voiceover from project + intro clip selection + bg music
     const { data: project } = await sb.from("projects")
-      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds")
+      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, bg_music_url, bg_music_gain")
       .eq("id", projectId).single();
     let voiceoverLocal: string | undefined;
     if (project?.voiceover_url) {
       voiceoverLocal = path.join(tmp, "voiceover.audio");
       try { await downloadHttp(project.voiceover_url, voiceoverLocal); }
       catch { voiceoverLocal = undefined; }
+    }
+    // Background music is best-effort — a download failure should not
+    // block the render. The user gets a video without the bed and the
+    // log line tells the operator why.
+    let bgMusicLocal: string | undefined;
+    if (project?.bg_music_url) {
+      bgMusicLocal = path.join(tmp, "bg_music.audio");
+      try {
+        await downloadHttp(project.bg_music_url, bgMusicLocal);
+      } catch (e) {
+        bgMusicLocal = undefined;
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.bg_music.download_failed", { err: (e as Error).message });
+      }
     }
 
     // 3b) Build the intro segment (best-effort — failures fall back to a
@@ -243,11 +257,16 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
 
     // 4) Concat
     const finalLocal = path.join(tmp, `final_${projectId}.mp4`);
+    const bgMusicGain = project?.bg_music_gain != null
+      ? Number(project.bg_music_gain)
+      : 0.15;
     await concatNormalizedClips({
       inputPaths: normalized,
       outputPath: finalLocal,
       voiceoverPath: voiceoverLocal,
       voiceoverGain: 1.0,
+      bgMusicPath: bgMusicLocal,
+      bgMusicGain,
       introAudioPath,
       introDurationSeconds: introDurationActual || undefined,
     });

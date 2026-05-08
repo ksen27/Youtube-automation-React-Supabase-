@@ -6,7 +6,7 @@ import { enqueueClip, enqueueDownload } from "@/lib/jobs/queue";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { probeFile } from "@/lib/media/probe";
-import { ensureTmp, safeUnlink } from "@/lib/storage";
+import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { getEnv } from "@/lib/env";
 import { safeFilename } from "@/lib/utils";
 import type { JobAttemptInfo } from "../index";
@@ -35,8 +35,10 @@ export async function processDownloadJob(
     .eq("youtube_video_id", safeId)
     .maybeSingle();
 
-  if (existing && existing.status === "clipped" && existing.local_path) {
-    // Already have file locally — re-clip cheaply by cutting again from cache.
+  if (existing && existing.status === "clipped" && existing.storage_url) {
+    // Already have the source persisted in R2 — re-clip cheaply by re-downloading
+    // it on the clip worker and cutting again. (We cannot trust local_path: the
+    // file may live on a different worker's disk or have been GC'd since.)
     await logJob({ projectId, jobId: mediaJobId, sourceId: existing.id }, "download.cache.hit");
     // Make sure source is associated with this project (one source row per video).
     if (existing.project_id !== projectId) {
@@ -108,21 +110,33 @@ export async function processDownloadJob(
       return; // do not throw — terminal, not retryable
     }
 
-    // 5) Mark video_source ready for clipping
+    // 5) Upload source to R2 so the clip worker (potentially a different
+    //    machine) can fetch it. Without this, clipProcessor sees no file at
+    //    `local_path` and every cutClip throws → "all clip cuts failed".
+    const sourceDest = `projects/${projectId}/source/${safeId}.mp4`;
+    await setMediaJob(mediaJobId, { progress: 75 });
+    const sourceUp = await uploadFile(result.outputPath, sourceDest, "video/mp4");
+
+    // 6) Mark video_source ready for clipping. local_path stays unset — the
+    //    R2 key on storage_url is the source of truth across workers.
     const { error: updErr } = await sb.from("video_sources").update({
       status: "downloaded",
-      local_path: path.resolve(result.outputPath),
+      storage_url: sourceUp.publicUrl,
       duration_seconds: Math.round(probe.durationSeconds),
       title: vs.title,
       metadata: {
         ...(vs.metadata as Record<string, unknown> ?? {}),
+        storage_path: sourceDest,
         probe: { width: probe.width, height: probe.height, hasAudio: probe.hasAudio,
                  videoCodec: probe.videoCodec, audioCodec: probe.audioCodec },
       },
     }).eq("id", vs.id);
     if (updErr) throw new Error(`update video_source: ${updErr.message}`);
 
-    // 6) Update youtube_search_results status to "downloaded"
+    // Local copy is no longer needed — the clip worker pulls from R2.
+    await safeUnlink(result.outputPath);
+
+    // 7) Update youtube_search_results status to "downloaded"
     await sb.from("youtube_search_results")
       .update({ status: "downloaded" })
       .eq("project_id", projectId)
@@ -130,7 +144,7 @@ export async function processDownloadJob(
 
     await setMediaJob(mediaJobId, { progress: 90 });
 
-    // 7) Enqueue clip job
+    // 8) Enqueue clip job
     const clipJobId = await createMediaJob({
       projectId, type: "clip", metadata: { videoSourceId: vs.id },
     });

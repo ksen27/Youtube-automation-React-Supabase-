@@ -23,8 +23,12 @@ export function ProcessingScreen({
   jobs: JobsResp | undefined;
   onRetry?: () => void;
 }) {
-  const mediaJobs = jobs?.media_jobs ?? [];
+  const rawMediaJobs = jobs?.media_jobs ?? [];
   const sources = jobs?.video_sources ?? [];
+  // Collapse duplicate download attempts for the same YouTube video (retries,
+  // fallback re-promotions) to a single row — keep the most recent job, since
+  // that is the one whose status reflects what the user can act on.
+  const mediaJobs = dedupeDownloadJobs(rawMediaJobs);
   const failedCount = mediaJobs.filter((j) => j.status === "failed").length;
 
   const downloadState = aggregateState("download", mediaJobs);
@@ -467,6 +471,31 @@ function fmtClockShort(sec: number): string {
 
 function jobsOfType(type: string, jobs: MediaJob[]) {
   return jobs.filter((j) => j.type === type);
+}
+
+// Each download attempt for the same YouTube video produces a fresh media_job
+// (retry-failed, fallback promotion, etc.) — left raw, the same video shows
+// up multiple times. Keep only the most recent job per youtube_video_id;
+// non-download jobs pass through untouched.
+function dedupeDownloadJobs(jobs: MediaJob[]): MediaJob[] {
+  const latestByVideo = new Map<string, MediaJob>();
+  const passthrough: MediaJob[] = [];
+  for (const j of jobs) {
+    if (j.type !== "download") {
+      passthrough.push(j);
+      continue;
+    }
+    const ytId = (j.metadata?.youtube_video_id as string | undefined) ?? null;
+    if (!ytId) {
+      passthrough.push(j);
+      continue;
+    }
+    const prev = latestByVideo.get(ytId);
+    if (!prev || new Date(j.created_at) > new Date(prev.created_at)) {
+      latestByVideo.set(ytId, j);
+    }
+  }
+  return [...passthrough, ...latestByVideo.values()];
 }
 
 function aggregateState(type: string, jobs: MediaJob[]): StepState {

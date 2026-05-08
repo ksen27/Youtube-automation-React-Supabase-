@@ -5,7 +5,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { maybeEnqueueMatch } from "./_shared";
 import { cutClip, generateThumbnail } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps, pickFromScenes } from "@/lib/media/scenes";
-import { ensureTmp, removeFiles, safeUnlink, uploadFile } from "@/lib/storage";
+import { downloadToFile, ensureTmp, removeFiles, safeUnlink, uploadFile } from "@/lib/storage";
 import { CLIP_DURATION_SECONDS, computeProjectClipCap, getEnv } from "@/lib/env";
 import { labelClipFromThumbnail, isJunkCategory } from "@/lib/ai/gemini";
 
@@ -20,8 +20,14 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const { data: vs, error: vsErr } = await sb
     .from("video_sources").select("*").eq("id", videoSourceId).single();
   if (vsErr || !vs) throw new Error(`video_source missing: ${vsErr?.message}`);
-  if (!vs.local_path) throw new Error("video_source has no local_path");
   if (!vs.duration_seconds || vs.duration_seconds <= 0) throw new Error("video_source has no duration");
+
+  // The R2 key for the source MP4. The clip worker may run on a different
+  // machine than the download worker, so we cannot rely on local_path —
+  // metadata.storage_path is the cross-machine handle. We resolve it now so
+  // we fail fast if the upstream download skipped the upload.
+  const sourceStoragePath = (vs.metadata as Record<string, unknown> | null)?.storage_path as string | undefined;
+  if (!sourceStoragePath) throw new Error("video_source has no metadata.storage_path — re-download required");
 
   // Project clip cap is sized to the voiceover so the matcher has enough
   // footage candidates per timeline block without overshooting on storage.
@@ -72,6 +78,15 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const physicalMax = Math.max(1, Math.floor(usableSeconds / minStride) + 1);
   const cappedCount = Math.min(targetCount, physicalMax);
 
+  // Pull the source MP4 from R2 to local tmp. Done lazily — only once we know
+  // the cap hasn't already been reached, so a no-op clip job doesn't pay for
+  // the download. Cleaned up in the finally below.
+  const sourceTmp = await ensureTmp(`source/${vs.youtube_video_id}`);
+  const sourceLocal = path.join(sourceTmp, `${vs.youtube_video_id}.mp4`);
+  await downloadToFile(sourceStoragePath, sourceLocal);
+
+  try {
+
   // Try scene-detection first — cuts at visual boundaries beat blind
   // uniform sampling (no half-shots, cleaner thumbnails). Fall back to
   // the uniform sampler if scene-detect returns too few candidates or
@@ -80,7 +95,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   let timestampSource: "scene_detect" | "uniform" | "scene_detect_then_uniform" = "uniform";
   let sceneCount = 0;
   try {
-    const scenes = await detectSceneTimestamps({ inputPath: vs.local_path });
+    const scenes = await detectSceneTimestamps({ inputPath: sourceLocal });
     sceneCount = scenes.length;
     const fromScenes = pickFromScenes({
       scenes,
@@ -157,8 +172,8 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       // (input-side seek, no decoding overlap), and on a typical machine the
       // pair finishes faster than running them serially.
       await Promise.all([
-        cutClip({ inputPath: vs.local_path, outputPath: clipLocal, startSeconds: start, durationSeconds: dur }),
-        generateThumbnail({ inputPath: vs.local_path, outputPath: thumbLocal, atSeconds: start + 1 }),
+        cutClip({ inputPath: sourceLocal, outputPath: clipLocal, startSeconds: start, durationSeconds: dur }),
+        generateThumbnail({ inputPath: sourceLocal, outputPath: thumbLocal, atSeconds: start + 1 }),
       ]);
 
       // Kick off labeling and upload in parallel. Labeling is the slow leg
@@ -293,6 +308,13 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
     });
 
   await maybeEnqueueMatch(projectId);
+
+  } finally {
+    // Source MP4 only lives on disk for the duration of this clip job.
+    // Drop it whether we succeeded, failed, or threw — the worker's tmp
+    // dir is not a cache.
+    await safeUnlink(sourceLocal);
+  }
 }
 
 // Sample evenly across the video, skipping the first 10 seconds (intros).

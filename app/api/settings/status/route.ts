@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getEnv } from "@/lib/env";
 import { isSupabaseConfigured, getServerSupabase } from "@/lib/supabase/server";
 import { newRedisClient } from "@/lib/jobs/queue";
+import { checkR2Health } from "@/lib/storage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,14 +13,7 @@ export async function GET() {
   const gemini  = Boolean(env.GEMINI_API_KEY);
   const supabase = isSupabaseConfigured();
 
-  let storage = false;
-  if (supabase) {
-    try {
-      const sb = getServerSupabase();
-      const { data, error } = await sb.storage.getBucket(env.SUPABASE_STORAGE_BUCKET);
-      storage = !error && !!data;
-    } catch { storage = false; }
-  }
+  const storage = await checkR2Health();
 
   let redis = false;
   try {
@@ -44,7 +38,7 @@ export async function GET() {
 
   return NextResponse.json({
     youtube, gemini, supabase, storage, redis,
-    bucket: env.SUPABASE_STORAGE_BUCKET,
+    bucket: env.R2_BUCKET,
     approved, blocked,
     limits: {
       max_videos: env.MAX_VIDEOS_PER_PROJECT,

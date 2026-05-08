@@ -6,11 +6,21 @@ const ServerEnvSchema = z.object({
   NEXT_PUBLIC_SUPABASE_URL: z.string().url().optional(),
   NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
-  SUPABASE_STORAGE_BUCKET: z.string().default("video-automation"),
+  // Cloudflare R2 (S3-compatible). The bucket should be public via r2.dev
+  // subdomain or a custom domain. R2_PUBLIC_BASE_URL must NOT include a
+  // trailing slash; uploadFile/uploadBuffer concatenate it as `${base}/${key}`.
+  R2_ACCOUNT_ID: z.string().optional(),
+  R2_ACCESS_KEY_ID: z.string().optional(),
+  R2_SECRET_ACCESS_KEY: z.string().optional(),
+  R2_BUCKET: z.string().default("video-automation"),
+  R2_PUBLIC_BASE_URL: z.string().url().optional(),
   YOUTUBE_API_KEY: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
-  // Google Programmable Search (Custom Search JSON API). Separate from the
-  // Gemini key — Cloud Console → enable Custom Search API → create key. The
+  // Brave Image Search API. Primary image source — get a key at
+  // https://api-dashboard.search.brave.com/. Free tier: 1 qps, 2000/month.
+  BRAVE_SEARCH_API_KEY: z.string().optional(),
+  // Google Programmable Search (Custom Search JSON API). Fallback when Brave
+  // returns nothing. Cloud Console → enable Custom Search API → create key.
   // CX is the Programmable Search Engine ID from programmablesearchengine.google.com.
   GOOGLE_SEARCH_API_KEY: z.string().optional(),
   GOOGLE_SEARCH_CX: z.string().optional(),
@@ -45,11 +55,33 @@ const ServerEnvSchema = z.object({
   MAX_CLIP_CAP: z.coerce.number().int().positive().default(400),
   MAX_SOURCE_DURATION_SECONDS: z.coerce.number().int().positive().default(1500),
   YTDLP_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
-  FFMPEG_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
+  // Bumped from 120s — on shared-CPU hosts (Fly shared-cpu-2x) several
+  // concurrent ffmpegs can starve each other and a single short clip cut
+  // ends up taking >2 min. The fix is `-threads` capping + lower
+  // CLIP_PIPELINE_CONCURRENCY, but we leave headroom for the slowest clip.
+  FFMPEG_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(240),
+  // Per-ffmpeg thread cap. Multiplied by CLIP_PIPELINE_CONCURRENCY this is
+  // the worst-case number of cores ffmpeg will try to use. Tune so the
+  // product stays at or below the host's vCPU count to avoid thrash.
+  FFMPEG_THREADS: z.coerce.number().int().positive().default(2),
   HTTP_DOWNLOAD_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
   YTDLP_PATH: z.string().default("yt-dlp"),
+  // Run heavy subprocesses (ffmpeg, yt-dlp) at lower scheduling priority on
+  // Linux. On shared-CPU hosts, full-throttle ffmpeg can starve Redis of CPU
+  // long enough for idle TCP keepalives to time out, surfacing as
+  // intermittent worker ECONNRESET logs even though Redis itself is fine.
+  // `nice -n N` lets the kernel preempt the encoder whenever Redis/node
+  // need a slice. 0 = disabled (default for local dev / Windows where the
+  // binary doesn't exist). 10 = cooperative on Fly.
+  NICE_LEVEL: z.coerce.number().int().min(0).max(19).default(0),
+  // Residential proxy pool for yt-dlp. YouTube blocks downloads from cloud
+  // IPs (Fly/AWS/GCP) with a "Sign in to confirm you're not a bot" wall, so
+  // every yt-dlp call has to egress through a residential proxy. Format is
+  // newline- or comma-separated `ip:port:user:pass` entries (Webshare's
+  // standard list export). Empty = no proxy (local/dev only).
+  YTDLP_PROXIES: z.string().optional(),
   TMP_DIR: z.string().default("./tmp"),
 });
 

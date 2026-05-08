@@ -1,0 +1,32 @@
+# fly.toml app configuration file generated for video-automation-worker on 2026-05-07T20:27:07+02:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'video-automation-worker'
+primary_region = 'lhr'
+
+[build]
+  dockerfile = 'Dockerfile.worker'
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '2gb'
+
+# Redis AOF lives here so queue state survives container restarts/deploys.
+# Without this, every redeploy would wipe in-flight jobs.
+[[mounts]]
+  source = 'worker_data'
+  destination = '/data'
+
+# Expose the in-container Redis to the public internet so the Next.js app
+# on Vercel can enqueue jobs. Password-protected via REDIS_PASSWORD secret.
+# auto_stop/auto_start are off — the worker must stay up to keep Redis up.
+[[services]]
+  internal_port = 6379
+  protocol = 'tcp'
+  auto_stop_machines = false
+  auto_start_machines = false
+
+  [[services.ports]]
+    port = 6379

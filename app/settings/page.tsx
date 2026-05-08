@@ -3,6 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { getEnv } from "@/lib/env";
 import { isSupabaseConfigured, getServerSupabase } from "@/lib/supabase/server";
 import { newRedisClient } from "@/lib/jobs/queue";
+import { checkR2Health } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -12,14 +13,7 @@ async function getStatus() {
   const gemini = Boolean(env.GEMINI_API_KEY);
   const supabase = isSupabaseConfigured();
 
-  let storage = false;
-  if (supabase) {
-    try {
-      const sb = getServerSupabase();
-      const { data, error } = await sb.storage.getBucket(env.SUPABASE_STORAGE_BUCKET);
-      storage = !error && !!data;
-    } catch { storage = false; }
-  }
+  const storage = await checkR2Health();
   let redis = false;
   try {
     const c = newRedisClient();
@@ -78,8 +72,15 @@ export default async function SettingsPage() {
           <CardHeader><CardTitle>Supabase</CardTitle></CardHeader>
           <CardContent className="text-sm space-y-1">
             <div className="flex items-center justify-between"><span>Database</span><StatusBadge ok={s.supabase} /></div>
-            <div className="flex items-center justify-between"><span>Storage bucket "{s.env.SUPABASE_STORAGE_BUCKET}"</span><StatusBadge ok={s.storage} /></div>
-            <p className="text-xs text-muted-foreground">Set <code>NEXT_PUBLIC_SUPABASE_URL</code>, <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code>. Create the bucket as public.</p>
+            <p className="text-xs text-muted-foreground">Set <code>NEXT_PUBLIC_SUPABASE_URL</code>, <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code>.</p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader><CardTitle>Cloudflare R2</CardTitle></CardHeader>
+          <CardContent className="text-sm space-y-1">
+            <div className="flex items-center justify-between"><span>Bucket "{s.env.R2_BUCKET}"</span><StatusBadge ok={s.storage} /></div>
+            <p className="text-xs text-muted-foreground">Set <code>R2_ACCOUNT_ID</code>, <code>R2_ACCESS_KEY_ID</code>, <code>R2_SECRET_ACCESS_KEY</code>, <code>R2_BUCKET</code>, and <code>R2_PUBLIC_BASE_URL</code>. Bucket must be public via r2.dev or a custom domain.</p>
           </CardContent>
         </Card>
 

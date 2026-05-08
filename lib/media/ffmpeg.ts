@@ -24,6 +24,7 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
   // during concat, not from clip audio.
   const args = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-ss", String(opts.startSeconds),
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
@@ -58,6 +59,7 @@ export async function buildStillVideo(opts: {
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
   const args = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-loop", "1",
     "-t", String(opts.durationSeconds),
     "-i", opts.inputImagePath,
@@ -90,6 +92,7 @@ export async function cutAudio(opts: {
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
   const args = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-ss", String(opts.startSeconds),
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
@@ -113,6 +116,7 @@ export async function generateThumbnail(opts: ThumbnailOptions): Promise<void> {
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
   const args = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-ss", String(opts.atSeconds),
     "-i", opts.inputPath,
     "-frames:v", "1",
@@ -140,6 +144,7 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
   const args = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-i", opts.inputPath,
     "-an",
     "-vf",
@@ -187,6 +192,7 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   // We re-encode during concat to dodge the strict-codec requirements of -c copy.
   const args: string[] = [
     "-y",
+    "-threads", String(env.FFMPEG_THREADS),
     "-f", "concat",
     "-safe", "0",
     "-i", listPath,
@@ -198,6 +204,12 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   const hasIntro = !!(opts.introAudioPath && opts.introDurationSeconds && opts.introDurationSeconds > 0);
   let audioMap: string[] = [];
   let hasAudioOutput = false;
+  // Background music behavior: loop forever via `-stream_loop -1` (input-side,
+  // before -i) so a short bed repeats to cover the full voiceover. In the
+  // filter graph we mix with `duration=first` keyed on the voiceover/main
+  // mix, which means a long bed gets cut at the voiceover's end instead of
+  // extending the audio past the video. The final encode's `-shortest` then
+  // pins everything to the silent-video length as a final guard.
   if (hasIntro && opts.voiceoverPath) {
     // Intro mode: input 0 = silent video, 1 = intro audio, 2 = voiceover,
     // (3 = bg music if provided). Final audio plays the intro for the
@@ -217,9 +229,7 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     filter += `[2:a]volume=${opts.voiceoverGain ?? 1.0},asetpts=PTS-STARTPTS[vo];`;
     filter += `[intro][vo]acrossfade=d=${xfade}:c1=tri:c2=tri[mainmix]`;
     if (opts.bgMusicPath) {
-      args.push("-i", opts.bgMusicPath);
-      // bg music plays under everything. Delayed start so it doesn't
-      // step on the intro's spoken audio — start it ~0.5s in.
+      args.push("-stream_loop", "-1", "-i", opts.bgMusicPath);
       filter += `;[3:a]volume=${opts.bgMusicGain ?? 0.15},asetpts=PTS-STARTPTS[bg];`;
       filter += `[mainmix][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
     } else {
@@ -230,13 +240,15 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     hasAudioOutput = true;
   } else if (opts.voiceoverPath && opts.bgMusicPath) {
     args.push("-i", opts.voiceoverPath);
-    args.push("-i", opts.bgMusicPath);
-    // input 0 = silent video, 1 = voiceover, 2 = bg music
+    args.push("-stream_loop", "-1", "-i", opts.bgMusicPath);
+    // input 0 = silent video, 1 = voiceover, 2 = bg music (looped).
+    // duration=first → mix length = voiceover length, so a long bed is
+    // cut at voiceover end and a short bed loops to fill.
     args.push(
       "-filter_complex",
       `[1:a]volume=${opts.voiceoverGain ?? 1.0}[vo];` +
       `[2:a]volume=${opts.bgMusicGain ?? 0.15}[bg];` +
-      `[vo][bg]amix=inputs=2:duration=longest:dropout_transition=0[aout]`
+      `[vo][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]`
     );
     audioMap = ["-map", "0:v:0", "-map", "[aout]"];
     hasAudioOutput = true;
@@ -245,7 +257,9 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     audioMap = ["-map", "0:v:0", "-map", "1:a:0"];
     hasAudioOutput = true;
   } else if (opts.bgMusicPath) {
-    args.push("-i", opts.bgMusicPath);
+    // No voiceover: bg music carries the whole video. Loop it; -shortest
+    // on the encoder pins length to the silent video.
+    args.push("-stream_loop", "-1", "-i", opts.bgMusicPath);
     args.push(
       "-filter_complex",
       `[1:a]volume=${opts.bgMusicGain ?? 0.15}[bg]`
@@ -283,9 +297,16 @@ function runFFmpeg(
   args: string[],
   signal?: AbortSignal
 ): Promise<void> {
-  const timeoutSeconds = getEnv().FFMPEG_TIMEOUT_SECONDS;
+  const env = getEnv();
+  const timeoutSeconds = env.FFMPEG_TIMEOUT_SECONDS;
+  // On Linux, drop ffmpeg's scheduling priority via `nice` so a busy encoder
+  // can't starve Redis or the worker process. Skipped when NICE_LEVEL=0 or
+  // on platforms where `nice` isn't reliably available (Windows dev).
+  const useNice = env.NICE_LEVEL > 0 && process.platform === "linux";
+  const finalBin = useNice ? "nice" : bin;
+  const finalArgs = useNice ? ["-n", String(env.NICE_LEVEL), bin, ...args] : args;
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(finalBin, finalArgs, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let timedOut = false;
     const timer = setTimeout(() => {

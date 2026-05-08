@@ -17,17 +17,27 @@ export interface ClipJobData      { projectId: string; mediaJobId: string; video
 export interface MatchJobData     { projectId: string; mediaJobId: string; }
 export interface RenderJobData    { projectId: string; mediaJobId: string; renderJobId: string; }
 
+// Idle BullMQ workers sit on a long blocking BRPOP. On Fly, idle TCP sockets
+// to the colocated Redis get torn down by the network layer after a few
+// minutes — surfacing as intermittent "read ECONNRESET" worker.error logs
+// even though ioredis silently reconnects. Enabling TCP keepalive every 30s
+// keeps the socket warm so the disconnect never happens.
+const REDIS_BASE_OPTIONS = {
+  maxRetriesPerRequest: null, // BullMQ requirement on shared connections.
+  enableReadyCheck: true,
+  keepAlive: 30_000,
+} as const;
+
 let connection: Redis | null = null;
 export function getRedisConnection(): Redis {
   if (connection) return connection;
-  // BullMQ requires { maxRetriesPerRequest: null } on the shared ioredis instance.
-  connection = new IORedis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
+  connection = new IORedis(getEnv().REDIS_URL, REDIS_BASE_OPTIONS);
   return connection;
 }
 
 // One-off clients for ad-hoc Redis ops (e.g. health pings).
 export function newRedisClient(): Redis {
-  return new IORedis(getEnv().REDIS_URL, { maxRetriesPerRequest: null });
+  return new IORedis(getEnv().REDIS_URL, REDIS_BASE_OPTIONS);
 }
 
 const queues = new Map<QueueName, Queue>();

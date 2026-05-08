@@ -1,11 +1,12 @@
 // Image-fetch orchestrator. Tries sources in priority order:
 //   1. Wikipedia (free, copyright-clean, best for named people/places)
-//   2. Google Custom Search (rights-filtered, broad coverage)
+//   2. Brave Image Search (broad coverage, less SEO-skewed than Google)
+//   3. Google Custom Search (rights-filtered fallback)
 //
 // YouTube thumbnails were previously the last-resort fallback but produced
 // low-quality, off-topic results (clickbait overlays, random channels) that
-// shipped into the final video. They've been removed; if Wikipedia + Google
-// CSE both fail for a query, the caller should leave the image block blank.
+// shipped into the final video. They've been removed; if all three sources
+// fail for a query, the caller should leave the image block blank.
 //
 // Two callers exist:
 //   - fetchImage(query)       — returns the single best image (legacy callers)
@@ -14,9 +15,10 @@
 //                                appear at most once across the timeline).
 
 import { fetchWikipediaImage } from "./wikipedia";
+import { fetchBraveImage, fetchBraveImages } from "./brave";
 import { fetchGoogleImage, fetchGoogleImages } from "./google-cse";
 
-export type ImageSource = "wikipedia" | "google_cse";
+export type ImageSource = "wikipedia" | "brave" | "google_cse";
 
 export interface FetchedImage {
   url: string;
@@ -49,6 +51,18 @@ export async function fetchImage(query: string, opts: FetchOptions = {}): Promis
         attribution: `Wikipedia: ${wiki.pageTitle}`,
       };
     }
+  }
+
+  const brave = await fetchBraveImage(q);
+  if (brave) {
+    return {
+      url: brave.url,
+      source: "brave",
+      width: brave.width,
+      height: brave.height,
+      contextUrl: brave.contextUrl,
+      attribution: brave.contextUrl ? `via ${new URL(brave.contextUrl).hostname}` : "Brave",
+    };
   }
 
   const cse = await fetchGoogleImage(q);
@@ -92,6 +106,23 @@ export async function fetchImages(
         attribution: `Wikipedia: ${wiki.pageTitle}`,
       });
       seenUrls.add(wiki.url);
+    }
+  }
+
+  if (out.length < max) {
+    const braveImages = await fetchBraveImages(q, max - out.length);
+    for (const brave of braveImages) {
+      if (seenUrls.has(brave.url)) continue;
+      out.push({
+        url: brave.url,
+        source: "brave",
+        width: brave.width,
+        height: brave.height,
+        contextUrl: brave.contextUrl,
+        attribution: brave.contextUrl ? `via ${new URL(brave.contextUrl).hostname}` : "Brave",
+      });
+      seenUrls.add(brave.url);
+      if (out.length >= max) break;
     }
   }
 
