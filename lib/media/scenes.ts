@@ -35,11 +35,17 @@ export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<
   const env = getEnv();
   const threshold = opts.threshold ?? 0.35;
 
+  // Downscale to 320 wide before running the scene filter. Scene detection
+  // compares frame-to-frame differences, which is a coarse signal that does
+  // not need full-res pixels — decoding 320p instead of 1080p is 5–10× faster
+  // on shared-CPU hosts and produces near-identical scene timestamps. `-an`
+  // skips audio decoding which the filter doesn't read.
   const args = [
     "-hide_banner",
     "-nostats",
     "-i", opts.inputPath,
-    "-vf", `select=gt(scene\\,${threshold}),showinfo`,
+    "-an",
+    "-vf", `scale=320:-2,select=gt(scene\\,${threshold}),showinfo`,
     "-f", "null",
     "-",
   ];
