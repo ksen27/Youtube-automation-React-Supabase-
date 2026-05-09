@@ -60,6 +60,19 @@ const ServerEnvSchema = z.object({
   // ends up taking >2 min. The fix is `-threads` capping + lower
   // CLIP_PIPELINE_CONCURRENCY, but we leave headroom for the slowest clip.
   FFMPEG_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(240),
+  // Scene-detect runs once per source before clip cuts and decodes (downscaled)
+  // every frame. It should fail fast: a slow scene-detect means the clip job
+  // has to wait that long before its first lane starts, even though the
+  // fallback (uniform sampling) produces perfectly usable clips. Keep this
+  // well below FFMPEG_TIMEOUT_SECONDS so a pathological source can't burn
+  // 4 minutes of dead time before we give up.
+  SCENE_DETECT_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(90),
+  // Hard cap on how many seconds of source we ask scene-detect to analyze.
+  // For a 30-minute source, the first 10 minutes have plenty of scene
+  // boundaries to pick clip timestamps from — analyzing the whole thing is
+  // wasted CPU. Combined with downscale=320, this keeps scene-detect under
+  // ~20s on shared-CPU hosts.
+  SCENE_DETECT_MAX_INPUT_SECONDS: z.coerce.number().int().positive().default(600),
   // Per-ffmpeg thread cap. Multiplied by CLIP_PIPELINE_CONCURRENCY this is
   // the worst-case number of cores ffmpeg will try to use. Tune so the
   // product stays at or below the host's vCPU count to avoid thrash.

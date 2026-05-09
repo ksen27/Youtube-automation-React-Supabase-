@@ -64,13 +64,17 @@ function startWorker<T>(
     // lockDuration must exceed the longest blocking subprocess we await.
     // The processor only heartbeats between awaits, so a single ffmpeg or
     // yt-dlp call that runs longer than lockDuration trips "stalled more
-    // than allowable limit" and BullMQ re-queues the job. With ffmpeg's
-    // hard timeout at 240s and yt-dlp at 300s, we set the lock to 360s
-    // so even a near-timeout subprocess still updates before we lose the
-    // lock. stalledInterval matches — the recovery checker only needs to
-    // run once per lock window.
-    stalledInterval: 360_000,
-    lockDuration: 360_000,
+    // than allowable limit" and BullMQ re-queues the job.
+    //
+    // 15 minutes covers the render queue's worst case: the final concat
+    // re-encodes a 100+ item timeline plus voiceover + bg music in a
+    // single ffmpeg call, which on shared-CPU Fly machines can take 8–12
+    // minutes during which nothing else awaits. With ffmpeg's hard
+    // timeout at 240s and yt-dlp at 300s, the smaller queues
+    // (clip/download/match/search) never approach this lock window;
+    // they just inherit the safer ceiling.
+    stalledInterval: 900_000,
+    lockDuration: 900_000,
   });
 
   // Transient Redis disconnects (ECONNRESET, ETIMEDOUT) get auto-recovered

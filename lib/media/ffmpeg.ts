@@ -18,8 +18,22 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
   const env = getEnv();
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
-  // -ss before -i is fastest (input-side seek). We re-encode to ensure clean
-  // GOP boundaries and consistent codec across clips for the final render.
+  // -ss before -i is input-side seek (fast: ffmpeg jumps in the file rather
+  // than decoding from frame 0). With -c:v copy we stream-copy the H.264
+  // packets straight to the output container — no decode, no encode. On
+  // shared-CPU Fly machines this turns a ~2-3s re-encode into ~0.2s of pure
+  // I/O, which is the single biggest win for clip-cut throughput.
+  //
+  // Trade-off: the cut starts at the nearest keyframe at or before the
+  // requested -ss, so the clip can begin up to ~1-2s earlier than asked.
+  // For 5-second B-roll windows this is invisible — the matcher picks
+  // clips by visual labels, not frame-accurate timestamps, and the
+  // thumbnail (still re-encoded by generateThumbnail) remains a faithful
+  // representation of what's in the clip.
+  //
+  // -avoid_negative_ts make_zero resets PTS to start at 0; without it some
+  // players show a brief black frame at the start because the first packet's
+  // PTS reflects its keyframe-relative position in the source.
   // -an because source downloads are video-only — final voiceover is mixed in
   // during concat, not from clip audio.
   const args = [
@@ -29,10 +43,8 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
     "-an",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
-    "-pix_fmt", "yuv420p",
+    "-c:v", "copy",
+    "-avoid_negative_ts", "make_zero",
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -43,6 +55,13 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
 // image blocks in the timeline — the same image is held for the block's
 // duration. Output codec/res/fps matches normalizeClip so the segment can
 // be concatenated alongside footage clips without re-encoding mismatches.
+//
+// AVIF inputs are pre-transcoded to PNG. ffmpeg 5.1's image2 demuxer (which
+// `-loop 1` requires) does not recognize AVIF as a loopable still source,
+// so passing an `.avif` directly fails with the misleading "Option loop
+// not found" error. ffmpeg can still decode AVIF as a single frame though,
+// so we shell out one quick ffmpeg call to write a PNG copy and feed that
+// to the still-video build.
 export async function buildStillVideo(opts: {
   inputImagePath: string;
   outputPath: string;
@@ -57,12 +76,41 @@ export async function buildStillVideo(opts: {
   const h = opts.height ?? 720;
   const fps = opts.fps ?? 30;
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  // Always pre-transcode the input image to a clean PNG before feeding it
+  // to the looping still-video build. This is unconditional — not just for
+  // AVIF/HEIF — because ffmpeg's image2 demuxer combined with `-loop 1` can
+  // *hang* on any number of pathological inputs:
+  //
+  //   - AVIF/HEIF (ISO base-media brands ffmpeg's image2 doesn't accept)
+  //   - JPEGs with unusual color profiles or non-standard markers
+  //   - Server-rendered "print preview" JPEGs with bleed/crop metadata
+  //   - Oversized PNGs (we've seen 8000×8000 inputs lock up the demuxer)
+  //   - Animated WEBPs (image2 expects a still)
+  //
+  // A standalone single-frame decode (no -loop) cannot hang the same way:
+  // ffmpeg either decodes one frame and exits, or fails immediately on
+  // malformed input. Doing the transcode unconditionally costs <1s for a
+  // normal image but turns silent hangs into clean failures.
+  //
+  // The transcode also gets a tight dedicated timeout. If decoding a single
+  // frame takes more than 30s, the input is broken and we want the failure
+  // surfaced now, not after burning the global 900s ffmpeg budget.
+  const transcodedPng = `${opts.inputImagePath}.normalized.png`;
+  await runFFmpeg(env.FFMPEG_PATH, [
+    "-y",
+    "-i", opts.inputImagePath,
+    "-frames:v", "1",
+    transcodedPng,
+  ], opts.signal, 30);
+  const actualInput = transcodedPng;
+
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
     "-loop", "1",
     "-t", String(opts.durationSeconds),
-    "-i", opts.inputImagePath,
+    "-i", actualInput,
     "-an",
     "-vf",
     `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
@@ -74,7 +122,13 @@ export async function buildStillVideo(opts: {
     "-movflags", "+faststart",
     opts.outputPath,
   ];
-  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  try {
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  } finally {
+    if (transcodedPng) {
+      try { await fs.unlink(transcodedPng); } catch { /* ignore */ }
+    }
+  }
 }
 
 // Cut a window of audio out of a longer audio file. Used by the intro
@@ -295,10 +349,14 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
 function runFFmpeg(
   bin: string,
   args: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // Optional per-call timeout override. Used for short ops (e.g. single-frame
+  // image transcode) where the global FFMPEG_TIMEOUT_SECONDS would let a
+  // hung input burn the whole render budget before failing.
+  timeoutOverrideSeconds?: number,
 ): Promise<void> {
   const env = getEnv();
-  const timeoutSeconds = env.FFMPEG_TIMEOUT_SECONDS;
+  const timeoutSeconds = timeoutOverrideSeconds ?? env.FFMPEG_TIMEOUT_SECONDS;
   // On Linux, drop ffmpeg's scheduling priority via `nice` so a busy encoder
   // can't starve Redis or the worker process. Skipped when NICE_LEVEL=0 or
   // on platforms where `nice` isn't reliably available (Windows dev).
@@ -307,14 +365,32 @@ function runFFmpeg(
   const finalArgs = useNice ? ["-n", String(env.NICE_LEVEL), bin, ...args] : args;
   return new Promise((resolve, reject) => {
     const child = spawn(finalBin, finalArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
+    // Ring-buffer the last STDERR_KEEP bytes of ffmpeg's stderr. The previous
+    // implementation concatenated every chunk into one ever-growing string,
+    // which crashed the worker with `RangeError: Invalid string length` on
+    // long-running operations (V8's max string is ~512 MB). The final concat
+    // for a 100+ item timeline can emit hundreds of MB of stderr — warnings
+    // per input, per-frame status, per-segment codec notices — and once that
+    // limit is hit the stream `data` callback throws, the unhandled error
+    // tears the worker down, Fly auto-restarts, BullMQ marks the in-flight
+    // job stalled. We only ever surface the tail anyway (the catch block
+    // below slices the last 2000 bytes), so dropping older bytes is free.
+    const STDERR_KEEP = 16_384; // 16 KB — generous tail for diagnostics
+    let stderrTail = "";
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutSeconds * 1000);
 
-    child.stderr.on("data", (c) => { stderr += c.toString(); });
+    child.stderr.on("data", (c: Buffer) => {
+      // Append then trim. Working with strings (not buffers) keeps the
+      // existing slice-from-end semantics for error messages.
+      stderrTail += c.toString();
+      if (stderrTail.length > STDERR_KEEP) {
+        stderrTail = stderrTail.slice(-STDERR_KEEP);
+      }
+    });
     child.on("error", (err) => {
       clearTimeout(timer);
       reject(err);
@@ -323,7 +399,7 @@ function runFFmpeg(
       clearTimeout(timer);
       if (timedOut) reject(new Error(`ffmpeg timed out after ${timeoutSeconds}s`));
       else if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
+      else reject(new Error(`ffmpeg exited ${code}: ${stderrTail.slice(-2000)}`));
     });
     signal?.addEventListener("abort", () => {
       clearTimeout(timer);

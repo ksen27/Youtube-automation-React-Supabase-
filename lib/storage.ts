@@ -1,4 +1,7 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+import { Agent as HttpsAgent } from "node:https";
 import path from "node:path";
 import {
   S3Client,
@@ -7,6 +10,7 @@ import {
   DeleteObjectsCommand,
   HeadBucketCommand,
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { getEnv } from "@/lib/env";
 
 // Storage layer backed by Cloudflare R2 (S3-compatible).
@@ -19,6 +23,16 @@ export interface UploadResult {
   path: string;       // bucket key (no leading slash)
   publicUrl: string;  // CDN URL
 }
+
+// Single keep-alive agent shared by every S3 call. Without this, each
+// upload/download pays a fresh TLS handshake (~100–300ms) — for a clip job
+// doing dozens of uploads that adds 3–10s of pure overhead. maxSockets caps
+// the per-host concurrency so a runaway never exhausts file descriptors.
+const keepAliveAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 64,
+});
 
 let cachedClient: S3Client | null = null;
 function getR2(): S3Client {
@@ -34,6 +48,11 @@ function getR2(): S3Client {
       accessKeyId: env.R2_ACCESS_KEY_ID,
       secretAccessKey: env.R2_SECRET_ACCESS_KEY,
     },
+    requestHandler: new NodeHttpHandler({
+      httpsAgent: keepAliveAgent,
+      connectionTimeout: 5_000,
+      socketTimeout: 60_000,
+    }),
   });
   return cachedClient;
 }
@@ -51,8 +70,21 @@ export async function uploadFile(
   destPath: string,
   contentType: string
 ): Promise<UploadResult> {
-  const buf = await fs.readFile(localPath);
-  return uploadBuffer(buf, destPath, contentType);
+  const env = getEnv();
+  // Stream the file from disk instead of loading it into memory. With
+  // CLIP_PIPELINE_CONCURRENCY lanes uploading in parallel, the buffered
+  // version held N×file-size in RAM at peak — on the 2GB Fly worker that
+  // pushed past safe limits and triggered GC pressure. ContentLength is
+  // required so S3 can size the request without buffering on its side.
+  const stat = await fs.stat(localPath);
+  await getR2().send(new PutObjectCommand({
+    Bucket: env.R2_BUCKET,
+    Key: destPath,
+    Body: createReadStream(localPath),
+    ContentLength: stat.size,
+    ContentType: contentType,
+  }));
+  return { path: destPath, publicUrl: publicUrlFor(destPath) };
 }
 
 export async function uploadBuffer(
@@ -99,12 +131,16 @@ export async function downloadToFile(
   }));
   if (!res.Body) throw new Error(`Storage download failed (${storagePath}): empty body`);
   await fs.mkdir(path.dirname(destLocalPath), { recursive: true });
-  // Body is a stream in Node — collect it into a buffer.
-  const chunks: Buffer[] = [];
-  for await (const chunk of res.Body as AsyncIterable<Uint8Array>) {
-    chunks.push(Buffer.from(chunk));
-  }
-  await fs.writeFile(destLocalPath, Buffer.concat(chunks));
+  // Pipe the response body straight to disk. The previous implementation
+  // collected every chunk into an in-memory array and only wrote at the
+  // end — for a 200–500MB source on a 2GB Fly machine that allocated 2×
+  // the file size (chunks + Buffer.concat) and starved everything else.
+  // With pipeline, peak memory stays at the stream's high-water-mark
+  // (~64KB) and the disk write happens concurrently with the network read.
+  await pipeline(
+    res.Body as Readable,
+    createWriteStream(destLocalPath),
+  );
 }
 
 // Used by the settings status route to confirm R2 credentials work and the

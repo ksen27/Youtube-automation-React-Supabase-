@@ -1,5 +1,7 @@
 import path from "node:path";
-import { promises as fs } from "node:fs";
+import { promises as fs, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
 import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
@@ -62,24 +64,34 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   );
 
   const tmp = await ensureTmp(`render/${projectId}`);
-  const downloaded: string[] = [];
-  const normalized: string[] = [];
+  // Output slots indexed by timeline position so we can build them in
+  // parallel without losing order. Failed items leave their slot null and
+  // get filtered out before concat.
+  const slots: (string | null)[] = new Array(renderable.length).fill(null);
   let imageRendered = 0;
   let imageFailed = 0;
 
   try {
-    // 1) Process each item in order. Footage items are downloaded then
-    //    trimmed+normalized; image items fetch the URL, save locally, and
-    //    build a still video segment of the block's duration. Both feed
-    //    into `normalized[]` in timeline order.
-    for (let i = 0; i < renderable.length; i++) {
+    // 1) Process each item in parallel lanes. Footage items are downloaded
+    //    then trimmed+normalized; image items fetch the URL, save locally,
+    //    and build a still video segment. Each lane writes into its
+    //    timeline slot so the final order matches `renderable`.
+    //
+    // Lane count tracks CLIP_PIPELINE_CONCURRENCY: it's the same shape of
+    // workload (download + ffmpeg) with the same CPU/network trade-off,
+    // so reusing the tunable means operators only have one knob.
+    const env = getEnv();
+    const laneCount = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, renderable.length));
+    let cursor = 0;
+    let completed = 0;
+
+    async function processItem(i: number): Promise<void> {
       const it = renderable[i];
       const plannedDur = Math.max(0.5, Number(it.duration) || 0);
       const idx = String(i).padStart(3, "0");
       const out = path.join(tmp, `norm_${idx}.mp4`);
 
       if (it.type === "image" && it.image_url) {
-        // Image block: download the image, build a still-video segment.
         try {
           const localImg = path.join(tmp, `img_${idx}`);
           await downloadHttp(it.image_url as string, localImg);
@@ -89,7 +101,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             durationSeconds: plannedDur,
             width: 1280, height: 720, fps: 30,
           });
-          normalized.push(out);
+          slots[i] = out;
           imageRendered++;
           await safeUnlink(localImg);
         } catch (e) {
@@ -98,18 +110,16 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             "render.image.failed", { idx: i, url: it.image_url, err: (e as Error).message });
         }
       } else if (it.clip_id) {
-        // Footage block: download → trim → normalize.
         const url = clipUrlById.get(it.clip_id as string);
         if (!url) {
           await logJob({ projectId, jobId: mediaJobId },
             "render.clip.missing_url", { idx: i, clipId: it.clip_id });
-          continue;
+          return;
         }
         const local = path.join(tmp, `in_${idx}.mp4`);
         const trimmed = path.join(tmp, `cut_${idx}.mp4`);
         try {
           await downloadHttp(url, local);
-          downloaded.push(local);
           await cutClip({
             inputPath: local, outputPath: trimmed,
             startSeconds: 0, durationSeconds: plannedDur,
@@ -118,18 +128,32 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             inputPath: trimmed, outputPath: out,
             width: 1280, height: 720, fps: 30,
           });
-          normalized.push(out);
+          slots[i] = out;
           await safeUnlink(trimmed);
         } catch (e) {
           await logJob({ projectId, jobId: mediaJobId },
             "render.clip.failed", { idx: i, err: (e as Error).message });
         }
       }
-
-      const pct = 5 + Math.floor(((i + 1) / renderable.length) * 60);
-      await setMediaJob(mediaJobId, { progress: pct });
-      await sb.from("render_jobs").update({ progress: pct }).eq("id", renderJobId);
     }
+
+    await Promise.all(
+      Array.from({ length: laneCount }, async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= renderable.length) return;
+          await processItem(i);
+          completed++;
+          const pct = 5 + Math.floor((completed / renderable.length) * 60);
+          await setMediaJob(mediaJobId, { progress: pct });
+          await sb.from("render_jobs").update({ progress: pct }).eq("id", renderJobId);
+        }
+      }),
+    );
+
+    // Flatten the slots into the in-order list of normalized segments,
+    // dropping any failed items.
+    const normalized: string[] = slots.filter((s): s is string => s !== null);
 
     if (normalized.length === 0) throw new Error("all timeline items failed to render");
 
@@ -289,8 +313,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     await setProjectStatus(projectId, "failed");
     throw e;
   } finally {
-    // Best-effort cleanup
-    for (const f of [...downloaded, ...normalized]) await safeUnlink(f);
+    // Best-effort cleanup. Walking the tmp dir covers every file the run
+    // might have written (downloads, trimmed cuts, normalized segments,
+    // intro pieces, the final mp4 itself once uploaded) without us having
+    // to maintain a parallel list.
     try {
       const entries = await fs.readdir(tmp);
       for (const f of entries) await safeUnlink(path.join(tmp, f));
@@ -305,11 +331,27 @@ async function downloadHttp(url: string, destPath: string): Promise<void> {
   try {
     const r = await fetch(url, { signal: ctrl.signal });
     if (!r.ok) throw new Error(`download ${url}: ${r.status}`);
-    const buf = Buffer.from(await r.arrayBuffer());
+    if (!r.body) throw new Error(`download ${url}: empty body`);
     await fs.mkdir(path.dirname(destPath), { recursive: true });
-    await fs.writeFile(destPath, buf);
+    // Stream the response straight to disk instead of buffering the entire
+    // body via arrayBuffer(). For a 16-clip render this loop runs 17+ times
+    // with 1–10 MB per file; the buffered version peaked all of them in RAM
+    // at once and starved ffmpeg. Streaming holds ~64KB at any moment and
+    // overlaps network read with disk write.
+    //
+    // pipeline() honors the signal option natively — without it, a server
+    // that holds the connection open without sending bytes (slow CDN, dead
+    // origin) leaves the read half waiting forever and the AbortController's
+    // fire-on-timeout never propagates to the disk-write side. We've seen
+    // renders hang at 64% (one image left) for exactly this reason.
+    await pipeline(
+      Readable.fromWeb(r.body as never),
+      createWriteStream(destPath),
+      { signal: ctrl.signal },
+    );
   } catch (e) {
-    if ((e as Error).name === "AbortError") {
+    const err = e as Error & { code?: string };
+    if (err.name === "AbortError" || err.code === "ABORT_ERR") {
       throw new Error(`download ${url}: timed out after ${timeoutMs / 1000}s`);
     }
     throw e;

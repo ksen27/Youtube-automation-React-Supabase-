@@ -8,10 +8,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { NewProjectForm } from "./new-project-form";
 import { statusToTone } from "@/app/projects/[id]/_shared";
+import { ProjectCard, type ProjectCardData } from "./project-card";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +23,7 @@ interface ProjectRow {
   updated_at: string;
 }
 
-async function loadProjects(): Promise<ProjectRow[]> {
+async function loadProjects(): Promise<ProjectCardData[]> {
   if (!isSupabaseConfigured()) return [];
   const sb = getServerSupabase();
   const { data, error } = await sb
@@ -32,7 +32,33 @@ async function loadProjects(): Promise<ProjectRow[]> {
     .order("created_at", { ascending: false })
     .limit(100);
   if (error) return [];
-  return (data ?? []) as ProjectRow[];
+  const rows = (data ?? []) as ProjectRow[];
+
+  // For completed projects, fetch the most recent render's output_url so we
+  // can show an inline preview on the card without needing to open it.
+  const completedIds = rows.filter((r) => r.status === "completed").map((r) => r.id);
+  const videoByProject = new Map<string, string>();
+  if (completedIds.length > 0) {
+    const { data: renders } = await sb
+      .from("render_jobs")
+      .select("project_id, output_url, created_at")
+      .in("project_id", completedIds)
+      .eq("status", "completed")
+      .not("output_url", "is", null)
+      .order("created_at", { ascending: false });
+    for (const r of renders ?? []) {
+      if (!videoByProject.has(r.project_id)) videoByProject.set(r.project_id, r.output_url);
+    }
+  }
+
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    status: r.status,
+    created_at: r.created_at,
+    badgeVariant: badgeVariantFor(r.status),
+    videoUrl: videoByProject.get(r.id) ?? null,
+  }));
 }
 
 function badgeVariantFor(s: string): "default" | "secondary" | "success" | "warning" | "destructive" | "info" | "outline" {
@@ -114,23 +140,7 @@ export default async function DashboardPage() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
-              <Link key={p.id} href={`/projects/${p.id}`} className="block group">
-                <Card interactive className="h-full">
-                  <CardHeader>
-                    <CardTitle className="truncate text-fg group-hover:text-brand-300 transition-colors">
-                      {p.title}
-                    </CardTitle>
-                    <CardDescription className="text-xs">
-                      {new Date(p.created_at).toLocaleString()}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <Badge variant={badgeVariantFor(p.status)}>
-                      {p.status.replace(/_/g, " ")}
-                    </Badge>
-                  </CardContent>
-                </Card>
-              </Link>
+              <ProjectCard key={p.id} project={p} />
             ))}
           </div>
         )}

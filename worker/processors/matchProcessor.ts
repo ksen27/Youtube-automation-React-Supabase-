@@ -721,23 +721,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     entitiesFailed: poolFetchStats.entitiesFailed,
   });
 
-  // Lower-third overlays for the first few celebrity / year / place entities.
-  // These don't consume timeline duration in the renderer (they're overlays),
-  // so we keep them outside the planned-block sum.
-  const { data: ents } = await sb.from("project_entities")
-    .select("type, value").eq("project_id", projectId)
-    .in("type", ["celebrity", "year", "place"]).limit(6);
-  for (const e of ents ?? []) {
-    items.push({
-      project_id: projectId, clip_id: null, type: "lower_third",
-      position: position++, duration: 3,
-      script_text: null,
-      overlay_text: `${e.value}`,
-      metadata: { entity_type: e.type, overlay: true },
-      approved: false,
-    });
-  }
-
   // Diagnostic summary: tells us at a glance whether the matcher is using
   // Gemini scores or silently degrading to insertion-order fallback. If
   // pickSourceCounts.scored_top is 0 and the others are non-zero, scoring

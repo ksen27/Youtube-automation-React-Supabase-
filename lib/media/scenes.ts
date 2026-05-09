@@ -40,9 +40,16 @@ export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<
   // not need full-res pixels — decoding 320p instead of 1080p is 5–10× faster
   // on shared-CPU hosts and produces near-identical scene timestamps. `-an`
   // skips audio decoding which the filter doesn't read.
+  //
+  // -t bounds how much of the source we analyze. Long sources (30+ min) used
+  // to time out at 240s even after downscaling because every frame still has
+  // to be decoded; capping the input to the first 10 minutes (default) gives
+  // plenty of scene boundaries to pick timestamps from and keeps the probe
+  // under ~20s on shared-CPU hosts.
   const args = [
     "-hide_banner",
     "-nostats",
+    "-t", String(env.SCENE_DETECT_MAX_INPUT_SECONDS),
     "-i", opts.inputPath,
     "-an",
     "-vf", `scale=320:-2,select=gt(scene\\,${threshold}),showinfo`,
@@ -72,7 +79,12 @@ export function parsePtsTimes(stderr: string): number[] {
 }
 
 function runCapturingStderr(bin: string, args: string[], signal?: AbortSignal): Promise<string> {
-  const timeoutSeconds = getEnv().FFMPEG_TIMEOUT_SECONDS;
+  // Use a dedicated, shorter timeout for scene-detect rather than the global
+  // FFMPEG_TIMEOUT_SECONDS. Scene-detect failing means we fall back to
+  // uniform sampling — a perfectly fine outcome that costs nothing to retry.
+  // The longer ffmpeg timeout exists for clip cuts and the final concat,
+  // where a timeout means a real failure.
+  const timeoutSeconds = getEnv().SCENE_DETECT_TIMEOUT_SECONDS;
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";

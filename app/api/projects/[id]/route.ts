@@ -74,3 +74,16 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ project: data });
 }
+
+export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params;
+  if (!UuidSchema.safeParse(id).success) return NextResponse.json({ error: "invalid id" }, { status: 400 });
+
+  const sb = getServerSupabase();
+  // Child tables (project_entities, youtube_search_results, video_clips,
+  // timeline_items, render_jobs, media_jobs) all cascade on project_id.
+  // video_sources is set null by FK because rows are deduped across projects.
+  const { error } = await sb.from("projects").delete().eq("id", id);
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json({ ok: true });
+}
