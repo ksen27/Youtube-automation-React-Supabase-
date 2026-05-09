@@ -48,7 +48,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // return an error so the user can retry without re-uploading the file.
   let transcript: string;
   try {
-    transcript = await transcribeAudio(buf, file.type);
+    const result = await transcribeAudio(buf, file.type);
+    transcript = result.transcript;
+    // Deepgram is the source of truth for duration on hosts without ffprobe
+    // (Vercel). When ffprobe succeeded above we trust it; otherwise fall back
+    // to Deepgram's reported duration so the timeline planner gets a real
+    // value instead of null (which would floor the project clip cap to MIN).
+    if (voiceoverDurationSeconds == null && result.durationSeconds != null) {
+      voiceoverDurationSeconds = Math.round(result.durationSeconds);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : "transcription failed";
     return NextResponse.json(

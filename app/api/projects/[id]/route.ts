@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { estimateDurationSeconds } from "@/lib/ai/segments";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -50,7 +51,26 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
   }
 
   const sb = getServerSupabase();
-  const { data, error } = await sb.from("projects").update(parsed.data).eq("id", id).select("*").single();
+  // If the patch includes a transcript and the project has no probed
+  // voiceover duration yet, fill it from a word-count estimate so downstream
+  // clip planning gets a real cap. A real Deepgram-probed duration always
+  // takes precedence and is never overwritten here.
+  const update: { title?: string; transcript?: string; voiceover_duration_seconds?: number } = {
+    ...parsed.data,
+  };
+  if (parsed.data.transcript) {
+    const { data: existing } = await sb
+      .from("projects")
+      .select("voiceover_duration_seconds")
+      .eq("id", id)
+      .single();
+    const hasProbedDuration = existing && Number(existing.voiceover_duration_seconds) > 0;
+    if (!hasProbedDuration) {
+      const est = estimateDurationSeconds(parsed.data.transcript);
+      if (est > 0) update.voiceover_duration_seconds = est;
+    }
+  }
+  const { data, error } = await sb.from("projects").update(update).eq("id", id).select("*").single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ project: data });
 }

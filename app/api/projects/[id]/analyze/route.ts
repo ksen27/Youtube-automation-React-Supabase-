@@ -37,8 +37,13 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (!latest) return NextResponse.json({ analyze: null });
-  return NextResponse.json({ analyze: latest });
+  if (!latest) return NextResponse.json({ analyze: null, payload: null });
+  // The full AnalyzeResponse is persisted in metadata.payload by the POST
+  // handler so the workspace can re-render saved results without re-running
+  // Gemini + YouTube search on every navigation.
+  const md = (latest.metadata ?? {}) as Record<string, unknown>;
+  const payload = (md.payload ?? null) as unknown;
+  return NextResponse.json({ analyze: latest, payload });
 }
 
 interface PreviewCandidate {
@@ -307,6 +312,10 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         footageBlocks: plan.footageBlocks,
         imageBlocks: plan.imageBlocks,
         candidate_count: rows.length,
+        // Persist the full payload so GET can rehydrate the analyze screen
+        // without re-running Gemini + YouTube search. Saves API spend on
+        // every navigation back to a project that's already been analyzed.
+        payload,
       },
     });
     await setProjectStatus(id, "ready_for_review");

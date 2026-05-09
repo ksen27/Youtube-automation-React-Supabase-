@@ -12,11 +12,20 @@ interface DeepgramChannel {
   alternatives: DeepgramAlternative[];
 }
 interface DeepgramListenResponse {
+  metadata?: { duration?: number };
   results?: { channels?: DeepgramChannel[] };
   err_msg?: string;
 }
 
-export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<string> {
+export interface TranscribeResult {
+  transcript: string;
+  // Audio duration in seconds, reported by Deepgram. Used as the primary
+  // source of voiceover length on hosts where ffprobe isn't available
+  // (e.g. Vercel's serverless Node runtime).
+  durationSeconds: number | null;
+}
+
+export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<TranscribeResult> {
   const env = getEnv();
   if (!env.DEEPGRAM_API_KEY) throw new Error("DEEPGRAM_API_KEY not configured");
 
@@ -44,5 +53,8 @@ export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<st
   const json = (await res.json()) as DeepgramListenResponse;
   const transcript = json.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
   if (!transcript) throw new Error("Deepgram returned no transcript");
-  return transcript;
+  const dur = typeof json.metadata?.duration === "number" && json.metadata.duration > 0
+    ? json.metadata.duration
+    : null;
+  return { transcript, durationSeconds: dur };
 }

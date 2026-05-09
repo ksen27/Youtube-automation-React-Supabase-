@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { estimateDurationSeconds } from "@/lib/ai/segments";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,9 +21,29 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "invalid input", issues: parsed.error.flatten() }, { status: 400 });
   }
   const sb = getServerSupabase();
+  // Pasted-transcript flow has no audio file, so Deepgram never runs and
+  // voiceover_duration_seconds would otherwise stay null — flooring the clip
+  // cap to MIN_CLIP_CAP downstream. Estimate from word count (≈150 wpm) so
+  // computeProjectClipCap scales to the script length. We only fill it when
+  // the project doesn't already have a real probed duration from a prior
+  // voiceover upload — overwriting Deepgram's accurate value with an estimate
+  // would degrade the cap.
+  const { data: existing } = await sb
+    .from("projects")
+    .select("voiceover_duration_seconds")
+    .eq("id", id)
+    .single();
+  const hasProbedDuration = existing && Number(existing.voiceover_duration_seconds) > 0;
+  const estimatedDuration = estimateDurationSeconds(parsed.data.transcript);
+  const update: { transcript: string; voiceover_duration_seconds?: number } = {
+    transcript: parsed.data.transcript,
+  };
+  if (!hasProbedDuration && estimatedDuration > 0) {
+    update.voiceover_duration_seconds = estimatedDuration;
+  }
   const { data, error } = await sb
     .from("projects")
-    .update({ transcript: parsed.data.transcript })
+    .update(update)
     .eq("id", id)
     .select("*")
     .single();

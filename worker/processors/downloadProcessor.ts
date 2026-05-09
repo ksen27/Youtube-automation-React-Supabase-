@@ -190,7 +190,12 @@ export async function processDownloadJob(
 // fallback promotion; null means "transient, worth retrying".
 function classifyTerminalError(msg: string): string | null {
   const m = msg.toLowerCase();
-  if (m.includes("sign in to confirm") || m.includes("age-restricted") || m.includes("age restricted")) return "age_gated";
+  // "Sign in to confirm you're not a bot" is YouTube's bot-detection wall
+  // hitting cloud IPs — NOT a permanent failure. A retry through a different
+  // residential proxy from YTDLP_PROXIES usually succeeds, so we let BullMQ
+  // run its full attempts loop instead of short-circuiting to fallback
+  // promotion (which produced duplicate-title sources from re-uploads).
+  if (m.includes("age-restricted") || m.includes("age restricted")) return "age_gated";
   if (m.includes("private video")) return "private";
   if (m.includes("video unavailable") || m.includes("removed by the uploader") || m.includes("account associated with this video has been terminated")) return "unavailable";
   if (m.includes("not available in your country") || m.includes("blocked it in your country") || m.includes("geo restrict")) return "geo_blocked";

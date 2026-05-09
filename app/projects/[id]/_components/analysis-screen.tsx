@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   ChevronDown,
@@ -110,6 +110,19 @@ export function AnalysisScreen({
   const [openSegments, setOpenSegments] = useState<Set<number>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
+  // Hydrate from the saved analyze job so re-visiting the screen doesn't
+  // wipe and re-run Gemini + YouTube search. The POST handler persists the
+  // full AnalyzeResponse in media_jobs.metadata.payload.
+  const savedQ = useQuery<{ payload: AnalyzeResponse | null }>({
+    queryKey: ["analyze", projectId],
+    queryFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/analyze`);
+      if (!r.ok) throw new Error(`load analyze: ${r.status}`);
+      return r.json();
+    },
+    staleTime: 60_000,
+  });
+
   const runAnalyze = useMutation<AnalyzeResponse, Error, void>({
     mutationFn: async () => {
       setPhase("understanding");
@@ -129,6 +142,9 @@ export function AnalysisScreen({
       setSelected(initial);
       setOpenSegments(new Set([0]));
       setPhase("results");
+      // Refresh the saved-payload cache so a future remount re-hydrates from
+      // the new run instead of the previous one.
+      qc.setQueryData(["analyze", projectId], { payload: d });
     },
     onError: (e) => {
       setError(e.message);
@@ -160,9 +176,25 @@ export function AnalysisScreen({
   });
 
   useEffect(() => {
-    if (autoStart && phase === "idle") runAnalyze.mutate();
+    if (phase !== "idle") return;
+    // Wait for the saved-payload fetch to settle before deciding what to do.
+    if (savedQ.isLoading) return;
+    const saved = savedQ.data?.payload ?? null;
+    if (saved) {
+      // Rehydrate prior results — no Gemini/YouTube spend on re-visit.
+      setData(saved);
+      const initial = new Set<string>();
+      for (const seg of saved.segments) {
+        for (const c of seg.candidates.slice(0, 5)) initial.add(c.videoId);
+      }
+      setSelected(initial);
+      setOpenSegments(new Set([0]));
+      setPhase("results");
+      return;
+    }
+    if (autoStart) runAnalyze.mutate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart]);
+  }, [autoStart, savedQ.isLoading, savedQ.data]);
 
   const totals = useMemo(() => {
     if (!data) return { selected: 0, segments: 0, durationSec: 0 };

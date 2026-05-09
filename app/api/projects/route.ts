@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { estimateDurationSeconds } from "@/lib/ai/segments";
 
 // We need the Node runtime for any code path that ends up touching FFmpeg /
 // yt-dlp / Supabase storage uploads. Keep all our routes Node-only.
@@ -30,9 +31,23 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid input", issues: parsed.error.flatten() }, { status: 400 });
   }
   const sb = getServerSupabase();
+  // When the create form supplies a transcript inline, estimate voiceover
+  // duration from word count so downstream clip planning has a real cap to
+  // size against. Without this, projects created via this route start with
+  // voiceover_duration_seconds=null and the clip cap floors to MIN_CLIP_CAP.
+  // A later voiceover upload (Deepgram-probed) overrides this estimate.
+  const transcript = parsed.data.transcript ?? null;
+  const voiceoverDurationSeconds = transcript
+    ? (estimateDurationSeconds(transcript) || null)
+    : null;
   const { data, error } = await sb
     .from("projects")
-    .insert({ title: parsed.data.title, transcript: parsed.data.transcript ?? null, status: "draft" })
+    .insert({
+      title: parsed.data.title,
+      transcript,
+      voiceover_duration_seconds: voiceoverDurationSeconds,
+      status: "draft",
+    })
     .select("*")
     .single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
