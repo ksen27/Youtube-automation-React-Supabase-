@@ -8,8 +8,10 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectsCommand,
+  HeadObjectCommand,
   HeadBucketCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { getEnv } from "@/lib/env";
 
@@ -141,6 +143,52 @@ export async function downloadToFile(
     res.Body as Readable,
     createWriteStream(destLocalPath),
   );
+}
+
+// Presigned PUT URL for browser-direct uploads. Returns a URL the client can
+// PUT the file body to without proxying through our server. We use this for
+// large uploads (voiceover audio) that exceed Vercel's ~4.5MB request body
+// limit. The bucket key is decided server-side so callers can't overwrite
+// arbitrary objects. The browser must send the same Content-Type the URL
+// was signed with, otherwise R2 rejects the PUT with SignatureDoesNotMatch.
+export async function presignPutUrl(
+  destPath: string,
+  contentType: string,
+  expiresInSeconds: number = 900,
+): Promise<{ url: string; path: string; publicUrl: string }> {
+  const env = getEnv();
+  const cmd = new PutObjectCommand({
+    Bucket: env.R2_BUCKET,
+    Key: destPath,
+    ContentType: contentType,
+  });
+  const url = await getSignedUrl(getR2(), cmd, { expiresIn: expiresInSeconds });
+  return { url, path: destPath, publicUrl: publicUrlFor(destPath) };
+}
+
+// Verify an object exists and return its size. Used after a presigned upload
+// to confirm the client actually wrote something before we run downstream
+// processing on it.
+export async function headObject(
+  storagePath: string,
+): Promise<{ size: number; contentType?: string } | null> {
+  const env = getEnv();
+  try {
+    const res = await getR2().send(new HeadObjectCommand({
+      Bucket: env.R2_BUCKET,
+      Key: storagePath,
+    }));
+    return {
+      size: Number(res.ContentLength ?? 0),
+      contentType: res.ContentType,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function publicUrlForKey(key: string): string {
+  return publicUrlFor(key);
 }
 
 // Used by the settings status route to confirm R2 credentials work and the

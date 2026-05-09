@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import type { ProjectResp } from "../_shared";
+import { uploadVoiceoverDirect } from "@/lib/client/upload-voiceover";
 
 export function IntakeScreen({
   projectId,
@@ -59,16 +60,17 @@ function IntakeForm({
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
   });
 
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
   const uploadVoiceover = useMutation({
     mutationFn: async (file: File) => {
-      const fd = new FormData();
-      fd.append("file", file);
-      const r = await fetch(`/api/projects/${projectId}/voiceover`, {
-        method: "POST",
-        body: fd,
-      });
-      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
-      return r.json();
+      setUploadPct(0);
+      try {
+        return await uploadVoiceoverDirect(projectId, file, (loaded, total) => {
+          setUploadPct(total > 0 ? Math.round((loaded / total) * 100) : null);
+        });
+      } finally {
+        setUploadPct(null);
+      }
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
   });
@@ -139,7 +141,9 @@ function IntakeForm({
             {transcribing && (
               <div className="flex items-center gap-2 text-xs text-fg-muted">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                Uploading and transcribing — this can take a minute for long audio.
+                {uploadPct != null && uploadPct < 100
+                  ? `Uploading ${uploadPct}%`
+                  : "Transcribing — this can take a minute for long audio."}
               </div>
             )}
             {uploadVoiceover.error && (

@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { uploadVoiceoverDirect } from "@/lib/client/upload-voiceover";
 
 type InputMode = "transcript" | "voiceover";
 
@@ -18,6 +19,7 @@ export function NewProjectForm() {
   const [voiceoverFile, setVoiceoverFile] = useState<File | null>(null);
   const [mode, setMode] = useState<InputMode>("transcript");
   const [submitting, setSubmitting] = useState(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const canSubmit =
@@ -42,13 +44,9 @@ export function NewProjectForm() {
       const { project } = await r.json();
 
       if (mode === "voiceover" && voiceoverFile) {
-        const fd = new FormData();
-        fd.append("file", voiceoverFile);
-        const vr = await fetch(`/api/projects/${project.id}/voiceover`, {
-          method: "POST",
-          body: fd,
+        await uploadVoiceoverDirect(project.id, voiceoverFile, (loaded, total) => {
+          setUploadPct(total > 0 ? Math.round((loaded / total) * 100) : null);
         });
-        if (!vr.ok) throw new Error((await vr.json()).error ?? "Voiceover upload failed");
       }
 
       router.push(`/projects/${project.id}?analyze=1`);
@@ -131,7 +129,11 @@ export function NewProjectForm() {
           disabled={!canSubmit}
         >
           <Sparkles className="h-4 w-4" />
-          {submitting ? "Starting…" : "Analyze & Search"}
+          {submitting
+            ? uploadPct != null && uploadPct < 100
+              ? `Uploading ${uploadPct}%`
+              : "Starting…"
+            : "Analyze & Search"}
         </Button>
         {error && <p className="text-xs text-danger">{error}</p>}
       </div>
