@@ -675,25 +675,44 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const poolUrlSet = new Set<string>();
   const poolFetchStats = { entitiesQueried: 0, entitiesFailed: 0 };
 
+  // Build the actual image-search query for an entity. The main celebrity is
+  // the only entity that's specific enough to search on its own — every other
+  // entity type (place, event, company, related_person, etc.) can collide
+  // with unrelated content. "Utah" returns state maps, "court ruling"
+  // returns generic gavels, "Creative Controls" could be any company.
+  // Prepending the subject keeps the search anchored to this project.
+  //
+  // The skip is intentional: if the entity value already contains the
+  // subject's name (e.g. "Kindig It Design lawsuit"), don't double-up.
+  function buildImageQuery(ent: { type: string; value: string }): string {
+    const value = ent.value.trim();
+    if (!mainCelebrity) return value;                       // no subject known
+    if (ent.type === "celebrity") return value;             // already the subject
+    const subjLower = mainCelebrity.toLowerCase();
+    if (value.toLowerCase().includes(subjLower)) return value;
+    return `${mainCelebrity} ${value}`;
+  }
+
   for (const ent of poolEntities) {
     if (pool.length >= imageBlockCount) break;       // already have enough
+    const query = buildImageQuery(ent);
     poolFetchStats.entitiesQueried++;
     try {
-      const fetched = await fetchImages(ent.value, IMAGES_PER_ENTITY, { entityType: ent.type });
+      const fetched = await fetchImages(query, IMAGES_PER_ENTITY, { entityType: ent.type });
       if (fetched.length === 0) {
         poolFetchStats.entitiesFailed++;
         continue;
       }
       for (const f of fetched) {
         if (poolUrlSet.has(f.url)) continue;          // dedupe across entities
-        pool.push({ url: f.url, source: f.source, query: ent.value, entityType: ent.type });
+        pool.push({ url: f.url, source: f.source, query, entityType: ent.type });
         poolUrlSet.add(f.url);
         if (pool.length >= imageBlockCount) break;
       }
     } catch (e) {
       poolFetchStats.entitiesFailed++;
       void logJob({ projectId, jobId: mediaJobId },
-        "match.image_fetch.failed", { query: ent.value, err: (e as Error).message });
+        "match.image_fetch.failed", { query, err: (e as Error).message });
     }
   }
 

@@ -137,14 +137,24 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       return [] as Awaited<ReturnType<typeof extractEntities>>;
     });
     const mainCelebrity = projectEntities.find((e) => e.type === "celebrity")?.value;
+    const relatedCompanies = projectEntities.filter((e) => e.type === "company").map((e) => e.value);
+    const relatedPeople = projectEntities.filter((e) => e.type === "related_person").map((e) => e.value);
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.main_celebrity", {
       mainCelebrity: mainCelebrity ?? null,
       celebrityCount: projectEntities.filter((e) => e.type === "celebrity").length,
       totalEntities: projectEntities.length,
     });
 
-    // 1b) Per-segment understanding (parallel — Gemini calls are independent)
-    const understandings = await Promise.all(segments.map((seg) => analyzeSegment(seg)));
+    // 1b) Per-segment understanding (parallel — Gemini calls are independent).
+    // We pass the project subject + named companies/people into every segment
+    // so Gemini anchors its queries (e.g. "Kindig It Design lawsuit 2016"
+    // instead of "Utah court ruling 2016", which pulls unrelated trials).
+    const segmentContext = {
+      mainSubject: mainCelebrity,
+      relatedCompanies: relatedCompanies.slice(0, 6),
+      relatedPeople: relatedPeople.slice(0, 6),
+    };
+    const understandings = await Promise.all(segments.map((seg) => analyzeSegment(seg, segmentContext)));
     await setMediaJob(mediaJobId, { progress: 35 });
 
     // Persist a flat entity list for the existing matchProcessor / workspace UI.

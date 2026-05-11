@@ -113,10 +113,38 @@ export const SegmentUnderstandingSchema = z.object({
 });
 export type SegmentUnderstanding = z.infer<typeof SegmentUnderstandingSchema>;
 
-export async function analyzeSegment(segment: RawSegment): Promise<SegmentUnderstanding> {
+export interface SegmentContext {
+  // The main subject of the whole video (e.g., "Dave Kindig"). Every search
+  // query for this segment is forced to include this name when set, so we
+  // don't drift into generic footage for legal/news/event segments where the
+  // narration mentions a place or year without re-stating the subject.
+  mainSubject?: string;
+  // Other proper nouns extracted from the whole script — companies, related
+  // people, etc. Gemini can pick the most relevant ones for this section.
+  relatedCompanies?: string[];
+  relatedPeople?: string[];
+}
+
+export async function analyzeSegment(
+  segment: RawSegment,
+  context: SegmentContext = {},
+): Promise<SegmentUnderstanding> {
   const model = getModel();
+  const subject = context.mainSubject?.trim();
+  const subjectBlock = subject
+    ? `\nPROJECT SUBJECT: ${subject}\nThis whole video is about ${subject}. The current section may not re-state the name, but every visual we pull must still be about ${subject} or directly involve them.\n`
+    : "";
+  const relatedBlock = (() => {
+    const parts: string[] = [];
+    if (context.relatedCompanies?.length) parts.push(`Companies in this script: ${context.relatedCompanies.join(", ")}.`);
+    if (context.relatedPeople?.length) parts.push(`Other people in this script: ${context.relatedPeople.join(", ")}.`);
+    return parts.length ? `\n${parts.join(" ")}\n` : "";
+  })();
+  const subjectQueryRule = subject
+    ? `- ANCHOR RULE: every "query" MUST mention "${subject}" (or a company/person from this script that is uniquely tied to ${subject}, like ${(context.relatedCompanies ?? []).slice(0, 2).join(" / ") || "their business"}). A generic query like "Utah court ruling 2016" will pull unrelated trials — instead write "${subject} lawsuit 2016" or "${(context.relatedCompanies?.[0]) ?? subject} court ruling". If you cannot anchor a query to ${subject} or one of their named entities, drop the intent.`
+    : "";
   const prompt = `You are helping a video editor understand one section of a celebrity-focused voiceover.
-Return STRICT JSON ONLY in this shape:
+${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
 {
   "mainTopic": "short phrase, e.g. 'Margot Robbie's early career'",
   "people": ["person names mentioned"],
@@ -144,6 +172,7 @@ Rules:
 
 Query construction rules — these matter most. YouTube indexes against the
 literal query string, so abstract or editorial words pull in the wrong videos:
+${subjectQueryRule}
 - Every "query" MUST contain at least one proper noun: a person's name, a place
   name, a 4-digit year, or a specific event name. If you can't anchor the query
   to a proper noun, drop the intent — don't pad with filler.

@@ -114,11 +114,24 @@ export async function buildStillVideo(opts: {
     "-an",
     "-vf",
     `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
+    // IMPORTANT: keep these encoder flags identical to normalizeClip(). The
+    // final concat uses -c:v copy (mux-only, no re-encode) which requires
+    // every input segment to share codec params, GOP structure, and SPS/PPS.
+    // Adding "-tune stillimage" here would diverge from normalizeClip and
+    // cause concat to fall back to re-encoding (or fail outright on strict
+    // demuxers). The ~5% extra bitrate that "tune stillimage" would save on
+    // image segments is dwarfed by the 30× speedup from skipping concat
+    // re-encode, so we deliberately use the same plain ultrafast/crf 25.
     "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
+    "-preset", "ultrafast",
+    "-crf", "25",
     "-pix_fmt", "yuv420p",
     "-r", String(fps),
+    // Force a keyframe at the start of every segment so concat boundaries
+    // are clean on stream-copy. Without this, x264's adaptive GOP can put
+    // the first keyframe a few frames in, causing the demuxer to drop or
+    // freeze the first frames of an image block during -c copy concat.
+    "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -196,6 +209,15 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   const h = opts.height ?? 720;
   const fps = opts.fps ?? 30;
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  // ultrafast + crf 25 is the sweet spot for B-roll on shared CPU. We also
+  // force a keyframe at frame 0 so every normalized segment starts with an
+  // IDR — that's a hard prerequisite for the final concat to use -c:v copy
+  // (mux-only, ~30s instead of ~15min for a 30-minute output).
+  //
+  // We deliberately DO NOT pass "-tune fastdecode" here, even though it
+  // would slightly speed up the *next* ffmpeg pass: tune flags change SPS/PPS
+  // in ways that can prevent stream-copy concat. Encoder params must match
+  // exactly between normalizeClip() and buildStillVideo() for -c copy to work.
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
@@ -204,9 +226,11 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     "-vf",
     `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
     "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
+    "-preset", "ultrafast",
+    "-crf", "25",
     "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -325,12 +349,24 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     audioMap = ["-map", "0:v:0"];
   }
 
+  // Final concat: stream-copy the video (no re-encode). All input segments
+  // are already H.264 1280x720 30fps yuv420p with identical encoder params
+  // (see normalizeClip + buildStillVideo) and start with an IDR keyframe,
+  // which is exactly what the concat demuxer needs for -c:v copy to work.
+  //
+  // On shared-cpu-4x this changes the concat call from a ~15 minute libx264
+  // pass on 30 minutes of 720p output to a ~30 second mux. The audio side
+  // still has to be encoded because we mix voiceover + bg music + intro
+  // crossfade live in the filter graph — that work is unavoidable.
+  //
+  // If a future code path emits a non-conforming segment, ffmpeg will fail
+  // with "non monotonically increasing dts" or similar. The fix is to
+  // either re-encode that path through normalizeClip first, or fall back
+  // to re-encoding here. We don't fall back automatically because a silent
+  // 15× slowdown is worse than a clear failure.
   args.push(
     ...audioMap,
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
-    "-pix_fmt", "yuv420p",
+    "-c:v", "copy",
   );
   if (hasAudioOutput) {
     args.push("-c:a", "aac", "-b:a", "192k", "-shortest");

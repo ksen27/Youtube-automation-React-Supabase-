@@ -43,6 +43,14 @@ const ServerEnvSchema = z.object({
   // I/O- or Gemini-bound, not CPU-bound. Drop to 2 on machines with
   // limited CPU/RAM if ffmpeg starts losing the race.
   CLIP_PIPELINE_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  // Render-stage parallelism. Render is encode-heavy (every clip gets a full
+  // libx264 pass in normalize, and the final concat is another encode), so
+  // the right cap is different from CLIP_PIPELINE_CONCURRENCY (which is
+  // download-heavy). Rule of thumb: RENDER_PIPELINE_CONCURRENCY * FFMPEG_THREADS
+  // ≤ vCPU count. On a 4-vCPU host with FFMPEG_THREADS=2, that's 2. Going
+  // higher causes ffmpeg processes to fight for cores and each one slows
+  // down ~linearly, so wall-time stays the same or gets worse.
+  RENDER_PIPELINE_CONCURRENCY: z.coerce.number().int().positive().default(2),
   // How many candidate clips to generate per footage block in the timeline.
   // Higher = matcher has more options to pick from = better matches, but more
   // storage/processing. 1 = no choice, 2 = balanced, 3+ = quality-first.

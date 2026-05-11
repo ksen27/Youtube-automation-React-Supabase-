@@ -77,11 +77,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     //    and build a still video segment. Each lane writes into its
     //    timeline slot so the final order matches `renderable`.
     //
-    // Lane count tracks CLIP_PIPELINE_CONCURRENCY: it's the same shape of
-    // workload (download + ffmpeg) with the same CPU/network trade-off,
-    // so reusing the tunable means operators only have one knob.
+    // Render is encode-heavy (every clip gets a full libx264 pass during
+    // normalize, then again in the final concat). Use the dedicated render
+    // knob — clip-stage parallelism is download-heavy and tolerates more
+    // concurrency than encoding does. Tune RENDER_PIPELINE_CONCURRENCY *
+    // FFMPEG_THREADS ≤ vCPU count to avoid encoder thrash.
     const env = getEnv();
-    const laneCount = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, renderable.length));
+    const laneCount = Math.max(1, Math.min(env.RENDER_PIPELINE_CONCURRENCY, renderable.length));
     let cursor = 0;
     let completed = 0;
 

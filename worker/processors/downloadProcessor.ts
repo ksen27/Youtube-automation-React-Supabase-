@@ -171,12 +171,16 @@ export async function processDownloadJob(
     }
 
     // Final attempt OR a known-terminal error — record failure and promote fallback.
-    await sb.from("video_sources").update({ status: "failed", error: msg }).eq("id", vs.id);
+    // The user-facing error replaces yt-dlp's stderr blob (which links to
+    // GitHub wikis about cookies and proxies — not actionable for the user).
+    // The full raw `msg` is already in the structured log above.
+    const userMessage = humanizeDownloadError(msg);
+    await sb.from("video_sources").update({ status: "failed", error: userMessage }).eq("id", vs.id);
     await sb.from("youtube_search_results")
       .update({ status: "failed" })
       .eq("project_id", projectId)
       .eq("youtube_video_id", safeId);
-    await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: msg });
+    await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: userMessage });
 
     await tryPromoteFallback(projectId, safeId, mediaJobId, terminalReason ?? "download_failed");
     // Do NOT rethrow — we've handled the terminal state and (if possible) queued
@@ -202,6 +206,52 @@ function classifyTerminalError(msg: string): string | null {
   if (m.includes("members-only") || m.includes("join this channel")) return "members_only";
   if (m.includes("requested format is not available") || m.includes("no video formats found")) return "no_compatible_format";
   return null;
+}
+
+// Convert a raw yt-dlp stderr blob into a short, user-friendly sentence for
+// the UI. The raw text contains GitHub wiki URLs and CLI flag instructions
+// that aren't actionable for the end user — the worker is the one that
+// would need new cookies/proxy, not them. We keep the full raw message in
+// the structured log (logJob) for debugging; this function only shapes what
+// the user sees on the processing screen.
+function humanizeDownloadError(raw: string): string {
+  const m = raw.toLowerCase();
+  if (m.includes("sign in to confirm") || m.includes("not a bot") || m.includes("confirm you're not a bot")) {
+    return "YouTube blocked the download (bot check). Retrying with a different network route — if every retry fails, the next-best source will be used.";
+  }
+  if (m.includes("age-restricted") || m.includes("age restricted")) {
+    return "Video is age-restricted on YouTube and can't be downloaded without sign-in. Using the next-best source.";
+  }
+  if (m.includes("private video")) {
+    return "Video is private. Using the next-best source.";
+  }
+  if (m.includes("removed by the uploader") || m.includes("account associated with this video has been terminated")) {
+    return "Video was removed from YouTube. Using the next-best source.";
+  }
+  if (m.includes("video unavailable")) {
+    return "Video is unavailable on YouTube. Using the next-best source.";
+  }
+  if (m.includes("not available in your country") || m.includes("blocked it in your country") || m.includes("geo restrict")) {
+    return "Video is region-blocked and can't be reached from this server. Using the next-best source.";
+  }
+  if (m.includes("members-only") || m.includes("join this channel")) {
+    return "Video is members-only on YouTube. Using the next-best source.";
+  }
+  if (m.includes("requested format is not available") || m.includes("no video formats found")) {
+    return "Video has no compatible format (likely live or audio-only). Using the next-best source.";
+  }
+  if (m.includes("timed out") || m.includes("etimedout") || m.includes("network is unreachable")) {
+    return "Network timed out while downloading. Retrying.";
+  }
+  // Fallback: yt-dlp surfaced something we don't have a friendly translation
+  // for. Strip the wiki URLs and the CLI-flag noise so at least the UI line
+  // is readable, and cap the length.
+  const cleaned = raw
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/--cookies(-from-browser)?/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 180 ? `Download failed: ${cleaned.slice(0, 180)}…` : `Download failed: ${cleaned}`;
 }
 
 // Pick the next-best youtube_search_results row that hasn't been tried yet
