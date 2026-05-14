@@ -4,7 +4,7 @@
 // video to match the voiceover length while keeping per-block durations
 // bucketed by content type:
 //   - footage (real clips):   4–6s   (short, lowers copyright risk)
-//   - images / backgrounds:   8–12s  (longer holds, stabilize pacing)
+//   - images / backgrounds:   5s     (fixed — user spec)
 //   - split screens:          6–8s
 //   - intro:                  5–6s   (one only, at start)
 //
@@ -21,12 +21,10 @@ export interface DurationRange {
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
   footage: { min: 4,  max: 6  },
-  // Image holds shortened from 8–12s to 5–8s. Long static holds were dead
-  // air when image content was a placeholder; even with auto-fetched images,
-  // 10s of held content feels long. 5–8s gives the viewer time to process
-  // the visual without dragging pacing. Slightly longer than footage so the
-  // hold still reads as "pause to look" vs the constant motion of footage.
-  image:   { min: 5,  max: 8  },
+  // Fixed at 5s per user spec. Image holds previously ranged 5–8s, averaging
+  // ~7s. The fixed value standardizes pacing across the slideshow stretch
+  // and makes the timeline-plan math deterministic for image-time budgeting.
+  image:   { min: 5,  max: 5  },
   split_2: { min: 6,  max: 8  },
   split_4: { min: 6,  max: 8  },
 };
@@ -53,19 +51,17 @@ export function pickAvgBlockSeconds(voiceoverSeconds: number): {
 export function planTimeline(voiceoverSeconds: number): TimelinePlan {
   const safeVo = Math.max(1, Math.round(voiceoverSeconds));
   const { avg, bucket } = pickAvgBlockSeconds(safeVo);
-  // 60/40 split is on TIME ON SCREEN, not block count. Footage uses 4–6s
-  // windows; images hold 8–12s. A count-based split made images dominate
-  // visual time (35 × 10s = 350s vs 52 × 5s = 260s = 57% slideshow), which
-  // breaks "60% celebrity footage" and increases copyright-claim risk
-  // because long static stretches between rare footage shots stand out.
-  // Computing block counts from target seconds instead gives ~60% footage
-  // ON SCREEN — which is what users actually mean by "60% footage."
-  const targetFootageSec = safeVo * 0.6;
-  const targetImageSec   = safeVo * 0.4;
-  // Footage avg ~5s, image avg ~6.5s — slightly longer than footage so a
-  // held still reads as "pause to look" without dragging the pacing.
+  // 70/30 split is on TIME ON SCREEN, not block count. Footage uses 4–6s
+  // windows; images are fixed at 5s. A count-based split made images
+  // dominate visual time when image holds were 8–12s; computing from
+  // target seconds gives ~70% footage ON SCREEN — what users mean by
+  // "70% footage."
+  const targetFootageSec = safeVo * 0.7;
+  const targetImageSec   = safeVo * 0.3;
+  // Footage avg ~5s, image fixed at 5s. Both 5 in current ranges; the avg
+  // computation handles future range tweaks without touching this math.
   const footageAvg = (DURATION_RANGES.footage.min + DURATION_RANGES.footage.max) / 2;   // 5
-  const imageAvg   = (DURATION_RANGES.image.min   + DURATION_RANGES.image.max)   / 2;   // 6.5
+  const imageAvg   = (DURATION_RANGES.image.min   + DURATION_RANGES.image.max)   / 2;   // 5
   const footageBlocks = Math.max(1, Math.round(targetFootageSec / footageAvg));
   const imageBlocks   = Math.max(1, Math.round(targetImageSec / imageAvg));
   const totalBlocks = footageBlocks + imageBlocks;
@@ -183,10 +179,21 @@ export function buildBlockSequence(
       last.duration = Math.round(newDur * 10) / 10;
     }
   } else if (overshoot < 0 && Math.abs(overshoot) < 3) {
-    // Stretch the last image block slightly. Works for any type but image
-    // tolerates longer holds best.
+    // Stretch to absorb the gap. Images are fixed at 5s by spec — extending
+    // them would break that contract — so we stretch the last FOOTAGE block
+    // instead. If the tail is all-image, walk back to the most recent
+    // footage block and stretch that one. If there is no footage block at
+    // all (degenerate plan), fall through and accept the small undershoot
+    // rather than violating the image fix.
     const stretch = -overshoot;
-    last.duration = Math.round((last.duration + stretch) * 10) / 10;
+    let stretchIdx = -1;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i].type === "footage") { stretchIdx = i; break; }
+    }
+    if (stretchIdx >= 0) {
+      const target = blocks[stretchIdx];
+      target.duration = Math.round((target.duration + stretch) * 10) / 10;
+    }
   }
 
   return blocks;

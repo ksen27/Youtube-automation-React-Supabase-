@@ -682,18 +682,105 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // Source priority: Wikipedia first (free, rights-clean) then Google CSE
   // for variety. YouTube thumbnails are no longer used at all.
   //
-  // Skipped entity types: "year" and "age" produce nonsense image searches
-  // (a bare "2021" returns whatever YouTube/CSE thinks is relevant for that
-  // string — usually unrelated). Skip them; "place" / "event" / "company"
-  // tend to produce on-topic imagery.
-  const POOL_SKIP_TYPES = new Set(["year", "age"]);
+  // Skipped entity types: bare "year" entities produce flag-of-the-year or
+  // historical-period noise rather than on-topic imagery. "age" is handled
+  // via a per-type query strategy below (we search the celebrity at that
+  // age range), so it is NOT in this set.
+  const POOL_SKIP_TYPES = new Set(["year"]);
   const ENTITY_TYPE_PRIORITY: string[] = [
     "celebrity", "related_person", "company", "tv_show",
-    "movie", "song", "place", "event",
+    "movie", "song", "place", "event", "life_event", "age",
   ];
   const IMAGES_PER_ENTITY = 5;
 
   const imageBlockCount = items.filter((it) => it.type === "image").length;
+
+  // Country, state, region, and continent names. Even when these are
+  // legitimately proper nouns, image search for them returns flags, maps,
+  // and coats of arms — which are never the right visual for a celebrity
+  // documentary. Drop any "place" entity whose value is in this set, or
+  // whose value resolves to one after stripping common prefixes ("the").
+  // Match is lowercase and exact-on-words: "the united states" hits "united
+  // states"; "salt lake city" does not match "city" alone.
+  const GENERIC_PLACE_STOP = new Set([
+    // Continents
+    "africa", "antarctica", "asia", "europe", "north america", "south america", "australia", "oceania",
+    // Big countries / common transcript references
+    "united states", "usa", "u.s.", "u.s.a.", "america", "the states",
+    "united kingdom", "uk", "u.k.", "great britain", "britain", "england", "scotland", "wales", "ireland", "northern ireland",
+    "canada", "australia", "new zealand", "ireland",
+    "france", "germany", "italy", "spain", "portugal", "netherlands", "belgium", "switzerland", "austria", "sweden", "norway", "denmark", "finland", "iceland", "greece", "russia", "poland", "ukraine",
+    "china", "japan", "korea", "south korea", "north korea", "india", "pakistan", "bangladesh", "thailand", "vietnam", "indonesia", "philippines", "malaysia", "singapore",
+    "mexico", "brazil", "argentina", "chile", "colombia", "peru", "venezuela", "cuba",
+    "egypt", "south africa", "nigeria", "kenya", "morocco", "ethiopia",
+    "israel", "turkey", "iran", "iraq", "saudi arabia", "uae",
+    // US states
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
+    "delaware", "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa",
+    "kansas", "kentucky", "louisiana", "maine", "maryland", "massachusetts", "michigan",
+    "minnesota", "mississippi", "missouri", "montana", "nebraska", "nevada", "new hampshire",
+    "new jersey", "new mexico", "new york state", "north carolina", "north dakota", "ohio",
+    "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina", "south dakota",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington state", "west virginia",
+    "wisconsin", "wyoming",
+    // Common UK / CA / AU regions
+    "scotland", "wales", "northern ireland", "ontario", "quebec", "british columbia",
+    "new south wales", "victoria", "queensland",
+  ]);
+  function isGenericPlace(value: string): boolean {
+    const norm = value.toLowerCase().replace(/^the\s+/, "").trim();
+    return GENERIC_PLACE_STOP.has(norm);
+  }
+
+  // Proper-noun gate for image-search candidates. Even with the tightened
+  // extraction prompt, Gemini occasionally emits an activity noun like
+  // "Charity Project" or "Restoration Work" (capitalized because it
+  // appeared at sentence start in the transcript). Those produce stock
+  // clipart from image search — which is the bug this gate exists to
+  // prevent. Whitelist: at least one word is a clearly proper noun
+  // (capitalized AND not a common-noun stop word). For celebrity /
+  // related_person we soften this since names are always the main signal.
+  const ACTIVITY_NOUN_STOP = new Set([
+    "the", "a", "an",
+    // Generic activity / topic words that Gemini mislabels as named entities.
+    // Lowercased; matched against each word of the value.
+    "charity", "donation", "donations", "fundraiser", "fundraising",
+    "lawsuit", "case", "trial", "court", "litigation", "settlement",
+    "project", "projects", "build", "builds", "restoration", "renovation",
+    "deal", "deals", "contract", "agreement",
+    "company", "firm", "business", "shop", "office", "warehouse", "garage",
+    "marriage", "divorce", "wedding", "scandal", "interview", "appearance",
+    "career", "show", "episode", "season", "series",
+    "work", "works", "story", "journey",
+  ]);
+  // Life-event values are intentionally generic lowercase words ("marriage",
+  // "wedding") — they DON'T need a proper-noun anchor because the query
+  // builder treats them as stock-imagery requests, not as named entities.
+  const LIFE_EVENT_VALUES = new Set([
+    "marriage", "wedding", "divorce", "funeral", "birth",
+    "graduation", "engagement", "retirement", "baptism", "anniversary",
+  ]);
+  function isImageSearchableValue(type: string, value: string): boolean {
+    if (type === "celebrity" || type === "related_person") {
+      // People are accepted on capitalization alone — names dominate visual
+      // search signal and we want to keep e.g. single-name stage names.
+      return /[A-Z]/.test(value);
+    }
+    if (type === "life_event") {
+      // Whitelist-only: must match one of the allowed life-event values.
+      return LIFE_EVENT_VALUES.has(value.trim().toLowerCase());
+    }
+    if (type === "age") {
+      // Plain age number like "25". Anything 1-120 is searchable.
+      const n = Number(value.trim());
+      return Number.isInteger(n) && n >= 1 && n <= 120;
+    }
+    // For everything else: must contain at least one word that is BOTH
+    // capitalized AND not in the activity-noun stop list. "Kindig It Design"
+    // passes ("Kindig"); "Charity Project" fails (both stop words).
+    const words = value.split(/\s+/).filter(Boolean);
+    return words.some((w) => /^[A-Z][a-zA-Z'’-]+$/.test(w) && !ACTIVITY_NOUN_STOP.has(w.toLowerCase()));
+  }
 
   // Sort entities by priority then confidence so the most-relevant pictures
   // land at the head of the pool. This matters when the pool is shorter
@@ -704,7 +791,15 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       value: String(e.value ?? "").trim(),
       confidence: Number(e.confidence ?? 0.8),
     }))
-    .filter((e) => e.value.length > 0 && !POOL_SKIP_TYPES.has(e.type))
+    .filter((e) =>
+      e.value.length > 0 &&
+      !POOL_SKIP_TYPES.has(e.type) &&
+      isImageSearchableValue(e.type, e.value) &&
+      // Country / state / region / continent places produce flags and maps,
+      // never on-topic photographs. Drop them at the pool stage even when
+      // the extraction prompt let them through.
+      !(e.type === "place" && isGenericPlace(e.value))
+    )
     .sort((a, b) => {
       const pa = ENTITY_TYPE_PRIORITY.indexOf(a.type);
       const pb = ENTITY_TYPE_PRIORITY.indexOf(b.type);
@@ -719,59 +814,201 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const poolUrlSet = new Set<string>();
   const poolFetchStats = { entitiesQueried: 0, entitiesFailed: 0 };
 
-  // Build the actual image-search query for an entity. The main celebrity is
-  // the only entity that's specific enough to search on its own — every other
-  // entity type (place, event, company, related_person, etc.) can collide
-  // with unrelated content. "Utah" returns state maps, "court ruling"
-  // returns generic gavels, "Creative Controls" could be any company.
-  // Prepending the subject keeps the search anchored to this project.
+  // Per-type query strategy. Different entity types want different framing
+  // because the celebrity-name anchor that helps with people/companies HURTS
+  // for titled works (a search for "Drew Pritchard Salvage Hunters" returns
+  // press photos of Drew, not the show's title card / artwork). Each branch
+  // returns the query string for the image search; the caller also reads
+  // queryImgType to decide between imgType=photo (default) and imgType=logo.
   //
-  // The skip is intentional: if the entity value already contains the
-  // subject's name (e.g. "Kindig It Design lawsuit"), don't double-up.
-  function buildImageQuery(ent: { type: string; value: string }): string {
+  // Quote-anchoring: we wrap multi-word terms in double quotes so search
+  // engines treat them as required phrases. Without quotes, "Drew Pritchard
+  // Kindig It Design" returns pages matching the most "important" subset of
+  // those words, which is exactly what dragged unrelated content into the
+  // pool. With quotes, no-match returns nothing → entity gets dropped at
+  // validation — better than off-topic results.
+  //
+  // Try to extract a birth year from the transcript for age queries. We look
+  // for "born in 1965" / "born 1965" patterns near the celebrity name.
+  // Returns the year as a number, or null if not found.
+  function extractBirthYear(): number | null {
+    if (!mainCelebrity) return null;
+    const t = transcript.toLowerCase();
+    const name = mainCelebrity.toLowerCase();
+    // Search globally first (catches "Drew Pritchard, born in 1969"), then
+    // anywhere in the transcript (the script may not repeat the name on the
+    // birth-year sentence). Accept years 1900-2025.
+    const namedPattern = new RegExp(
+      `${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^.]{0,100}\\bborn\\s+(?:in\\s+)?(\\d{4})\\b`,
+      "i",
+    );
+    const m1 = t.match(namedPattern);
+    if (m1) {
+      const y = Number(m1[1]);
+      if (y >= 1900 && y <= 2025) return y;
+    }
+    const anyPattern = /\bborn\s+(?:in\s+)?(\d{4})\b/i;
+    const m2 = t.match(anyPattern);
+    if (m2) {
+      const y = Number(m2[1]);
+      if (y >= 1900 && y <= 2025) return y;
+    }
+    return null;
+  }
+  const birthYear = extractBirthYear();
+
+  function quoteIfMultiWord(s: string): string {
+    return s.includes(" ") ? `"${s}"` : s;
+  }
+  function quoted(s: string): string {
+    return `"${s}"`;
+  }
+  type QuerySpec = { query: string; imgType?: "photo" | "logo" };
+
+  function buildImageQuery(ent: { type: string; value: string }): QuerySpec {
     const value = ent.value.trim();
-    if (!mainCelebrity) return value;                       // no subject known
-    if (ent.type === "celebrity") return value;             // already the subject
-    const subjLower = mainCelebrity.toLowerCase();
-    if (value.toLowerCase().includes(subjLower)) return value;
-    return `${mainCelebrity} ${value}`;
+    const subj = mainCelebrity ? quoted(mainCelebrity) : "";
+
+    switch (ent.type) {
+      case "celebrity":
+      case "related_person":
+        // Person's name. Wikipedia handles famous people; Brave/CSE picks up
+        // the rest. No anchor needed — the name IS the search target.
+        return { query: quoteIfMultiWord(value) };
+
+      case "company":
+        // Company logos. Google CSE has a native imgType=logo filter; we set
+        // it explicitly so the pool gets brand marks, not storefronts or
+        // exec photos. Query is the company name + "logo" so Brave (no
+        // server-side logo filter) returns logos too.
+        return { query: `${quoteIfMultiWord(value)} logo`, imgType: "logo" };
+
+      case "tv_show":
+      case "movie":
+        // Titled work. The celebrity anchor HURTS here — searching for
+        // "Drew Pritchard Salvage Hunters" returns press photos of Drew,
+        // not the show's title card. Search the title alone, asking for
+        // the poster / cover.
+        return { query: `${quoteIfMultiWord(value)} poster` };
+
+      case "song":
+        // Album cover for the song. Anchor to the artist if known (because
+        // song names alone often collide with other works), but ask for the
+        // cover specifically so we get album art rather than music videos.
+        if (subj) return { query: `${subj} ${quoteIfMultiWord(value)} album cover` };
+        return { query: `${quoteIfMultiWord(value)} album cover` };
+
+      case "place":
+        // Specific named place (the country/state filter ran earlier).
+        // The celebrity anchor HURTS — searching "Drew Pritchard Buckingham
+        // Palace" returns nothing useful. Just search the place name.
+        return { query: quoteIfMultiWord(value) };
+
+      case "event":
+        // Named historical event. Same logic as place — the event has its
+        // own iconography; the celebrity anchor only narrows to press shots
+        // of the celebrity AT the event (which is fine, but usually less
+        // visually striking than the canonical event imagery).
+        return { query: quoteIfMultiWord(value) };
+
+      case "life_event":
+        // Generic stock imagery for a life moment (marriage, funeral, etc.).
+        // No anchor — the client wants generic visuals here, not the
+        // celebrity at their own wedding (which is usually a press-photo
+        // already covered by celebrity/related_person queries).
+        return { query: `${value} ceremony` };
+
+      case "age": {
+        // Search the celebrity at the stated age. Two strategies:
+        //   1. We know the birth year → compute year-of-photo as birth+age
+        //      and search "Name 1990" which hits Wikipedia/news from that
+        //      era. Most precise.
+        //   2. We don't know the birth year → fall back to "Name young"
+        //      for ages <30, otherwise just search the name (results may
+        //      not be age-targeted but at least are on-celebrity).
+        const ageNum = Number(value);
+        if (subj && birthYear && Number.isFinite(ageNum)) {
+          const year = birthYear + ageNum;
+          return { query: `${subj} ${year}` };
+        }
+        if (subj && Number.isFinite(ageNum) && ageNum < 30) {
+          return { query: `${subj} young` };
+        }
+        if (subj) return { query: subj };
+        return { query: value };
+      }
+
+      default: {
+        // Unknown type — fall back to the old celebrity-anchored search.
+        if (!mainCelebrity) return { query: quoteIfMultiWord(value) };
+        if (value.toLowerCase().includes(mainCelebrity.toLowerCase())) {
+          return { query: quoteIfMultiWord(value) };
+        }
+        return { query: `${subj} ${quoteIfMultiWord(value)}` };
+      }
+    }
   }
 
   for (const ent of poolEntities) {
     if (pool.length >= imageBlockCount) break;       // already have enough
-    const query = buildImageQuery(ent);
+    const spec = buildImageQuery(ent);
     poolFetchStats.entitiesQueried++;
     try {
-      const fetched = await fetchImages(query, IMAGES_PER_ENTITY, { entityType: ent.type });
+      const fetched = await fetchImages(spec.query, IMAGES_PER_ENTITY, {
+        entityType: ent.type,
+        imgType: spec.imgType,
+      });
       if (fetched.length === 0) {
         poolFetchStats.entitiesFailed++;
         continue;
       }
       for (const f of fetched) {
         if (poolUrlSet.has(f.url)) continue;          // dedupe across entities
-        pool.push({ url: f.url, source: f.source, query, entityType: ent.type });
+        pool.push({ url: f.url, source: f.source, query: spec.query, entityType: ent.type });
         poolUrlSet.add(f.url);
         if (pool.length >= imageBlockCount) break;
       }
     } catch (e) {
       poolFetchStats.entitiesFailed++;
       void logJob({ projectId, jobId: mediaJobId },
-        "match.image_fetch.failed", { query, err: (e as Error).message });
+        "match.image_fetch.failed", { query: spec.query, err: (e as Error).message });
     }
   }
 
   // Assign pool images to image blocks in timeline order. Each image is
-  // consumed at most once. When the pool runs out, remaining blocks stay
-  // blank — the renderer skips blocks without an image_url, which is what
-  // the user requested ("each image only appears once, no duplicates").
-  let poolIdx = 0;
+  // consumed at most once (pool dedup happens at fetch time by normalized
+  // URL). When the pool runs out, remaining blocks stay blank — the
+  // renderer skips blocks without an image_url.
+  //
+  // Anti-clustering: don't place two images from the SAME entity back-to-
+  // back. Even when the URLs are distinct, two pictures of the same
+  // person/place in a row reads to viewers as "the editor showed me the
+  // same thing twice" (the duplicate-Rebecca complaint). We try to pick
+  // the next pool entry whose entity differs from the previous block's;
+  // if no such entry exists, we fall back to the first available — better
+  // a clustered image than a blank block.
+  const consumed = new Set<number>();
+  let lastEntityKey: string | null = null;
+  function pickNextPoolIdx(): number {
+    let fallback = -1;
+    for (let i = 0; i < pool.length; i++) {
+      if (consumed.has(i)) continue;
+      if (fallback < 0) fallback = i;
+      const key = `${pool[i].entityType}:${pool[i].query}`;
+      if (key !== lastEntityKey) return i;
+    }
+    return fallback;
+  }
   for (const item of items) {
     if (item.type !== "image") continue;
-    if (poolIdx >= pool.length) break;
-    const next = pool[poolIdx++];
+    const idx = pickNextPoolIdx();
+    if (idx < 0) break;
+    consumed.add(idx);
+    const next = pool[idx];
     item.image_query = next.query;
     item.image_url = next.url;
     item.image_source = next.source;
+    lastEntityKey = `${next.entityType}:${next.query}`;
   }
 
   await logJob({ projectId, jobId: mediaJobId }, "match.image_fetch", {

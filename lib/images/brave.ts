@@ -11,6 +11,7 @@
 // imagery skewed by SEO. We try Brave first and fall back to Google CSE.
 
 import { getEnv } from "@/lib/env";
+import { looksLikeClipart } from "./clipart-filter";
 
 export interface BraveImageResult {
   url: string;
@@ -76,6 +77,10 @@ export async function fetchBraveImages(query: string, max: number = 5): Promise<
       const link = item.properties?.url;
       if (!link) continue;
       if (seenUrls.has(link)) continue;
+      // Reject clipart / illustrations / stock-graphic hosts. Brave has no
+      // server-side photo filter; this is the only thing keeping cartoon
+      // results out of the pool when queries like "charity" surface them.
+      if (looksLikeClipart(link, item.url ?? "")) continue;
       const w = item.width ?? 0;
       const h = item.height ?? 0;
       // Skip only when dimensions are reported and clearly too small. Brave

@@ -143,7 +143,8 @@ function trySalvageTruncatedJson(raw: string): unknown | null {
 export const ExtractedEntitySchema = z.object({
   type: z.enum([
     "celebrity", "related_person", "movie", "tv_show",
-    "song", "company", "place", "event", "year", "age",
+    "song", "company", "place", "event", "life_event",
+    "year", "age",
   ]),
   // Gemini sometimes returns numbers for year/age despite the prompt asking for strings.
   value: z.union([z.string(), z.number()]).transform((v) => String(v)).pipe(z.string().min(1)),
@@ -158,16 +159,60 @@ export async function extractEntities(transcript: string): Promise<ExtractedEnti
   if (!transcript.trim()) return [];
   const model = getModel();
   const prompt = `You are extracting structured entities from a celebrity-focused video script.
+These entities are later used as image-search queries, so the bar for inclusion is high:
+only entities that would return on-topic PHOTOGRAPHS from a web image search should be extracted.
+Activity nouns, abstract concepts, and generic words produce stock clipart and must be skipped.
+
 Return strict JSON ONLY in the form:
 { "entities": [ { "type": "...", "value": "...", "confidence": 0.0-1.0, "metadata": {} } ] }
 
-Allowed types: celebrity, related_person, movie, tv_show, song, company, place, event, year, age.
-- "celebrity" = the main subject(s).
-- "related_person" = co-stars, family, friends, rivals.
+Allowed types: celebrity, related_person, movie, tv_show, song, company, place, event, life_event, year, age.
+
+PROPER-NOUN RULE — applies to: celebrity, related_person, movie, tv_show, song, company, place, event.
+- value MUST be a proper noun. A proper noun starts with a capital letter and names a specific
+  thing (a person, a titled work, a registered company, a named place, a named event).
+- REJECT activity descriptions, generic concepts, common nouns, and topical phrases — even if
+  they appear capitalized in the transcript (e.g. at sentence start or in title case headlines).
+- The life_event type below has DIFFERENT rules and does NOT require proper-noun form.
+
+Type-specific rules:
+- "celebrity" = the main subject(s). Full name. e.g. "Drew Pritchard".
+- "related_person" = co-stars, spouses, family, friends, rivals. Full name. e.g. "Rebecca Pritchard".
+- "movie" / "tv_show" / "song" = the titled work. e.g. "Salvage Hunters", "Match Game", "Bohemian Rhapsody".
+- "company" = a registered company / brand name, capitalized. e.g. "Kindig It Design", "Apple".
+  REJECT: "charity", "restoration", "the company", "the project", "the firm".
+- "place" = a SPECIFIC named city / building / landmark whose image search returns
+  on-topic photographs. e.g. "Buckingham Palace", "Salt Lake City", "Studio 8H",
+  "Wembley Stadium", "the Eiffel Tower".
+  REJECT generic locations: "garage", "shop", "the warehouse", "country house", "the office".
+  REJECT countries, states, regions, and continents — they produce flags, maps,
+  and coats of arms in image search, not on-topic photographs. Examples to
+  reject: "United States", "USA", "America", "United Kingdom", "UK", "England",
+  "Europe", "Asia", "California", "Utah", "Texas", "Ontario", "Bavaria".
+  A celebrity living in a country is not a reason to emit the country as a place;
+  only emit places that the script specifically VISUALLY references.
+- "event" = a NAMED historical event with a recognizable title. e.g. "Royal Wedding 1981",
+  "Apollo 11", "Watergate scandal", "9/11 attacks", "Brexit referendum".
+  REJECT: "charity project", "lawsuit", "court case", "restoration", "donation", "renovation",
+  "the project", "the build", "the deal" — these are activity nouns.
+- "life_event" = a GENERIC life-stage moment that the script narrates as happening to a person —
+  the visual is stock imagery of that kind of event, NOT a named historical occurrence.
+  Allowed values (use these EXACT lowercase strings):
+    "marriage", "wedding", "divorce", "funeral", "birth", "graduation", "engagement",
+    "retirement", "baptism", "anniversary".
+  Emit ONE life_event entity per kind that the transcript clearly mentions ("they got married" →
+  marriage; "after the divorce" → divorce). Do NOT emit when the script only mentions the word
+  in passing ("a marriage of convenience" as a metaphor → skip).
+
+OTHER:
 - Years should be 4-digit strings like "1998".
-- Ages should be plain numbers like "32".
-- Skip duplicates. Skip generic words.
-- Confidence reflects how certain you are.
+- "age" = emit when the script clearly states the celebrity's or a related person's age at a
+  moment in time, e.g. "when she was 25", "by age 30 he had". Value is the plain age number
+  ("25", "30"). The downstream pipeline searches for the celebrity at that age range.
+- Skip duplicates.
+- Confidence reflects how certain you are that (a) the type rules above are satisfied AND
+  (b) the entity is genuinely referenced visually in the script. If either is uncertain,
+  drop the entity rather than emitting a low-confidence guess.
 
 SCRIPT:
 """${transcript.slice(0, 12000)}"""`;

@@ -9,6 +9,7 @@
 // shield (publishers mistag), but better than no filter.
 
 import { getEnv } from "@/lib/env";
+import { looksLikeClipart } from "./clipart-filter";
 
 export interface GoogleCseImageResult {
   url: string;
@@ -29,7 +30,17 @@ export async function fetchGoogleImage(query: string): Promise<GoogleCseImageRes
 // Returns up to `max` valid image results for the query. Used by the project-
 // level image pool builder which needs multiple distinct images per entity to
 // fill many image blocks without repeating the same picture.
-export async function fetchGoogleImages(query: string, max: number = 5): Promise<GoogleCseImageResult[]> {
+export interface FetchGoogleImagesOptions {
+  // Server-side image type filter. Default "photo" excludes clipart and
+  // illustrations. "logo" targets company marks specifically. Other CSE
+  // imgType values (face, lineart, animated) are not currently used.
+  imgType?: "photo" | "logo";
+}
+export async function fetchGoogleImages(
+  query: string,
+  max: number = 5,
+  opts: FetchGoogleImagesOptions = {},
+): Promise<GoogleCseImageResult[]> {
   const env = getEnv();
   if (!env.GOOGLE_SEARCH_API_KEY || !env.GOOGLE_SEARCH_CX) return [];
   const timeoutMs = env.HTTP_DOWNLOAD_TIMEOUT_SECONDS * 1000;
@@ -42,6 +53,12 @@ export async function fetchGoogleImages(query: string, max: number = 5): Promise
     searchType: "image",
     safe: "high",
     imgSize: "large",
+    // Image-type filter at the search-engine level. "photo" is the default
+    // (excludes clipart, line drawings, illustrated graphics). "logo" is
+    // requested explicitly for company entities so the pool gets brand
+    // marks instead of news photos / storefronts. Google CSE supports both
+    // natively via imgType.
+    imgType: opts.imgType ?? "photo",
     // Filter to images that publishers tagged as licensed for reuse.
     rights: "cc_publicdomain|cc_attribute|cc_sharealike",
     num: String(requested),
@@ -69,6 +86,10 @@ export async function fetchGoogleImages(query: string, max: number = 5): Promise
     for (const item of json.items ?? []) {
       if (!item.link) continue;
       if (seenUrls.has(item.link)) continue;
+      // Defense in depth on top of imgType=photo: also reject results from
+      // known stock-illustration hosts and any URL containing clipart-y
+      // words. Google sometimes mislabels SVGs / vector graphics as photos.
+      if (looksLikeClipart(item.link, item.image?.contextLink ?? "")) continue;
       const w = item.image?.width ?? 0;
       const h = item.image?.height ?? 0;
       if (w < 400 || h < 300) continue;     // too small to scale to 1280x720
