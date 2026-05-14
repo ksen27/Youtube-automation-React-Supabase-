@@ -752,6 +752,85 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     totalFootageBlocks: footageBlockIdxs.length,
   });
 
+  // ---- Lower-third tagging --------------------------------------------
+  // Stamp metadata.lower_third on items where the client-requested overlay
+  // should burn in during render. Rules (per client spec):
+  //   - Names: only on the FIRST clip that visibly depicts them, never again.
+  //     "Depicts" is approximated by the clip's labels containing the name —
+  //     this is what we have without a structured entity→clip linkage.
+  //   - Years / places: on every scored (non-filler) clip whose block mentions
+  //     one. We can't verify them in labels (a clip won't carry the label
+  //     "1956") so we trust the scored match.
+  // Only Tier-1 scored picks qualify; filler clips weren't chosen for entity
+  // relevance, so labelling them would mislead the viewer.
+  // Order matters — we walk items by position so "first occurrence" is the
+  // first clip in the final video.
+  const labelsByClipId = new Map<string, string[]>(
+    clipsForMatch.map((c) => [c.id, (c.labels ?? []).map((l) => l.toLowerCase())]),
+  );
+  const introducedNames = new Set<string>();
+  const lowerThirdCounts = { name: 0, year: 0, place: 0 };
+  // Items are still in insertion order at this point (we haven't sorted).
+  // Sort defensively in case future edits reorder; the array is small.
+  const orderedItems = [...items].sort(
+    (a, b) => (a.position as number) - (b.position as number),
+  );
+  for (const it of orderedItems) {
+    if (it.type !== "footage") continue;
+    const meta = it.metadata as Record<string, unknown> | undefined;
+    if (!meta || meta.pick_source !== "scored_top") continue;
+    const blockIdx = Number(meta.block_index ?? -1);
+    if (blockIdx < 0) continue;
+    const ents = blockEntities[blockIdx] ?? [];
+    if (ents.length === 0) continue;
+    const clipLabels = labelsByClipId.get(it.clip_id as string) ?? [];
+    const labelStr = clipLabels.join(" ");
+
+    // Pick at most one lower-third per clip; names take priority over
+    // years/places because a name-on-screen is the strongest signal we want
+    // to surface. If no name qualifies, fall back to year, then place.
+    type Candidate = { text: string; type: "name" | "year" | "place" };
+    let pick: Candidate | null = null;
+
+    for (const ent of ents) {
+      if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
+      const key = ent.value.toLowerCase();
+      if (introducedNames.has(key)) continue;
+      if (!labelStr.includes(key)) continue;
+      pick = { text: ent.value, type: "name" };
+      break;
+    }
+    if (!pick) {
+      for (const ent of ents) {
+        if (ent.type !== "year") continue;
+        pick = { text: ent.value, type: "year" };
+        break;
+      }
+    }
+    if (!pick) {
+      for (const ent of ents) {
+        if (ent.type !== "place") continue;
+        pick = { text: ent.value, type: "place" };
+        break;
+      }
+    }
+
+    if (!pick) continue;
+    if (pick.type === "name") introducedNames.add(pick.text.toLowerCase());
+    lowerThirdCounts[pick.type]++;
+    (it.metadata as Record<string, unknown>) = {
+      ...meta,
+      lower_third: { text: pick.text, type: pick.type },
+    };
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.lower_thirds", {
+    name: lowerThirdCounts.name,
+    year: lowerThirdCounts.year,
+    place: lowerThirdCounts.place,
+    namesIntroduced: introducedNames.size,
+  });
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);

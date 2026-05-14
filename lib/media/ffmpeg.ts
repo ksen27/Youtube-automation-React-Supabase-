@@ -200,7 +200,89 @@ export interface NormalizeOptions {
   width?: number;     // default 1280
   height?: number;    // default 720
   fps?: number;       // default 30
+  // Optional lower-third overlay. When set, the matcher decided this clip
+  // should introduce a named entity (person, year, or place). The text is
+  // burned in via ffmpeg's drawtext filter for the first ~3 seconds with a
+  // fade in/out, sitting in the lower-third zone with a translucent bar.
+  lowerThird?: { text: string };
   signal?: AbortSignal;
+}
+
+// Escape a string for use inside an ffmpeg filter `text=...` value. ffmpeg's
+// filtergraph parser treats `:`, `'`, `\`, and `%` specially, and the
+// containing arg already uses single-quoted segments separated by `:`, so we
+// also strip newlines defensively. Drawtext's docs spell out the full rules
+// (https://ffmpeg.org/ffmpeg-filters.html#drawtext) — this matches them.
+function escapeDrawtextValue(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:")
+    .replace(/%/g, "\\%")
+    .replace(/[\r\n]+/g, " ");
+}
+
+// Resolve the font file to hand to ffmpeg's drawtext filter. On the Fly
+// worker container the Dockerfile installs `fonts-dejavu-core`, so the
+// DejaVu Sans Bold TTF lives at a known absolute path. On Windows dev,
+// drawtext can use the system Arial. The path must be filesystem-real and
+// readable by the ffmpeg process. Returns null if no font is reachable — the
+// caller then skips the overlay rather than failing the whole render.
+async function resolveLowerThirdFont(): Promise<string | null> {
+  const candidates =
+    process.platform === "win32"
+      ? ["C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/arial.ttf"]
+      : [
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ];
+  for (const c of candidates) {
+    try {
+      await fs.access(c);
+      return c;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// Build the drawtext filter chain for a 3-second lower-third with fade in/out
+// and a translucent bar. Pinned to the lower-third zone (≈ 78% of frame
+// height), 36px bold text with a black drop-shadow for legibility against
+// busy footage. Returns null if no font is available on the host.
+async function buildLowerThirdFilter(text: string, width: number, height: number): Promise<string | null> {
+  const font = await resolveLowerThirdFont();
+  if (!font) return null;
+  // Show for the first 3 seconds of the clip with 0.4s fade in/out. The
+  // alpha expression evaluates per-frame: 0→1 over [0, 0.4], 1 through 2.6,
+  // 1→0 over [2.6, 3.0], 0 after.
+  const start = 0;
+  const fadeIn = 0.4;
+  const hold = 2.6;
+  const fadeOut = 0.4;
+  const end = start + fadeIn + hold + fadeOut;
+  const alphaExpr =
+    `'if(lt(t,${start}),0,` +
+    `if(lt(t,${start + fadeIn}),(t-${start})/${fadeIn},` +
+    `if(lt(t,${start + fadeIn + hold}),1,` +
+    `if(lt(t,${end}),(${end}-t)/${fadeOut},0))))'`;
+  const fontPath = font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:");
+  const escaped = escapeDrawtextValue(text);
+
+  // Bar geometry: full-width translucent black behind the text, 90px tall,
+  // sitting ~78% down the frame. drawbox uses the same alpha expression so
+  // bar + text fade together as one element.
+  const barY = Math.round(height * 0.78);
+  const textY = barY + 22;
+  const fontsize = Math.round(height / 20);  // 36 at 720p
+
+  return (
+    `drawbox=x=0:y=${barY}:w=${width}:h=90:color=black@0.55:t=fill:enable='between(t,${start},${end})',` +
+    `drawtext=fontfile='${fontPath}':text='${escaped}':` +
+    `fontcolor=white:fontsize=${fontsize}:` +
+    `borderw=2:bordercolor=black@0.85:` +
+    `x=60:y=${textY}:` +
+    `alpha=${alphaExpr}`
+  );
 }
 
 export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
@@ -218,13 +300,74 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   // would slightly speed up the *next* ffmpeg pass: tune flags change SPS/PPS
   // in ways that can prevent stream-copy concat. Encoder params must match
   // exactly between normalizeClip() and buildStillVideo() for -c copy to work.
+  let vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`;
+  if (opts.lowerThird?.text) {
+    const lt = await buildLowerThirdFilter(opts.lowerThird.text, w, h);
+    // If the host has no usable font, ship the clip without the overlay
+    // rather than failing the render. The match.lower_thirds log already
+    // tells operators a lower-third was requested.
+    if (lt) vf = `${vf},${lt}`;
+  }
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
     "-i", opts.inputPath,
     "-an",
-    "-vf",
-    `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
+    "-vf", vf,
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// Crossfade two already-normalized segments into a single segment. Used only
+// for image→image boundaries so consecutive stills dissolve into each other
+// instead of hard-cutting. The two inputs MUST share codec params with
+// normalizeClip/buildStillVideo — they do, since both inputs come from
+// buildStillVideo. Output is re-encoded with the same params, so the merged
+// segment is still concat-compatible with -c:v copy in the final mux.
+//
+// The xfade filter requires an explicit `offset` measured from the start of
+// input A: the transition begins at `offset` and lasts `duration` seconds,
+// during which A fades out while B fades in. Total output length is
+// (durA + durB - duration). Caller is responsible for having rendered A and B
+// with `duration` seconds of headroom baked in, so the visible hold time of
+// each image matches the planned timeline duration.
+export async function xfadePair(opts: {
+  inputAPath: string;
+  inputBPath: string;
+  outputPath: string;
+  inputADurationSeconds: number;
+  transitionDurationSeconds: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const xfadeOffset = Math.max(0, opts.inputADurationSeconds - opts.transitionDurationSeconds);
+  // Keep encoder flags byte-identical to normalizeClip / buildStillVideo so the
+  // merged segment stays stream-copy-concatable downstream. Forcing a keyframe
+  // at frame 0 is essential — without it the final concat falls back to a
+  // re-encode (or fails outright on strict demuxers).
+  const filter =
+    `[0:v]settb=AVTB,fps=${fps},setsar=1[a];` +
+    `[1:v]settb=AVTB,fps=${fps},setsar=1[b];` +
+    `[a][b]xfade=transition=fade:duration=${opts.transitionDurationSeconds}:offset=${xfadeOffset},format=yuv420p[v]`;
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputAPath,
+    "-i", opts.inputBPath,
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-an",
     "-c:v", "libx264",
     "-preset", "ultrafast",
     "-crf", "25",

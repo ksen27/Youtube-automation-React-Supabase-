@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair } from "@/lib/media/ffmpeg";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
 
@@ -68,6 +68,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   // parallel without losing order. Failed items leave their slot null and
   // get filtered out before concat.
   const slots: (string | null)[] = new Array(renderable.length).fill(null);
+  // Per-slot recorded duration of the rendered segment, in seconds. For image
+  // slots that have an image neighbor this is `planned + headroom` so the
+  // xfade pass can eat the overlap; for footage and isolated images it's the
+  // plain planned duration. Used downstream to compute xfade offset.
+  const slotDurations: number[] = new Array(renderable.length).fill(0);
+  // Image→image crossfade configuration. 0.5s dissolve between any two
+  // consecutive image blocks. To preserve the planned visible hold time of
+  // each image, we render each image with HALF the transition baked in on
+  // each side it has an image neighbor; the xfade then consumes exactly
+  // that extra headroom.
+  const IMAGE_XFADE_SECONDS = 0.5;
+  const isImageNeighbor = (i: number): boolean => {
+    const it = renderable[i];
+    return it?.type === "image" && !!it.image_url;
+  };
   let imageRendered = 0;
   let imageFailed = 0;
 
@@ -94,16 +109,24 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       const out = path.join(tmp, `norm_${idx}.mp4`);
 
       if (it.type === "image" && it.image_url) {
+        // Bake headroom into the still video on every side that has an image
+        // neighbor: half the xfade duration per side. The xfade pass later
+        // overlaps the tail of A with the head of B by IMAGE_XFADE_SECONDS,
+        // so the visible hold of each image stays equal to plannedDur.
+        const headLeft = isImageNeighbor(i - 1) ? IMAGE_XFADE_SECONDS / 2 : 0;
+        const headRight = isImageNeighbor(i + 1) ? IMAGE_XFADE_SECONDS / 2 : 0;
+        const renderDur = plannedDur + headLeft + headRight;
         try {
           const localImg = path.join(tmp, `img_${idx}`);
           await downloadHttp(it.image_url as string, localImg);
           await buildStillVideo({
             inputImagePath: localImg,
             outputPath: out,
-            durationSeconds: plannedDur,
+            durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
           });
           slots[i] = out;
+          slotDurations[i] = renderDur;
           imageRendered++;
           await safeUnlink(localImg);
         } catch (e) {
@@ -126,11 +149,20 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             inputPath: local, outputPath: trimmed,
             startSeconds: 0, durationSeconds: plannedDur,
           });
+          // Lower-third stamped by the matcher: { text, type } on
+          // metadata.lower_third when this clip should introduce a name
+          // (first occurrence only) or label a year/place visual. Render
+          // passes only the text — type is used by the matcher for the
+          // first-time-only rule and is irrelevant downstream.
+          const meta = (it.metadata ?? {}) as Record<string, unknown>;
+          const lt = meta.lower_third as { text?: string } | undefined;
           await normalizeClip({
             inputPath: trimmed, outputPath: out,
             width: 1280, height: 720, fps: 30,
+            lowerThird: lt?.text ? { text: lt.text } : undefined,
           });
           slots[i] = out;
+          slotDurations[i] = plannedDur;
           await safeUnlink(trimmed);
         } catch (e) {
           await logJob({ projectId, jobId: mediaJobId },
@@ -153,9 +185,74 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }),
     );
 
-    // Flatten the slots into the in-order list of normalized segments,
-    // dropping any failed items.
-    const normalized: string[] = slots.filter((s): s is string => s !== null);
+    // Crossfade consecutive image→image boundaries. We walk the slots
+    // left-to-right; whenever two adjacent successfully-rendered items are
+    // both images, we merge them via xfadePair into one segment that already
+    // contains the dissolve. Chains of 3+ images fold into a single merged
+    // segment by feeding the previous merge result as input A of the next
+    // pair. The merged segment's duration after one fold is
+    //   durA + durB - IMAGE_XFADE_SECONDS
+    // which is what we pass as inputADurationSeconds on the next fold so the
+    // next xfade lands at the correct offset.
+    //
+    // Footage↔image and image↔footage boundaries stay as hard cuts per spec.
+    // A failed slot breaks the image run on both sides — handled naturally
+    // since we only fold pairs where both slots are non-null images.
+    // Fold consecutive image→image boundaries into a single segment that
+    // contains the dissolve. Footage↔image stays a hard cut per spec. A
+    // failed slot breaks the image run on both sides automatically because
+    // we only fold pairs where both ends are non-null images.
+    //
+    // For chains of 3+ images we feed the previous merge result back in as
+    // input A of the next pair. The running duration after one fold is
+    // (aDur + bDur - xfade), since xfade overlaps the tail of A with the
+    // head of B — that value is what the *next* fold needs as offset.
+    const mergedSegments: string[] = [];
+    const mergedDurations: number[] = [];
+    const mergedKinds: ("image" | "footage")[] = [];
+    let xfadeMerges = 0;
+    for (let i = 0; i < slots.length; i++) {
+      const seg = slots[i];
+      if (seg === null) continue;
+      const itemIsImage = isImageNeighbor(i);
+      const canFold =
+        itemIsImage &&
+        mergedSegments.length > 0 &&
+        mergedKinds[mergedKinds.length - 1] === "image";
+      if (canFold) {
+        const a = mergedSegments[mergedSegments.length - 1];
+        const aDur = mergedDurations[mergedDurations.length - 1];
+        const mergedOut = path.join(tmp, `xfade_${String(i).padStart(3, "0")}.mp4`);
+        try {
+          await xfadePair({
+            inputAPath: a,
+            inputBPath: seg,
+            outputPath: mergedOut,
+            inputADurationSeconds: aDur,
+            transitionDurationSeconds: IMAGE_XFADE_SECONDS,
+            fps: 30,
+          });
+          mergedSegments[mergedSegments.length - 1] = mergedOut;
+          mergedDurations[mergedDurations.length - 1] = aDur + slotDurations[i] - IMAGE_XFADE_SECONDS;
+          xfadeMerges++;
+          await safeUnlink(a);
+          await safeUnlink(seg);
+        } catch (e) {
+          // Fall back to a hard cut so one xfade failure doesn't kill the
+          // whole render. Operator sees the log line.
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.xfade.failed", { idx: i, err: (e as Error).message });
+          mergedSegments.push(seg);
+          mergedDurations.push(slotDurations[i]);
+          mergedKinds.push("image");
+        }
+      } else {
+        mergedSegments.push(seg);
+        mergedDurations.push(slotDurations[i]);
+        mergedKinds.push(itemIsImage ? "image" : "footage");
+      }
+    }
+    const normalized: string[] = mergedSegments;
 
     if (normalized.length === 0) throw new Error("all timeline items failed to render");
 
@@ -164,6 +261,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       built: normalized.length,
       imageRendered,
       imageFailed,
+      xfadeMerges,
     });
 
     // 3) Optional voiceover from project + intro clip selection + bg music
