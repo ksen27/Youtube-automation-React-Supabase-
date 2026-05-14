@@ -69,12 +69,18 @@ export async function buildStillVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
+  // Direction of the slow zoom applied to the still so it doesn't read as a
+  // frozen frame. "in" crops a shrinking window over time (zoom-in feel);
+  // "out" crops an expanding window (zoom-out feel). Caller alternates per
+  // image so consecutive stills don't move identically. Defaults to "in".
+  motionDirection?: "in" | "out";
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
   const w = opts.width ?? 1280;
   const h = opts.height ?? 720;
   const fps = opts.fps ?? 30;
+  const direction = opts.motionDirection ?? "in";
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
   // Always pre-transcode the input image to a clean PNG before feeding it
@@ -105,6 +111,56 @@ export async function buildStillVideo(opts: {
   ], opts.signal, 30);
   const actualInput = transcodedPng;
 
+  // Slow zoom motion using a time-driven crop window. The two critical
+  // pieces that make this jitter-free (and which earlier attempts got
+  // wrong) are:
+  //
+  //   1) `fps=${fps}` is the FIRST filter, BEFORE crop. With `-loop 1` the
+  //      image2 demuxer feeds frames at its own default rate (~25 fps).
+  //      If `fps=` runs later, ffmpeg duplicates frames to reach 30 — and
+  //      duplicate frames are exactly what produces the visible "every 6th
+  //      frame freezes" stutter pattern. Putting `fps=` first means every
+  //      downstream filter sees a clean 30 fps stream and the crop window
+  //      gets a fresh `t` for every output frame.
+  //
+  //   2) The zoom range is large enough that the per-frame crop dimensions
+  //      change by at least ~2px between consecutive frames. crop rounds
+  //      its w/h to integers, so smaller per-frame changes produce a
+  //      stair-step ("same crop for 5 frames then jump 2px") that the eye
+  //      reads as irregular motion. ZOOM_MAX = 1.12 over a short clip
+  //      keeps the per-frame delta well above the rounding floor.
+  //
+  // The UPSCALE factor must be ≥ ZOOM_MAX so that even at peak zoom the
+  // crop window still fits inside the upscaled image.
+  const ZOOM_MAX = 1.12;
+  const UPSCALE = 1.15;
+  const upW = Math.round(w * UPSCALE);
+  const upH = Math.round(h * UPSCALE);
+  const dur = Math.max(0.1, opts.durationSeconds);
+  // Crop window interpolates between full upscaled size (zoom=1.0) and a
+  // smaller window (zoom=ZOOM_MAX). For "in" the window shrinks → visible
+  // zoom in. For "out" the window expands → visible zoom out. Centered, no
+  // pan — just a clean zoom.
+  const zStart = direction === "in" ? 1.0 : ZOOM_MAX;
+  const zEnd = direction === "in" ? ZOOM_MAX : 1.0;
+  // Linear time ramp clamped to [0, 1] so the crop dimensions never
+  // overshoot at the last partial frame.
+  const zoomT = `min(t/${dur}\\,1)`;
+  const zExpr = `(${zStart}+(${zEnd}-${zStart})*${zoomT})`;
+  const cropW = `${upW}/${zExpr}`;
+  const cropH = `${upH}/${zExpr}`;
+  // Center the crop window inside the upscaled frame.
+  const cropX = `(in_w-(${cropW}))/2`;
+  const cropY = `(in_h-(${cropH}))/2`;
+
+  const vfChain =
+    // CRITICAL: fps FIRST. See comment block above.
+    `fps=${fps},` +
+    `scale=${upW}:${upH}:force_original_aspect_ratio=decrease,` +
+    `pad=${upW}:${upH}:-1:-1:color=black,` +
+    `crop=w='${cropW}':h='${cropH}':x='${cropX}':y='${cropY}',` +
+    `scale=${w}:${h},setsar=1`;
+
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
@@ -112,8 +168,7 @@ export async function buildStillVideo(opts: {
     "-t", String(opts.durationSeconds),
     "-i", actualInput,
     "-an",
-    "-vf",
-    `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`,
+    "-vf", vfChain,
     // IMPORTANT: keep these encoder flags identical to normalizeClip(). The
     // final concat uses -c:v copy (mux-only, no re-encode) which requires
     // every input segment to share codec params, GOP structure, and SPS/PPS.
@@ -326,6 +381,20 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// Palette of xfade transitions we use between consecutive image segments. The
+// renderer rotates through this list deterministically by boundary index so a
+// long slideshow doesn't repeat the same dissolve every time. All names are
+// ffmpeg xfade `transition=` values (https://ffmpeg.org/ffmpeg-filters.html#xfade).
+export const IMAGE_XFADE_PALETTE = [
+  "fade",
+  "fadeblack",
+  "slideleft",
+  "slideright",
+  "wiperight",
+  "circleopen",
+] as const;
+export type XfadeStyle = (typeof IMAGE_XFADE_PALETTE)[number];
+
 // Crossfade two already-normalized segments into a single segment. Used only
 // for image→image boundaries so consecutive stills dissolve into each other
 // instead of hard-cutting. The two inputs MUST share codec params with
@@ -345,11 +414,13 @@ export async function xfadePair(opts: {
   outputPath: string;
   inputADurationSeconds: number;
   transitionDurationSeconds: number;
+  style?: XfadeStyle;
   fps?: number;
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
   const fps = opts.fps ?? 30;
+  const style: XfadeStyle = opts.style ?? "fade";
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
   const xfadeOffset = Math.max(0, opts.inputADurationSeconds - opts.transitionDurationSeconds);
   // Keep encoder flags byte-identical to normalizeClip / buildStillVideo so the
@@ -359,7 +430,7 @@ export async function xfadePair(opts: {
   const filter =
     `[0:v]settb=AVTB,fps=${fps},setsar=1[a];` +
     `[1:v]settb=AVTB,fps=${fps},setsar=1[b];` +
-    `[a][b]xfade=transition=fade:duration=${opts.transitionDurationSeconds}:offset=${xfadeOffset},format=yuv420p[v]`;
+    `[a][b]xfade=transition=${style}:duration=${opts.transitionDurationSeconds}:offset=${xfadeOffset},format=yuv420p[v]`;
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
@@ -368,6 +439,61 @@ export async function xfadePair(opts: {
     "-filter_complex", filter,
     "-map", "[v]",
     "-an",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// Burn a fade-out at the tail and/or a fade-in at the head of an already-
+// normalized segment. Used at image↔video boundaries so the still doesn't
+// hard-cut into footage (and vice versa). Unlike xfadePair this does NOT need
+// a partner segment or extra headroom — it just darkens the existing frames
+// at the edge, so it's safe to apply to a video clip we cut to exact length
+// without re-cutting with overlap.
+//
+// The resulting segment is the same length as the input (a tail fade does
+// not shorten the clip — frames are still emitted, they're just multiplied
+// toward black). Encoder flags match normalizeClip / buildStillVideo so the
+// segment stays concat-compatible with -c:v copy.
+export async function applyEdgeFade(opts: {
+  inputPath: string;
+  outputPath: string;
+  inputDurationSeconds: number;
+  fadeInSeconds?: number;    // 0 disables; default 0
+  fadeOutSeconds?: number;   // 0 disables; default 0
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const fps = opts.fps ?? 30;
+  const fadeIn = Math.max(0, opts.fadeInSeconds ?? 0);
+  const fadeOut = Math.max(0, opts.fadeOutSeconds ?? 0);
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  // Build the filter chain. Use ffmpeg's `fade` filter which multiplies pixel
+  // values toward black over a window. `st` = start time, `d` = duration.
+  // A tail fade-out starts at (inputDur - fadeOut). Both fades coexist fine
+  // when chained.
+  const parts: string[] = [`fps=${fps}`, `setsar=1`];
+  if (fadeIn > 0) parts.push(`fade=t=in:st=0:d=${fadeIn}`);
+  if (fadeOut > 0) {
+    const start = Math.max(0, opts.inputDurationSeconds - fadeOut);
+    parts.push(`fade=t=out:st=${start}:d=${fadeOut}`);
+  }
+  parts.push("format=yuv420p");
+  const vf = parts.join(",");
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputPath,
+    "-an",
+    "-vf", vf,
     "-c:v", "libx264",
     "-preset", "ultrafast",
     "-crf", "25",

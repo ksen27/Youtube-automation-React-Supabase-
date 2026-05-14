@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, applyEdgeFade, IMAGE_XFADE_PALETTE } from "@/lib/media/ffmpeg";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
 
@@ -73,15 +73,31 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   // xfade pass can eat the overlap; for footage and isolated images it's the
   // plain planned duration. Used downstream to compute xfade offset.
   const slotDurations: number[] = new Array(renderable.length).fill(0);
-  // Image→image crossfade configuration. 0.5s dissolve between any two
-  // consecutive image blocks. To preserve the planned visible hold time of
-  // each image, we render each image with HALF the transition baked in on
-  // each side it has an image neighbor; the xfade then consumes exactly
-  // that extra headroom.
+  // Transition timing.
+  //   - image↔image: 0.5s xfade, rotating through IMAGE_XFADE_PALETTE.
+  //   - image↔video and video↔image: 0.4s fade-through-black (no xfade,
+  //     just an edge fade on each side that meets at black).
+  //   - video↔video: hard cut, no transition.
+  //
+  // For image↔image we render each image with HALF the xfade baked in on the
+  // sides that have an image neighbor (existing behavior), so the xfade
+  // consumes the headroom and visible hold stays equal to planned duration.
+  //
+  // For image↔video boundaries we extend the IMAGE side with HALF the fade
+  // duration of headroom (so the visible content time on the image side
+  // matches its planned duration), but the VIDEO side keeps its exact
+  // cutClip duration — the fade just darkens existing frames, doesn't
+  // shorten the clip. Net effect on total timeline length: each mixed
+  // boundary stays within ~0.2s of the planned length.
   const IMAGE_XFADE_SECONDS = 0.5;
+  const MIXED_FADE_SECONDS = 0.4;
   const isImageNeighbor = (i: number): boolean => {
     const it = renderable[i];
     return it?.type === "image" && !!it.image_url;
+  };
+  const isVideoNeighbor = (i: number): boolean => {
+    const it = renderable[i];
+    return !!it?.clip_id;
   };
   let imageRendered = 0;
   let imageFailed = 0;
@@ -109,12 +125,27 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       const out = path.join(tmp, `norm_${idx}.mp4`);
 
       if (it.type === "image" && it.image_url) {
-        // Bake headroom into the still video on every side that has an image
-        // neighbor: half the xfade duration per side. The xfade pass later
-        // overlaps the tail of A with the head of B by IMAGE_XFADE_SECONDS,
-        // so the visible hold of each image stays equal to plannedDur.
-        const headLeft = isImageNeighbor(i - 1) ? IMAGE_XFADE_SECONDS / 2 : 0;
-        const headRight = isImageNeighbor(i + 1) ? IMAGE_XFADE_SECONDS / 2 : 0;
+        // Bake headroom into the still video on every side that has a
+        // transition partner. For image↔image we eat IMAGE_XFADE_SECONDS / 2
+        // because the xfade overlaps the tail of A with the head of B; for
+        // image↔video we eat MIXED_FADE_SECONDS / 2 because the edge fade
+        // darkens the last frames into black (still visible, but content
+        // time effectively halves on that side). Either way the visible
+        // "useful" hold time stays close to plannedDur.
+        const leftPartnerImage = isImageNeighbor(i - 1);
+        const leftPartnerVideo = isVideoNeighbor(i - 1);
+        const rightPartnerImage = isImageNeighbor(i + 1);
+        const rightPartnerVideo = isVideoNeighbor(i + 1);
+        const headLeft = leftPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : leftPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
+        const headRight = rightPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : rightPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
         const renderDur = plannedDur + headLeft + headRight;
         try {
           const localImg = path.join(tmp, `img_${idx}`);
@@ -124,6 +155,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             outputPath: out,
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
+            // Alternate zoom direction by timeline index so consecutive
+            // image blocks don't all push the viewer the same way.
+            motionDirection: i % 2 === 0 ? "in" : "out",
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
@@ -185,43 +219,88 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }),
     );
 
-    // Crossfade consecutive image→image boundaries. We walk the slots
-    // left-to-right; whenever two adjacent successfully-rendered items are
-    // both images, we merge them via xfadePair into one segment that already
-    // contains the dissolve. Chains of 3+ images fold into a single merged
-    // segment by feeding the previous merge result as input A of the next
-    // pair. The merged segment's duration after one fold is
-    //   durA + durB - IMAGE_XFADE_SECONDS
-    // which is what we pass as inputADurationSeconds on the next fold so the
-    // next xfade lands at the correct offset.
+    // Apply transitions at boundaries between successfully-rendered slots.
+    // Three cases:
+    //   1) image↔image: fold via xfadePair with a palette style (rotated by
+    //      boundary index). Merged segment replaces the previous list entry;
+    //      chains of 3+ images chain through the same slot.
+    //   2) image↔video and video↔image: apply a fade-out on the tail of the
+    //      left segment and a fade-in on the head of the right segment.
+    //      Both segments stay separate in the concat list; they meet at
+    //      black for a clean dip-to-black transition.
+    //   3) video↔video: hard cut, no edits.
     //
-    // Footage↔image and image↔footage boundaries stay as hard cuts per spec.
-    // A failed slot breaks the image run on both sides — handled naturally
-    // since we only fold pairs where both slots are non-null images.
-    // Fold consecutive image→image boundaries into a single segment that
-    // contains the dissolve. Footage↔image stays a hard cut per spec. A
-    // failed slot breaks the image run on both sides automatically because
-    // we only fold pairs where both ends are non-null images.
-    //
-    // For chains of 3+ images we feed the previous merge result back in as
-    // input A of the next pair. The running duration after one fold is
-    // (aDur + bDur - xfade), since xfade overlaps the tail of A with the
-    // head of B — that value is what the *next* fold needs as offset.
+    // A failed slot (null) is skipped, which also breaks any transition
+    // chain it sat in — the surrounding boundaries become hard cuts.
+    type SegKind = "image" | "video";
     const mergedSegments: string[] = [];
     const mergedDurations: number[] = [];
-    const mergedKinds: ("image" | "footage")[] = [];
+    const mergedKinds: SegKind[] = [];
     let xfadeMerges = 0;
+    let mixedFades = 0;
+    // Boundary index for palette rotation. Incremented every time we apply
+    // an image→image xfade so consecutive dissolves cycle through the list.
+    let imageBoundaryIdx = 0;
+
+    // Helper: replace the tail of the last entry with a faded version. The
+    // input file is unlinked after a successful re-encode. Falls back to
+    // leaving the original in place on failure.
+    async function fadeLastTail(reason: string, idx: number): Promise<void> {
+      if (mergedSegments.length === 0) return;
+      const j = mergedSegments.length - 1;
+      const src = mergedSegments[j];
+      const srcDur = mergedDurations[j];
+      const out = path.join(tmp, `fade_tail_${String(idx).padStart(3, "0")}.mp4`);
+      try {
+        await applyEdgeFade({
+          inputPath: src,
+          outputPath: out,
+          inputDurationSeconds: srcDur,
+          fadeOutSeconds: MIXED_FADE_SECONDS,
+          fps: 30,
+        });
+        mergedSegments[j] = out;
+        await safeUnlink(src);
+        mixedFades++;
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.edge_fade.failed", { idx, side: "tail", reason, err: (e as Error).message });
+      }
+    }
+
+    // Helper: replace `seg` with a head-faded version before appending.
+    async function fadeHead(seg: string, segDur: number, idx: number): Promise<string> {
+      const out = path.join(tmp, `fade_head_${String(idx).padStart(3, "0")}.mp4`);
+      try {
+        await applyEdgeFade({
+          inputPath: seg,
+          outputPath: out,
+          inputDurationSeconds: segDur,
+          fadeInSeconds: MIXED_FADE_SECONDS,
+          fps: 30,
+        });
+        await safeUnlink(seg);
+        mixedFades++;
+        return out;
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.edge_fade.failed", { idx, side: "head", err: (e as Error).message });
+        return seg;
+      }
+    }
+
     for (let i = 0; i < slots.length; i++) {
       const seg = slots[i];
       if (seg === null) continue;
-      const itemIsImage = isImageNeighbor(i);
-      const canFold =
-        itemIsImage &&
-        mergedSegments.length > 0 &&
-        mergedKinds[mergedKinds.length - 1] === "image";
-      if (canFold) {
+      const itemKind: SegKind = isImageNeighbor(i) ? "image" : "video";
+      const prevKind: SegKind | null =
+        mergedKinds.length > 0 ? mergedKinds[mergedKinds.length - 1] : null;
+
+      if (itemKind === "image" && prevKind === "image") {
+        // image→image: fold via xfade with rotating palette.
         const a = mergedSegments[mergedSegments.length - 1];
         const aDur = mergedDurations[mergedDurations.length - 1];
+        const style = IMAGE_XFADE_PALETTE[imageBoundaryIdx % IMAGE_XFADE_PALETTE.length];
         const mergedOut = path.join(tmp, `xfade_${String(i).padStart(3, "0")}.mp4`);
         try {
           await xfadePair({
@@ -230,26 +309,40 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             outputPath: mergedOut,
             inputADurationSeconds: aDur,
             transitionDurationSeconds: IMAGE_XFADE_SECONDS,
+            style,
             fps: 30,
           });
           mergedSegments[mergedSegments.length - 1] = mergedOut;
           mergedDurations[mergedDurations.length - 1] = aDur + slotDurations[i] - IMAGE_XFADE_SECONDS;
           xfadeMerges++;
+          imageBoundaryIdx++;
           await safeUnlink(a);
           await safeUnlink(seg);
         } catch (e) {
           // Fall back to a hard cut so one xfade failure doesn't kill the
-          // whole render. Operator sees the log line.
+          // whole render.
           await logJob({ projectId, jobId: mediaJobId },
-            "render.xfade.failed", { idx: i, err: (e as Error).message });
+            "render.xfade.failed", { idx: i, style, err: (e as Error).message });
           mergedSegments.push(seg);
           mergedDurations.push(slotDurations[i]);
           mergedKinds.push("image");
         }
+      } else if (
+        (itemKind === "image" && prevKind === "video") ||
+        (itemKind === "video" && prevKind === "image")
+      ) {
+        // image↔video boundary: fade prev's tail to black, then fade this
+        // segment's head from black, and append separately.
+        await fadeLastTail("mixed_boundary", i);
+        const faded = await fadeHead(seg, slotDurations[i], i);
+        mergedSegments.push(faded);
+        mergedDurations.push(slotDurations[i]);
+        mergedKinds.push(itemKind);
       } else {
+        // First segment, or video↔video — hard cut, append as-is.
         mergedSegments.push(seg);
         mergedDurations.push(slotDurations[i]);
-        mergedKinds.push(itemIsImage ? "image" : "footage");
+        mergedKinds.push(itemKind);
       }
     }
     const normalized: string[] = mergedSegments;
@@ -262,6 +355,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       imageRendered,
       imageFailed,
       xfadeMerges,
+      mixedFades,
     });
 
     // 3) Optional voiceover from project + intro clip selection + bg music
