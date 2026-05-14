@@ -356,8 +356,9 @@ Return STRICT JSON ONLY in this shape:
 Rules:
 - Describe what is VISIBLY in the frame. Don't guess things you can't see.
 - Prefer concrete nouns: "iron palace gates", "wedding dress", "press photographers", "archival newspaper headline".
-- NEVER name a person unless you can clearly see a face or full person in the frame. If the source title mentions a celebrity but the frame shows only an object, vehicle, building, or scenery, do NOT include the celebrity's name in labels or primarySubject. The title provides context, not visual content.
-- "primarySubject" must describe what is actually visible: e.g. "car grille close-up", "engine compartment", "shop floor", NOT the title's subject. Only use a person's name when the person is visible in frame.
+- NEVER write a person's proper name (first name, last name, full name, nickname) anywhere — not in labels, not in primarySubject, not in setting. This rule is absolute, even when the source title contains a name and you are confident the frame shows that person. Names from the title are not visual evidence; they are also frequently wrong (sources that name two related people in the title routinely show only one, and the labeler cannot tell which). The downstream pipeline gets names from the transcript, not from you.
+- When a person is visible, describe them with neutral visible attributes only: apparent sex ("man", "woman"), apparent age band ("young", "middle-aged", "older"), hair ("bald", "grey hair", "long blonde hair"), facial hair ("bearded", "clean-shaven"), clothing ("blue shirt", "leather jacket"), pose ("talking head", "looking down", "holding object"). Example primarySubject: "middle-aged bearded man, talking head" — NOT "Drew Pritchard".
+- "primarySubject" must describe what is actually visible: e.g. "car grille close-up", "engine compartment", "shop floor", "middle-aged woman seated", NOT the title's subject and NOT a name.
 - "setting" must describe the visible environment, not the source video's overall theme. A car-detail close-up's setting is "shop interior" or "garage"; it is NOT "interview" just because the source video happens to be an interview.
 - Avoid vague labels like "scene", "moment", "image", "footage".
 - Skip duplicates.
@@ -547,15 +548,16 @@ For each section, return up to ${topN} clip_ids ranked by visual fit, with a 0�
 
 How to score:
 - The labels describe what is VISIBLY in the clip's thumbnail. Weight labels heavily.
-- source_title is shared across many clips from the same documentary — it tells you the topic of the source video, not the visual content of THIS clip. Use it only as a weak tiebreaker.
-- A clip whose labels match the section's subject (people, places, events, objects) is high score.
+- Clip labels never contain people's proper names — by design. When a person is in frame, labels describe them by visible attributes only (e.g. "middle-aged bearded man, talking head", "young blonde woman, red carpet"). To pick a clip for a person, match those VISIBLE attributes to what you know about the person from the section text.
+- source_title is shared across many clips from the same documentary — it tells you the topic of the source video, not the visual content of THIS clip. Use it only as a weak tiebreaker. NEVER use a name in source_title as evidence that a specific clip shows that person; source titles routinely name multiple people (spouses, co-hosts, co-stars) while a given clip shows only one of them — or neither.
+- A clip whose labels match the section's subject (places, events, objects, or the visible attributes of a named person) is high score.
 - A clip with generic labels (close-up, talking head, studio backdrop) gets a low score unless the section is itself about an interview.
-- ENTITY MATCHING is the strongest signal. When a section lists "(entities: ...)", a clip whose labels reference that specific person, place, movie, TV show, song, company, or event scores HIGHER than a generic celebrity B-roll clip. For example:
+- ENTITY MATCHING is the strongest signal. When a section lists "(entities: ...)" with a person, prefer clips whose visible attributes are consistent with that person. If the section is about a woman and the clip clearly shows a man (or vice versa), score it 0 — that is a wrong-person mismatch, not a near miss. For non-person entities:
     - section entity "place=St Paul's Cathedral" → clip with labels containing "cathedral", "church wedding", "St Paul's" wins over a red-carpet clip.
     - section entity "event=car crash" → clip with labels referencing wreckage, accident, ambulance wins over a studio interview.
     - section entity "company=Apple" → a clip showing the Apple logo or storefront beats a generic tech-event clip.
     - section entity "tv_show=Match Game" → a clip from that game show (or labels like "game show set", "panel buzzer") beats a generic talking-head.
-- score = 0 means "wrong fit" and the clip should not be considered.
+- score = 0 means "wrong fit" and the clip should not be considered. Wrong-sex person matches MUST be 0.
 - DO NOT include a "reason" field. We do not use it. Output only clip_id and score.
 
 Return STRICT MINIMAL JSON in this shape:

@@ -170,33 +170,74 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const STAGED_SETTING_RE = /studio|stage|set\b/i;
   // A frame must visibly contain a person to qualify as a usable intro
   // clip. Without this gate, a car-grille close-up from a Dave Kindig
-  // interview source gets labeled as "subject: Dave Kindig" by the
-  // title-context-prone Vision labeler, scores 110/110 on intro
-  // criteria, and ships as the intro — even though no person is in
-  // the frame. The PERSON_VISIBLE_RE check forces real human content.
+  // interview source passes on setting/source-title hints alone — even
+  // though no person is in the frame.
   const PERSON_VISIBLE_RE = /\b(face|person|man|woman|host|interviewee|guest|portrait|headshot|smiling|talking head|speaker|shoulders|sitting|standing|wearing)\b/i;
   // Hard exclusions — labels that strongly suggest the frame is NOT a
-  // person shot, even if the labeler also hallucinated a celebrity name.
+  // person shot.
   const NOT_PERSON_RE = /\b(grille|engine|wheel|hood|bumper|dashboard|tire|exhaust|paint|garage floor|shop floor|tool|wrench|chassis|product|logo only)\b/i;
+  // When a named person is a woman, the clip representing them should show
+  // a woman; same for man. Clip labels never contain names (the labeler is
+  // forbidden from emitting them), but they DO contain sex/age descriptors
+  // — those are the only reliable on-frame signal we have for picking the
+  // right person when the source documentary stars more than one.
+  const WOMAN_RE = /\b(woman|girl|lady|female|actress|her|she|hostess)\b/i;
+  const MAN_RE = /\b(\bman\b|boy|guy|male|actor|bearded|moustache|mustache)\b/i;
+  // Heuristic sex inference for any named person. We don't have structured
+  // gender metadata, so we look for matching pronouns near the name in the
+  // transcript. Returns "woman" | "man" | null (unknown → no bias).
+  // Cached per name because we call this for the main celebrity AND once
+  // per related_person during lower-third tagging.
+  const sexByName = new Map<string, "woman" | "man" | null>();
+  function inferPersonSex(name: string): "woman" | "man" | null {
+    const key = name.toLowerCase();
+    if (sexByName.has(key)) return sexByName.get(key)!;
+    const t = transcript.toLowerCase();
+    let womanHits = 0;
+    let manHits = 0;
+    let idx = 0;
+    while ((idx = t.indexOf(key, idx)) !== -1) {
+      const ctx = t.slice(Math.max(0, idx - 80), Math.min(t.length, idx + key.length + 80));
+      womanHits += (ctx.match(/\b(she|her|hers|herself|woman|lady)\b/g) ?? []).length;
+      manHits += (ctx.match(/\b(he|him|his|himself|man|guy)\b/g) ?? []).length;
+      idx += key.length;
+    }
+    let result: "woman" | "man" | null;
+    if (womanHits === 0 && manHits === 0) result = null;
+    else if (womanHits >= manHits * 2) result = "woman";
+    else if (manHits >= womanHits * 2) result = "man";
+    else result = null;
+    sexByName.set(key, result);
+    return result;
+  }
+  const mainCelebritySex = mainCelebrity ? inferPersonSex(mainCelebrity) : null;
 
   function scoreIntroCandidate(c: { id: string; labels?: string[]; source_title: string | null }): number {
     const labelStr = (c.labels ?? []).join(" ").toLowerCase();
     // Gate 1: hard reject if labels suggest no-person object content.
     if (NOT_PERSON_RE.test(labelStr)) return 0;
-    // Gate 2: must have at least one person-visible token. Prevents
-    // hallucinated celebrity-name labels from passing on object frames.
+    // Gate 2: must have at least one person-visible token.
     if (!PERSON_VISIBLE_RE.test(labelStr)) return 0;
+    // Gate 3: when we inferred the main celebrity's sex, reject clips
+    // whose visible-attribute labels clearly contradict it. This is the
+    // primary defense against picking a spouse/co-host of the opposite
+    // sex from the same source video.
+    if (mainCelebritySex === "woman" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr)) return 0;
+    if (mainCelebritySex === "man" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr)) return 0;
 
     let score = 0;
     if (mainCelebrity) {
-      const cel = mainCelebrity.toLowerCase();
-      // Celebrity name in labels still scores, but only after the
-      // person-visible gate passed — so we know an actual person IS
-      // in the frame. The +50 is "labels say it's the celebrity AND
-      // a person is visible" not "labels say it's the celebrity."
-      if (labelStr.includes(cel)) score += 50;
-      if ((c.source_title ?? "").toLowerCase().includes(cel)) score += 10;
+      // Source title is the only celebrity-name signal left now that
+      // labels are name-free by design. It's weak — source titles often
+      // name multiple people — but it's better than nothing for ranking
+      // person-shots from the right documentary higher than unrelated
+      // person-shots from other sources.
+      if ((c.source_title ?? "").toLowerCase().includes(mainCelebrity.toLowerCase())) score += 30;
     }
+    // Sex match bonus — rewards clips whose labels match the celebrity's
+    // sex, beyond the contradiction gate above.
+    if (mainCelebritySex === "woman" && WOMAN_RE.test(labelStr)) score += 20;
+    if (mainCelebritySex === "man" && MAN_RE.test(labelStr)) score += 20;
     // Setting check — grab the `setting: ...` label entry if present.
     const settingLabel = (c.labels ?? []).find((l) => l.toLowerCase().startsWith("setting:")) ?? "";
     if (INTERVIEW_SETTING_RE.test(settingLabel)) score += 30;
@@ -229,6 +270,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         : 5.5;
       introClipDuration = Math.min(6, Math.max(5, cutDuration || 5.5));
       // Classify which tier won. Used only for diagnostics.
+      // New score ceiling is 100 (30 source-title + 20 sex + 30 setting +
+      // 20 interview label). Tiers: >=70 = source title + sex + interview;
+      // >=50 = source title + setting OR sex + interview/setting; below = weaker.
       if (best.score >= 70) introSelectionTier = "celebrity_interview";
       else if (best.score >= 50) introSelectionTier = "celebrity_any";
       else introSelectionTier = "source_title_match";
@@ -796,7 +840,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
       const key = ent.value.toLowerCase();
       if (introducedNames.has(key)) continue;
-      if (!labelStr.includes(key)) continue;
+      // Verify the clip plausibly depicts this person. Labels no longer
+      // carry names (the labeler is forbidden from emitting them), so we
+      // fall back to sex agreement: infer the person's sex from transcript
+      // pronouns, then require the clip's visible-attribute labels not to
+      // contradict it. If we can't infer the person's sex (no pronouns
+      // near the name), we skip rather than burn in a possibly-wrong
+      // lower-third — a missing name is better than a wrong one.
+      const personSex = inferPersonSex(ent.value);
+      if (!personSex) continue;
+      const sexMatches =
+        (personSex === "woman" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr)) ||
+        (personSex === "man" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr));
+      if (!sexMatches) continue;
       pick = { text: ent.value, type: "name" };
       break;
     }
