@@ -10,8 +10,8 @@ primary_region = 'lhr'
   dockerfile = 'Dockerfile.worker'
 
 [[vm]]
-  size = 'shared-cpu-4x'
-  memory = '4gb'
+  size = 'performance-4x'
+  memory = '8gb'
 
 # Redis AOF lives here so queue state survives container restarts/deploys.
 # Without this, every redeploy would wipe in-flight jobs.

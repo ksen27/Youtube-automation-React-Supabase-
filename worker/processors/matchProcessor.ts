@@ -1,7 +1,12 @@
 import type { MatchJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
-import { scoreClipsForSections, type ClipForMatch, type SectionScore } from "@/lib/ai/gemini";
+import {
+  scoreClipsForSections,
+  verifyIntroCandidates,
+  type ClipForMatch,
+  type SectionScore,
+} from "@/lib/ai/gemini";
 import {
   buildBlockSequence,
   planTimeline,
@@ -117,7 +122,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   const { data: clipRows } = await sb
     .from("video_clips")
-    .select("id, start_time, end_time, labels, video_source_id, status")
+    .select("id, start_time, end_time, labels, video_source_id, status, thumbnail_url")
     .eq("project_id", projectId)
     .eq("status", "ready");
   const clips = clipRows ?? [];
@@ -266,55 +271,98 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return score;
   }
 
-  // Tiered intro selection. We pick the highest-scoring clip; if everything
-  // scores 0 the intro is skipped (rendered without one).
+  // Two-stage intro selection:
+  //   Stage 1 — heuristic ranking (source title + setting + sex + head bonus)
+  //   Stage 2 — Gemini Vision verifier looks at the top-N thumbnails and
+  //             picks the clip that ACTUALLY shows the celebrity on camera.
+  //
+  // Stage 2 exists because the heuristics let title cards / wrong-speaker
+  // openings win whenever the labeler missed the person in the first frame
+  // — and the audio is cut from the same window, so a title-card pick gives
+  // narrator/title-screen audio instead of the celebrity's voice.
   let introClipId: string | null = null;
   let introClipScore = 0;
   let introClipDuration = 0;
   let introSelectionTier:
-    | "head_celebrity_interview"
-    | "head_clip"
-    | "celebrity_interview"
-    | "celebrity_any"
-    | "source_title_match"
+    | "verified"
+    | "heuristic_fallback"
     | "skipped" = "skipped";
-  {
-    const ranked = clipsForMatch
-      .map((c) => ({ c, score: scoreIntroCandidate(c) }))
-      .sort((a, b) => b.score - a.score);
+  let introVerifierReason: string | null = null;
+  let introCandidateCount = 0;
 
-    const best = ranked[0];
-    if (best && best.score > 0) {
-      introClipId = best.c.id;
-      introClipScore = best.score;
-      // Find the original clip row so we know its duration. We clamp to
-      // 5–6s; the YouTube clip is usually 5s already, so this is mostly a
-      // safety net for any longer clips that slipped through.
-      const fullClip = clips.find((cc) => cc.id === best.c.id);
-      const cutDuration = fullClip
-        ? Math.max(0, (Number(fullClip.end_time) || 0) - (Number(fullClip.start_time) || 0))
-        : 5.5;
-      introClipDuration = Math.min(6, Math.max(5, cutDuration || 5.5));
-      // Diagnostic tier. Score ceiling is now 160 (60 head + 30 source title
-      // + 20 sex + 30 setting + 20 interview).
-      const bestLabels = (best.c.labels ?? []).map((l) => l.toLowerCase());
-      const wasHead = bestLabels.includes("intro_candidate")
-        || (Number(best.c.start_time) || 0) < 1;
-      if (wasHead && best.score >= 110) introSelectionTier = "head_celebrity_interview";
-      else if (wasHead) introSelectionTier = "head_clip";
-      else if (best.score >= 70) introSelectionTier = "celebrity_interview";
-      else if (best.score >= 50) introSelectionTier = "celebrity_any";
-      else introSelectionTier = "source_title_match";
+  const ranked = clipsForMatch
+    .map((c) => ({ c, score: scoreIntroCandidate(c) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  function selectClip(clipId: string, score: number): void {
+    introClipId = clipId;
+    introClipScore = score;
+    const fullClip = clips.find((cc) => cc.id === clipId);
+    const cutDuration = fullClip
+      ? Math.max(0, (Number(fullClip.end_time) || 0) - (Number(fullClip.start_time) || 0))
+      : 5.5;
+    introClipDuration = Math.min(6, Math.max(5, cutDuration || 5.5));
+  }
+
+  if (ranked.length > 0) {
+    // Send up to 5 top heuristic candidates (with thumbnails) to Gemini.
+    // 5 is enough to give the verifier real choice without ballooning the
+    // request — most projects only have 2-3 plausible head-of-source clips
+    // anyway. Skip candidates with no thumbnail_url; the verifier can't see
+    // them. If after filtering we have nothing left, fall back to the top
+    // heuristic pick.
+    const TOP_N_FOR_VERIFY = 5;
+    const verifyInputs = ranked
+      .slice(0, TOP_N_FOR_VERIFY)
+      .map(({ c }) => {
+        const full = clips.find((cc) => cc.id === c.id);
+        return {
+          clipId: c.id,
+          thumbnailUrl: (full?.thumbnail_url as string | undefined) ?? "",
+          sourceTitle: c.source_title,
+          labels: c.labels ?? [],
+        };
+      })
+      .filter((x) => x.thumbnailUrl.length > 0);
+    introCandidateCount = verifyInputs.length;
+
+    if (mainCelebrity && verifyInputs.length > 0) {
+      const verdict = await verifyIntroCandidates(
+        mainCelebrity,
+        mainCelebritySex,
+        verifyInputs,
+      );
+      introVerifierReason = verdict.reason;
+      if (verdict.winnerClipId) {
+        const matched = ranked.find((r) => r.c.id === verdict.winnerClipId);
+        selectClip(verdict.winnerClipId, matched?.score ?? 0);
+        introSelectionTier = "verified";
+      }
+    }
+
+    // Gemini found no qualifying candidate (or we couldn't run it). Fall
+    // back to the top heuristic pick rather than shipping without an intro
+    // — the heuristic is wrong sometimes, but skipping the intro entirely
+    // is wrong every time.
+    if (!introClipId) {
+      const best = ranked[0];
+      selectClip(best.c.id, best.score);
+      introSelectionTier = "heuristic_fallback";
     }
   }
 
   await logJob({ projectId, jobId: mediaJobId }, "match.intro", {
     mainCelebrity: mainCelebrity ?? null,
+    mainCelebritySex,
     introClipId,
     introClipScore,
     introClipDuration,
     tier: introSelectionTier,
+    verifierReason: introVerifierReason,
     candidatesScored: clipsForMatch.length,
+    candidatesVerified: introCandidateCount,
+    heuristicRanked: ranked.length,
   });
 
   // Persist the intro selection on the project. Render step picks it up.
@@ -720,7 +768,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     "celebrity", "related_person", "company", "tv_show",
     "movie", "song", "place", "event", "life_event", "age",
   ];
-  const IMAGES_PER_ENTITY = 5;
+  // Per-entity fetch cap. Sized large enough that a handful of strong
+  // entities (celebrity + 2-3 related people + a show/company) can fill the
+  // ~90 image blocks of a 30-minute timeline on their own. Image search APIs
+  // happily return 10-15 results per query at no extra cost vs 5, and the
+  // dedup + anti-clustering steps downstream keep variety high.
+  const IMAGES_PER_ENTITY = 12;
 
   const imageBlockCount = items.filter((it) => it.type === "image").length;
 
@@ -1004,21 +1057,121 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
 
-  // Assign pool images to image blocks in timeline order. Each image is
-  // consumed at most once (pool dedup happens at fetch time by normalized
-  // URL). When the pool runs out, remaining blocks stay blank — the
-  // renderer skips blocks without an image_url.
+  // Second pass: if the strict (quoted) queries didn't fill the pool, retry
+  // with RELAXED queries — same entities, but unquoted and without the
+  // narrowing modifiers ("poster", "album cover", "logo"). Image-search
+  // engines treat unquoted multi-word inputs as "match any subset," which
+  // widens the candidate set substantially. We accept some loss of topical
+  // precision here in exchange for never leaving image blocks blank — a
+  // blank block gets DROPPED at render time, which shortens the final video
+  // below the voiceover length (the symptom this whole pass is designed to
+  // prevent). The first-pass strict queries already populated the pool with
+  // the highest-quality matches; this pass just backfills the tail.
+  if (pool.length < imageBlockCount) {
+    for (const ent of poolEntities) {
+      if (pool.length >= imageBlockCount) break;
+      // Drop quotes and trailing modifiers — the entity value alone, with
+      // the celebrity anchor where it helps (people-ish types only).
+      const value = ent.value.trim();
+      const subj = mainCelebrity ?? "";
+      let relaxedQuery: string;
+      switch (ent.type) {
+        case "celebrity":
+        case "related_person":
+          relaxedQuery = value;
+          break;
+        case "company":
+        case "tv_show":
+        case "movie":
+        case "song":
+        case "place":
+        case "event":
+          relaxedQuery = value;
+          break;
+        case "life_event":
+          relaxedQuery = subj ? `${subj} ${value}` : value;
+          break;
+        case "age":
+          relaxedQuery = subj || value;
+          break;
+        default:
+          relaxedQuery = subj && !value.toLowerCase().includes(subj.toLowerCase())
+            ? `${subj} ${value}`
+            : value;
+      }
+      poolFetchStats.entitiesQueried++;
+      try {
+        const fetched = await fetchImages(relaxedQuery, IMAGES_PER_ENTITY, {
+          entityType: ent.type,
+          // No imgType in the relaxed pass — even for companies, a
+          // photo/storefront/exec-shot beats a blank block.
+        });
+        if (fetched.length === 0) {
+          poolFetchStats.entitiesFailed++;
+          continue;
+        }
+        for (const f of fetched) {
+          if (poolUrlSet.has(f.url)) continue;
+          pool.push({ url: f.url, source: f.source, query: relaxedQuery, entityType: ent.type });
+          poolUrlSet.add(f.url);
+          if (pool.length >= imageBlockCount) break;
+        }
+      } catch (e) {
+        poolFetchStats.entitiesFailed++;
+        void logJob({ projectId, jobId: mediaJobId },
+          "match.image_fetch.failed", { query: relaxedQuery, relaxed: true, err: (e as Error).message });
+      }
+    }
+  }
+
+  // Third pass: if STILL short (no entities, or all queries failed), seed
+  // the pool with a bare celebrity-name query. A 30-minute video must not
+  // ship with dropped image blocks regardless of entity quality; the
+  // celebrity name is the one query we know is on-topic for the whole
+  // project.
+  if (pool.length < imageBlockCount && mainCelebrity) {
+    const need = imageBlockCount - pool.length;
+    poolFetchStats.entitiesQueried++;
+    try {
+      const fetched = await fetchImages(mainCelebrity, Math.max(IMAGES_PER_ENTITY, need + 4), {
+        entityType: "celebrity",
+      });
+      for (const f of fetched) {
+        if (poolUrlSet.has(f.url)) continue;
+        pool.push({ url: f.url, source: f.source, query: mainCelebrity, entityType: "celebrity" });
+        poolUrlSet.add(f.url);
+        if (pool.length >= imageBlockCount) break;
+      }
+    } catch (e) {
+      poolFetchStats.entitiesFailed++;
+      void logJob({ projectId, jobId: mediaJobId },
+        "match.image_fetch.failed", { query: mainCelebrity, finalFallback: true, err: (e as Error).message });
+    }
+  }
+
+  // Assign pool images to image blocks in timeline order.
   //
-  // Anti-clustering: don't place two images from the SAME entity back-to-
-  // back. Even when the URLs are distinct, two pictures of the same
-  // person/place in a row reads to viewers as "the editor showed me the
-  // same thing twice" (the duplicate-Rebecca complaint). We try to pick
-  // the next pool entry whose entity differs from the previous block's;
-  // if no such entry exists, we fall back to the first available — better
-  // a clustered image than a blank block.
+  // Two-tier policy:
+  //   Tier 1 — every image is used at most once. This is the preferred path
+  //            and runs as long as the pool still has unused entries.
+  //   Tier 2 — if the pool runs out before every image block is filled, we
+  //            REUSE images from the pool (least-recently-used first) so no
+  //            block is left blank. A reused image is invisible to most
+  //            viewers; a missing 60 s of video is not. The audio/video
+  //            duration contract is upheld unconditionally.
+  //
+  // Anti-clustering applies in both tiers: don't place two images from the
+  // SAME entity back-to-back. The picker tries to satisfy the no-cluster
+  // rule; if that's impossible we accept a cluster rather than a gap.
   const consumed = new Set<number>();
   let lastEntityKey: string | null = null;
-  function pickNextPoolIdx(): number {
+  // Last-used timestamp per pool index. Tier 2 picks the entry whose last
+  // use is OLDEST (and whose entity isn't equal to lastEntityKey when
+  // possible) so reuse is spread evenly across the pool rather than
+  // hammering pool[0]. Initialized to -1 (= never used).
+  const lastUsedAt: number[] = new Array(pool.length).fill(-1);
+  let useCounter = 0;
+  function pickFreshPoolIdx(): number {
     let fallback = -1;
     for (let i = 0; i < pool.length; i++) {
       if (consumed.has(i)) continue;
@@ -1028,23 +1181,56 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
     return fallback;
   }
+  function pickReusePoolIdx(): number {
+    if (pool.length === 0) return -1;
+    // Walk the pool sorted by lastUsedAt ascending; pick the first whose
+    // entity key differs from lastEntityKey. If none differs, return the
+    // oldest one anyway.
+    let bestDiff = -1;
+    let bestDiffAge = Number.POSITIVE_INFINITY;
+    let bestAny = -1;
+    let bestAnyAge = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < pool.length; i++) {
+      const age = lastUsedAt[i];
+      if (age < bestAnyAge) { bestAnyAge = age; bestAny = i; }
+      const key = `${pool[i].entityType}:${pool[i].query}`;
+      if (key !== lastEntityKey && age < bestDiffAge) {
+        bestDiffAge = age; bestDiff = i;
+      }
+    }
+    return bestDiff >= 0 ? bestDiff : bestAny;
+  }
+  let imagesReused = 0;
   for (const item of items) {
     if (item.type !== "image") continue;
-    const idx = pickNextPoolIdx();
-    if (idx < 0) break;
-    consumed.add(idx);
+    let idx = pickFreshPoolIdx();
+    if (idx < 0) {
+      // Fresh pool exhausted — fall back to reuse. pickFreshPoolIdx returns
+      // -1 only when every entry is in `consumed`; that's the trigger for
+      // Tier 2.
+      idx = pickReusePoolIdx();
+      if (idx < 0) break;                 // pool itself is empty — truly nothing to do
+      imagesReused++;
+    } else {
+      consumed.add(idx);
+    }
     const next = pool[idx];
     item.image_query = next.query;
     item.image_url = next.url;
     item.image_source = next.source;
     lastEntityKey = `${next.entityType}:${next.query}`;
+    lastUsedAt[idx] = useCounter++;
   }
 
   await logJob({ projectId, jobId: mediaJobId }, "match.image_fetch", {
     totalImageBlocks: imageBlockCount,
     poolSize: pool.length,
-    assigned: Math.min(pool.length, imageBlockCount),
-    leftBlank: Math.max(0, imageBlockCount - pool.length),
+    // Every image block now gets an image_url whenever pool.length > 0
+    // (reuse covers the shortfall). leftBlank is non-zero only in the
+    // truly-degenerate case where no entity produced any image at all.
+    assigned: pool.length > 0 ? imageBlockCount : 0,
+    imagesReused,
+    leftBlank: pool.length === 0 ? imageBlockCount : 0,
     entitiesAvailable: poolEntities.length,
     entitiesQueried: poolFetchStats.entitiesQueried,
     entitiesFailed: poolFetchStats.entitiesFailed,
@@ -1068,9 +1254,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   //   - Names: only on the FIRST clip that visibly depicts them, never again.
   //     "Depicts" is approximated by the clip's labels containing the name —
   //     this is what we have without a structured entity→clip linkage.
-  //   - Years / places: on every scored (non-filler) clip whose block mentions
-  //     one. We can't verify them in labels (a clip won't carry the label
-  //     "1956") so we trust the scored match.
+  //   - Years: on every scored clip whose block's spoken text mentions the
+  //     year — i.e. the narrator is saying it right now. blockEntities[i]
+  //     already comes from the transcript window over this block, so the
+  //     existing "block mentions a year" check is exactly that signal.
+  //   - Places: only when the clip VISUALLY depicts the place, not just when
+  //     narration name-drops it. Approximated by the place name appearing in
+  //     the clip's labels (case-insensitive substring), same shape as the
+  //     name sex-contradiction check below.
   // Only Tier-1 scored picks qualify; filler clips weren't chosen for entity
   // relevance, so labelling them would mislead the viewer.
   // Order matters — we walk items by position so "first occurrence" is the
@@ -1139,6 +1330,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
+        if (!labelStr.includes(ent.value.toLowerCase())) continue;
         pick = { text: ent.value, type: "place" };
         break;
       }

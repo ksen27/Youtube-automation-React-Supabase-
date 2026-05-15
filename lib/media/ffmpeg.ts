@@ -759,10 +759,22 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
       // and graft an amix that adds SFX on top, re-emitting [aout].
       // duration=first keys the final length to [aoutpre] (the voiceover/bg
       // mix) so SFX at the tail can't extend audio past the video.
-      const reroutedFilter = existingFilter.replace(/\[aout\]\s*$/, "[aoutpre]");
+      //
+      // Voiceover-only branch is special: it has no -filter_complex at all
+      // and maps 1:a:0 directly. In that case we have to synthesize the
+      // [aoutpre] label from 1:a:0 ourselves — otherwise the filter graph
+      // starts with a bare ";" (parsed as an empty filter → "No such filter:
+      // ''") and the amix references an undefined [aoutpre] label.
+      let baseFilter: string;
+      if (filterIdx >= 0) {
+        baseFilter = existingFilter.replace(/\[aout\]\s*$/, "[aoutpre]");
+      } else {
+        baseFilter = `[1:a:0]anull[aoutpre]`;
+        audioMap = ["-map", "0:v:0", "-map", "[aout]"];
+      }
       const newFilter =
-        reroutedFilter +
-        (reroutedFilter.endsWith(";") ? "" : ";") +
+        baseFilter +
+        (baseFilter.endsWith(";") ? "" : ";") +
         sfxGraph +
         `;[aoutpre][sfxmix]amix=inputs=2:duration=first:normalize=0[aout]`;
       if (filterIdx >= 0) {

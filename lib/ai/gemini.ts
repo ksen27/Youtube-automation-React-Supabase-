@@ -476,6 +476,168 @@ When visualCategory is anything other than "content", labels can be a single sho
   };
 }
 
+// ---------------------------------------------------------------------------
+// Intro candidate verification (Gemini Vision)
+// ---------------------------------------------------------------------------
+
+export interface IntroCandidateInput {
+  clipId: string;
+  thumbnailUrl: string;
+  sourceTitle: string | null;
+  labels: string[];
+}
+
+export interface IntroVerifyResult {
+  winnerClipId: string | null;
+  reason: string;
+  perCandidate: Array<{ clipId: string; showsCelebrity: boolean; confidence: number; note: string }>;
+}
+
+const IntroVerifySchema = z.object({
+  winner_clip_id: z.string().nullable(),
+  reason: z.string().default(""),
+  candidates: z.array(z.object({
+    clip_id: z.string(),
+    shows_celebrity: z.boolean(),
+    confidence: z.number().min(0).max(1),
+    note: z.string().default(""),
+  })).default([]),
+});
+
+async function fetchImageAsBase64(url: string): Promise<{ data: string; mimeType: string } | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const ct = res.headers.get("content-type") || "image/jpeg";
+    const mimeType = ct.startsWith("image/") ? ct.split(";")[0].trim() : "image/jpeg";
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { data: buf.toString("base64"), mimeType };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ask Gemini Vision to pick the intro clip that actually shows the named
+ * celebrity on camera. We send up to ~5 candidate thumbnails together with
+ * each clip's id, source title, and labels. Returns the winning clip_id, or
+ * null when no candidate clearly depicts the celebrity (caller skips intro).
+ *
+ * Why this exists:
+ *   The heuristic intro picker scores by source-title match + head-of-source
+ *   bonus + setting labels. It bypasses person-visibility gates for head
+ *   clips because the labeler frequently misses people in title frames — but
+ *   that bypass also lets actual title cards / wrong-speaker openings win.
+ *   This verifier looks at the frame itself and rejects those.
+ */
+export async function verifyIntroCandidates(
+  celebrityName: string,
+  celebritySex: "man" | "woman" | null,
+  candidates: IntroCandidateInput[],
+): Promise<IntroVerifyResult> {
+  if (candidates.length === 0) {
+    return { winnerClipId: null, reason: "no candidates", perCandidate: [] };
+  }
+  const env = getEnv();
+  if (!env.GEMINI_API_KEY) {
+    return { winnerClipId: null, reason: "GEMINI_API_KEY not configured", perCandidate: [] };
+  }
+
+  // Fetch all thumbnails in parallel. Skip any that fail to load — Gemini
+  // gets the remaining set and decides among those.
+  const fetched = await Promise.all(
+    candidates.map(async (c) => {
+      const img = await fetchImageAsBase64(c.thumbnailUrl);
+      return img ? { ...c, image: img } : null;
+    }),
+  );
+  const usable = fetched.filter((x): x is NonNullable<typeof x> => x !== null);
+  if (usable.length === 0) {
+    return { winnerClipId: null, reason: "all thumbnails failed to load", perCandidate: [] };
+  }
+
+  const sexHint = celebritySex
+    ? ` (apparent sex from context: ${celebritySex})`
+    : "";
+  const prompt = `You are picking the intro shot for a celebrity documentary.
+The intro must clearly show ${celebrityName}${sexHint} on camera — ideally speaking, but a clean on-camera shot is acceptable. The clip's audio will be the audio from this exact frame's source video.
+
+Reject candidates that are:
+- Title cards, channel logos, watermarks, or end-screens
+- Wide establishing shots with no recognizable person in frame
+- Other speakers (host, narrator, family member) instead of ${celebrityName}
+- Objects, scenery, or B-roll with no person
+
+You do NOT need a photographic ID of ${celebrityName}. You DO need to see a real person on camera in a way consistent with the supplied sex hint and the source video's topic. When several candidates look like valid on-camera shots of the subject, prefer the one that most looks like an interview / speaking moment.
+
+For each candidate, set "shows_celebrity" to true ONLY if the frame plausibly depicts ${celebrityName} on camera. Pick exactly one "winner_clip_id" from among the ones marked true — or null if NONE qualify.
+
+Return STRICT JSON ONLY:
+{
+  "winner_clip_id": "<clip_id>" | null,
+  "reason": "one short sentence",
+  "candidates": [
+    { "clip_id": "...", "shows_celebrity": true|false, "confidence": 0.0-1.0, "note": "short note" }
+  ]
+}
+
+CANDIDATES (id | source_title | labels):
+${usable.map((c) => `${c.clipId} | ${c.sourceTitle ?? "?"} | ${(c.labels ?? []).join(", ")}`).join("\n")}
+
+Each candidate's thumbnail follows in the same order.`;
+
+  const model = getModel();
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
+    { text: prompt },
+  ];
+  for (const c of usable) {
+    parts.push({ inlineData: { mimeType: c.image.mimeType, data: c.image.data } });
+  }
+
+  let txt: string;
+  try {
+    const res = await withGeminiRetry(
+      "verifyIntro",
+      () => model.generateContent({
+        contents: [{ role: "user", parts }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      }),
+      { attempts: 2, baseMs: 500 },
+    );
+    txt = res.response.text();
+  } catch (e) {
+    return {
+      winnerClipId: null,
+      reason: `gemini_failed: ${(e as Error).message.slice(0, 120)}`,
+      perCandidate: [],
+    };
+  }
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch {
+    return { winnerClipId: null, reason: "parse_failed", perCandidate: [] };
+  }
+  const safe = IntroVerifySchema.safeParse(parsed);
+  if (!safe.success) {
+    return { winnerClipId: null, reason: "schema_failed", perCandidate: [] };
+  }
+
+  const usableIds = new Set(usable.map((c) => c.clipId));
+  const winner = safe.data.winner_clip_id && usableIds.has(safe.data.winner_clip_id)
+    ? safe.data.winner_clip_id
+    : null;
+  return {
+    winnerClipId: winner,
+    reason: safe.data.reason || (winner ? "verified" : "no candidate qualified"),
+    perCandidate: safe.data.candidates.map((c) => ({
+      clipId: c.clip_id,
+      showsCelebrity: c.shows_celebrity,
+      confidence: c.confidence,
+      note: c.note,
+    })),
+  };
+}
+
 /**
  * Score every (section, clip) pair so the assignment step can pick the
  * highest-scoring UNUSED clip per section and break ties properly.
