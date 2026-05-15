@@ -7,6 +7,7 @@ import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, applyEdgeFade, IMAGE_XFADE_PALETTE } from "@/lib/media/ffmpeg";
+import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
 
@@ -415,6 +416,45 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // (a) Download silent intro video, trim, normalize, prepend to list.
         const introVideoLocal = path.join(tmp, "intro_in.mp4");
         await downloadHttp(introClip.clip_url as string, introVideoLocal);
+
+        // Scene-boundary clamp: if a hard cut falls inside the visible
+        // intro window, shorten the intro so it ends just before the cut.
+        // Without this, the rendered intro showed the real opening shot for
+        // the first ~3s and then jumped to whatever came next in the source
+        // (the "0–3s intro, 4–5s different footage" symptom). We keep a 5s
+        // floor — going below the spec minimum would defeat the point of
+        // having an intro. If the first shot is shorter than 5s we accept
+        // the small overflow and log it so the operator can investigate.
+        try {
+          const sceneCuts = await detectSceneTimestamps({ inputPath: introVideoLocal });
+          const firstCutInside = sceneCuts.find((t) => t > 0.5 && t < introDurationActual);
+          if (firstCutInside !== undefined) {
+            const SHOT_TAIL_BUFFER = 0.1;
+            const candidate = firstCutInside - SHOT_TAIL_BUFFER;
+            if (candidate >= 5) {
+              introDurationActual = Math.round(candidate * 10) / 10;
+              await logJob({ projectId, jobId: mediaJobId },
+                "render.intro.scene_clamp", {
+                  declaredDur,
+                  introDurationActual,
+                  firstCutInside,
+                });
+            } else {
+              await logJob({ projectId, jobId: mediaJobId },
+                "render.intro.scene_clamp_skipped", {
+                  declaredDur,
+                  introDurationActual,
+                  firstCutInside,
+                  reason: "first shot shorter than 5s floor",
+                });
+            }
+          }
+        } catch (e) {
+          // Scene-detect failures are non-fatal — keep the original duration.
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.intro.scene_clamp_failed", { err: (e as Error).message });
+        }
+
         const introTrimmed = path.join(tmp, "intro_trim.mp4");
         await cutClip({
           inputPath: introVideoLocal,

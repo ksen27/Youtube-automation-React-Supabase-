@@ -210,14 +210,35 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           });
           continue;
         }
+        const rejectTally: Record<string, number> = {};
+        let accepted = 0;
+        let dupes = 0;
         for (const c of cands) {
-          if (seenVideo.has(c.videoId)) continue;
+          if (seenVideo.has(c.videoId)) { dupes++; continue; }
           const ranked = rankCandidate({
             candidate: c, mainCelebrity, keywords: segKeywords,
             approvedChannelIds: approved, blockedChannelIds: blocked,
             intentType,
           });
-          if (ranked.rejected) continue;     // keep the preview clean
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand", {
+            segment: i,
+            query: intent.query,
+            intentType,
+            videoId: c.videoId,
+            title: c.title.slice(0, 100),
+            channelTitle: c.channelTitle,
+            durationSeconds: c.durationSeconds,
+            score: ranked.score,
+            rejected: ranked.rejected,
+            rejectReason: ranked.rejectReason ?? null,
+            reasons: ranked.reasons,
+          });
+          if (ranked.rejected) {
+            const k = ranked.rejectReason ?? "unknown";
+            rejectTally[k] = (rejectTally[k] ?? 0) + 1;
+            continue;
+          }
+          accepted++;
           seenVideo.add(c.videoId);
           segCandidates.push({
             videoId: c.videoId,
@@ -232,6 +253,17 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
             rejected: false,
           });
         }
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.query.summary", {
+          segment: i,
+          query: intent.query,
+          intentType,
+          mainCelebrity: mainCelebrity ?? null,
+          keywords: segKeywords,
+          fetched: cands.length,
+          accepted,
+          dupes,
+          rejected: rejectTally,
+        });
       }
       segCandidates.sort((a, b) => b.score - a.score);
       const segDuration = Math.max(0, seg.endSeconds - seg.startSeconds);

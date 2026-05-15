@@ -212,20 +212,40 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   }
   const mainCelebritySex = mainCelebrity ? inferPersonSex(mainCelebrity) : null;
 
-  function scoreIntroCandidate(c: { id: string; labels?: string[]; source_title: string | null }): number {
+  function scoreIntroCandidate(c: ClipForMatch): number {
     const labelStr = (c.labels ?? []).join(" ").toLowerCase();
-    // Gate 1: hard reject if labels suggest no-person object content.
-    if (NOT_PERSON_RE.test(labelStr)) return 0;
-    // Gate 2: must have at least one person-visible token.
-    if (!PERSON_VISIBLE_RE.test(labelStr)) return 0;
-    // Gate 3: when we inferred the main celebrity's sex, reject clips
-    // whose visible-attribute labels clearly contradict it. This is the
-    // primary defense against picking a spouse/co-host of the opposite
-    // sex from the same source video.
-    if (mainCelebritySex === "woman" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr)) return 0;
-    if (mainCelebritySex === "man" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr)) return 0;
+    // The clip stage tags the head-of-source window (start ~ 0s) so the
+    // matcher can prefer it. Head clips contain the actual opening shot,
+    // which is what we want as an intro — both for picture and for the
+    // audio the renderer cuts from the same window.
+    const isIntroCandidate =
+      (c.labels ?? []).some((l) => l.toLowerCase() === "intro_candidate")
+      || (Number(c.start_time) || 0) < 1;
+    // Intro-head clips bypass the person-visible / sex-agreement gates:
+    // the labeler runs on a single thumbnail and frequently misses the
+    // celebrity in the first frame (a title card, a wide shot, a logo).
+    // Those clips are still the right pick because the AUDIO under them
+    // is the celebrity's intro voice — which is the symptom we're fixing.
+    if (!isIntroCandidate) {
+      // Gate 1: hard reject if labels suggest no-person object content.
+      if (NOT_PERSON_RE.test(labelStr)) return 0;
+      // Gate 2: must have at least one person-visible token.
+      if (!PERSON_VISIBLE_RE.test(labelStr)) return 0;
+      // Gate 3: when we inferred the main celebrity's sex, reject clips
+      // whose visible-attribute labels clearly contradict it. This is the
+      // primary defense against picking a spouse/co-host of the opposite
+      // sex from the same source video.
+      if (mainCelebritySex === "woman" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr)) return 0;
+      if (mainCelebritySex === "man" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr)) return 0;
+    }
 
     let score = 0;
+    // Strong preference for intro-head clips. The bonus is sized to dominate
+    // the setting/sex/interview signals (max ~100) so a head clip from the
+    // celebrity's source always outranks a mid-source interview clip; a head
+    // clip from an unrelated source still loses to a celebrity-source
+    // interview clip because it gets the head bonus but no source-title bonus.
+    if (isIntroCandidate) score += 60;
     if (mainCelebrity) {
       // Source title is the only celebrity-name signal left now that
       // labels are name-free by design. It's weak — source titles often
@@ -251,7 +271,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let introClipId: string | null = null;
   let introClipScore = 0;
   let introClipDuration = 0;
-  let introSelectionTier: "celebrity_interview" | "celebrity_any" | "source_title_match" | "skipped" = "skipped";
+  let introSelectionTier:
+    | "head_celebrity_interview"
+    | "head_clip"
+    | "celebrity_interview"
+    | "celebrity_any"
+    | "source_title_match"
+    | "skipped" = "skipped";
   {
     const ranked = clipsForMatch
       .map((c) => ({ c, score: scoreIntroCandidate(c) }))
@@ -269,11 +295,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         ? Math.max(0, (Number(fullClip.end_time) || 0) - (Number(fullClip.start_time) || 0))
         : 5.5;
       introClipDuration = Math.min(6, Math.max(5, cutDuration || 5.5));
-      // Classify which tier won. Used only for diagnostics.
-      // New score ceiling is 100 (30 source-title + 20 sex + 30 setting +
-      // 20 interview label). Tiers: >=70 = source title + sex + interview;
-      // >=50 = source title + setting OR sex + interview/setting; below = weaker.
-      if (best.score >= 70) introSelectionTier = "celebrity_interview";
+      // Diagnostic tier. Score ceiling is now 160 (60 head + 30 source title
+      // + 20 sex + 30 setting + 20 interview).
+      const bestLabels = (best.c.labels ?? []).map((l) => l.toLowerCase());
+      const wasHead = bestLabels.includes("intro_candidate")
+        || (Number(best.c.start_time) || 0) < 1;
+      if (wasHead && best.score >= 110) introSelectionTier = "head_celebrity_interview";
+      else if (wasHead) introSelectionTier = "head_clip";
+      else if (best.score >= 70) introSelectionTier = "celebrity_interview";
       else if (best.score >= 50) introSelectionTier = "celebrity_any";
       else introSelectionTier = "source_title_match";
     }

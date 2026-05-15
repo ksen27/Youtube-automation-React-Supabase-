@@ -126,6 +126,23 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
     timestampSource = "uniform";
   }
 
+  // Reserve a head-of-source window (t=0) as a dedicated intro candidate.
+  // The general-purpose timestamps above all skip the first 10 s to avoid
+  // channel bumpers, which means the matcher's intro selector has nothing
+  // from the actual opening shot to choose from — so the rendered intro
+  // ended up being a mid-source clip with a narrator's voice instead of
+  // the celebrity's. We prepend index 0 here, dedup against any general
+  // timestamp that happens to also fall at 0, and tag the resulting clip
+  // so the matcher can prefer it.
+  const INTRO_CANDIDATE_LABEL = "intro_candidate";
+  const introHeadStart = 0;
+  const introTimestampIndex = (() => {
+    if (vs.duration_seconds < CLIP_DURATION_SECONDS + 1) return -1;
+    if (timestamps.some((t) => Math.abs(t - introHeadStart) < 0.5)) return -1;
+    timestamps.unshift(introHeadStart);
+    return 0;
+  })();
+
   await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
     "clip.plan", {
       count: timestamps.length,
@@ -138,6 +155,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       existingCount,
       timestampSource,
       sceneCount,
+      introHeadAdded: introTimestampIndex >= 0,
     });
 
   const clipsTmp = await ensureTmp(`clips/${vs.youtube_video_id}`);
@@ -160,6 +178,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // block the upload from starting; if the labeler decides the frame is junk
   // we delete the just-uploaded objects (cheap, rare).
   async function processOne(i: number, start: number): Promise<void> {
+    const isIntroHead = i === introTimestampIndex;
     const dur = CLIP_DURATION_SECONDS;
     const idx = String(i).padStart(3, "0");
     const clipLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}.mp4`);
@@ -192,7 +211,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
 
       const [visionLabels, [clipUp, thumbUp]] = await Promise.all([labelPromise, uploadPromise]);
 
-      if (visionLabels && isJunkCategory(visionLabels.visualCategory)) {
+      if (visionLabels && isJunkCategory(visionLabels.visualCategory) && !isIntroHead) {
         droppedJunk++;
         junkCategoryCounts[visionLabels.visualCategory] =
           (junkCategoryCounts[visionLabels.visualCategory] ?? 0) + 1;
@@ -217,6 +236,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
         if (visionLabels.primarySubject) labelSet.add(`subject: ${visionLabels.primarySubject}`);
         if (visionLabels.setting) labelSet.add(`setting: ${visionLabels.setting}`);
       }
+      if (isIntroHead) labelSet.add(INTRO_CANDIDATE_LABEL);
       const labels = Array.from(labelSet);
       await sb.from("video_clips").insert({
         project_id: projectId,
