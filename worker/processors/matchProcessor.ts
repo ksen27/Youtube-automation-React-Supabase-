@@ -1106,19 +1106,26 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
       const key = ent.value.toLowerCase();
       if (introducedNames.has(key)) continue;
-      // Verify the clip plausibly depicts this person. Labels no longer
-      // carry names (the labeler is forbidden from emitting them), so we
-      // fall back to sex agreement: infer the person's sex from transcript
-      // pronouns, then require the clip's visible-attribute labels not to
-      // contradict it. If we can't infer the person's sex (no pronouns
-      // near the name), we skip rather than burn in a possibly-wrong
-      // lower-third — a missing name is better than a wrong one.
+      // We trust the matcher's block→clip assignment as evidence the clip
+      // is about this person — that's the whole point of having scored it
+      // into this footage block. Earlier versions required sex-agreement
+      // confirmation from labels before burning in the name, which dropped
+      // most main-character overlays whenever Gemini's labeler didn't
+      // tag a man/woman cue (very common for vehicle/B-roll shots) or
+      // when no pronouns sat near the name in transcript.
+      //
+      // Safety net: if we CAN infer the person's sex from transcript
+      // pronouns AND the labels directly contradict it (woman-name on a
+      // clip tagged "man" with no "woman" cue, or vice versa), skip.
+      // This catches the obvious wrong-face-with-name case without
+      // requiring positive confirmation.
       const personSex = inferPersonSex(ent.value);
-      if (!personSex) continue;
-      const sexMatches =
-        (personSex === "woman" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr)) ||
-        (personSex === "man" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr));
-      if (!sexMatches) continue;
+      if (personSex) {
+        const contradicts =
+          (personSex === "woman" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr)) ||
+          (personSex === "man" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr));
+        if (contradicts) continue;
+      }
       pick = { text: ent.value, type: "name" };
       break;
     }

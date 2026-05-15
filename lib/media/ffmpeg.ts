@@ -304,7 +304,7 @@ async function resolveLowerThirdFont(): Promise<string | null> {
 // and a translucent bar. Pinned to the lower-third zone (≈ 78% of frame
 // height), 36px bold text with a black drop-shadow for legibility against
 // busy footage. Returns null if no font is available on the host.
-async function buildLowerThirdFilter(text: string, width: number, height: number): Promise<string | null> {
+async function buildLowerThirdFilter(text: string, height: number): Promise<string | null> {
   const font = await resolveLowerThirdFont();
   if (!font) return null;
   // Show for the first 3 seconds of the clip with 0.4s fade in/out. The
@@ -323,18 +323,23 @@ async function buildLowerThirdFilter(text: string, width: number, height: number
   const fontPath = font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:");
   const escaped = escapeDrawtextValue(text);
 
-  // Bar geometry: full-width translucent black behind the text, 90px tall,
-  // sitting ~78% down the frame. drawbox uses the same alpha expression so
-  // bar + text fade together as one element.
-  const barY = Math.round(height * 0.78);
-  const textY = barY + 22;
+  // Text sits in the lower-third zone (~80% of frame height). No background
+  // bar: per client direction, the overlay is text-only. Legibility on busy
+  // footage comes from a thick black border around each glyph plus a small
+  // dark drop-shadow — drawtext's `shadowcolor` + `shadowx`/`shadowy` paints
+  // an offset shadow so the red doesn't disappear over bright frames.
+  const textY = Math.round(height * 0.80);
   const fontsize = Math.round(height / 20);  // 36 at 720p
 
+  // Text color: red (#FF3030) to match the client's "highlighted in red"
+  // script convention. Border is thicker now that there's no bar behind it,
+  // and a shadow gives a bit of depth so the text still reads on a bright
+  // background (sky, light car body, etc.).
   return (
-    `drawbox=x=0:y=${barY}:w=${width}:h=90:color=black@0.55:t=fill:enable='between(t,${start},${end})',` +
     `drawtext=fontfile='${fontPath}':text='${escaped}':` +
-    `fontcolor=white:fontsize=${fontsize}:` +
-    `borderw=2:bordercolor=black@0.85:` +
+    `fontcolor=0xFF3030:fontsize=${fontsize}:` +
+    `borderw=4:bordercolor=black@0.9:` +
+    `shadowcolor=black@0.8:shadowx=2:shadowy=2:` +
     `x=60:y=${textY}:` +
     `alpha=${alphaExpr}`
   );
@@ -357,7 +362,7 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   // exactly between normalizeClip() and buildStillVideo() for -c copy to work.
   let vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`;
   if (opts.lowerThird?.text) {
-    const lt = await buildLowerThirdFilter(opts.lowerThird.text, w, h);
+    const lt = await buildLowerThirdFilter(opts.lowerThird.text, h);
     // If the host has no usable font, ship the clip without the overlay
     // rather than failing the render. The match.lower_thirds log already
     // tells operators a lower-third was requested.
@@ -588,6 +593,14 @@ export interface ConcatOptions {
   // padded to its start time via adelay, then merged into the existing
   // voiceover/bg-music output.
   sfxCues?: SfxCue[];
+  // Outro audio fade in seconds. When set, the final audio mix fades to
+  // silence over the last `outroFadeSeconds` of the output. The video-side
+  // fade-to-black is applied by the caller before concat (so concat can keep
+  // the cheap -c:v copy mux), but the audio fade lives here because the mix
+  // graph is the only place the final track exists. Caller must pass the
+  // total output duration so afade knows when to start.
+  outroFadeSeconds?: number;
+  outroFadeStartSeconds?: number;
   signal?: AbortSignal;
 }
 
@@ -778,6 +791,42 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
       args.push("-filter_complex", filter);
       audioMap = ["-map", "0:v:0", "-map", "[aout]"];
       hasAudioOutput = true;
+    }
+  }
+
+  // Outro audio fade: apply afade to the final audio output so the mix
+  // doesn't get hard-cut by -shortest at the same moment the video fades
+  // to black. Two cases:
+  //   1) There's already a -filter_complex (every branch except voiceover-
+  //      only-no-SFX). Rewire its [aout] label to [aoutpre2] and append
+  //      afade — same splice pattern the SFX path uses.
+  //   2) Voiceover-only-no-SFX maps 1:a:0 directly. Add a tiny graph that
+  //      fades input 1's audio and remap to [aout].
+  // No-op when outroFadeSeconds or outroFadeStartSeconds is missing/zero,
+  // or when there's no audio output to fade.
+  const outroFade = Math.max(0, opts.outroFadeSeconds ?? 0);
+  const outroFadeStart = Math.max(0, opts.outroFadeStartSeconds ?? 0);
+  if (outroFade > 0 && hasAudioOutput && outroFadeStart > 0) {
+    const filterIdx2 = args.indexOf("-filter_complex");
+    if (filterIdx2 >= 0) {
+      const existing = args[filterIdx2 + 1];
+      const rerouted = existing.replace(/\[aout\]\s*$/, "[aoutpre2]");
+      args[filterIdx2 + 1] =
+        rerouted +
+        (rerouted.endsWith(";") ? "" : ";") +
+        `[aoutpre2]afade=t=out:st=${outroFadeStart}:d=${outroFade}[aout]`;
+    } else {
+      // Voiceover-only-no-SFX. Build a tiny graph and rewire audioMap.
+      args.push(
+        "-filter_complex",
+        `[1:a]afade=t=out:st=${outroFadeStart}:d=${outroFade}[aout]`,
+      );
+      for (let k = 0; k < audioMap.length - 1; k++) {
+        if (audioMap[k] === "-map" && audioMap[k + 1] === "1:a:0") {
+          audioMap[k + 1] = "[aout]";
+          break;
+        }
+      }
     }
   }
 

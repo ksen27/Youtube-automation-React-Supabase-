@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, xfadeFadeBlack, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
@@ -577,6 +577,41 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         gain: sfxGain,
       });
     }
+
+    // Outro polish: fade the last segment's tail to black and fade the final
+    // audio mix down in parallel so the video doesn't hard-cut on the
+    // voiceover's last word. We re-encode only the last segment (one short
+    // libx264 pass) so the concat itself still uses cheap -c:v copy.
+    //
+    // The intro (if any) sits at index 0 in `normalized`, so the last entry
+    // is always normalized[normalized.length - 1] regardless of intro state.
+    // mergedDurations tracks the rendered timeline length (excluding intro);
+    // total output duration = introDurationActual + sum(mergedDurations).
+    const OUTRO_FADE_SECONDS = 1.5;
+    const lastIdx = normalized.length - 1;
+    const lastSegDur = mergedDurations[mergedDurations.length - 1] ?? 0;
+    let outroFadeStartSeconds = 0;
+    if (lastSegDur > OUTRO_FADE_SECONDS) {
+      const fadedLast = path.join(tmp, "outro_fade.mp4");
+      try {
+        await applyEdgeFade({
+          inputPath: normalized[lastIdx],
+          outputPath: fadedLast,
+          inputDurationSeconds: lastSegDur,
+          fadeOutSeconds: OUTRO_FADE_SECONDS,
+          fps: 30,
+        });
+        await safeUnlink(normalized[lastIdx]);
+        normalized[lastIdx] = fadedLast;
+        const totalDur = introDurationActual + mergedDurations.reduce((a, b) => a + b, 0);
+        outroFadeStartSeconds = Math.max(0, totalDur - OUTRO_FADE_SECONDS);
+      } catch (e) {
+        // Fade failure shouldn't kill the render — ship without the polish.
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.outro_fade.failed", { err: (e as Error).message });
+      }
+    }
+
     await concatNormalizedClips({
       inputPaths: normalized,
       outputPath: finalLocal,
@@ -587,6 +622,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       introAudioPath,
       introDurationSeconds: introDurationActual || undefined,
       sfxCues,
+      outroFadeSeconds: outroFadeStartSeconds > 0 ? OUTRO_FADE_SECONDS : undefined,
+      outroFadeStartSeconds: outroFadeStartSeconds > 0 ? outroFadeStartSeconds : undefined,
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
