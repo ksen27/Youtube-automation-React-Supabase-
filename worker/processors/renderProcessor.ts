@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, xfadeFadeBlack, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
@@ -249,50 +249,44 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // and SFX-file rotation are wired in after fetching the project row.
     const sfxOffsetsAtBoundary: number[] = [];
 
-    // Helper: replace the tail of the last entry with a faded version. The
-    // input file is unlinked after a successful re-encode. Falls back to
-    // leaving the original in place on failure.
-    async function fadeLastTail(reason: string, idx: number): Promise<void> {
-      if (mergedSegments.length === 0) return;
+    // Helper: merge the previous segment with `seg` through a single
+    // dip-to-black xfade pass. Replaces the older two-pass approach
+    // (fade tail of A in one ffmpeg call, fade head of B in another) with
+    // xfade's `fadeblack` transition — same visual result, half the encode
+    // work per mixed boundary. On failure we fall back to a hard cut so one
+    // boundary glitch doesn't kill the render.
+    async function mergeMixedBoundary(seg: string, segKind: SegKind, idx: number): Promise<boolean> {
+      if (mergedSegments.length === 0) return false;
       const j = mergedSegments.length - 1;
-      const src = mergedSegments[j];
-      const srcDur = mergedDurations[j];
-      const out = path.join(tmp, `fade_tail_${String(idx).padStart(3, "0")}.mp4`);
+      const a = mergedSegments[j];
+      const aDur = mergedDurations[j];
+      const out = path.join(tmp, `mixfade_${String(idx).padStart(3, "0")}.mp4`);
       try {
-        await applyEdgeFade({
-          inputPath: src,
+        await xfadeFadeBlack({
+          inputAPath: a,
+          inputBPath: seg,
           outputPath: out,
-          inputDurationSeconds: srcDur,
-          fadeOutSeconds: MIXED_FADE_SECONDS,
+          inputADurationSeconds: aDur,
+          transitionDurationSeconds: MIXED_FADE_SECONDS,
           fps: 30,
         });
         mergedSegments[j] = out;
-        await safeUnlink(src);
+        // xfade output length = aDur + segDur - transitionDuration. Total
+        // visible content time matches the planned timeline because the
+        // image side already baked MIXED_FADE_SECONDS / 2 of headroom.
+        mergedDurations[j] = aDur + slotDurations[idx] - MIXED_FADE_SECONDS;
+        // Kind tracks what plays AFTER the transition midpoint — i.e. the
+        // incoming segment — so the next boundary decision sees the right
+        // neighbor type.
+        mergedKinds[j] = segKind;
         mixedFades++;
-      } catch (e) {
-        await logJob({ projectId, jobId: mediaJobId },
-          "render.edge_fade.failed", { idx, side: "tail", reason, err: (e as Error).message });
-      }
-    }
-
-    // Helper: replace `seg` with a head-faded version before appending.
-    async function fadeHead(seg: string, segDur: number, idx: number): Promise<string> {
-      const out = path.join(tmp, `fade_head_${String(idx).padStart(3, "0")}.mp4`);
-      try {
-        await applyEdgeFade({
-          inputPath: seg,
-          outputPath: out,
-          inputDurationSeconds: segDur,
-          fadeInSeconds: MIXED_FADE_SECONDS,
-          fps: 30,
-        });
+        await safeUnlink(a);
         await safeUnlink(seg);
-        mixedFades++;
-        return out;
+        return true;
       } catch (e) {
         await logJob({ projectId, jobId: mediaJobId },
-          "render.edge_fade.failed", { idx, side: "head", err: (e as Error).message });
-        return seg;
+          "render.mixed_fade.failed", { idx, err: (e as Error).message });
+        return false;
       }
     }
 
@@ -352,13 +346,18 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         (itemKind === "image" && prevKind === "video") ||
         (itemKind === "video" && prevKind === "image")
       ) {
-        // image↔video boundary: fade prev's tail to black, then fade this
-        // segment's head from black, and append separately.
-        await fadeLastTail("mixed_boundary", i);
-        const faded = await fadeHead(seg, slotDurations[i], i);
-        mergedSegments.push(faded);
-        mergedDurations.push(slotDurations[i]);
-        mergedKinds.push(itemKind);
+        // image↔video boundary: merge A and B through a single dip-to-black
+        // xfade. One libx264 pass instead of the old tail-then-head pair.
+        // The merged segment replaces the previous entry in place (just like
+        // image→image), so the next boundary decision sees this transition's
+        // incoming kind as its `prevKind`.
+        const merged = await mergeMixedBoundary(seg, itemKind, i);
+        if (!merged) {
+          // Fall back to a hard cut. Visible jump but render still completes.
+          mergedSegments.push(seg);
+          mergedDurations.push(slotDurations[i]);
+          mergedKinds.push(itemKind);
+        }
       } else {
         // First segment, or video↔video — hard cut, append as-is.
         mergedSegments.push(seg);
