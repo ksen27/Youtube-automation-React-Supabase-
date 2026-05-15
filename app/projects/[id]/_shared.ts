@@ -9,6 +9,8 @@ export interface ProjectResp {
     voiceover_url: string | null;
     bg_music_url: string | null;
     bg_music_gain: number;
+    sfx_urls: string[];
+    sfx_gain: number;
     status: string;
     created_at: string;
     updated_at: string;

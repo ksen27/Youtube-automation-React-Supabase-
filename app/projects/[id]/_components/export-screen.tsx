@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Loader2, Music, RefreshCw, Trash2 } from "lucide-react";
+import { Download, Loader2, Music, RefreshCw, Trash2, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -112,6 +112,15 @@ export function ExportScreen({
         // Remount when the upload URL changes so the local volume state
         // resyncs to whatever the server stored for the new file.
         key={projectQ.data?.project?.bg_music_url ?? "none"}
+        projectId={projectId}
+        project={projectQ.data?.project}
+        disabled={isRunning}
+      />
+
+      <SfxCard
+        // Remount when the list length changes so the upload input resets
+        // and the local gain state resyncs to the server.
+        key={`sfx-${projectQ.data?.project?.sfx_urls?.length ?? 0}`}
         projectId={projectId}
         project={projectQ.data?.project}
         disabled={isRunning}
@@ -303,6 +312,168 @@ function BgMusicCard({
                 )}
                 Remove
               </Button>
+              {saveGain.isPending && (
+                <span className="text-xs text-fg-muted">Saving…</span>
+              )}
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SfxCard({
+  projectId,
+  project,
+  disabled,
+}: {
+  projectId: string;
+  project: ProjectResp["project"] | undefined;
+  disabled: boolean;
+}) {
+  const qc = useQueryClient();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Mirrors BgMusicCard's responsive-slider pattern. Default 0.7 sits
+  // between bg music (~0.15) and voiceover (~1.0). The parent remounts
+  // this component when the list length changes, so the initial gain
+  // resyncs to the server on add/remove.
+  const initialGain = project?.sfx_gain ?? 0.7;
+  const [gainPct, setGainPct] = useState(() => Math.round(initialGain * 100));
+
+  const urls = project?.sfx_urls ?? [];
+
+  const upload = useMutation({
+    mutationFn: async (file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch(`/api/projects/${projectId}/sfx`, {
+        method: "POST",
+        body: fd,
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
+      return r.json();
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["project", projectId] });
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    },
+  });
+
+  const removeOne = useMutation({
+    mutationFn: async (url: string) => {
+      const r = await fetch(
+        `/api/projects/${projectId}/sfx?url=${encodeURIComponent(url)}`,
+        { method: "DELETE" },
+      );
+      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
+      return r.json();
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+  });
+
+  const saveGain = useMutation({
+    mutationFn: async (value: number) => {
+      const r = await fetch(`/api/projects/${projectId}/sfx`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sfx_gain: value }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
+      return r.json();
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+  });
+
+  const uploading = upload.isPending;
+  const busy = disabled || uploading || removeOne.isPending;
+  const hasAny = urls.length > 0;
+
+  return (
+    <Card aria-disabled={busy} className={busy ? "opacity-80" : undefined}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Volume2 className="h-4 w-4 text-fg-muted" />
+          Transition sound effects
+        </CardTitle>
+        <CardDescription>
+          Optional clicks or swipes layered onto image transitions. Fires on
+          every 3rd image transition and rotates through the uploaded files.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="sfx-file">Add an SFX clip</Label>
+          <Input
+            id="sfx-file"
+            ref={fileInputRef}
+            type="file"
+            accept="audio/*"
+            disabled={busy}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) upload.mutate(f);
+            }}
+          />
+        </div>
+
+        {uploading && (
+          <div className="flex items-center gap-2 text-xs text-fg-muted">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Uploading…
+          </div>
+        )}
+        {upload.error && (
+          <p className="text-xs text-danger">{(upload.error as Error).message}</p>
+        )}
+        {removeOne.error && (
+          <p className="text-xs text-danger">{(removeOne.error as Error).message}</p>
+        )}
+
+        {hasAny && (
+          <>
+            <ul className="space-y-2">
+              {urls.map((url, i) => (
+                <li
+                  key={url}
+                  className="flex items-center gap-2 rounded-md border border-border bg-bg-elevated p-2"
+                >
+                  <span className="text-xs tabular-nums text-fg-subtle w-6 text-center">
+                    {i + 1}
+                  </span>
+                  <audio controls src={url} className="flex-1 min-w-0" />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => removeOne.mutate(url)}
+                    disabled={busy}
+                    aria-label="Remove SFX clip"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </li>
+              ))}
+            </ul>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="sfx-vol">Volume</Label>
+                <span className="text-xs tabular-nums text-fg-muted">{gainPct}%</span>
+              </div>
+              <input
+                id="sfx-vol"
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={gainPct}
+                disabled={busy}
+                onChange={(e) => setGainPct(Number(e.target.value))}
+                onMouseUp={() => saveGain.mutate(gainPct / 100)}
+                onTouchEnd={() => saveGain.mutate(gainPct / 100)}
+                onKeyUp={() => saveGain.mutate(gainPct / 100)}
+                className="w-full accent-brand-300"
+              />
               {saveGain.isPending && (
                 <span className="text-xs text-fg-muted">Saving…</span>
               )}

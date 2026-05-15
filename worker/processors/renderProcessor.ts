@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, applyEdgeFade, IMAGE_XFADE_PALETTE } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
@@ -242,6 +242,12 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // Boundary index for palette rotation. Incremented every time we apply
     // an image→image xfade so consecutive dissolves cycle through the list.
     let imageBoundaryIdx = 0;
+    // SFX cue offsets, measured from the start of the rendered timeline
+    // (BEFORE any intro is prepended — intro offset is added later when we
+    // pass these into concatNormalizedClips). Offsets are computed mid-xfade
+    // so the click/swipe lands on the visual transition midpoint. Cadence
+    // and SFX-file rotation are wired in after fetching the project row.
+    const sfxOffsetsAtBoundary: number[] = [];
 
     // Helper: replace the tail of the last entry with a faded version. The
     // input file is unlinked after a successful re-encode. Falls back to
@@ -303,6 +309,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const aDur = mergedDurations[mergedDurations.length - 1];
         const style = IMAGE_XFADE_PALETTE[imageBoundaryIdx % IMAGE_XFADE_PALETTE.length];
         const mergedOut = path.join(tmp, `xfade_${String(i).padStart(3, "0")}.mp4`);
+        // Timeline offset where this xfade STARTS (sum of all prior merged
+        // durations). Computed before we mutate mergedDurations[]. The
+        // midpoint of the xfade is `boundaryStart + IMAGE_XFADE_SECONDS / 2`
+        // — that's where we want the click/swipe to land if this boundary
+        // is selected for an SFX trigger.
+        let boundaryStart = 0;
+        for (let k = 0; k < mergedDurations.length - 1; k++) boundaryStart += mergedDurations[k];
+        boundaryStart += aDur - IMAGE_XFADE_SECONDS;
         try {
           await xfadePair({
             inputAPath: a,
@@ -316,6 +330,12 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           mergedSegments[mergedSegments.length - 1] = mergedOut;
           mergedDurations[mergedDurations.length - 1] = aDur + slotDurations[i] - IMAGE_XFADE_SECONDS;
           xfadeMerges++;
+          // Cadence: trigger SFX every 3rd image→image xfade. imageBoundaryIdx
+          // is 0-based at this point, so 0, 3, 6, ... fire. The intro offset
+          // is added later when we hand these to concatNormalizedClips.
+          if (imageBoundaryIdx % 3 === 0) {
+            sfxOffsetsAtBoundary.push(boundaryStart + IMAGE_XFADE_SECONDS / 2);
+          }
           imageBoundaryIdx++;
           await safeUnlink(a);
           await safeUnlink(seg);
@@ -359,9 +379,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       mixedFades,
     });
 
-    // 3) Optional voiceover from project + intro clip selection + bg music
+    // 3) Optional voiceover from project + intro clip selection + bg music + SFX
     const { data: project } = await sb.from("projects")
-      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, bg_music_url, bg_music_gain")
+      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, bg_music_url, bg_music_gain, sfx_urls, sfx_gain")
       .eq("id", projectId).single();
     let voiceoverLocal: string | undefined;
     if (project?.voiceover_url) {
@@ -383,6 +403,26 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           "render.bg_music.download_failed", { err: (e as Error).message });
       }
     }
+
+    // SFX: also best-effort. Download each URL into tmp. If a file fails to
+    // download, drop just that one — the others still get used. The cue
+    // collection below rotates through whatever ended up local.
+    const sfxLocals: string[] = [];
+    const sfxUrlsRaw = project?.sfx_urls;
+    const sfxUrls: string[] = Array.isArray(sfxUrlsRaw)
+      ? (sfxUrlsRaw as unknown[]).filter((u): u is string => typeof u === "string" && u.length > 0)
+      : [];
+    for (let k = 0; k < sfxUrls.length; k++) {
+      const dest = path.join(tmp, `sfx_${String(k).padStart(2, "0")}.audio`);
+      try {
+        await downloadHttp(sfxUrls[k], dest);
+        sfxLocals.push(dest);
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.sfx.download_failed", { idx: k, err: (e as Error).message });
+      }
+    }
+    const sfxGain = project?.sfx_gain != null ? Number(project.sfx_gain) : 0.7;
 
     // 3b) Build the intro segment (best-effort — failures fall back to a
     // render without an intro). The intro plays BEFORE the planned timeline:
@@ -518,6 +558,26 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const bgMusicGain = project?.bg_music_gain != null
       ? Number(project.bg_music_gain)
       : 0.15;
+    // Build the SFX cue list now that we know the intro offset. Cue offsets
+    // recorded during the transition loop are timeline-relative (no intro),
+    // so we add introDurationActual to each one to land them at the right
+    // spot in the final audio mix. SFX files rotate so consecutive cues use
+    // different sounds. If no SFX files are local, the list stays empty and
+    // concatNormalizedClips skips the SFX branch entirely.
+    const sfxCues: SfxCue[] = sfxLocals.length > 0
+      ? sfxOffsetsAtBoundary.map((t, n) => ({
+          path: sfxLocals[n % sfxLocals.length],
+          atSeconds: t + introDurationActual,
+          gain: sfxGain,
+        }))
+      : [];
+    if (sfxCues.length > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "render.sfx.cues", {
+        count: sfxCues.length,
+        files: sfxLocals.length,
+        gain: sfxGain,
+      });
+    }
     await concatNormalizedClips({
       inputPaths: normalized,
       outputPath: finalLocal,
@@ -527,6 +587,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       bgMusicGain,
       introAudioPath,
       introDurationSeconds: introDurationActual || undefined,
+      sfxCues,
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);

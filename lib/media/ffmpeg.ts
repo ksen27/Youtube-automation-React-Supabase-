@@ -451,6 +451,60 @@ export async function xfadePair(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// Merge two normalized segments through a dip-to-black transition in a single
+// libx264 pass. Used at image↔video and video↔image boundaries: the tail of A
+// fades to black while the head of B fades from black, meeting at full black
+// at the boundary midpoint. Replaces the older two-pass approach (tail
+// re-encode + head re-encode) — same visual result, half the encode work.
+//
+// Caller is responsible for pre-baking `transitionDurationSeconds / 2` of
+// headroom on the image side (see renderProcessor's image-block headroom
+// logic). The video side keeps its exact cut length: xfade just multiplies
+// the last `transitionDurationSeconds` frames of A toward black and the
+// first frames of B from black, no extra frames consumed.
+//
+// Encoder flags match normalizeClip / buildStillVideo so the merged segment
+// remains stream-copy-concatable in the final mux.
+export async function xfadeFadeBlack(opts: {
+  inputAPath: string;
+  inputBPath: string;
+  outputPath: string;
+  inputADurationSeconds: number;
+  transitionDurationSeconds: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const xfadeOffset = Math.max(0, opts.inputADurationSeconds - opts.transitionDurationSeconds);
+  // `transition=fadeblack` is the xfade built-in that does exactly the visual
+  // we want — A multiplies toward black, B multiplies from black, with peak
+  // darkness at the midpoint. No separate fade filters needed.
+  const filter =
+    `[0:v]settb=AVTB,fps=${fps},setsar=1[a];` +
+    `[1:v]settb=AVTB,fps=${fps},setsar=1[b];` +
+    `[a][b]xfade=transition=fadeblack:duration=${opts.transitionDurationSeconds}:offset=${xfadeOffset},format=yuv420p[v]`;
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputAPath,
+    "-i", opts.inputBPath,
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 // Burn a fade-out at the tail and/or a fade-in at the head of an already-
 // normalized segment. Used at image↔video boundaries so the still doesn't
 // hard-cut into footage (and vice versa). Unlike xfadePair this does NOT need
@@ -506,6 +560,16 @@ export async function applyEdgeFade(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+export interface SfxCue {
+  // Local file path to a short audio clip (any audio/* ffmpeg can decode).
+  path: string;
+  // Timeline position to play the cue at, in seconds, measured from the
+  // start of the final video (i.e. INCLUDING any intro that gets prepended).
+  atSeconds: number;
+  // 0..1, defaults to 0.7. Sits above bg music (0.15) but under voiceover (1.0).
+  gain?: number;
+}
+
 export interface ConcatOptions {
   inputPaths: string[]; // already-normalized clips, same codec/res/fps
   outputPath: string;
@@ -519,6 +583,11 @@ export interface ConcatOptions {
   // controls only the audio side.
   introAudioPath?: string;
   introDurationSeconds?: number;
+  // Optional one-shot SFX cues layered on top of the final audio mix at
+  // specific timeline offsets. Each cue is added as its own ffmpeg input,
+  // padded to its start time via adelay, then merged into the existing
+  // voiceover/bg-music output.
+  sfxCues?: SfxCue[];
   signal?: AbortSignal;
 }
 
@@ -614,8 +683,102 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     audioMap = ["-map", "0:v:0", "-map", "[bg]"];
     hasAudioOutput = true;
   } else {
-    // No external audio at all — produce a silent video.
+    // No external audio at all — produce a silent video (SFX-only case is
+    // handled below as a graft onto this branch).
     audioMap = ["-map", "0:v:0"];
+  }
+
+  // SFX cues: each cue becomes an extra input, padded to its start time via
+  // adelay. Cues are summed into [sfxmix], then folded into the existing
+  // audio output. When there's no other audio (silent video), we synthesize
+  // a silent base via anullsrc so the cues have something to mix onto and
+  // the encoder still gets a stereo audio stream of the correct duration.
+  const sfxCues = (opts.sfxCues ?? []).filter((c) => c && c.path && Number.isFinite(c.atSeconds) && c.atSeconds >= 0);
+  if (sfxCues.length > 0) {
+    // Track the audio-input index ffmpeg will assign to each SFX file.
+    // Inputs added so far (input 0 is always the concat list):
+    //   - hasIntro+voiceover branch: intro=1, voiceover=2, [bg=3]
+    //   - voiceover+bg branch: voiceover=1, bg=2
+    //   - voiceover only branch: voiceover=1
+    //   - bg only branch: bg=1
+    //   - silent branch: (none beyond input 0)
+    // Walk the existing args to find the count of -i flags so we don't have
+    // to maintain a parallel counter.
+    let inputCount = 0;
+    for (const a of args) if (a === "-i") inputCount++;
+
+    // Append SFX inputs.
+    for (const cue of sfxCues) {
+      args.push("-i", cue.path);
+    }
+
+    // Find the existing -filter_complex (if any) and append the SFX graph
+    // to it. If there isn't one yet (voiceover-only or silent branches),
+    // we'll add one.
+    const filterIdx = args.indexOf("-filter_complex");
+    const existingFilter = filterIdx >= 0 ? args[filterIdx + 1] : "";
+
+    // Per-cue: delay to start time, set per-cue gain.
+    const cueLabels: string[] = [];
+    let sfxGraph = "";
+    sfxCues.forEach((cue, i) => {
+      const ffIdx = inputCount + i;
+      const delayMs = Math.max(0, Math.round(cue.atSeconds * 1000));
+      const gain = cue.gain ?? 0.7;
+      const label = `sfx${i}`;
+      // adelay pads with silence on every channel; all=1 covers stereo without
+      // having to know the source layout. apad lets a very short cue sit in an
+      // amix that's keyed off a longer track without being cut prematurely.
+      sfxGraph += `[${ffIdx}:a]adelay=${delayMs}:all=1,volume=${gain}[${label}];`;
+      cueLabels.push(`[${label}]`);
+    });
+
+    // Sum SFX cues into [sfxmix]. amix with normalize=0 keeps each cue at its
+    // tagged volume instead of dividing by N.
+    if (cueLabels.length === 1) {
+      sfxGraph += `${cueLabels[0]}anull[sfxmix]`;
+    } else {
+      sfxGraph += `${cueLabels.join("")}amix=inputs=${cueLabels.length}:duration=longest:normalize=0[sfxmix]`;
+    }
+
+    if (hasAudioOutput) {
+      // Existing graph produces [aout]. Rewire its output label to [aoutpre]
+      // and graft an amix that adds SFX on top, re-emitting [aout].
+      // duration=first keys the final length to [aoutpre] (the voiceover/bg
+      // mix) so SFX at the tail can't extend audio past the video.
+      const reroutedFilter = existingFilter.replace(/\[aout\]\s*$/, "[aoutpre]");
+      const newFilter =
+        reroutedFilter +
+        (reroutedFilter.endsWith(";") ? "" : ";") +
+        sfxGraph +
+        `;[aoutpre][sfxmix]amix=inputs=2:duration=first:normalize=0[aout]`;
+      if (filterIdx >= 0) {
+        args[filterIdx + 1] = newFilter;
+      } else {
+        args.push("-filter_complex", newFilter);
+      }
+    } else {
+      // Silent base case: synthesize a silent stereo track using anullsrc,
+      // sized to the video duration via -shortest at the encoder, then mix
+      // SFX on top. We can't reference 0:a because input 0 (concat) has no
+      // audio. Using a lavfi anullsrc input means an extra -i, which would
+      // bump every later input index — so add it BEFORE the SFX inputs we
+      // just appended. Easiest: rebuild the SFX indices off (inputCount+1).
+      // To avoid the rebuild, splice the anullsrc input in at the right spot.
+      const anullIdx = inputCount;
+      // Insert anullsrc input ahead of the SFX inputs we just pushed.
+      // SFX inputs were appended starting at position (args.length - 2*sfxCues.length).
+      const sfxInsertAt = args.length - 2 * sfxCues.length;
+      args.splice(sfxInsertAt, 0, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000");
+      // SFX indices shift up by 1 because of the inserted anullsrc input.
+      const shiftedSfxGraph = sfxGraph.replace(/\[(\d+):a\]/g, (_m, n) => `[${Number(n) + 1}:a]`);
+      const filter =
+        shiftedSfxGraph +
+        `;[${anullIdx}:a][sfxmix]amix=inputs=2:duration=first:normalize=0[aout]`;
+      args.push("-filter_complex", filter);
+      audioMap = ["-map", "0:v:0", "-map", "[aout]"];
+      hasAudioOutput = true;
+    }
   }
 
   // Final concat: stream-copy the video (no re-encode). All input segments
