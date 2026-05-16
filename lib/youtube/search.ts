@@ -19,6 +19,14 @@ export interface YoutubeCandidate {
   durationSeconds: number;
   isLive: boolean;
   privacyStatus: string;
+  // Aspect ratio of the source video, derived from the largest available
+  // thumbnail (high > standard > maxres > medium > default). Horizontal
+  // landscape 16:9 ≈ 1.78; YouTube Shorts and vertical TikTok cross-posts
+  // ≈ 0.56. `null` when no thumbnail dimensions were returned (legacy
+  // uploads or older API responses) — the ranker treats null as "unknown
+  // orientation, allow" so we don't false-positive on the few cases where
+  // dimensions are missing.
+  aspectRatio: number | null;
 }
 
 export interface SearchInput {
@@ -41,6 +49,18 @@ const SearchItemSchema = z.object({
   }),
 });
 
+// YouTube's thumbnail object always mirrors the source video's aspect ratio:
+// horizontal 16:9 video → horizontal thumbnail; vertical 9:16 Short → vertical
+// thumbnail. We capture `high` and `maxres` because the smaller default/medium
+// thumbnails are often padded/letterboxed and don't preserve the source ratio
+// faithfully. width/height are reported as numbers when present, but the API
+// occasionally omits them for legacy uploads — both are optional.
+const ThumbnailSchema = z.object({
+  url: z.string().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+});
+
 const VideoItemSchema = z.object({
   id: z.string(),
   snippet: z.object({
@@ -49,6 +69,13 @@ const VideoItemSchema = z.object({
     channelId: z.string(),
     channelTitle: z.string(),
     liveBroadcastContent: z.string().optional(),
+    thumbnails: z.object({
+      default: ThumbnailSchema.optional(),
+      medium: ThumbnailSchema.optional(),
+      high: ThumbnailSchema.optional(),
+      standard: ThumbnailSchema.optional(),
+      maxres: ThumbnailSchema.optional(),
+    }).optional(),
   }),
   contentDetails: z.object({
     duration: z.string(),
@@ -115,9 +142,35 @@ export async function searchYoutube(input: SearchInput): Promise<YoutubeCandidat
       isLive: safe.data.snippet.liveBroadcastContent === "live"
             || safe.data.snippet.liveBroadcastContent === "upcoming",
       privacyStatus: safe.data.status?.privacyStatus ?? "public",
+      aspectRatio: pickAspectRatio(safe.data.snippet.thumbnails),
     });
   }
   return out;
+}
+
+// Pick the aspect ratio off the highest-resolution thumbnail that has
+// dimensions. We prefer `maxres` > `high` > `standard` > `medium` > `default`
+// — bigger thumbnails preserve the source aspect more faithfully (the
+// `default` 120x90 is heavily padded for legacy reasons and can mislead).
+// Returns null when no thumbnail dimensions are available; the ranker treats
+// null as "unknown, allow."
+function pickAspectRatio(
+  thumbnails: {
+    default?: { width?: number; height?: number };
+    medium?: { width?: number; height?: number };
+    high?: { width?: number; height?: number };
+    standard?: { width?: number; height?: number };
+    maxres?: { width?: number; height?: number };
+  } | undefined,
+): number | null {
+  if (!thumbnails) return null;
+  const priority = [thumbnails.maxres, thumbnails.high, thumbnails.standard, thumbnails.medium, thumbnails.default];
+  for (const t of priority) {
+    if (t && typeof t.width === "number" && typeof t.height === "number" && t.height > 0) {
+      return t.width / t.height;
+    }
+  }
+  return null;
 }
 
 export function parseISO8601Duration(iso: string): number {
@@ -224,6 +277,47 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   if (c.privacyStatus !== "public") {
     return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: `privacy=${c.privacyStatus}` };
   }
+  // Client requirement: YouTube Shorts and other vertical-format sources are
+  // never used. The deliverable is a horizontal 16:9 video; vertical 9:16
+  // footage can't be re-cut without pillarboxing or destructive cropping.
+  //
+  // The fundamental property is aspect ratio, not duration — a 3-minute
+  // vertical TikTok cross-post is just as unusable as a 30-second Short.
+  // We therefore lead with aspect ratio and use the other signals as
+  // backstops for the few cases where the API doesn't return thumbnail
+  // dimensions.
+  //
+  // Detection (any one rejects):
+  //   1. Aspect ratio < 1.0 — the thumbnail is taller than wide, i.e. the
+  //      source video is vertical. Real horizontal videos sit around 1.78
+  //      (16:9); Shorts and vertical cross-posts sit around 0.56 (9:16).
+  //      We pick 1.0 as the threshold because anything ≥ 1.0 is at least
+  //      square and editable into a 16:9 frame.
+  //   2. Duration > 0 and ≤ 60s — YouTube's own Shorts cap. Catches Shorts
+  //      whose thumbnails were uploaded in landscape (rare but happens) or
+  //      whose dimensions weren't returned.
+  //   3. Title contains a "shorts" token on a token boundary, or the watch
+  //      URL contains "/shorts/" — defensive catches for the long-tail of
+  //      Shorts that escape both the aspect and duration heuristics.
+  //
+  // Aspect-ratio null (no thumbnail dimensions) is treated as "unknown,
+  // allow" so we don't false-positive on legacy uploads. The duration and
+  // title checks still apply.
+  const SHORTS_TITLE_RE = /(^|\s|[#:/])shorts?(\s|$|[#:/!?.])/i;
+  const isVerticalAspect = c.aspectRatio !== null && c.aspectRatio < 1.0;
+  const isShortDuration = c.durationSeconds > 0 && c.durationSeconds <= 60;
+  const isShortByTitleOrUrl = SHORTS_TITLE_RE.test(c.title) || c.url.includes("/shorts/");
+  if (isVerticalAspect || isShortDuration || isShortByTitleOrUrl) {
+    const reason =
+      isVerticalAspect ? `vertical video (aspect=${c.aspectRatio!.toFixed(2)})` :
+      isShortDuration ? `youtube short (${c.durationSeconds}s)` :
+      "youtube short (title/url)";
+    return {
+      ...c, score: 0, displayScore: 0, reasons: [],
+      rejected: true,
+      rejectReason: reason,
+    };
+  }
   if (c.durationSeconds < window.min) {
     return { ...c, score: 0, displayScore: 0, reasons: [], rejected: true, rejectReason: `too short for ${intentType}` };
   }
@@ -322,8 +416,10 @@ export function rankCandidate(input: RankInput): RankedCandidate {
     reasons.push(`sweet-spot duration (${intentType})`);
   }
 
-  // Penalize obvious junk
-  for (const bad of ["#shorts", "compilation", "funniest moments", "tier list"]) {
+  // Penalize obvious junk. (#shorts handled earlier as a hard reject; this
+  // covers compilations and ranking-style videos that don't yield clean
+  // single-subject cuts.)
+  for (const bad of ["compilation", "funniest moments", "tier list"]) {
     if (titleLower.includes(bad)) { score -= 10; reasons.push(`-junk:${bad}`); }
   }
   // Penalise titles that scream "unrelated product / tutorial / company
