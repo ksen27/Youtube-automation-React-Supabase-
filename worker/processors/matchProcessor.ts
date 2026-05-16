@@ -9,11 +9,14 @@ import {
 } from "@/lib/ai/gemini";
 import {
   buildBlockSequence,
+  buildBlockSequenceFromHints,
   planTimeline,
   sumDurations,
+  type BlockPlanHint,
   type PlannedBlock,
+  type PlannedBlockWithHint,
 } from "@/lib/ai/timeline-plan";
-import { estimateDurationSeconds } from "@/lib/ai/segments";
+import { estimateDurationSeconds, type BlockPlan, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages } from "@/lib/images/fetch";
 
 // Below this score (0–100), Gemini judged the clip a poor visual fit for the
@@ -380,8 +383,50 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // The block sequence is the unit of matching now. Each block's wall-clock
   // window determines what voiceover words it covers; clips are scored
   // against THAT text, not against arbitrary pre-split sections.
+  //
+  // We prefer Gemini's per-block visual plan (emitted by analyzeSegment
+  // during the analyze step and persisted in media_jobs.metadata.payload).
+  // Each block carries a recommended_visual_type that says whether the
+  // narration wants footage / image / title_card / split_2. The hint-aware
+  // builder respects those recommendations and only rebalances when the
+  // realized 60/40 footage:image ratio drifts outside ±10%.
+  //
+  // If the analyze payload is missing (older project, or analyze never ran),
+  // we fall back to the legacy duration-only planner. Same downstream
+  // contract — every block ends up with a type + duration + text.
   const plan = planTimeline(voiceoverSeconds);
-  const blocks = buildBlockSequence(plan);
+  const hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds);
+  const planSource: "gemini_hints" | "legacy_quota" = hints.length > 0 ? "gemini_hints" : "legacy_quota";
+
+  let blocks: PlannedBlock[];
+  let blockHintTexts: Array<string | null>;
+  let blockSectionTitles: Array<string | null>;
+  let blockResolvedSubjects: Array<string | null>;
+  let blockRecommendedTypes: Array<string | null>;
+  if (planSource === "gemini_hints") {
+    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds);
+    blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
+    blockHintTexts = planned.map((p) => p.text || null);
+    blockSectionTitles = planned.map((p) => p.section_title ?? null);
+    blockResolvedSubjects = planned.map((p) => p.resolved_subject ?? null);
+    blockRecommendedTypes = planned.map((p) => p.type);
+  } else {
+    blocks = buildBlockSequence(plan);
+    blockHintTexts = blocks.map(() => null);
+    blockSectionTitles = blocks.map(() => null);
+    blockResolvedSubjects = blocks.map(() => null);
+    blockRecommendedTypes = blocks.map(() => null);
+  }
+
+  // Phase D will add real title_card / split_2 renderers; until then,
+  // those types downgrade to image so the existing render path still
+  // works. We preserve the hint metadata in parallel arrays so Phase D
+  // can promote them back without re-running Gemini.
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type === "title_card" || blocks[i].type === "split_2") {
+      blocks[i] = { type: "image", duration: blocks[i].duration };
+    }
+  }
 
   // If we have far fewer clips than footage slots, pre-downgrade the surplus
   // footage blocks to image blocks. We leave the intro alone so the video
@@ -434,6 +479,24 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const blocksWithEntities = blockEntities.filter((e) => e.length > 0).length;
   const totalEntityHits = blockEntities.reduce((n, e) => n + e.length, 0);
 
+  // Realized block-type tally — useful to see how much title_card / split_2
+  // got downgraded to image vs how much landed as Gemini recommended.
+  const realizedTypeCounts = {
+    footage: 0, image: 0, title_card: 0, split_2: 0, split_4: 0, intro: 0,
+  } as Record<string, number>;
+  for (const b of blocks) realizedTypeCounts[b.type] = (realizedTypeCounts[b.type] ?? 0) + 1;
+  const recommendedTypeCounts = { footage: 0, image: 0, title_card: 0, split_2: 0 } as Record<string, number>;
+  for (const t of blockRecommendedTypes) {
+    if (t) recommendedTypeCounts[t] = (recommendedTypeCounts[t] ?? 0) + 1;
+  }
+  const totalDurationSum = sumDurations(blocks);
+  const footageDurationSum = blocks
+    .filter((b) => b.type === "footage")
+    .reduce((s, b) => s + b.duration, 0);
+  const realizedFootageRatio = totalDurationSum > 0
+    ? Math.round((footageDurationSum / totalDurationSum) * 1000) / 1000
+    : 0;
+
   await logJob({ projectId, jobId: mediaJobId }, "match.plan", {
     voiceoverSeconds,
     avgBlockSeconds: plan.avgBlockSeconds,
@@ -441,12 +504,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     footageBlocks: plan.footageBlocks,
     imageBlocks: plan.imageBlocks,
     bucket: plan.bucket,
-    plannedDurationSum: Math.round(sumDurations(blocks) * 10) / 10,
+    plannedDurationSum: Math.round(totalDurationSum * 10) / 10,
     blockTextSampleHead: blockTexts[0]?.slice(0, 100) ?? "",
     blockTextSampleMid: blockTexts[Math.floor(blocks.length / 2)]?.slice(0, 100) ?? "",
     entitiesLoaded: allEntities.length,
     blocksWithEntities,
     totalEntityHits,
+    planSource,
+    realizedTypeCounts,
+    recommendedTypeCounts,
+    realizedFootageRatio,
+    actualBlockCount: blocks.length,
   });
 
   // Score only the blocks that actually need a clip (footage + intro). We
@@ -657,6 +725,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
+  // Phase A metadata helper. Every timeline_item gets the originating
+  // block's hint data so downstream phases (B = scoring, C = image search,
+  // D = render) can use resolved_subject / section_title /
+  // recommended_visual_type without re-deriving them. Stored on the
+  // timeline_items.metadata jsonb column — no schema change required.
+  const planHintFor = (idx: number) => ({
+    plan_source: planSource,
+    resolved_subject: blockResolvedSubjects[idx] ?? null,
+    section_title: blockSectionTitles[idx] ?? null,
+    recommended_visual_type: blockRecommendedTypes[idx] ?? null,
+    hint_text: blockHintTexts[idx] ?? null,
+  });
+
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
     const assigned = blockAssignments.get(i);
@@ -695,6 +776,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             match_reason: assigned.reason ?? null,
             pick_source: pickSource,
             block_index: i,
+            ...planHintFor(i),
           },
           approved: false,
         });
@@ -721,6 +803,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             pick_source: "pool_exhausted",
             block_index: i,
             preserved_footage_duration: true,
+            ...planHintFor(i),
           },
           approved: false,
         });
@@ -738,7 +821,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       duration: block.duration,
       script_text: blockText || null,
       overlay_text: null,
-      metadata: { placeholder: true, planned: true, block_index: i },
+      metadata: { placeholder: true, planned: true, block_index: i, ...planHintFor(i) },
       approved: false,
     });
   }
@@ -1375,4 +1458,66 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     },
   });
   await setProjectStatus(projectId, "ready_for_review");
+}
+
+// Read the most recent analyze job's payload from media_jobs and flatten
+// every segment's Gemini-supplied blocks into a single ordered hint stream.
+//
+// Why this lives here and not in the analyze route: the matcher is the
+// step that builds the final block sequence, and it needs the blocks in
+// strict narration order regardless of which segment they came from. The
+// analyze step persists per-segment blocks; the matcher concatenates.
+//
+// Returns [] when:
+//   - no analyze job exists for the project
+//   - the payload is missing or malformed
+//   - none of the segments produced blocks (older payload, pre-Phase-A)
+// The caller falls back to the legacy duration-only planner in that case
+// so older projects keep working without re-running analyze.
+async function loadBlockHintsFromAnalyze(
+  sb: ReturnType<typeof getServerSupabase>,
+  projectId: string,
+  voiceoverSeconds: number,
+): Promise<BlockPlanHint[]> {
+  const { data } = await sb
+    .from("media_jobs")
+    .select("metadata")
+    .eq("project_id", projectId)
+    .eq("type", "analyze")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const payload = (data?.metadata as { payload?: { segments?: Array<{ understanding?: SegmentUnderstanding; startSeconds?: number; endSeconds?: number }> } } | null)?.payload;
+  const segments = payload?.segments ?? [];
+  if (segments.length === 0) return [];
+
+  // We need to know which segment each block belongs to so we can recover
+  // the segment's sectionTitle for title_card blocks. The hint stream is
+  // segments concatenated in order.
+  const hints: BlockPlanHint[] = [];
+  for (const seg of segments) {
+    const u = seg.understanding;
+    if (!u) continue;
+    const segBlocks: BlockPlan[] = Array.isArray(u.blocks) ? u.blocks : [];
+    if (segBlocks.length === 0) continue;
+    for (let i = 0; i < segBlocks.length; i++) {
+      const b = segBlocks[i];
+      hints.push({
+        text: b.text,
+        resolved_subject: b.resolved_subject || undefined,
+        recommended_visual_type: b.recommended_visual_type,
+        // Only attach section_title to the FIRST block of a segment with a
+        // sectionTitle — that's the chapter boundary. Later blocks in the
+        // same segment continue under the same section.
+        section_title: (i === 0 && u.sectionTitle) ? u.sectionTitle : undefined,
+      });
+    }
+  }
+  // Sanity check: if the total hint count is wildly out of range with the
+  // voiceover length we'd produce a degenerate timeline. The legacy planner
+  // targets ~voiceoverSeconds / 5s blocks; if Gemini produced fewer than
+  // half that, the hints are probably truncated — fall back to legacy.
+  const minReasonable = Math.max(2, Math.floor(voiceoverSeconds / 10));
+  if (hints.length < minReasonable) return [];
+  return hints;
 }

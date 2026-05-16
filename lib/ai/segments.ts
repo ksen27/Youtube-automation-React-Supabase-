@@ -98,6 +98,53 @@ function buildSegment(index: number, text: string, priorWords: number, words: nu
 export const IntentType = z.enum(["talking_head", "broll", "archival"]);
 export type IntentType = z.infer<typeof IntentType>;
 
+// Per-block visual plan emitted by Gemini alongside searchIntents. Drives
+// the new script-aware planner (Phase A of the celebrity-style refactor):
+// each narration chunk gets its own visual recommendation rather than being
+// fitted into a pre-computed footage/image quota.
+//
+// Naming follows the client spec exactly so the planner can be reasoned
+// about against the requirements doc without translation.
+export const SubjectType = z.enum([
+  "person", "place", "movie", "show", "company",
+  "event", "object", "general",
+]);
+export type SubjectType = z.infer<typeof SubjectType>;
+
+export const VisualType = z.enum([
+  "footage", "image", "title_card", "split_2",
+]);
+export type VisualType = z.infer<typeof VisualType>;
+
+export const BlockPlanSchema = z.object({
+  text: z.string().min(1),
+  // The person/thing the block is "about". For pronoun-only blocks Gemini
+  // may emit "" — the deterministic continuity pass fills it in afterward
+  // from the previous block's subject.
+  resolved_subject: z.string().default(""),
+  subject_type: SubjectType.default("general"),
+  // Named entities literally appearing in this block's text.
+  mentioned_entities: z.array(z.string()).default([]),
+  // Specific reference words that should drive an image search instead of
+  // footage matching (e.g. "tattoo", "mother", "1998", "Frida"). The image
+  // matcher in Phase C consumes this list directly.
+  specific_visual_references: z.array(z.string()).default([]),
+  // Did the block use pronouns (he/she/him/her) without naming the subject?
+  // The continuity pass uses this as a hint when deciding whether to keep
+  // the previous resolved_subject.
+  pronouns_detected: z.boolean().default(false),
+  // Free-text reason describing what the block is visually trying to convey.
+  // Used in the per-block log so reviewers can see why a visual type was
+  // picked, not just what was picked.
+  visual_intent: z.string().default(""),
+  // Gemini's recommended visual type. The planner is allowed to override
+  // this (e.g. demote split_2 → image when only one image is available, or
+  // promote a stretch of footage to title_card when a section title fits)
+  // but the recommendation is the starting point.
+  recommended_visual_type: VisualType.default("footage"),
+});
+export type BlockPlan = z.infer<typeof BlockPlanSchema>;
+
 export const SegmentUnderstandingSchema = z.object({
   mainTopic: z.string().min(1),
   people: z.array(z.string()).default([]),
@@ -105,11 +152,18 @@ export const SegmentUnderstandingSchema = z.object({
   events: z.array(z.string()).default([]),
   topics: z.array(z.string()).default([]),
   relatedKeywords: z.array(z.string()).default([]),
+  // Optional section title for the segment. When present, the planner uses
+  // it as the text of a black title_card inserted at the section boundary.
+  sectionTitle: z.string().default(""),
   searchIntents: z.array(z.object({
     label: z.string().min(1),       // human-friendly: "Searching for early life interviews"
     query: z.string().min(1),       // raw query passed to YouTube
     intentType: IntentType.default("talking_head"),
   })).min(1).max(6),
+  // Per-block visual plan. Empty array is allowed when Gemini decides the
+  // whole segment is one block — the planner handles that gracefully by
+  // synthesizing a single block from the segment text.
+  blocks: z.array(BlockPlanSchema).default([]),
 });
 export type SegmentUnderstanding = z.infer<typeof SegmentUnderstandingSchema>;
 
@@ -152,10 +206,23 @@ ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
   "events": ["awards, premieres, news moments"],
   "topics": ["broader themes like 'method acting', 'family life'"],
   "relatedKeywords": ["3-8 short phrases a viewer would say to describe the visuals"],
+  "sectionTitle": "OPTIONAL short title for this section if the narration clearly opens a new chapter (e.g. 'The Cancellation', 'Marriage', 'Early Career'). Empty string if no clear chapter break.",
   "searchIntents": [
     { "label": "human-friendly description of what we are searching for",
       "query": "concrete YouTube search query, no quotes, max 8 words",
       "intentType": "talking_head | broll | archival" }
+  ],
+  "blocks": [
+    {
+      "text": "the verbatim 1-3 sentence chunk of narration this block covers",
+      "resolved_subject": "the person/thing this block is visually ABOUT. For a pronoun-only block, leave \\"\\" and the code will inherit from the previous block.",
+      "subject_type": "person | place | movie | show | company | event | object | general",
+      "mentioned_entities": ["proper nouns literally appearing in this block"],
+      "specific_visual_references": ["concrete objects/references that should drive a still-image search, e.g. 'tattoo', 'mother', '1998', 'Frida poster'. Leave [] for blocks that are just general narration about the subject."],
+      "pronouns_detected": true,
+      "visual_intent": "one short phrase describing what the screen should show here",
+      "recommended_visual_type": "footage | image | title_card | split_2"
+    }
   ]
 }
 
@@ -164,6 +231,18 @@ Rules:
 - Provide 2 to 4 searchIntents that together cover the visual story of THIS section.
 - Skip the section's narration tone and writing style. Focus on what should appear on screen.
 - Skip duplicates. Skip empty arrays — return [] if you have nothing.
+
+Block-level visual rules (these matter — they drive what appears on screen):
+- Split the section into 4-12 blocks. Each block is 1-3 sentences of consecutive narration.
+- Choose "recommended_visual_type" per block:
+  * "footage" — general narration ABOUT the celebrity/person; career, public life, story context. The viewer just needs to see the person on screen.
+  * "image" — block names a SPECIFIC reference: tattoo, parent, sibling, childhood, a place, a movie/show/song title, a company, an event, a year. List the exact reference in "specific_visual_references".
+  * "title_card" — block is a section heading or a strong topic shift. Rare; only if the narration explicitly opens a chapter.
+  * "split_2" — block compares/relates TWO named people or two named entities (e.g. "Salma Hayek and Danny Trejo worked together"). Only when both are important visuals.
+- Default to "footage" when in doubt. Footage does NOT need to perfectly match every sentence — it just needs to show the right person.
+- Use "image" for specific references even when the celebrity is the subject (e.g. "Her mother raised three kids" → image of mother). The reference is what drives the visual, not the celebrity.
+- For pronoun-only blocks (he/she/him/her) leave "resolved_subject" as "" — the code inherits from the previous block.
+- "mentioned_entities" should contain literal names in this block's text, not synonyms.
 - Classify each intent's "intentType":
   * "talking_head" — interviews, host shots, podcasts (long-form, 4–25 min videos)
   * "broll" — places, locations, objects, scenery, action shots (often short clips)
@@ -231,12 +310,16 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
   }
   // Belt-and-suspenders: even with the prompt rules, Gemini occasionally slips
   // an editorial word into a query. Strip them here so YouTube never sees them.
+  // Also run the deterministic subject-continuity pass before returning so
+  // downstream consumers always see resolved subjects on pronoun-only blocks.
+  const blocks = applySubjectContinuity(safe.data.blocks, context.mainSubject);
   return {
     ...safe.data,
     searchIntents: safe.data.searchIntents.map((it) => ({
       ...it,
       query: sanitizeQuery(it.query),
     })),
+    blocks,
   };
 }
 
@@ -256,12 +339,58 @@ export function sanitizeQuery(raw: string): string {
   return kept.length ? kept.join(" ") : raw;
 }
 
+// Deterministic post-processor. Walks an ordered block list and fills in
+// resolved_subject for pronoun-only blocks by inheriting from the previous
+// block's subject. Also normalises subject_type when a clear named person
+// shows up in mentioned_entities.
+//
+// Why this exists separate from Gemini: Gemini's per-block subject inference
+// is noisy when the narration uses pronouns for several blocks in a row. A
+// deterministic pass that says "if this block has no explicit name and the
+// previous block had one, keep it" is both cheap and easy to reason about.
+// The client spec calls out pronoun continuity as a hard requirement.
+export function applySubjectContinuity(blocks: BlockPlan[], fallbackSubject?: string): BlockPlan[] {
+  if (blocks.length === 0) return blocks;
+  let currentSubject = fallbackSubject?.trim() || "";
+  let currentSubjectType: SubjectType = currentSubject ? "person" : "general";
+  return blocks.map((b) => {
+    const explicit = b.resolved_subject?.trim() || "";
+    if (explicit) {
+      // Explicit subject — adopt it as the running subject for following
+      // pronoun-only blocks. Trust Gemini's subject_type on explicit blocks.
+      currentSubject = explicit;
+      currentSubjectType = b.subject_type;
+      return b;
+    }
+    // No explicit subject. If the block is pronoun-only OR Gemini left it
+    // blank, inherit. If neither current nor inherited is available, fall
+    // back to whatever Gemini sent (likely "").
+    if (currentSubject) {
+      return { ...b, resolved_subject: currentSubject, subject_type: currentSubjectType };
+    }
+    return b;
+  });
+}
+
 function fallbackUnderstanding(segment: RawSegment): SegmentUnderstanding {
   const firstSentence = segment.text.split(/[.!?]/, 1)[0]?.slice(0, 80) ?? "Section";
   return {
     mainTopic: firstSentence || `Part ${segment.index + 1}`,
     people: [], places: [], events: [], topics: [],
     relatedKeywords: [],
+    sectionTitle: "",
     searchIntents: [{ label: "Looking for relevant background footage", query: firstSentence, intentType: "talking_head" }],
+    // No Gemini analysis available — emit a single footage-typed block from
+    // the whole segment so the planner has something to align against.
+    blocks: [{
+      text: segment.text,
+      resolved_subject: "",
+      subject_type: "general",
+      mentioned_entities: [],
+      specific_visual_references: [],
+      pronouns_detected: false,
+      visual_intent: "",
+      recommended_visual_type: "footage",
+    }],
   };
 }
