@@ -222,6 +222,14 @@ export interface BlockPlanHint {
   // title_card hint, the builder falls back to "" and the matcher fills
   // text in from the segment's sectionTitle at assignment time.
   section_title?: string;
+  // Phase C: specific visual references in this block's narration
+  // ("tattoo", "mother", "Frida"). The image matcher uses these to build
+  // reference-driven queries instead of falling back to the entity pool.
+  specific_visual_references?: string[];
+  // Phase C: named entities literally appearing in the block's text.
+  // Lets the image matcher prefer logos/posters when the reference is a
+  // company/show/movie that's also a named entity.
+  mentioned_entities?: string[];
 }
 
 export interface PlannedBlockWithHint extends PlannedBlock {
@@ -231,6 +239,8 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   text: string;
   resolved_subject?: string;
   section_title?: string;
+  specific_visual_references?: string[];
+  mentioned_entities?: string[];
 }
 
 // Approximate 60/40 footage:image balance per the client spec. Title cards
@@ -268,6 +278,8 @@ export function buildBlockSequenceFromHints(
       text: h.text,
       resolved_subject: h.resolved_subject,
       section_title: h.section_title,
+      specific_visual_references: h.specific_visual_references,
+      mentioned_entities: h.mentioned_entities,
     };
   });
 

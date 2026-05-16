@@ -403,6 +403,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let blockSectionTitles: Array<string | null>;
   let blockResolvedSubjects: Array<string | null>;
   let blockRecommendedTypes: Array<string | null>;
+  // Phase C: per-block specific references ("tattoo", "mother", "Frida")
+  // surfaced from the Gemini block plan. Drives the reference-driven image
+  // matcher below — when a block has any references, we search for them
+  // BEFORE falling back to the entity pool. We index hints by absolute
+  // block index post-build (Phase A's buildBlockSequenceFromHints preserves
+  // input order 1:1 so hint[i] === block[i]).
+  let blockSpecificRefs: Array<string[]>;
   if (planSource === "gemini_hints") {
     const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
@@ -410,12 +417,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSectionTitles = planned.map((p) => p.section_title ?? null);
     blockResolvedSubjects = planned.map((p) => p.resolved_subject ?? null);
     blockRecommendedTypes = planned.map((p) => p.type);
+    blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
   } else {
     blocks = buildBlockSequence(plan);
     blockHintTexts = blocks.map(() => null);
     blockSectionTitles = blocks.map(() => null);
     blockResolvedSubjects = blocks.map(() => null);
     blockRecommendedTypes = blocks.map(() => null);
+    blockSpecificRefs = blocks.map(() => []);
   }
 
   // Phase D will add real title_card / split_2 renderers; until then,
@@ -886,6 +895,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     section_title: blockSectionTitles[idx] ?? null,
     recommended_visual_type: blockRecommendedTypes[idx] ?? null,
     hint_text: blockHintTexts[idx] ?? null,
+    specific_visual_references: blockSpecificRefs[idx] ?? [],
   });
 
   for (let i = 0; i < blocks.length; i++) {
@@ -978,6 +988,136 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       approved: false,
     });
   }
+
+  // ---- Phase C: reference-driven per-block image matching ---------------
+  // BEFORE we fall back to the entity-pool approach, walk every image block
+  // whose Phase-A hint has specific_visual_references and try to resolve
+  // each block to an image that depicts THAT reference. The client spec
+  // explicitly calls this out:
+  //   "She had a tattoo..." → search "{resolved_subject} tattoo"
+  //   "Her mother..."       → search "{resolved_subject} mother"
+  //
+  // Query priority per the spec:
+  //   1. Exact entity/reference from block (mentioned_entities)
+  //   2. resolved_subject + reference
+  //   3. Section subject + reference (subject from earlier blocks)
+  //   4. Main celebrity fallback (bare name)
+  //
+  // We persist the full provenance ({query_used, source_url, image_url,
+  // entity, reason_selected}) on the timeline_items.metadata jsonb so
+  // reviewers can see exactly why each image was chosen.
+  //
+  // Image blocks that don't get filled here (no references, or all queries
+  // failed) drop through to the entity-pool pass that follows. That keeps
+  // the existing pool logic as the backstop without losing reference
+  // precision when the script genuinely calls it out.
+  const refUrlSet = new Set<string>();      // URLs claimed by reference pass
+  let refImagesAssigned = 0;
+  let refImagesFailed = 0;
+
+  // Lowercase tokens that indicate "fetch a logo, not a photo" — feeds the
+  // existing fetchImages imgType plumbing.
+  const LOGO_REF_TOKENS = /^(logo|company|brand|corporation|corp\.?|inc\.?|llc)$/i;
+  // Tokens that indicate poster/cover artwork rather than a head-shot.
+  const POSTER_REF_TOKENS = /^(poster|movie|film|show|series|episode)$/i;
+  // Tokens that indicate place imagery rather than person-of-the-place.
+  const PLACE_REF_TOKENS = /^(building|skyline|landmark|venue|stadium|theater|theatre|museum|palace|monument|landscape)$/i;
+
+  function buildReferenceQueries(
+    references: string[],
+    resolvedSubject: string | null,
+    mentionedEntities: string[],
+  ): Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> {
+    const out: Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> = [];
+    const subj = (resolvedSubject ?? mainCelebrity ?? "").trim();
+    // Tier 1: each mentioned entity verbatim. Highest precision — the script
+    // named something concrete (a movie, a place, a person).
+    for (const ent of mentionedEntities) {
+      const e = ent.trim();
+      if (!e) continue;
+      out.push({ query: e, reason: `mentioned_entity:${e}` });
+    }
+    // Tier 2: subject + reference. Most reference→image work lives here.
+    // "tattoo" / "mother" / "Frida" combine with the celebrity name to
+    // give Wikipedia/CSE a precise image to find.
+    for (const ref of references) {
+      const r = ref.trim();
+      if (!r) continue;
+      const isLogo = LOGO_REF_TOKENS.test(r);
+      const isPoster = POSTER_REF_TOKENS.test(r);
+      const isPlace = PLACE_REF_TOKENS.test(r);
+      // Special-case framings: logos/posters/places use the reference WITHOUT
+      // the celebrity anchor because the anchor produces press-photos of the
+      // celebrity AT the location instead of canonical imagery of the thing.
+      if (isLogo) {
+        out.push({ query: `${r} logo`, reason: `reference:${r}:logo`, imgType: "logo" });
+      } else if (isPoster) {
+        out.push({ query: `${r} poster`, reason: `reference:${r}:poster` });
+      } else if (isPlace) {
+        out.push({ query: r, reason: `reference:${r}:place` });
+      } else if (subj) {
+        out.push({ query: `${subj} ${r}`, reason: `subject_plus_reference:${subj}:${r}` });
+      } else {
+        out.push({ query: r, reason: `reference:${r}` });
+      }
+    }
+    // Tier 3: subject alone — only if we exhausted Tier 1 and 2. Skipped
+    // here because the entity pool already covers it as a fallback, and
+    // we don't want to "use up" a generic subject photo on a reference
+    // block that should have a specific image.
+    return out;
+  }
+
+  // First pass: walk image blocks in order, try to fill from references.
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type !== "image") continue;
+    const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+    if (blockIdx == null) continue;
+    const refs = blockSpecificRefs[blockIdx] ?? [];
+    const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
+    if (refs.length === 0 && ents.length === 0) continue;
+    const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
+    const queries = buildReferenceQueries(refs, resolvedSubject, ents);
+    let filled = false;
+    for (const q of queries) {
+      try {
+        const fetched = await fetchImages(q.query, 4, { imgType: q.imgType });
+        // Take the first non-duplicate image. We use a per-pass set to
+        // avoid two image blocks landing on the same URL when the script
+        // mentions the same reference twice.
+        const pick = fetched.find((f) => !refUrlSet.has(f.url));
+        if (!pick) continue;
+        refUrlSet.add(pick.url);
+        item.image_url = pick.url;
+        item.image_query = q.query;
+        item.image_source = pick.source;
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.image_query_used = q.query;
+        meta.image_source_url = pick.url;
+        meta.image_source_provider = pick.source;
+        meta.image_entity = refs[0] ?? ents[0] ?? null;
+        meta.image_reason = q.reason;
+        meta.image_pick_source = "reference_driven";
+        item.metadata = meta;
+        refImagesAssigned++;
+        filled = true;
+        break;
+      } catch (e) {
+        void logJob({ projectId, jobId: mediaJobId },
+          "match.image_ref.failed", {
+            blockIndex: blockIdx, query: q.query, err: (e as Error).message,
+          });
+      }
+    }
+    if (!filled) refImagesFailed++;
+  }
+
+  await logJob({ projectId, jobId: mediaJobId }, "match.image_ref", {
+    refImagesAssigned,
+    refImagesFailed,
+    refBlocksWithHints: blockSpecificRefs.filter((r) => r.length > 0).length,
+  });
 
   // ---- Build a project-level image pool, then assign to image blocks ----
   // Strategy change (vs. per-block voiceover-substring matching):
@@ -1439,6 +1579,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let imagesReused = 0;
   for (const item of items) {
     if (item.type !== "image") continue;
+    // Phase C: skip blocks the reference-driven pass already filled —
+    // their image_url is the specific reference image the script asked
+    // for, and we don't want to overwrite it with a generic pool entry.
+    if (item.image_url) continue;
     let idx = pickFreshPoolIdx();
     if (idx < 0) {
       // Fresh pool exhausted — fall back to reuse. pickFreshPoolIdx returns
@@ -1454,6 +1598,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     item.image_query = next.query;
     item.image_url = next.url;
     item.image_source = next.source;
+    // Phase C: stamp pool-assigned provenance too so every image_url has
+    // matching metadata. Reference picks use "reference_driven"; pool
+    // picks use "entity_pool".
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+    meta.image_query_used = next.query;
+    meta.image_source_url = next.url;
+    meta.image_source_provider = next.source;
+    meta.image_entity = next.entityType;
+    meta.image_reason = `entity_pool:${next.entityType}`;
+    meta.image_pick_source = "entity_pool";
+    item.metadata = meta;
     lastEntityKey = `${next.entityType}:${next.query}`;
     lastUsedAt[idx] = useCounter++;
   }
@@ -1663,6 +1818,16 @@ async function loadBlockHintsFromAnalyze(
         // sectionTitle — that's the chapter boundary. Later blocks in the
         // same segment continue under the same section.
         section_title: (i === 0 && u.sectionTitle) ? u.sectionTitle : undefined,
+        // Phase C: forward Gemini's per-block visual references and
+        // mentioned entities so the image matcher can search for the
+        // specific reference ("tattoo", "Frida") instead of falling
+        // straight to the entity pool.
+        specific_visual_references: Array.isArray(b.specific_visual_references)
+          ? b.specific_visual_references.filter((s) => typeof s === "string" && s.trim().length > 0)
+          : undefined,
+        mentioned_entities: Array.isArray(b.mentioned_entities)
+          ? b.mentioned_entities.filter((s) => typeof s === "string" && s.trim().length > 0)
+          : undefined,
       });
     }
   }
