@@ -139,6 +139,27 @@ export type IntentType = "talking_head" | "broll" | "archival";
 export interface RankInput {
   candidate: YoutubeCandidate;
   mainCelebrity?: string;
+  // Short forms / nicknames / company-form variants of mainCelebrity. Any of
+  // these hitting a title or description still counts as a subject hit for
+  // the hard-reject rule on inherited segments.
+  aliases?: string[];
+  // Recurring proper nouns tied to the main subject — used as secondary
+  // anchors when a result's title doesn't restate the celebrity by name.
+  contextTerms?: string[];
+  // Short focus topic of the current segment (e.g. "lawsuit / Creative
+  // Controls"). Scored separately from the broader keyword bag so a result
+  // that nails the segment's specific beat outranks a generic celebrity hit.
+  segmentTopic?: string;
+  // The matched query string — feeds the +20 "query already anchored on the
+  // subject" boost. Helps disambiguate when two candidates have similar
+  // titles but came from different intents.
+  matchedQuery?: string;
+  // True when the segment inherited its subject from the global project
+  // (i.e. the segment never re-stated the celebrity's name). For inherited
+  // segments we hard-reject any candidate that doesn't mention the subject,
+  // an alias, or a context term — generic "Creative Controls company profile"
+  // is exactly the failure mode that triggered this work.
+  inheritedSegment?: boolean;
   keywords: string[];
   approvedChannelIds: Set<string>;
   blockedChannelIds: Set<string>;
@@ -153,10 +174,18 @@ export interface RankedCandidate extends YoutubeCandidate {
   rejectReason?: string;
 }
 
-// Theoretical max raw score: 40 (celebrity) + 40 (token cap) + 25 (approved
-// channel) + 10 (sweet-spot duration). Used to normalize for the UI so a
-// duration-only +10 hit doesn't render as a full bar.
-export const MAX_RANK_SCORE = 115;
+// Theoretical max raw score after the subject-anchor refactor:
+//   +50 subject in title/desc/channel
+//   +35 context term in title/desc
+//   +25 segment topic word in title/desc
+//   +20 matched query contains the subject
+//   +15 channel name contains the subject (heuristic celebrity channel)
+//   +25 approved channel
+//   +10 sweet-spot duration
+//   +40 keyword token cap (unchanged)
+// Total = 220. The UI bar normalises through MAX_RANK_SCORE so a +50/+20 hit
+// still renders as a healthy bar without saturating.
+export const MAX_RANK_SCORE = 220;
 
 // Duration windows per intent. b-roll and archival often surface as short
 // clips (30–120s) on YouTube — applying the talking-head floor would reject
@@ -205,13 +234,61 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   let score = 0;
   const titleLower = c.title.toLowerCase();
   const descLower = c.description.toLowerCase();
+  const channelLower = c.channelTitle.toLowerCase();
+  const matchedQueryLower = (input.matchedQuery ?? "").toLowerCase();
 
-  const celebrityHit = !!(
-    input.mainCelebrity && titleLower.includes(input.mainCelebrity.toLowerCase())
+  // Subject + alias hit (+50). An alias hitting the title counts as a subject
+  // anchor — "Kindig" in a title is just as strong a signal as "Dave Kindig"
+  // for a project anchored on Dave Kindig.
+  const subjectLower = input.mainCelebrity?.toLowerCase().trim() ?? "";
+  const aliasLowers = (input.aliases ?? [])
+    .map((a) => a.toLowerCase().trim())
+    .filter((a) => a && a !== subjectLower);
+  const subjectVariants = subjectLower ? [subjectLower, ...aliasLowers] : aliasLowers;
+  const subjectHit = subjectVariants.find((v) =>
+    titleLower.includes(v) || descLower.includes(v) || channelLower.includes(v)
   );
-  if (celebrityHit) {
-    score += 40;
-    reasons.push("title contains main celebrity");
+  if (subjectHit) {
+    score += 50;
+    reasons.push(`subject:${subjectHit}`);
+  }
+
+  // Context-term hit (+35 once). Context terms are recurring proper nouns tied
+  // to the subject — "Kindig It Design", "Bitchin Rides". They're the
+  // secondary anchor when a result doesn't restate the celebrity by name.
+  const contextLowers = (input.contextTerms ?? [])
+    .map((t) => t.toLowerCase().trim())
+    .filter((t) => t && !subjectVariants.includes(t));
+  const contextHit = contextLowers.find((t) => titleLower.includes(t) || descLower.includes(t));
+  if (contextHit) {
+    score += 35;
+    reasons.push(`context:${contextHit}`);
+  }
+
+  // Segment-topic word hit (+25). We tokenise the topic phrase the same way
+  // we tokenise keywords so "lawsuit / Creative Controls" lights up against
+  // a title containing "lawsuit" without needing exact-string match.
+  const topicTokens = tokenizeKeyword(input.segmentTopic ?? "");
+  const topicHit = topicTokens.find((t) => titleLower.includes(t) || descLower.includes(t));
+  if (topicHit) {
+    score += 25;
+    reasons.push(`topic:${topicHit}`);
+  }
+
+  // Matched query contained the subject (+20). Captures the "this candidate
+  // came from a subject-anchored search" signal independently from whether
+  // the title itself restates the name.
+  if (subjectLower && matchedQueryLower.includes(subjectLower)) {
+    score += 20;
+    reasons.push("query contains subject");
+  }
+
+  // Channel name looks like the subject's own channel (+15). Catches
+  // celebrity-owned and topic-specific channels (e.g. "Kindig It Design",
+  // "Margot Robbie Fan Channel") even when the individual title is sparse.
+  if (subjectVariants.some((v) => channelLower.includes(v))) {
+    score += 15;
+    reasons.push("channel matches subject");
   }
 
   // Tokenize keywords across the whole bag, dedupe, then count distinct token
@@ -220,10 +297,10 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   // stayed at 0 and ranking collapsed to the duration tie-breaker.
   const tokenSet = new Set<string>();
   for (const kw of input.keywords) for (const t of tokenizeKeyword(kw)) tokenSet.add(t);
-  // Don't double-count tokens that are part of the celebrity name we already
-  // scored above.
-  if (input.mainCelebrity) {
-    for (const t of tokenizeKeyword(input.mainCelebrity)) tokenSet.delete(t);
+  // Don't double-count tokens that are part of the subject/aliases/context
+  // we already scored above — they would otherwise compound the +50/+35 hit.
+  for (const v of [...subjectVariants, ...contextLowers]) {
+    for (const t of tokenizeKeyword(v)) tokenSet.delete(t);
   }
   let titleHits = 0;
   let descHits = 0;
@@ -249,14 +326,34 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   for (const bad of ["#shorts", "compilation", "funniest moments", "tier list"]) {
     if (titleLower.includes(bad)) { score -= 10; reasons.push(`-junk:${bad}`); }
   }
+  // Penalise titles that scream "unrelated product / tutorial / company
+  // profile" — these are the exact failure modes the user flagged (iPhone
+  // Creative Controls tutorials, "Creative Power Controls (Company Profile)"
+  // explainer diagrams). The penalty is heavy enough to outweigh the +25
+  // segment-topic hit so a tutorial that happens to share a word with the
+  // segment doesn't slip through.
+  for (const bad of ["company profile", "how to disable", "how to enable", "how to use", "tutorial", "app review", "product review"]) {
+    if (titleLower.includes(bad) && !subjectHit) { score -= 30; reasons.push(`-offtopic:${bad}`); }
+  }
+
+  // Hard reject for INHERITED segments that come back with zero subject /
+  // alias / context anchor in the result. Inherited segments are the ones
+  // where the section never re-stated the subject's name; the only way to
+  // keep them on-topic is to demand the result mentions the subject (or a
+  // tied entity) somewhere. Without this rule, a section about Dave Kindig's
+  // lawsuit pulls "iPhone Creative Controls tutorial" — the matched query
+  // tokens align but nothing in the result is about Dave Kindig.
+  if (input.inheritedSegment && !subjectHit && !contextHit) {
+    return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "inherited segment without subject/context anchor" };
+  }
 
   // Require at least one real content signal. Duration alone (+10) used to
   // wave through tourist clips and unrelated paparazzi videos because the
   // ranker had nothing else to weigh — they passed the duration window and
   // rendered as "100" in the UI. Approved channel counts as a signal too.
-  const hasContentSignal = celebrityHit || titleHits > 0 || descHits > 0 || approvedChannelHit;
+  const hasContentSignal = !!subjectHit || !!contextHit || !!topicHit || titleHits > 0 || descHits > 0 || approvedChannelHit;
   if (!hasContentSignal) {
-    return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "no keyword or celebrity match" };
+    return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "no keyword or subject match" };
   }
 
   // Normalize for the UI bar. Clamp to [0, 100] so the rare junk-penalized

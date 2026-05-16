@@ -152,6 +152,21 @@ export const SegmentUnderstandingSchema = z.object({
   events: z.array(z.string()).default([]),
   topics: z.array(z.string()).default([]),
   relatedKeywords: z.array(z.string()).default([]),
+  // The person / entity this SEGMENT is visually about. Filled in either by
+  // Gemini (when the section explicitly names a subject) or by the deterministic
+  // inheritance pass below (when the section uses pronouns / continues the
+  // global subject's story). Always non-empty after analyzeSegment() returns
+  // when a project-level subject is available.
+  segmentSubject: z.string().default(""),
+  // True when segmentSubject came from the global project subject rather than
+  // being explicitly named in this section. Drives the hard-reject rule in the
+  // YouTube ranker (an inherited segment must surface results that mention the
+  // subject, an alias, or a context term — otherwise it's noise).
+  inheritedSubject: z.boolean().default(false),
+  // Short focus topic for the section, e.g. "lawsuit / Creative Controls" or
+  // "early career". Used to anchor non-subject tokens in queries and to score
+  // results' titles against the segment's specific story beat.
+  segmentTopic: z.string().default(""),
   // Optional section title for the segment. When present, the planner uses
   // it as the text of a black title_card inserted at the section boundary.
   sectionTitle: z.string().default(""),
@@ -173,11 +188,89 @@ export interface SegmentContext {
   // don't drift into generic footage for legal/news/event segments where the
   // narration mentions a place or year without re-stating the subject.
   mainSubject?: string;
+  // Short forms, nicknames, and company-form variants of the main subject
+  // ("Dave", "Kindig", "Kindig It Design") — used to decide whether the
+  // current segment's narration counts as a subject re-statement or whether
+  // the segment is inheriting the global subject.
+  subjectAliases?: string[];
+  // Recurring proper nouns tied to the main subject — secondary anchors for
+  // search queries when the segment doesn't restate the subject's name.
+  contextTerms?: string[];
   // Other proper nouns extracted from the whole script — companies, related
   // people, etc. Gemini can pick the most relevant ones for this section.
   relatedCompanies?: string[];
   relatedPeople?: string[];
+  // Subject of the previous segment, used for topic-continuation inheritance
+  // (segment N uses pronouns AND segment N-1 just established a non-global
+  // subject → segment N inherits that subject, not the global one).
+  previousSegmentSubject?: string;
 }
+
+// Generic / ambiguous keywords that pull unrelated content when searched alone.
+// Queries that consist ONLY of these tokens (no subject, no proper noun) are
+// rewritten to prepend the global subject — or dropped entirely if no subject
+// is available. The set is intentionally short and behaviour-driven; growing
+// it is cheaper than adding more prompt rules to Gemini.
+const GENERIC_QUERY_KEYWORDS = new Set([
+  "lawsuit","lawsuits","court","ruling","trial","legal","dispute","case",
+  "litigation","judgment","verdict","subpoena",
+  "company","profile","overview","business","corporation","brand",
+  "tutorial","how","guide","review","tips","unboxing","setup",
+  "app","application","feature","features","controls","setting","settings",
+  "donation","charity","custom","build","project","renovation","restoration",
+  "creative","creative controls","creative power controls",
+]);
+
+// Token a generic / ambiguous phrase set against. Lowercases and strips
+// punctuation so "Creative Controls" matches "creative controls".
+function isGenericPhrase(s: string): boolean {
+  const norm = s.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
+  if (!norm) return true;
+  if (GENERIC_QUERY_KEYWORDS.has(norm)) return true;
+  // Split into tokens and check whether EVERY token is generic. "Utah court
+  // ruling 2016" has a year and a place so it survives; "court ruling 2016"
+  // (no proper noun) would be flagged because "court","ruling" are generic
+  // and a bare year isn't a strong enough anchor on its own.
+  const toks = norm.split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return true;
+  const nonGenericTokens = toks.filter((t) => !GENERIC_QUERY_KEYWORDS.has(t) && !/^\d{4}$/.test(t));
+  return nonGenericTokens.length === 0;
+}
+
+// Deterministic query post-processor. Guarantees that every query passed to
+// YouTube contains either the global subject, an alias, or a context term —
+// generic local keywords on their own pull "Creative Power Controls company
+// profile" and "iPhone Creative Controls" tutorials, which is exactly the
+// failure the user reported.
+export function buildSegmentQuery(
+  rawQuery: string,
+  context: SegmentContext,
+  segmentSubject: string,
+): string {
+  const subject = (segmentSubject || context.mainSubject || "").trim();
+  const aliases = (context.subjectAliases ?? []).map((s) => s.toLowerCase());
+  const contextTerms = (context.contextTerms ?? []).map((s) => s.toLowerCase());
+  const cleaned = sanitizeQuery(rawQuery).trim();
+  if (!cleaned) return subject; // last-ditch fallback — better than empty
+  const lower = cleaned.toLowerCase();
+  const containsSubject = subject && lower.includes(subject.toLowerCase());
+  const containsAlias = aliases.some((a) => a && lower.includes(a));
+  const containsContext = contextTerms.some((t) => t && lower.includes(t));
+  if (containsSubject || containsAlias || containsContext) {
+    // Already anchored. Return as-is.
+    return cleaned;
+  }
+  // No anchor present. If we have a subject, prepend it; otherwise, prepend
+  // the strongest context term (typically the subject's company). If neither
+  // exists, fall back to the cleaned query unchanged — the ranker still has
+  // the no-content-signal guard to drop irrelevant hits downstream.
+  if (subject) return `${subject} ${cleaned}`;
+  const firstContext = (context.contextTerms ?? [])[0];
+  if (firstContext) return `${firstContext} ${cleaned}`;
+  return cleaned;
+}
+
+export { GENERIC_QUERY_KEYWORDS, isGenericPhrase };
 
 export async function analyzeSegment(
   segment: RawSegment,
@@ -185,8 +278,14 @@ export async function analyzeSegment(
 ): Promise<SegmentUnderstanding> {
   const model = getModel();
   const subject = context.mainSubject?.trim();
+  const aliasList = (context.subjectAliases ?? []).filter(Boolean);
+  const contextTermList = (context.contextTerms ?? []).filter(Boolean);
   const subjectBlock = subject
-    ? `\nPROJECT SUBJECT: ${subject}\nThis whole video is about ${subject}. The current section may not re-state the name, but every visual we pull must still be about ${subject} or directly involve them.\n`
+    ? `\nPROJECT SUBJECT: ${subject}\nThis whole video is about ${subject}. The current section may not re-state the name, but every visual we pull must still be about ${subject} or directly involve them.${
+        aliasList.length ? `\nAliases the script may use: ${aliasList.join(", ")}.` : ""
+      }${
+        contextTermList.length ? `\nContext terms tied to ${subject}: ${contextTermList.join(", ")}.` : ""
+      }\n`
     : "";
   const relatedBlock = (() => {
     const parts: string[] = [];
@@ -195,13 +294,17 @@ export async function analyzeSegment(
     return parts.length ? `\n${parts.join(" ")}\n` : "";
   })();
   const subjectQueryRule = subject
-    ? `- ANCHOR RULE: every "query" MUST mention "${subject}" (or a company/person from this script that is uniquely tied to ${subject}, like ${(context.relatedCompanies ?? []).slice(0, 2).join(" / ") || "their business"}). A generic query like "Utah court ruling 2016" will pull unrelated trials — instead write "${subject} lawsuit 2016" or "${(context.relatedCompanies?.[0]) ?? subject} court ruling". If you cannot anchor a query to ${subject} or one of their named entities, drop the intent.`
+    ? `- ANCHOR RULE: every "query" MUST mention "${subject}" (or an alias / context term uniquely tied to ${subject}, like ${
+        [...aliasList, ...contextTermList].slice(0, 3).join(" / ") || "their business"
+      }). A generic query like "Utah court ruling 2016" will pull unrelated trials — instead write "${subject} lawsuit 2016" or "${(contextTermList[0]) ?? subject} court ruling". If you cannot anchor a query to ${subject} or one of their named entities, drop the intent.`
     : "";
   const prompt = `You are helping a video editor understand one section of a celebrity-focused voiceover.
 ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
 {
   "mainTopic": "short phrase, e.g. 'Margot Robbie's early career'",
-  "people": ["person names mentioned"],
+  "segment_subject": "the ONE person or entity this section is visually about. If the narration uses pronouns or only mentions topics (a lawsuit, a place, a year) without naming a person, leave this EMPTY — do NOT guess. The code will inherit the project subject for empty values.",
+  "segment_topic": "short focus topic, 2-5 words, e.g. 'lawsuit / Creative Controls', 'early career', 'wedding 2019'. This is the story beat, not the subject.",
+  "people": ["EVERY named person in this section, INCLUDING the main subject when their name appears. Do not omit the subject just because the whole video is about them."],
   "places": ["cities, countries, venues"],
   "events": ["awards, premieres, news moments"],
   "topics": ["broader themes like 'method acting', 'family life'"],
@@ -293,34 +396,97 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
       retryable: isRetryableGeminiError(e),
       err: (e as Error).message?.slice(0, 200),
     }));
-    return fallbackUnderstanding(segment);
+    return fallbackUnderstanding(segment, context);
   }
   let parsed: unknown;
   try { parsed = JSON.parse(txt); } catch {
-    return fallbackUnderstanding(segment);
+    return fallbackUnderstanding(segment, context);
   }
-  const safe = SegmentUnderstandingSchema.safeParse(parsed);
+  // Gemini emits snake_case (segment_subject / segment_topic) per the prompt
+  // contract but our zod schema uses camelCase. Normalise before parsing so a
+  // present-but-empty subject still lands in the schema's default and the
+  // inheritance pass below has a value to act on.
+  const normalised = (() => {
+    if (!parsed || typeof parsed !== "object") return parsed;
+    const p = parsed as Record<string, unknown>;
+    if ("segment_subject" in p && !("segmentSubject" in p)) p.segmentSubject = p.segment_subject;
+    if ("segment_topic" in p && !("segmentTopic" in p)) p.segmentTopic = p.segment_topic;
+    return p;
+  })();
+  const safe = SegmentUnderstandingSchema.safeParse(normalised);
   if (!safe.success) {
     console.error(JSON.stringify({
       msg: "analyzeSegment.schema_failed",
       raw: txt.slice(0, 400),
       issues: safe.error.flatten(),
     }));
-    return fallbackUnderstanding(segment);
+    return fallbackUnderstanding(segment, context);
   }
-  // Belt-and-suspenders: even with the prompt rules, Gemini occasionally slips
-  // an editorial word into a query. Strip them here so YouTube never sees them.
-  // Also run the deterministic subject-continuity pass before returning so
-  // downstream consumers always see resolved subjects on pronoun-only blocks.
-  const blocks = applySubjectContinuity(safe.data.blocks, context.mainSubject);
+
+  // 1) Resolve the segment's subject + inheritance flag deterministically.
+  //    Gemini was instructed to leave segment_subject blank when the section
+  //    doesn't explicitly name a person; we fill it in here so downstream
+  //    code can rely on a non-empty value whenever a project subject exists.
+  const resolved = resolveSegmentSubject(safe.data, context);
+
+  // 2) Belt-and-suspenders: even with the prompt rules, Gemini occasionally
+  //    emits a query with NO subject anchor when the section is pronoun-heavy.
+  //    Rewrite each query through buildSegmentQuery so the YouTube call always
+  //    sees subject + topic — generic "Utah court ruling 2016" becomes
+  //    "Dave Kindig Utah court ruling 2016". Also strip editorial framing
+  //    words via sanitizeQuery (already invoked inside buildSegmentQuery).
+  const rewrittenIntents = safe.data.searchIntents.map((it) => ({
+    ...it,
+    query: buildSegmentQuery(it.query, context, resolved.segmentSubject),
+  }));
+
+  const blocks = applySubjectContinuity(safe.data.blocks, resolved.segmentSubject || context.mainSubject);
   return {
     ...safe.data,
-    searchIntents: safe.data.searchIntents.map((it) => ({
-      ...it,
-      query: sanitizeQuery(it.query),
-    })),
+    segmentSubject: resolved.segmentSubject,
+    inheritedSubject: resolved.inheritedSubject,
+    segmentTopic: safe.data.segmentTopic?.trim() || safe.data.mainTopic.slice(0, 80),
+    searchIntents: rewrittenIntents,
     blocks,
   };
+}
+
+// Decide what subject the segment is "about" and whether it was inherited.
+// Inheritance priority:
+//   1. Gemini explicitly named a subject in this section → use it.
+//   2. Otherwise prefer the previous segment's subject if it was non-global
+//      (topic continuation through pronouns).
+//   3. Otherwise inherit the global project subject.
+//   4. If none of the above, leave empty — search will skip the anchor rule.
+//
+// `inheritedSubject` is true unless rule 1 fired with a value that is NOT just
+// a restatement of the global subject. Even when Gemini emits the project
+// subject as the segment subject (a section that DOES re-state "Dave Kindig"),
+// we keep inheritedSubject = false because the section anchored itself.
+function resolveSegmentSubject(
+  parsed: { segmentSubject?: string; people?: string[] },
+  context: SegmentContext,
+): { segmentSubject: string; inheritedSubject: boolean } {
+  const global = (context.mainSubject ?? "").trim();
+  const explicit = (parsed.segmentSubject ?? "").trim();
+  if (explicit) {
+    return { segmentSubject: explicit, inheritedSubject: false };
+  }
+  // No explicit segment_subject. Did Gemini at least name the global subject
+  // (or an alias) in the people array? If so, treat the section as anchored.
+  const aliases = [global, ...(context.subjectAliases ?? [])].map((s) => s.toLowerCase()).filter(Boolean);
+  const peopleHit = (parsed.people ?? []).find((p) => aliases.includes(p.toLowerCase()));
+  if (peopleHit) {
+    return { segmentSubject: global || peopleHit, inheritedSubject: false };
+  }
+  const prev = (context.previousSegmentSubject ?? "").trim();
+  if (prev && prev.toLowerCase() !== global.toLowerCase()) {
+    return { segmentSubject: prev, inheritedSubject: true };
+  }
+  if (global) {
+    return { segmentSubject: global, inheritedSubject: true };
+  }
+  return { segmentSubject: "", inheritedSubject: false };
 }
 
 // Words that describe how the writer feels about a subject but never appear in
@@ -372,20 +538,30 @@ export function applySubjectContinuity(blocks: BlockPlan[], fallbackSubject?: st
   });
 }
 
-function fallbackUnderstanding(segment: RawSegment): SegmentUnderstanding {
+function fallbackUnderstanding(segment: RawSegment, context: SegmentContext = {}): SegmentUnderstanding {
   const firstSentence = segment.text.split(/[.!?]/, 1)[0]?.slice(0, 80) ?? "Section";
+  // No Gemini understanding available, so we have no segment-level evidence
+  // either way. Treat as inherited from the global subject when one exists —
+  // the ranker's hard-reject rule will then still keep results on-topic.
+  const subject = (context.mainSubject ?? "").trim();
+  const rawQuery = firstSentence || `Part ${segment.index + 1}`;
+  const query = buildSegmentQuery(rawQuery, context, subject);
   return {
     mainTopic: firstSentence || `Part ${segment.index + 1}`,
-    people: [], places: [], events: [], topics: [],
+    people: subject ? [subject] : [],
+    places: [], events: [], topics: [],
     relatedKeywords: [],
+    segmentSubject: subject,
+    inheritedSubject: !!subject,
+    segmentTopic: firstSentence.slice(0, 60),
     sectionTitle: "",
-    searchIntents: [{ label: "Looking for relevant background footage", query: firstSentence, intentType: "talking_head" }],
+    searchIntents: [{ label: "Looking for relevant background footage", query, intentType: "talking_head" }],
     // No Gemini analysis available — emit a single footage-typed block from
     // the whole segment so the planner has something to align against.
     blocks: [{
       text: segment.text,
-      resolved_subject: "",
-      subject_type: "general",
+      resolved_subject: subject,
+      subject_type: subject ? "person" : "general",
       mentioned_entities: [],
       specific_visual_references: [],
       pronouns_detected: false,

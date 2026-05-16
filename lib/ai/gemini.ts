@@ -260,6 +260,81 @@ SCRIPT:
 }
 
 // ---------------------------------------------------------------------------
+// Project context — global subject + aliases + context terms
+// ---------------------------------------------------------------------------
+
+// Separate, focused call so that even when extractEntities() misses the
+// celebrity under its strict "full proper noun" rule (e.g. the script only
+// says "Dave" or "Kindig" without ever writing "Dave Kindig" in full), we
+// still recover a usable global subject for downstream segment anchoring.
+// Returns "" / [] when the model can't identify a clear subject — callers
+// should treat that as "no global anchor" rather than failing.
+
+export interface ProjectContext {
+  globalMainSubject: string;          // canonical full name, e.g. "Dave Kindig"
+  globalSubjectAliases: string[];     // short forms: "Dave", "Kindig", "Kindig It Design"
+  globalContextTerms: string[];       // recurring entities: "Kindig It Design", "Bitchin' Rides"
+}
+
+const ProjectContextSchema = z.object({
+  global_main_subject: z.string().default(""),
+  global_subject_aliases: z.array(z.string()).default([]),
+  global_context_terms: z.array(z.string()).default([]),
+});
+
+export async function extractProjectContext(transcript: string): Promise<ProjectContext> {
+  const empty: ProjectContext = { globalMainSubject: "", globalSubjectAliases: [], globalContextTerms: [] };
+  if (!transcript.trim()) return empty;
+  const model = getModel();
+  const prompt = `You are reading a celebrity / public-figure focused voiceover script and identifying its global subject.
+The result is used to anchor YouTube searches for EVERY section of the video, including sections that
+narrate a lawsuit, a place, or an event without re-stating the subject's name.
+
+Return STRICT JSON ONLY in this shape:
+{
+  "global_main_subject": "the ONE person or entity this whole video is about, full canonical name (e.g. 'Dave Kindig'). If the script only ever uses a short form like 'Kindig' or 'Dave', expand to the most likely full name. Empty string if no clear subject.",
+  "global_subject_aliases": ["short forms, nicknames, last-name-only, and company forms the script uses to refer to the main subject — e.g. ['Dave', 'Kindig', 'Kindig It', 'Kindig It Design']. Include the canonical name itself."],
+  "global_context_terms": ["3-8 recurring proper nouns tightly tied to the main subject — their business, their show, their famous projects. e.g. ['Kindig It Design', 'Bitchin Rides', 'custom cars']. These are used as SECONDARY anchors when a section never re-states the subject's name."]
+}
+
+Rules:
+- "global_main_subject" must be a person OR a tightly-named company/show, NOT a topic ("lawsuits", "custom cars" are NOT subjects).
+- "global_subject_aliases" should be lowercase-equivalent variants the script actually uses. Always include the canonical name.
+- "global_context_terms" should be proper nouns (capitalized), not topics. "lawsuit" is NOT a context term. "Kindig It Design" IS.
+- If you cannot find a single clear subject, return empty values rather than guessing.
+
+SCRIPT:
+"""${transcript.slice(0, 12000)}"""`;
+
+  let txt: string;
+  try {
+    const res = await withGeminiRetry("extractProjectContext", () =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      })
+    );
+    txt = res.response.text();
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "extractProjectContext.gemini_failed", err: (e as Error).message }));
+    return empty;
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch {
+    console.error(JSON.stringify({ msg: "extractProjectContext.parse_failed", raw: txt.slice(0, 300) }));
+    return empty;
+  }
+  const safe = ProjectContextSchema.safeParse(parsed);
+  if (!safe.success) return empty;
+  const subject = safe.data.global_main_subject.trim();
+  const aliases = Array.from(new Set(
+    [...safe.data.global_subject_aliases, subject].map((s) => s.trim()).filter(Boolean)
+  ));
+  const contextTerms = Array.from(new Set(safe.data.global_context_terms.map((s) => s.trim()).filter(Boolean)));
+  return { globalMainSubject: subject, globalSubjectAliases: aliases, globalContextTerms: contextTerms };
+}
+
+// ---------------------------------------------------------------------------
 // Query generation
 // ---------------------------------------------------------------------------
 

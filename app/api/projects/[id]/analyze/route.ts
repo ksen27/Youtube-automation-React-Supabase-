@@ -10,7 +10,7 @@ import {
 } from "@/lib/ai/segments";
 import { planTimeline } from "@/lib/ai/timeline-plan";
 import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
-import { extractEntities } from "@/lib/ai/gemini";
+import { extractEntities, extractProjectContext } from "@/lib/ai/gemini";
 
 // Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
 // a YouTube preview search. No FFmpeg, no yt-dlp, no downloads. The user
@@ -138,25 +138,58 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     // 1a) Project-level entity extraction. We need this BEFORE segment work
     // so the search ranker knows who the main celebrity is — `related_person`
     // (co-stars, family) is a different bucket and was being mis-used here.
-    const projectEntities = await extractEntities(transcript).catch(async (e) => {
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.extract_entities.failed", { err: (e as Error).message });
-      return [] as Awaited<ReturnType<typeof extractEntities>>;
-    });
-    const mainCelebrity = projectEntities.find((e) => e.type === "celebrity")?.value;
+    // We also call extractProjectContext in parallel — a separate, focused
+    // prompt that recovers the global subject + aliases + context terms even
+    // when extractEntities's strict "full proper noun" rule misses it (e.g.
+    // a script that only ever calls Dave Kindig "Dave" or "Kindig").
+    const [projectEntities, projectContext] = await Promise.all([
+      extractEntities(transcript).catch(async (e) => {
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.extract_entities.failed", { err: (e as Error).message });
+        return [] as Awaited<ReturnType<typeof extractEntities>>;
+      }),
+      extractProjectContext(transcript).catch(async (e) => {
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.extract_context.failed", { err: (e as Error).message });
+        return { globalMainSubject: "", globalSubjectAliases: [], globalContextTerms: [] };
+      }),
+    ]);
+    const entityCelebrity = projectEntities.find((e) => e.type === "celebrity")?.value;
+    // Prefer extractEntities's strict celebrity when present (it's the long-
+    // standing source of truth), otherwise fall back to extractProjectContext
+    // which is more lenient on partial names.
+    const mainCelebrity = entityCelebrity || projectContext.globalMainSubject || undefined;
     const relatedCompanies = projectEntities.filter((e) => e.type === "company").map((e) => e.value);
     const relatedPeople = projectEntities.filter((e) => e.type === "related_person").map((e) => e.value);
+    // Merge alias / context-term lists. Project-level companies are strong
+    // context anchors too — fold them in deduped, lowercase-equivalent.
+    const aliasSet = new Set<string>();
+    for (const a of projectContext.globalSubjectAliases) if (a) aliasSet.add(a);
+    if (mainCelebrity) aliasSet.add(mainCelebrity);
+    const subjectAliases = Array.from(aliasSet);
+    const contextSet = new Set<string>();
+    for (const t of projectContext.globalContextTerms) if (t) contextSet.add(t);
+    for (const c of relatedCompanies) if (c) contextSet.add(c);
+    const contextTerms = Array.from(contextSet).slice(0, 10);
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.main_celebrity", {
       mainCelebrity: mainCelebrity ?? null,
       celebrityCount: projectEntities.filter((e) => e.type === "celebrity").length,
       totalEntities: projectEntities.length,
+      subjectAliases,
+      contextTerms,
+      // Surface which extractor produced the subject so we can audit when
+      // extractEntities silently misses one and extractProjectContext saves us.
+      mainCelebritySource:
+        entityCelebrity ? "extractEntities" :
+        projectContext.globalMainSubject ? "extractProjectContext" : "none",
     });
 
     // 1b) Per-segment understanding (parallel — Gemini calls are independent).
-    // We pass the project subject + named companies/people into every segment
+    // We pass the project subject + aliases + context terms into every segment
     // so Gemini anchors its queries (e.g. "Kindig It Design lawsuit 2016"
     // instead of "Utah court ruling 2016", which pulls unrelated trials).
     const segmentContext = {
       mainSubject: mainCelebrity,
+      subjectAliases,
+      contextTerms,
       relatedCompanies: relatedCompanies.slice(0, 6),
       relatedPeople: relatedPeople.slice(0, 6),
     };
@@ -205,6 +238,18 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       // documentaries shouldn't outrank a focused b-roll clip just because
       // they hit more of the project's overall keyword bag.
       const segKeywords = Array.from(new Set([...(u.relatedKeywords ?? []), u.mainTopic].filter(Boolean)));
+      const segmentRejectionTotals: Record<string, number> = {};
+      let segmentRejectedTotal = 0;
+      // Per-segment subject anchor info logged once up front so rejection
+      // reasons make sense when paging through the log.
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segment.subject", {
+        segment: i,
+        global_main_subject: mainCelebrity ?? null,
+        segment_subject: u.segmentSubject || null,
+        inherited_subject: u.inheritedSubject,
+        segment_topic: u.segmentTopic || null,
+        generated_queries: u.searchIntents.map((it) => it.query),
+      });
       for (const intent of u.searchIntents) {
         const intentType = intent.intentType ?? "talking_head";
         // Phase B: per-query provenance. The analyze route classifies
@@ -235,8 +280,16 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         for (const c of cands) {
           if (seenVideo.has(c.videoId)) { dupes++; continue; }
           const ranked = rankCandidate({
-            candidate: c, mainCelebrity, keywords: segKeywords,
-            approvedChannelIds: approved, blockedChannelIds: blocked,
+            candidate: c,
+            mainCelebrity,
+            aliases: subjectAliases,
+            contextTerms,
+            segmentTopic: u.segmentTopic || u.mainTopic,
+            matchedQuery: intent.query,
+            inheritedSegment: u.inheritedSubject,
+            keywords: segKeywords,
+            approvedChannelIds: approved,
+            blockedChannelIds: blocked,
             intentType,
           });
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand", {
@@ -255,6 +308,8 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           if (ranked.rejected) {
             const k = ranked.rejectReason ?? "unknown";
             rejectTally[k] = (rejectTally[k] ?? 0) + 1;
+            segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
+            segmentRejectedTotal++;
             continue;
           }
           accepted++;
@@ -287,6 +342,16 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           rejected: rejectTally,
         });
       }
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segment.summary", {
+        segment: i,
+        global_main_subject: mainCelebrity ?? null,
+        segment_subject: u.segmentSubject || null,
+        inherited_subject: u.inheritedSubject,
+        segment_topic: u.segmentTopic || null,
+        generated_queries: u.searchIntents.map((it) => it.query),
+        rejected_results_count: segmentRejectedTotal,
+        rejection_reason: segmentRejectionTotals,
+      });
       segCandidates.sort((a, b) => b.score - a.score);
       const segDuration = Math.max(0, seg.endSeconds - seg.startSeconds);
       const segBlockCount = Math.max(1, Math.ceil(segDuration / plan.avgBlockSeconds));

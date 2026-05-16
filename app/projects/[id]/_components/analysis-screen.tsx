@@ -44,6 +44,12 @@ interface SegmentUnderstanding {
   events: string[];
   topics: string[];
   relatedKeywords: string[];
+  // Optional fields — older saved payloads predate the global-subject anchor
+  // work and won't have these. Default to empty/false on read so we don't
+  // crash the workspace when re-hydrating an analyze run from before the change.
+  segmentSubject?: string;
+  inheritedSubject?: boolean;
+  segmentTopic?: string;
   searchIntents: { label: string; query: string }[];
 }
 
@@ -502,6 +508,11 @@ function SegmentPanel({
             </div>
 
             <TabsContent value="understanding" className="px-5 pb-5 space-y-4 mt-4">
+              <SubjectHeader
+                segmentSubject={u.segmentSubject}
+                inheritedSubject={u.inheritedSubject}
+                segmentTopic={u.segmentTopic}
+              />
               <ChipGroup label="People" tone="person" values={u.people} />
               <ChipGroup label="Places" tone="place" values={u.places} />
               <ChipGroup label="Events" tone="topic" values={u.events} />
@@ -564,6 +575,41 @@ function SegmentPanel({
         </div>
       )}
     </Card>
+  );
+}
+
+function SubjectHeader({
+  segmentSubject,
+  inheritedSubject,
+  segmentTopic,
+}: {
+  segmentSubject?: string;
+  inheritedSubject?: boolean;
+  segmentTopic?: string;
+}) {
+  // Older payloads predate this surface — keep the tab tidy by rendering
+  // nothing when neither field is populated.
+  if (!segmentSubject && !segmentTopic) return null;
+  return (
+    <div className="rounded-md border border-border bg-surface-2 p-3 space-y-2">
+      {segmentSubject ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Segment subject</div>
+          <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-semibold text-fg">{segmentSubject}</span>
+            {inheritedSubject ? (
+              <Chip tone="keyword">inherited from project topic</Chip>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {segmentTopic ? (
+        <div>
+          <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Segment topic</div>
+          <div className="mt-0.5 text-sm text-fg">{segmentTopic}</div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
