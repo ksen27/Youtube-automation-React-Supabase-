@@ -2,12 +2,18 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCheck, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { CheckCheck, Play, Plus, RefreshCw, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { fmtMinutes, type ClipRow, type TimelineRow } from "../_shared";
+import { fmtClock, fmtMinutes, type ClipRow, type TimelineRow } from "../_shared";
 import { SceneBlock } from "./blocks/scene-block";
 
 export function BlockEditorScreen({
@@ -41,6 +47,7 @@ export function BlockEditorScreen({
 
   const [editingClipFor, setEditingClipFor] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [previewClip, setPreviewClip] = useState<ClipRow | null>(null);
 
   const patch = useMutation({
     mutationFn: async (body: {
@@ -214,6 +221,7 @@ export function BlockEditorScreen({
                 approved={it.approved}
                 selected={selectedId === it.id}
                 onSelect={() => onSelect(selectedId === it.id ? null : it.id)}
+                onPlay={clip?.clip_url ? () => setPreviewClip(clip) : undefined}
                 onReplace={() => setEditingClipFor(editingClipFor === it.id ? null : it.id)}
                 onDelete={() => removeItem(it.id)}
               />
@@ -221,29 +229,48 @@ export function BlockEditorScreen({
               {editingClipFor === it.id && (
                 <div className="mt-2 ml-12 rounded-[10px] border border-border bg-bg-elevated p-3">
                   <div className="mb-2 text-xs font-medium text-fg-muted">
-                    Replace with another clip
+                    Replace with another clip — click to use, ▶ to preview
                   </div>
                   {clips.length === 0 ? (
                     <p className="text-xs text-fg-subtle">No clips available.</p>
                   ) : (
                     <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2 max-h-56 overflow-y-auto">
                       {clips.map((c) => (
-                        <button
+                        <div
                           key={c.id}
-                          type="button"
-                          onClick={() => replaceClip(it.id, c.id)}
-                          className="aspect-video bg-bg-elevated rounded overflow-hidden border border-border hover:border-brand-500 transition-colors"
+                          className="relative group/clip aspect-video bg-bg-elevated rounded overflow-hidden border border-border hover:border-brand-500 transition-colors"
                         >
-                          {c.thumbnail_url ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img
-                              src={c.thumbnail_url}
-                              alt=""
-                              className="h-full w-full object-cover"
-                              loading="lazy"
-                            />
-                          ) : null}
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => replaceClip(it.id, c.id)}
+                            aria-label="Use this clip"
+                            className="absolute inset-0"
+                          >
+                            {c.thumbnail_url ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                src={c.thumbnail_url}
+                                alt=""
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                              />
+                            ) : null}
+                          </button>
+                          {c.clip_url && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setPreviewClip(c);
+                              }}
+                              aria-label="Preview clip"
+                              title="Preview clip"
+                              className="absolute bottom-1 right-1 grid place-items-center h-6 w-6 rounded-full bg-black/70 text-white opacity-0 group-hover/clip:opacity-100 transition-opacity hover:bg-black/90"
+                            >
+                              <Play className="h-3 w-3 ml-0.5" />
+                            </button>
+                          )}
+                        </div>
                       ))}
                     </div>
                   )}
@@ -253,6 +280,49 @@ export function BlockEditorScreen({
           );
         })}
       </ol>
+
+      <ClipPreviewDialog clip={previewClip} onClose={() => setPreviewClip(null)} />
     </div>
+  );
+}
+
+function ClipPreviewDialog({
+  clip,
+  onClose,
+}: {
+  clip: ClipRow | null;
+  onClose: () => void;
+}) {
+  const open = clip !== null;
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="p-0 overflow-hidden">
+        <div className="flex items-start justify-between gap-3 px-4 pt-3 pb-2">
+          <div className="min-w-0">
+            <DialogTitle className="truncate">
+              {clip?.source?.title ?? "Clip preview"}
+            </DialogTitle>
+            {clip && (
+              <DialogDescription className="tabular-nums">
+                {fmtClock(clip.start_time)} → {fmtClock(clip.end_time)} ·{" "}
+                {Math.round(clip.duration)}s
+              </DialogDescription>
+            )}
+          </div>
+        </div>
+        <div className="bg-black aspect-video">
+          {clip?.clip_url ? (
+            <video
+              key={clip.id}
+              src={clip.clip_url}
+              poster={clip.thumbnail_url ?? undefined}
+              controls
+              autoPlay
+              className="h-full w-full"
+            />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

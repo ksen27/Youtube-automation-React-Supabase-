@@ -81,6 +81,10 @@ export interface TimelineRow {
 export interface ClipRow {
   id: string;
   thumbnail_url: string | null;
+  clip_url: string | null;
+  start_time: number;
+  end_time: number;
+  duration: number;
   source: { title: string | null } | null;
 }
 
