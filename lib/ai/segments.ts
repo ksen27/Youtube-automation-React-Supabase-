@@ -337,12 +337,14 @@ Rules:
 
 Block-level visual rules (these matter — they drive what appears on screen):
 - Split the section into 4-12 blocks. Each block is 1-3 sentences of consecutive narration.
-- Choose "recommended_visual_type" per block:
-  * "footage" — general narration ABOUT the celebrity/person; career, public life, story context. The viewer just needs to see the person on screen.
-  * "image" — block names a SPECIFIC reference: tattoo, parent, sibling, childhood, a place, a movie/show/song title, a company, an event, a year. List the exact reference in "specific_visual_references".
+- Choose "recommended_visual_type" per block based on subject_type:
+  * When subject_type is "person" or "general" → "footage". The viewer needs to see the person on screen.
+  * When subject_type is "company" / "movie" / "show" / "place" / "event" / "object" AND the block names that entity → "image". The visual should be of THE ENTITY (a company logo, a movie poster, a place photo, an event's archival footage), NOT the celebrity. Put the entity name in "mentioned_entities" — downstream code routes "company" entities to logo search, "movie" entities to poster search, "place" entities to place-photo search, etc.
+  * IMPORTANT — place restriction: only emit subject_type "place" for SPECIFIC named buildings, courthouses, landmarks, stadiums, venues whose image search returns recognizable photographs (e.g. "Utah District Court", "Wembley Stadium", "Buckingham Palace"). DO NOT emit "place" for countries, states, regions, or continents ("Utah", "Michigan", "United States", "Europe"). Those return flags, outline maps, and coats of arms — useless as B-roll. A block whose only place reference is a country / state / region should be subject_type "general" with recommended_visual_type "footage", and the visual will be the project celebrity.
+  * IMPORTANT — event restriction: only emit subject_type "event" for NAMED historical events with a recognizable title ("Royal Wedding 1981", "Apollo 11", "Kindig It Design lawsuit ruling"). DO NOT emit "event" for bare dates ("January 2016", "2019", "the early 2000s") — image search on a date alone returns calendar pages and stock photos. A block whose only event reference is a date should be subject_type "general" with recommended_visual_type "footage".
   * "title_card" — block is a section heading or a strong topic shift. Rare; only if the narration explicitly opens a chapter.
   * "split_2" — block compares/relates TWO named people or two named entities (e.g. "Salma Hayek and Danny Trejo worked together"). Only when both are important visuals.
-- Default to "footage" when in doubt. Footage does NOT need to perfectly match every sentence — it just needs to show the right person.
+- DO NOT default to "footage" for blocks whose subject is a non-person entity. A block like "Creative Controls argued that the Utah court did not have authority" has subject_type="company" and subject="Creative Controls" — that is an "image" block, NOT a footage block. Footage of the project's main celebrity is wrong there; the visual must be of the named entity (or fall back to the celebrity ONLY when no entity image is available — the matcher handles that fallback, you don't need to).
 - Use "image" for specific references even when the celebrity is the subject (e.g. "Her mother raised three kids" → image of mother). The reference is what drives the visual, not the celebrity.
 - For pronoun-only blocks (he/she/him/her) leave "resolved_subject" as "" — the code inherits from the previous block.
 - "mentioned_entities" should contain literal names in this block's text, not synonyms.

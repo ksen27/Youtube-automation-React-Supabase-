@@ -26,6 +26,67 @@ import { fetchImages } from "@/lib/images/fetch";
 // screenshot.
 const MIN_RELEVANT_SCORE = 25;
 
+// Countries, U.S. states, regions, and continents whose image search returns
+// flags / outline maps / coats of arms instead of recognizable photographs.
+// Used by the Phase D image router to skip type-aware place routing when
+// Gemini emits a non-landmark "place" entity — the footage fallback (Dave
+// Kindig clip) is strictly better than a state flag for those blocks.
+//
+// We mirror the rejection list from extractEntities (lib/ai/gemini.ts) so
+// the matcher's defense lines up with the entity-extractor's prompt rules.
+const COUNTRY_REGION_SET = new Set<string>([
+  // Common country names + ISO short forms.
+  "usa","u.s.","u.s.a.","united states","united states of america","america",
+  "uk","u.k.","united kingdom","great britain","britain","england","scotland",
+  "wales","northern ireland","ireland","france","germany","spain","italy",
+  "portugal","netherlands","belgium","switzerland","austria","poland","russia",
+  "ukraine","greece","turkey","canada","mexico","brazil","argentina","chile",
+  "australia","new zealand","japan","china","india","pakistan","bangladesh",
+  "south korea","north korea","singapore","thailand","vietnam","philippines",
+  "indonesia","saudi arabia","uae","united arab emirates","egypt","south africa",
+  "nigeria","kenya","morocco","norway","sweden","denmark","finland","iceland",
+  // Continents.
+  "europe","asia","africa","north america","south america","antarctica","oceania",
+  // U.S. states (just the ones most likely to land in our scripts).
+  "alabama","alaska","arizona","arkansas","california","colorado","connecticut",
+  "delaware","florida","georgia","hawaii","idaho","illinois","indiana","iowa",
+  "kansas","kentucky","louisiana","maine","maryland","massachusetts","michigan",
+  "minnesota","mississippi","missouri","montana","nebraska","nevada","new hampshire",
+  "new jersey","new mexico","new york","north carolina","north dakota","ohio",
+  "oklahoma","oregon","pennsylvania","rhode island","south carolina","south dakota",
+  "tennessee","texas","utah","vermont","virginia","washington","west virginia",
+  "wisconsin","wyoming","district of columbia","washington dc","washington d.c.",
+  // Generic regions.
+  "the south","the north","the midwest","the west","the east","the eastern seaboard",
+  "the west coast","the east coast","the mainland",
+]);
+
+function isCountryOrRegion(s: string): boolean {
+  const norm = s.toLowerCase().trim().replace(/[.,!?;:]+$/, "");
+  if (COUNTRY_REGION_SET.has(norm)) return true;
+  // "Northern California" / "Eastern Europe" → contains a region word.
+  // Cheap heuristic — catches the common "{direction} {region}" cases.
+  return /\b(northern|southern|eastern|western|central)\s+(europe|asia|africa|america|california|state|states)\b/.test(norm);
+}
+
+// Bare-date detector. Catches "January 2016", "2019", "the early 2000s",
+// "spring of 1998" etc — strings that are PRIMARILY a calendar reference,
+// not a named event. A 4-digit year embedded inside a longer named-event
+// string ("Royal Wedding 1981") survives because the proper noun balances it.
+function isDateOnly(s: string): boolean {
+  const norm = s.toLowerCase().trim();
+  if (!norm) return true;
+  // Bare year, optional decade marker.
+  if (/^(the\s+)?(early|mid|late)?\s*\d{4}s?$/.test(norm)) return true;
+  // Month + year (e.g. "January 2016", "Jan. 2016").
+  if (/^(the\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z.]*\s+\d{4}$/.test(norm)) return true;
+  // "the 2000s" / "the early 2000s" / "the mid 90s".
+  if (/^(the\s+)?(early|mid|late)?\s*\d{2,4}s?$/.test(norm)) return true;
+  // Quarter / season + year ("spring 2018", "Q1 2020").
+  if (/^(the\s+)?(spring|summer|fall|autumn|winter|q[1-4])\s+(of\s+)?\d{4}$/.test(norm)) return true;
+  return false;
+}
+
 // Splits a transcript into ~sentence/paragraph sections. Retained for
 // backward-compatibility / test imports; the matcher itself no longer uses
 // section-cursor logic. See buildBlockTexts() below for the time-aligned
@@ -143,13 +204,50 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     (sources ?? []).map((s) => [s.id as string, (s.title as string | null) ?? null])
   );
 
-  const clipsForMatch: ClipForMatch[] = clips.map((c) => ({
-    id: c.id,
-    source_title: titleById.get(c.video_source_id) ?? null,
-    start_time: c.start_time,
-    end_time: c.end_time,
-    labels: Array.isArray(c.labels) ? c.labels as string[] : [],
-  }));
+  // Defensive junk filter at the matcher input. The clip stage already
+  // drops clips whose Gemini Vision visualCategory is non-content
+  // (subscribe_screen, blank, text_only, etc.) via isJunkCategory, but
+  // Vision occasionally mis-classifies them as "content" and lets the
+  // junk leak through to the matcher. The leaked clips show up in the
+  // final video as YouTube subscribe screens, static text cards, and
+  // blank black frames sitting under legal narration. Their LABELS
+  // usually betray them even when the category was wrong, so we drop
+  // any clip whose labels contain a junk telltale before matching runs.
+  const JUNK_LABEL_TELLTALES = [
+    "subscribe", "subscribe screen", "click here", "end card", "end screen",
+    "title card", "watermark", "channel logo", "blank frame", "black frame",
+    "uniform color", "solid black", "solid white", "credits", "scrolling text",
+    "lower third only", "text only", "quote card",
+  ];
+  const droppedJunkAtMatcher: Array<{ id: string; offending: string[] }> = [];
+  const clipsForMatch: ClipForMatch[] = [];
+  for (const c of clips) {
+    const labels = Array.isArray(c.labels) ? c.labels as string[] : [];
+    const lower = labels.map((l) => l.toLowerCase());
+    const offending = JUNK_LABEL_TELLTALES.filter((t) => lower.some((l) => l.includes(t)));
+    if (offending.length > 0) {
+      droppedJunkAtMatcher.push({ id: c.id as string, offending });
+      continue;
+    }
+    clipsForMatch.push({
+      id: c.id,
+      source_title: titleById.get(c.video_source_id) ?? null,
+      start_time: c.start_time,
+      end_time: c.end_time,
+      labels,
+    });
+  }
+  if (droppedJunkAtMatcher.length > 0) {
+    await logJob({ projectId, jobId: mediaJobId }, "match.junk_label_filter", {
+      dropped: droppedJunkAtMatcher.length,
+      sample: droppedJunkAtMatcher.slice(0, 8),
+    });
+  }
+  if (clipsForMatch.length === 0) {
+    await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: "all clips filtered as junk thumbnails" });
+    await setProjectStatus(projectId, "failed");
+    throw new Error("all clips filtered as junk thumbnails");
+  }
 
   // Load all extracted entities for this project. We use them to bias the
   // scorer so that when a block's text mentions a place / event / movie /
@@ -410,6 +508,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // block index post-build (Phase A's buildBlockSequenceFromHints preserves
   // input order 1:1 so hint[i] === block[i]).
   let blockSpecificRefs: Array<string[]>;
+  // Phase D: parallel array of per-block subject_type. Drives type-aware
+  // image routing and the once-per-video shown-entity dedup. null when the
+  // legacy planner is in use (no Gemini hints available).
+  let blockSubjectTypes: Array<string | null>;
   if (planSource === "gemini_hints") {
     const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
@@ -418,6 +520,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockResolvedSubjects = planned.map((p) => p.resolved_subject ?? null);
     blockRecommendedTypes = planned.map((p) => p.type);
     blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
+    blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
   } else {
     blocks = buildBlockSequence(plan);
     blockHintTexts = blocks.map(() => null);
@@ -425,6 +528,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockResolvedSubjects = blocks.map(() => null);
     blockRecommendedTypes = blocks.map(() => null);
     blockSpecificRefs = blocks.map(() => []);
+    blockSubjectTypes = blocks.map(() => null);
   }
 
   // Phase D will add real title_card / split_2 renderers; until then,
@@ -453,6 +557,51 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       blocks[idx] = { type: "image", duration: blocks[idx].duration };
     }
   }
+
+  // ---- Phase D: once-per-video shown-entity dedup -----------------------
+  // Per the client's spec ("show the logo only the first time, then use
+  // different Dave Kindig footage for later mentions"): walk image blocks
+  // whose subject is a non-person entity. The FIRST block per canonical
+  // entity keeps its image type. Every subsequent block for the SAME entity
+  // is downgraded to footage so the existing footage pipeline assigns it a
+  // Dave Kindig clip via the person-first bonus. Dedup is once-per-video,
+  // canonical match (lowercased entity value), non-person entities only —
+  // confirmed with the client.
+  const NON_PERSON_TYPES = new Set(["company", "movie", "show", "song", "place", "event", "object"]);
+  const shownEntityKeys = new Set<string>();
+  let dedupDowngradedCount = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type !== "image") continue;
+    const subjectType = blockSubjectTypes[i];
+    if (!subjectType || !NON_PERSON_TYPES.has(subjectType)) continue;
+    // Canonical key: prefer the first mentioned entity (most specific), fall
+    // back to resolved_subject. Lowercased to match anaphoric variations
+    // ("Creative Controls" vs "Creative controls"). Trim removes the
+    // whitespace Gemini sometimes leaves around entity strings.
+    const ents = hints[i]?.mentioned_entities ?? [];
+    const canonical = (ents[0] ?? blockResolvedSubjects[i] ?? "").trim().toLowerCase();
+    if (!canonical) continue;
+    if (shownEntityKeys.has(canonical)) {
+      // Repeat mention — downgrade to footage. The Tier 1 person-first
+      // bonus will route a Dave Kindig clip here so the visual doesn't
+      // flash the same logo/poster repeatedly. We clear the per-block
+      // reference state so Phase C doesn't try to re-search this block
+      // and accidentally re-show the entity image.
+      blocks[i] = { type: "footage", duration: blocks[i].duration };
+      blockRecommendedTypes[i] = "footage";
+      blockSpecificRefs[i] = [];
+      // We intentionally keep blockSubjectTypes[i] populated — downstream
+      // logging / future routing may still want to know the block was
+      // originally a non-person entity even after downgrade.
+      dedupDowngradedCount++;
+    } else {
+      shownEntityKeys.add(canonical);
+    }
+  }
+  await logJob({ projectId, jobId: mediaJobId }, "match.entity_dedup", {
+    shown_entities: Array.from(shownEntityKeys),
+    downgraded_blocks: dedupDowngradedCount,
+  });
 
   // For each block, derive the voiceover text spoken during that window.
   // The scorer treats each block as a "section" — same prompt, but the
@@ -1027,9 +1176,71 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     references: string[],
     resolvedSubject: string | null,
     mentionedEntities: string[],
+    subjectType: string | null,
   ): Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> {
     const out: Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> = [];
     const subj = (resolvedSubject ?? mainCelebrity ?? "").trim();
+
+    // Phase D: type-aware routing. When Gemini has typed the block's subject
+    // (company / movie / show / place / event / song / object), the docs spec
+    // says the visual should depict THAT entity, not the celebrity. We map
+    // the type to a search shape that matches the entity's canonical imagery:
+    //   company → "{name} logo" with imgType: "logo" (CSE returns vectorized
+    //     brand assets, not random photos containing the brand name)
+    //   movie / show → "{name} poster" — the canonical promotional image
+    //   song → "{name} album cover"
+    //   place → "{name}" alone (adding the celebrity anchor produces press
+    //     photos of them AT the place instead of the place itself)
+    //   event → "{name} archival footage" — try to find news-style imagery
+    //   object → "{name}" alone, photo bias
+    // This entry runs BEFORE the regex-based reference fallback so the
+    // entity gets routed by its known type before we try to infer from the
+    // reference string.
+    const primaryEntity = (mentionedEntities[0] ?? resolvedSubject ?? "").trim();
+    if (primaryEntity && subjectType) {
+      // Defensive guards — even with the prompt-side restrictions, Gemini
+      // occasionally emits "place" for a country/state ("Utah", "Michigan")
+      // or "event" for a bare date ("January 2016"). Those queries pull
+      // flags, outline maps, and calendar pages — strictly worse than a
+      // celebrity footage fallback. Detect and skip the type routing so the
+      // block falls through to subject_plus_reference / footage paths.
+      const isGeographicNonLandmark = isCountryOrRegion(primaryEntity);
+      const isBareDate = isDateOnly(primaryEntity);
+
+      switch (subjectType) {
+        case "company":
+          out.push({ query: `${primaryEntity} logo`, reason: `subject_type:company:${primaryEntity}`, imgType: "logo" });
+          break;
+        case "movie":
+          out.push({ query: `${primaryEntity} movie poster`, reason: `subject_type:movie:${primaryEntity}` });
+          break;
+        case "show":
+          out.push({ query: `${primaryEntity} tv show poster`, reason: `subject_type:show:${primaryEntity}` });
+          break;
+        case "place":
+          // Drop country / state / region "places" — they return flags and
+          // outline maps, never on-topic photographs. The footage fallback
+          // does a better job (Dave Kindig clip + segment context).
+          if (!isGeographicNonLandmark) {
+            out.push({ query: primaryEntity, reason: `subject_type:place:${primaryEntity}` });
+          }
+          break;
+        case "event":
+          // Drop bare dates — image search on "January 2016" returns calendar
+          // pages and stock photos. Only route named events through the
+          // archival query.
+          if (!isBareDate) {
+            out.push({ query: `${primaryEntity} archival footage`, reason: `subject_type:event:${primaryEntity}` });
+          }
+          break;
+        case "object":
+          out.push({ query: primaryEntity, reason: `subject_type:object:${primaryEntity}` });
+          break;
+        // "person" and "general" fall through to the reference / subject
+        // anchor path below — the existing flow handles them.
+      }
+    }
+
     // Tier 1: each mentioned entity verbatim. Highest precision — the script
     // named something concrete (a movie, a place, a person).
     for (const ent of mentionedEntities) {
@@ -1076,9 +1287,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (blockIdx == null) continue;
     const refs = blockSpecificRefs[blockIdx] ?? [];
     const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
-    if (refs.length === 0 && ents.length === 0) continue;
+    const subjectType = blockSubjectTypes[blockIdx] ?? null;
+    // Phase D: subject_type alone is enough to generate a logo/poster/place
+    // search even when refs and ents are empty — Gemini's per-block
+    // subject_type tells us this is a company/place/movie block. Without
+    // this, image blocks with no Gemini-emitted references would silently
+    // fall through to the entity-pool flow that runs after Phase C.
+    const hasTypeRoute = !!subjectType && ["company", "movie", "show", "place", "event", "object"].includes(subjectType);
+    if (refs.length === 0 && ents.length === 0 && !hasTypeRoute) continue;
     const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
-    const queries = buildReferenceQueries(refs, resolvedSubject, ents);
+    const queries = buildReferenceQueries(refs, resolvedSubject, ents, subjectType);
     let filled = false;
     for (const q of queries) {
       try {
@@ -1828,6 +2046,11 @@ async function loadBlockHintsFromAnalyze(
         mentioned_entities: Array.isArray(b.mentioned_entities)
           ? b.mentioned_entities.filter((s) => typeof s === "string" && s.trim().length > 0)
           : undefined,
+        // Phase D: forward Gemini's per-block subject_type so the matcher
+        // can route non-person entities through type-aware image search
+        // (company → logo, movie → poster, place → place photo) instead
+        // of pattern-matching the literal word "logo" inside references.
+        subject_type: b.subject_type,
       });
     }
   }

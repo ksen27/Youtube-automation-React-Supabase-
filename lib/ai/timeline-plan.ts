@@ -217,6 +217,12 @@ export function sumDurations(blocks: { duration: number }[]): number {
 export interface BlockPlanHint {
   text: string;
   resolved_subject?: string;
+  // Phase D: subject taxonomy emitted by Gemini per block. Drives the image
+  // matcher's type-aware routing (company → logo, movie → poster, place →
+  // place photo, etc.) and the once-per-video shown-entity dedup. The field
+  // was always carried on the Gemini block plan but was being dropped during
+  // hint forwarding; bringing it through unlocks the docs-spec routing.
+  subject_type?: "person" | "place" | "movie" | "show" | "company" | "event" | "object" | "general";
   recommended_visual_type: "footage" | "image" | "title_card" | "split_2";
   // Optional section title for title_card blocks. When unset for a
   // title_card hint, the builder falls back to "" and the matcher fills
@@ -241,6 +247,7 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   section_title?: string;
   specific_visual_references?: string[];
   mentioned_entities?: string[];
+  subject_type?: "person" | "place" | "movie" | "show" | "company" | "event" | "object" | "general";
 }
 
 // Approximate 60/40 footage:image balance per the client spec. Title cards
@@ -280,6 +287,7 @@ export function buildBlockSequenceFromHints(
       section_title: h.section_title,
       specific_visual_references: h.specific_visual_references,
       mentioned_entities: h.mentioned_entities,
+      subject_type: h.subject_type,
     };
   });
 
