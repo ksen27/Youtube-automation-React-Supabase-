@@ -50,6 +50,29 @@ export async function processDownloadJob(
     return;
   }
 
+  // Phase B: copy source-intent provenance from the youtube_search_results
+  // row so it follows the video into video_sources.metadata. This is the
+  // chain that ends with each video_clip carrying the same trio (matched
+  // query / intended subject / source intent) and lets the matcher's
+  // deterministic scorer apply its +50 person-first bonus without having
+  // to re-derive who the clip is supposed to depict.
+  //
+  // We look it up by youtube_video_id (not by id) because the analyze
+  // route inserts rows for the WHOLE project and the standalone search
+  // processor inserts a subset — but both keyed by the same safeId.
+  const { data: searchRow } = await sb
+    .from("youtube_search_results")
+    .select("metadata")
+    .eq("project_id", projectId)
+    .eq("youtube_video_id", safeId)
+    .maybeSingle();
+  const searchMeta = (searchRow?.metadata as Record<string, unknown> | null) ?? {};
+  const sourceProvenance = {
+    matched_query: (searchMeta.matched_query as string | null) ?? null,
+    intended_subject: (searchMeta.intended_subject as string | null) ?? null,
+    source_intent: (searchMeta.source_intent as string | null) ?? null,
+  };
+
   // 2) Upsert a video_source row (status=downloading). Include the title from
   // the search result so the UI has something readable while the download is
   // in flight — without this, the processing screen falls back to "Unknown
@@ -62,6 +85,7 @@ export async function processDownloadJob(
       title: title ?? null,
       status: "downloading",
       error: null,
+      metadata: sourceProvenance,
     },
     { onConflict: "youtube_video_id" }
   ).select("*").single();

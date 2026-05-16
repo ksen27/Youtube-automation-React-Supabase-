@@ -55,9 +55,34 @@ export async function processSearchJob(data: SearchJobData): Promise<void> {
     .filter((e) => ["movie", "tv_show", "song", "event", "place"].includes(e.type as string))
     .map((e) => e.value);
 
-  const allCandidates = new Map<string, ReturnType<typeof rankCandidate>>();
+  // Phase B: track which query produced each candidate AND who/what that
+  // query was about. This is the "source intent" trail — it follows the
+  // video from search → source → clip and feeds the +50 person-first bonus
+  // in the matcher's deterministic scorer. Without this, the matcher only
+  // sees the source title (often "Salma Hayek - The Untold Story") and has
+  // to guess at who the clip is supposed to depict.
+  type RankedWithProvenance = ReturnType<typeof rankCandidate> & {
+    matched_query: string;
+    intended_subject: string | null;
+    source_intent: "person" | "broll" | "archival" | "generic";
+  };
+  const allCandidates = new Map<string, RankedWithProvenance>();
+  // The `buildSearchQueries` helper produces queries shaped like
+  // "{celebrity} interview", "{celebrity} {movie}", "{place}", etc. We use
+  // a coarse classifier that walks each query's tokens and decides the
+  // intent based on whether the celebrity name is present and which
+  // keyword bucket the OTHER tokens fall into. Cheap and good enough — the
+  // matcher only needs a coarse hint, not a perfect tag.
+  const intentFor = (query: string): RankedWithProvenance["source_intent"] => {
+    const q = query.toLowerCase();
+    if (/\b(news|archive|archival|newsreel|original footage|vintage|1\d{3}|20\d{2})\b/.test(q)) return "archival";
+    if (/\b(scene|footage|b-?roll|montage|locations?|cities?|places?|streets?|venue)\b/.test(q)) return "broll";
+    if (mainCelebrity && q.includes(mainCelebrity.toLowerCase())) return "person";
+    return "generic";
+  };
   for (let i = 0; i < queries.length; i++) {
     const q = queries[i];
+    const intent = intentFor(q);
     try {
       const cands = await searchYoutube({ query: q });
       for (const c of cands) {
@@ -65,8 +90,16 @@ export async function processSearchJob(data: SearchJobData): Promise<void> {
           candidate: c, mainCelebrity, keywords,
           approvedChannelIds: approved, blockedChannelIds: blocked,
         });
+        const provenance: RankedWithProvenance = {
+          ...ranked,
+          matched_query: q,
+          intended_subject: mainCelebrity ?? null,
+          source_intent: intent,
+        };
         const prev = allCandidates.get(c.videoId);
-        if (!prev || ranked.score > prev.score) allCandidates.set(c.videoId, ranked);
+        // Keep the higher-scoring provenance for duplicates so we don't
+        // overwrite a "person" provenance with a later "broll" one.
+        if (!prev || ranked.score > prev.score) allCandidates.set(c.videoId, provenance);
       }
     } catch (e) {
       await logJob({ projectId, jobId: mediaJobId }, "search.query.failed", { q, err: (e as Error).message });
@@ -88,7 +121,15 @@ export async function processSearchJob(data: SearchJobData): Promise<void> {
     duration_seconds: c.durationSeconds,
     score: c.score,
     status: c.rejected ? "rejected" : "candidate",
-    metadata: { reasons: c.reasons, rejectReason: c.rejectReason ?? null, isLive: c.isLive, privacyStatus: c.privacyStatus },
+    metadata: {
+      reasons: c.reasons,
+      rejectReason: c.rejectReason ?? null,
+      isLive: c.isLive,
+      privacyStatus: c.privacyStatus,
+      matched_query: c.matched_query,
+      intended_subject: c.intended_subject,
+      source_intent: c.source_intent,
+    },
   }));
   if (candidateRows.length) {
     const { error } = await sb.from("youtube_search_results").insert(candidateRows);

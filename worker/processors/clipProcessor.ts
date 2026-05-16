@@ -26,8 +26,26 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // machine than the download worker, so we cannot rely on local_path —
   // metadata.storage_path is the cross-machine handle. We resolve it now so
   // we fail fast if the upstream download skipped the upload.
-  const sourceStoragePath = (vs.metadata as Record<string, unknown> | null)?.storage_path as string | undefined;
+  const sourceMeta = (vs.metadata as Record<string, unknown> | null) ?? {};
+  const sourceStoragePath = sourceMeta.storage_path as string | undefined;
   if (!sourceStoragePath) throw new Error("video_source has no metadata.storage_path — re-download required");
+
+  // Phase B: pull the source-intent provenance forward into every clip so
+  // the matcher's deterministic +50 person-first bonus has a clip-level
+  // signal to score against. We encode the trio as prefixed label tokens
+  // (no schema migration required — video_clips.labels is already jsonb).
+  // The matcher tokenises labels for the existing filler scorer, so
+  // these tokens are harmless additions there too.
+  const provenanceLabels: string[] = [];
+  if (typeof sourceMeta.matched_query === "string" && sourceMeta.matched_query) {
+    provenanceLabels.push(`matched_query: ${sourceMeta.matched_query}`);
+  }
+  if (typeof sourceMeta.intended_subject === "string" && sourceMeta.intended_subject) {
+    provenanceLabels.push(`intended_subject: ${sourceMeta.intended_subject}`);
+  }
+  if (typeof sourceMeta.source_intent === "string" && sourceMeta.source_intent) {
+    provenanceLabels.push(`source_intent: ${sourceMeta.source_intent}`);
+  }
 
   // Project clip cap is sized to the voiceover so the matcher has enough
   // footage candidates per timeline block without overshooting on storage.
@@ -237,6 +255,8 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
         if (visionLabels.setting) labelSet.add(`setting: ${visionLabels.setting}`);
       }
       if (isIntroHead) labelSet.add(INTRO_CANDIDATE_LABEL);
+      // Phase B provenance — same for every clip from this source.
+      for (const p of provenanceLabels) labelSet.add(p);
       const labels = Array.from(labelSet);
       await sb.from("video_clips").insert({
         project_id: projectId,

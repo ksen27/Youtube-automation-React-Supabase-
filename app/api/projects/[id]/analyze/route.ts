@@ -58,6 +58,12 @@ interface PreviewCandidate {
   reasons: string[];
   rejected: boolean;
   rejectReason?: string;
+  // Phase B: provenance — drives the matcher's +50 person-first bonus.
+  // Tracks which search query found this candidate and who/what it was
+  // about. Same shape as the standalone searchProcessor's metadata.
+  matched_query: string;
+  intended_subject: string | null;
+  source_intent: "person" | "broll" | "archival" | "generic";
 }
 
 interface SegmentAnalysis {
@@ -201,6 +207,19 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       const segKeywords = Array.from(new Set([...(u.relatedKeywords ?? []), u.mainTopic].filter(Boolean)));
       for (const intent of u.searchIntents) {
         const intentType = intent.intentType ?? "talking_head";
+        // Phase B: per-query provenance. The analyze route classifies
+        // source_intent from the searchIntent's own intentType (Gemini
+        // already labelled it as talking_head / broll / archival) instead
+        // of re-running the regex classifier from searchProcessor. This is
+        // strictly better signal — Gemini saw the script context. The
+        // intended_subject is the project's main celebrity for every
+        // query; broll/archival queries still depict that celebrity's
+        // story even when the literal subject is a place or event.
+        const sourceIntent: PreviewCandidate["source_intent"] =
+          intentType === "broll" ? "broll" :
+          intentType === "archival" ? "archival" :
+          mainCelebrity && intent.query.toLowerCase().includes(mainCelebrity.toLowerCase()) ? "person" :
+          "generic";
         let cands: Awaited<ReturnType<typeof searchYoutube>> = [];
         try {
           cands = await searchYoutube({ query: intent.query, maxResults: PER_INTENT_RESULTS });
@@ -251,6 +270,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
             displayScore: ranked.displayScore,
             reasons: ranked.reasons,
             rejected: false,
+            matched_query: intent.query,
+            intended_subject: mainCelebrity ?? null,
+            source_intent: sourceIntent,
           });
         }
         await logJob({ projectId: id, jobId: mediaJobId }, "analyze.query.summary", {
@@ -312,6 +334,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           thumbnail_url: c.thumbnailUrl,
           reasons: c.reasons,
           display_score: c.displayScore,
+          matched_query: c.matched_query,
+          intended_subject: c.intended_subject,
+          source_intent: c.source_intent,
         },
       }))
     );

@@ -567,6 +567,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
 
+  // Phase B: count how many clips carry the source-intent provenance
+  // we wired in. If this is 0 on a project that was analyzed/searched
+  // after the Phase B deploy, something broke the metadata pipeline.
+  const clipsWithProvenance = clipsForMatch.filter(
+    (c) => (c.labels ?? []).some((l) => /^(matched_query|intended_subject|source_intent):/i.test(l))
+  ).length;
+
   await logJob({ projectId, jobId: mediaJobId }, "match.scores", {
     blocksScored: blockScores.length,
     totalScorableBlocks: scorableBlockIdxs.length,
@@ -574,6 +581,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     totalClips: clips.length,
     clipsWithLabels,
     clipsWithoutLabels: clips.length - clipsWithLabels,
+    clipsWithProvenance,
     avgCandidatesPerBlock: blockScores.length
       ? Math.round((blockScores.reduce((n, s) => n + s.candidates.length, 0) / blockScores.length) * 10) / 10
       : 0,
@@ -583,32 +591,174 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     minRelevantScore: MIN_RELEVANT_SCORE,
   });
 
+  // ---- Phase B: deterministic person-first bonus ------------------------
+  // The Gemini score from scoreClipsForSections measures visual fit ("does
+  // this clip's frame match the block's narration"). It doesn't know which
+  // PERSON the clip is supposed to depict — only what's in the frame.
+  // We add a transparent, rule-based bonus that rewards matching the
+  // resolved_subject from Phase A against the clip's source-intent
+  // provenance (matched_query / intended_subject) and visual labels.
+  //
+  // Scoring rules — straight from the client spec:
+  //   +50  full resolved_subject matches person_hint / intended_subject /
+  //        matched_query / source_title
+  //   +25  strong name-token match (any token of the subject's name appears
+  //        in those same hint fields)
+  //   +15  visual labels include interview / talking head / red carpet /
+  //        movie / event / person tokens
+  //   +10  source is high-quality (intro_candidate flag, or source-intent
+  //        explicitly tagged "person")
+  //   -30  title card / logo / subscribe / blank / credits / text-only
+  //        labels (junk filter at clip stage missed it)
+  //   -50  clip_id already used (enforced by the usedClipIds set; we still
+  //        score the pair so logs show why it was beaten by another)
+  //
+  // The bonus is added to Gemini's 0-100 score. Final score can exceed 100.
+  // Threshold (MIN_RELEVANT_SCORE) still applies post-bonus, so a clip with
+  // zero Gemini score but a +50 person bonus passes Tier 1 — which is what
+  // the spec wants: footage doesn't need to perfectly match every sentence
+  // as long as it shows the right person.
+
+  // Parse provenance from a clip's labels. We persisted "matched_query: X",
+  // "intended_subject: Y", "source_intent: Z" as prefixed tokens in the
+  // clip processor; pull them back out here.
+  function readProvenance(c: ClipForMatch): {
+    matched_query: string;
+    intended_subject: string;
+    source_intent: string;
+    is_intro_candidate: boolean;
+  } {
+    let mq = "", is = "", si = "", intro = false;
+    for (const l of c.labels ?? []) {
+      const low = l.toLowerCase();
+      if (low.startsWith("matched_query:")) mq = l.slice("matched_query:".length).trim();
+      else if (low.startsWith("intended_subject:")) is = l.slice("intended_subject:".length).trim();
+      else if (low.startsWith("source_intent:")) si = l.slice("source_intent:".length).trim();
+      else if (low === "intro_candidate") intro = true;
+    }
+    return { matched_query: mq, intended_subject: is, source_intent: si, is_intro_candidate: intro };
+  }
+
+  // Junk-ish labels that should never have made it past the clip stage,
+  // but occasionally do (Gemini Vision misclassifies, or a partial response
+  // shipped without categories). Match against the raw label strings —
+  // setting/subject prefixes don't matter here.
+  const JUNK_LABEL_RE = /\b(title card|logo|subscribe|credits|blank frame|text only|end screen|watermark)\b/i;
+  // Useful-content labels that signal a clip is a real person shot.
+  const USEFUL_LABEL_RE = /\b(interview|talking head|red carpet|movie|event|person|portrait|host|stage|studio|premiere|microphone)\b/i;
+
+  // Compute the deterministic bonus for a (block, clip) pair given the
+  // block's resolved subject (from Phase A) and the clip's labels.
+  function personFirstBonus(resolvedSubject: string | null, clip: ClipForMatch): {
+    bonus: number;
+    breakdown: string;
+  } {
+    const subj = (resolvedSubject ?? "").trim();
+    if (!subj) return { bonus: 0, breakdown: "no_subject" };
+    const subjLow = subj.toLowerCase();
+    // Tokens of the subject's name, minus stop-words (1-letter or generic).
+    // Helps with multi-word names: "Salma Hayek" → ["salma", "hayek"], so
+    // a clip whose intended_subject says "Salma" still gets +25 even though
+    // the full "Salma Hayek" doesn't appear verbatim.
+    const subjTokens = subjLow.split(/\s+/).filter((t) => t.length >= 3);
+
+    const prov = readProvenance(clip);
+    const hintHaystack = [
+      prov.matched_query,
+      prov.intended_subject,
+      clip.source_title ?? "",
+    ].join(" | ").toLowerCase();
+    const labelStr = (clip.labels ?? []).join(" ").toLowerCase();
+
+    let bonus = 0;
+    const reasons: string[] = [];
+    // +50 — full subject name in any hint field
+    if (hintHaystack.includes(subjLow)) {
+      bonus += 50;
+      reasons.push("subject_full_match:+50");
+    } else if (subjTokens.length > 0 && subjTokens.some((t) => hintHaystack.includes(t))) {
+      // +25 — at least one strong name token in a hint field
+      bonus += 25;
+      reasons.push("subject_token_match:+25");
+    }
+    // +15 — useful visual content labels
+    if (USEFUL_LABEL_RE.test(labelStr)) {
+      bonus += 15;
+      reasons.push("useful_labels:+15");
+    }
+    // +10 — high-quality source signal
+    if (prov.is_intro_candidate || prov.source_intent === "person") {
+      bonus += 10;
+      reasons.push("high_quality_source:+10");
+    }
+    // -30 — junk content that slipped past the clip-stage filter
+    if (JUNK_LABEL_RE.test(labelStr)) {
+      bonus -= 30;
+      reasons.push("junk_label:-30");
+    }
+    return { bonus, breakdown: reasons.join(",") || "no_bonus" };
+  }
+
   // ---- Tier 1: Gemini-scored global assignment -------------------------
   // Greedy-by-best-score across all (block, clip) pairs that cleared
-  // MIN_RELEVANT_SCORE. Walk triples by score desc; assign each pair to its
-  // block IF both block and clip are still free. Each clip used at most
-  // once. This produces all the high-confidence matches.
-  type Triple = { blockIdx: number; clipId: string; score: number; reason?: string };
+  // MIN_RELEVANT_SCORE after the person-first bonus. Walk triples by score
+  // desc; assign each pair to its block IF both block and clip are still
+  // free. Each clip used at most once. This produces all the high-confidence
+  // matches.
+  type Triple = { blockIdx: number; clipId: string; score: number; baseScore: number; bonus: number; reason?: string; bonusBreakdown?: string };
   const triples: Triple[] = [];
+  // Index clips by id for fast bonus lookup inside the triple loop.
+  const clipById = new Map<string, ClipForMatch>(clipsForMatch.map((c) => [c.id, c]));
   for (const [blockIdx, cands] of scoresByBlock) {
+    const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
     for (const c of cands) {
-      if (c.score < MIN_RELEVANT_SCORE) continue;
-      triples.push({ blockIdx, clipId: c.clip_id, score: c.score, reason: c.reason });
+      const clip = clipById.get(c.clip_id);
+      const { bonus, breakdown } = clip
+        ? personFirstBonus(resolvedSubject, clip)
+        : { bonus: 0, breakdown: "missing_clip" };
+      const finalScore = c.score + bonus;
+      if (finalScore < MIN_RELEVANT_SCORE) continue;
+      triples.push({
+        blockIdx,
+        clipId: c.clip_id,
+        score: finalScore,
+        baseScore: c.score,
+        bonus,
+        reason: c.reason,
+        bonusBreakdown: breakdown,
+      });
     }
   }
   triples.sort((a, b) => b.score - a.score);
 
-  type Assignment = { clipId: string; score: number; reason?: string; tier: "scored" | "filler" };
+  type Assignment = {
+    clipId: string;
+    score: number;
+    baseScore?: number;
+    bonus?: number;
+    bonusBreakdown?: string;
+    reason?: string;
+    tier: "scored" | "filler";
+  };
   const blockAssignments = new Map<number, Assignment>();
   const usedClipIds = new Set<string>();
   // Reserve the intro clip so the regular matcher can't re-use it inside
   // the timeline. The intro plays as a prefix segment, not as a timeline block.
+  // Phase B: this is also the hard "no clip_id reuse" guarantee — every
+  // clip that gets assigned (intro, scored, or filler) goes into this set
+  // before any other block can claim it.
   if (introClipId) usedClipIds.add(introClipId);
   for (const t of triples) {
     if (blockAssignments.has(t.blockIdx)) continue;
     if (usedClipIds.has(t.clipId)) continue;
     blockAssignments.set(t.blockIdx, {
-      clipId: t.clipId, score: t.score, reason: t.reason, tier: "scored",
+      clipId: t.clipId,
+      score: t.score,
+      baseScore: t.baseScore,
+      bonus: t.bonus,
+      bonusBreakdown: t.bonusBreakdown,
+      reason: t.reason,
+      tier: "scored",
     });
     usedClipIds.add(t.clipId);
   }
@@ -773,6 +923,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           metadata: {
             planned: true,
             match_score: assigned.score,
+            match_base_score: assigned.baseScore ?? null,
+            match_bonus: assigned.bonus ?? null,
+            match_bonus_breakdown: assigned.bonusBreakdown ?? null,
             match_reason: assigned.reason ?? null,
             pick_source: pickSource,
             block_index: i,
