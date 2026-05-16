@@ -79,11 +79,21 @@ const ServerEnvSchema = z.object({
   // 4 minutes of dead time before we give up.
   SCENE_DETECT_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(90),
   // Hard cap on how many seconds of source we ask scene-detect to analyze.
-  // For a 30-minute source, the first 10 minutes have plenty of scene
-  // boundaries to pick clip timestamps from — analyzing the whole thing is
-  // wasted CPU. Combined with downscale=320, this keeps scene-detect under
-  // ~20s on shared-CPU hosts.
-  SCENE_DETECT_MAX_INPUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // 0 = no cap, scan the entire source. The previous 600s default caused a
+  // real editorial bug: every clip extracted from a 30-min Dave interview
+  // came from minutes 0–10, so the matcher had nothing from the back half
+  // of the source. We now default to no cap and rely on downscale=320 +
+  // SCENE_DETECT_TIMEOUT_SECONDS to keep wall-time in check. Operators can
+  // set a positive value to re-enable the cap on cost-sensitive hosts.
+  SCENE_DETECT_MAX_INPUT_SECONDS: z.coerce.number().int().nonnegative().default(0),
+  // Scene-change sensitivity for ffmpeg's `select=gt(scene,T)` filter. Range
+  // 0..1 where 0 = identical frames, 1 = totally different. 0.40 catches
+  // hard cuts on long sources without flooding on minor lighting flicker;
+  // dropping to 0.35 returns more boundaries (good for short, slow-cut
+  // sources). Bumped from 0.35 when we lifted the 10-min input cap — a
+  // 60-min source at 0.35 returned thousands of boundaries and slowed the
+  // post-detect filtering work materially.
+  SCENE_DETECT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.4),
   // Per-ffmpeg thread cap. Multiplied by CLIP_PIPELINE_CONCURRENCY this is
   // the worst-case number of cores ffmpeg will try to use. Tune so the
   // product stays at or below the host's vCPU count to avoid thrash.
@@ -126,7 +136,16 @@ export function getEnv(): ServerEnv {
   return cached;
 }
 
-export const CLIP_DURATION_SECONDS = 5; // 4–5s window; we standardize on 5
+// Clip duration is now variable: when scene-detect provides both a start
+// boundary and a next-boundary, we cut the clip to land exactly on that
+// next boundary so the user never sees a mid-clip scene change. The result
+// is clamped to [MIN, MAX]. Uniform-fallback clips (when scene-detect fails)
+// stay at DEFAULT.
+export const CLIP_DURATION_MIN_SECONDS = 5;
+export const CLIP_DURATION_MAX_SECONDS = 8;
+export const CLIP_DURATION_DEFAULT_SECONDS = 5;
+// Back-compat alias — anything that still imports this gets the default.
+export const CLIP_DURATION_SECONDS = CLIP_DURATION_DEFAULT_SECONDS;
 
 // Total clips a project should generate, sized to the voiceover length so the
 // final video has enough footage candidates without overshooting. Reads env

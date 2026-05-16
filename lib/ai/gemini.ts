@@ -427,11 +427,22 @@ export const VISUAL_CATEGORIES = [
 ] as const;
 export type VisualCategory = (typeof VISUAL_CATEGORIES)[number];
 
+// Whether the person named in the source title appears in the frame.
+//   "yes"        – they are visible (alone OR alongside other people)
+//   "no"         – people are visible but none plausibly match the title's person
+//   "uncertain"  – cannot tell (no faces, faces too small / obscured, no
+//                  identifiable person in title)
+// Gates the matcher's +50 person-first bonus so a clip of a stranger never
+// wins a block whose subject is supposed to be the title's person.
+export const SUBJECT_PRESENT_VALUES = ["yes", "no", "uncertain"] as const;
+export type SubjectPresent = (typeof SUBJECT_PRESENT_VALUES)[number];
+
 const ClipLabelsSchema = z.object({
   labels: z.array(z.string().min(1)).min(1).max(8),
   primarySubject: z.string().optional().default(""),
   setting: z.string().optional().default(""),
   visualCategory: z.enum(VISUAL_CATEGORIES).default("content"),
+  subjectPresent: z.enum(SUBJECT_PRESENT_VALUES).optional().default("uncertain"),
 });
 export type ClipLabels = z.infer<typeof ClipLabelsSchema>;
 
@@ -470,7 +481,8 @@ Return STRICT JSON ONLY in this shape:
   "labels": ["3 to 8 short visual descriptors, each 1–4 words"],
   "primarySubject": "the main thing in frame (a person's role, an object, a place)",
   "setting": "the environment (e.g. 'studio interview', 'red carpet', 'palace exterior', 'archival news')",
-  "visualCategory": "one of: content | title_card | logo | subscribe_screen | credits | blank | text_only"
+  "visualCategory": "one of: content | title_card | logo | subscribe_screen | credits | blank | text_only",
+  "subjectPresent": "one of: yes | no | uncertain — does the person the source title is about appear in the frame?"
 }
 
 Rules:
@@ -492,7 +504,15 @@ How to choose visualCategory:
 - "blank" — solid black, white, or near-uniform color frame; no recognizable subject.
 - "text_only" — a frame whose primary content is words (a quote card, a chyron-only shot with no visible subject behind it). NOT for normal lower-third overlays where a subject is also visible.
 
-When visualCategory is anything other than "content", labels can be a single short item like ["title card"] or ["channel logo"] — we won't use the clip.`;
+When visualCategory is anything other than "content", labels can be a single short item like ["title card"] or ["channel logo"] — we won't use the clip.
+
+How to choose subjectPresent:
+- Identify who the source title is about (e.g. "Dave Kindig restores a 1965 Mustang" → the title is about "Dave Kindig", a person).
+- "yes" — a person matching that title's subject is visible in the frame. This holds whether they are ALONE or APPEARING ALONGSIDE OTHER PEOPLE (a group shot, an interview with a host, a red-carpet crowd). Frame 3 faces, one of whom plausibly is the title's person → "yes".
+- "no" — people are clearly visible in the frame but none of them plausibly match the title's person (e.g. title is "Dave Kindig…" and the only people in frame are a young woman and a child — no middle-aged man at all).
+- "uncertain" — pick this when in any doubt: no faces are visible (B-roll of a car, a building, a graphic), the source title doesn't name a specific person, the face is too small / blurry / from behind to judge, or the title's person could plausibly be one of the people in frame but you can't be sure.
+- DEFAULT to "uncertain" rather than guessing "yes" when the title's person isn't obviously, recognisably present. False "yes" answers cause the matcher to insert wrong-person clips into the final video — that is the worst outcome. False "uncertain" merely downgrades the clip to filler.
+- This judgement is about RECOGNISABILITY from visible appearance, not name recognition. You do not need to write the person's name anywhere (and per the rule above, must not).`;
 
   let txt: string;
   try {
@@ -547,6 +567,7 @@ When visualCategory is anything other than "content", labels can be a single sho
     labels,
     primarySubject: safe.data.primarySubject,
     setting: safe.data.setting,
+    subjectPresent: safe.data.subjectPresent,
     visualCategory: safe.data.visualCategory,
   };
 }

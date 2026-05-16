@@ -4,9 +4,15 @@ import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { maybeEnqueueMatch } from "./_shared";
 import { cutClip, generateThumbnail } from "@/lib/media/ffmpeg";
-import { detectSceneTimestamps, pickFromScenes } from "@/lib/media/scenes";
+import { detectSceneTimestamps, pickFromScenes, type SceneClipWindow } from "@/lib/media/scenes";
 import { downloadToFile, ensureTmp, removeFiles, safeUnlink, uploadFile } from "@/lib/storage";
-import { CLIP_DURATION_SECONDS, computeProjectClipCap, getEnv } from "@/lib/env";
+import {
+  CLIP_DURATION_DEFAULT_SECONDS,
+  CLIP_DURATION_MAX_SECONDS,
+  CLIP_DURATION_MIN_SECONDS,
+  computeProjectClipCap,
+  getEnv,
+} from "@/lib/env";
 import { labelClipFromThumbnail, isJunkCategory } from "@/lib/ai/gemini";
 
 export async function processClipJob(data: ClipJobData): Promise<void> {
@@ -91,8 +97,11 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // non-overlapping windows. Without this, short sources (e.g. 20s)
   // got asked for 11 clips and `pickClipTimestamps` jammed them into
   // an overlapping mess that wasted the project budget on duplicates.
-  const usableSeconds = Math.max(0, vs.duration_seconds - 10 - CLIP_DURATION_SECONDS - 1);
-  const minStride = CLIP_DURATION_SECONDS;
+  // We size the stride against MIN clip duration since scene-snapped
+  // clips can be as short as MIN — using DEFAULT here would under-cap
+  // on fast-cut sources.
+  const usableSeconds = Math.max(0, vs.duration_seconds - 10 - CLIP_DURATION_MIN_SECONDS - 1);
+  const minStride = CLIP_DURATION_MIN_SECONDS;
   const physicalMax = Math.max(1, Math.floor(usableSeconds / minStride) + 1);
   const cappedCount = Math.min(targetCount, physicalMax);
 
@@ -109,7 +118,10 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // uniform sampling (no half-shots, cleaner thumbnails). Fall back to
   // the uniform sampler if scene-detect returns too few candidates or
   // fails outright (older codecs, encoded-only streams, etc).
-  let timestamps: number[] = [];
+  //
+  // Windows carry both start and duration so the clip can end on the
+  // next scene boundary instead of bleeding into the following shot.
+  let windows: SceneClipWindow[] = [];
   let timestampSource: "scene_detect" | "uniform" | "scene_detect_then_uniform" = "uniform";
   let sceneCount = 0;
   try {
@@ -119,28 +131,32 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       scenes,
       duration: vs.duration_seconds,
       targetCount: cappedCount,
-      clipDurationSeconds: CLIP_DURATION_SECONDS,
+      minDuration: CLIP_DURATION_MIN_SECONDS,
+      maxDuration: CLIP_DURATION_MAX_SECONDS,
       minGapSeconds: 20,
       skipLeadSeconds: 10,
     });
     if (fromScenes.length >= cappedCount) {
-      timestamps = fromScenes;
+      windows = fromScenes;
       timestampSource = "scene_detect";
     } else if (fromScenes.length > 0) {
       // Scene-detect found *some* boundaries but not enough. Pad with
-      // uniform samples that don't collide with the scene picks.
-      const uniform = pickClipTimestamps(vs.duration_seconds, cappedCount);
-      const merged = mergeWithMinGap([...fromScenes, ...uniform], minStride, cappedCount);
-      timestamps = merged;
+      // uniform samples (default duration) that don't collide with the
+      // scene picks.
+      const uniform = pickClipTimestamps(vs.duration_seconds, cappedCount)
+        .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
+      windows = mergeWithMinGap([...fromScenes, ...uniform], minStride, cappedCount);
       timestampSource = "scene_detect_then_uniform";
     } else {
-      timestamps = pickClipTimestamps(vs.duration_seconds, cappedCount);
+      windows = pickClipTimestamps(vs.duration_seconds, cappedCount)
+        .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
       timestampSource = "uniform";
     }
   } catch (e) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
       "clip.scene_detect.failed", { err: (e as Error).message });
-    timestamps = pickClipTimestamps(vs.duration_seconds, cappedCount);
+    windows = pickClipTimestamps(vs.duration_seconds, cappedCount)
+      .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
     timestampSource = "uniform";
   }
 
@@ -155,15 +171,15 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const INTRO_CANDIDATE_LABEL = "intro_candidate";
   const introHeadStart = 0;
   const introTimestampIndex = (() => {
-    if (vs.duration_seconds < CLIP_DURATION_SECONDS + 1) return -1;
-    if (timestamps.some((t) => Math.abs(t - introHeadStart) < 0.5)) return -1;
-    timestamps.unshift(introHeadStart);
+    if (vs.duration_seconds < CLIP_DURATION_MIN_SECONDS + 1) return -1;
+    if (windows.some((w) => Math.abs(w.start - introHeadStart) < 0.5)) return -1;
+    windows.unshift({ start: introHeadStart, duration: CLIP_DURATION_DEFAULT_SECONDS });
     return 0;
   })();
 
   await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
     "clip.plan", {
-      count: timestamps.length,
+      count: windows.length,
       requested: targetCount,
       cappedCount,
       duration: vs.duration_seconds,
@@ -174,6 +190,9 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       timestampSource,
       sceneCount,
       introHeadAdded: introTimestampIndex >= 0,
+      avgClipDuration: windows.length
+        ? Math.round((windows.reduce((s, w) => s + w.duration, 0) / windows.length) * 100) / 100
+        : 0,
     });
 
   const clipsTmp = await ensureTmp(`clips/${vs.youtube_video_id}`);
@@ -186,7 +205,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // Pin the source on the job up front so the UI can attribute "currently
   // clipping" to a video name even before the first iteration finishes.
   await setMediaJob(mediaJobId, {
-    metadata: { videoSourceId, totalClips: timestamps.length },
+    metadata: { videoSourceId, totalClips: windows.length },
   });
 
   // Per-clip pipeline. Each invocation is independent — runs cut + thumbnail
@@ -195,9 +214,10 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // labeler runs in parallel with upload so the slow Gemini call doesn't
   // block the upload from starting; if the labeler decides the frame is junk
   // we delete the just-uploaded objects (cheap, rare).
-  async function processOne(i: number, start: number): Promise<void> {
+  async function processOne(i: number, window: SceneClipWindow): Promise<void> {
     const isIntroHead = i === introTimestampIndex;
-    const dur = CLIP_DURATION_SECONDS;
+    const start = window.start;
+    const dur = window.duration;
     const idx = String(i).padStart(3, "0");
     const clipLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}.mp4`);
     const thumbLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}.jpg`);
@@ -248,11 +268,15 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
 
       // Fold primarySubject + setting into the labels list — the matcher
       // only reads `labels`, and these two are the most useful descriptors.
+      // `subject_present:` is the gating signal for the matcher's +50
+      // person-first bonus: only clips where the labeler said "yes the
+      // title's person is visible" win person-anchored blocks.
       const labelSet = new Set<string>();
       if (visionLabels) {
         for (const l of visionLabels.labels) labelSet.add(l);
         if (visionLabels.primarySubject) labelSet.add(`subject: ${visionLabels.primarySubject}`);
         if (visionLabels.setting) labelSet.add(`setting: ${visionLabels.setting}`);
+        labelSet.add(`subject_present: ${visionLabels.subjectPresent}`);
       }
       if (isIntroHead) labelSet.add(INTRO_CANDIDATE_LABEL);
       // Phase B provenance — same for every clip from this source.
@@ -280,11 +304,11 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       await safeUnlink(thumbLocal);
       processed++;
       await setMediaJob(mediaJobId, {
-        progress: 5 + Math.floor((processed / timestamps.length) * 90),
+        progress: 5 + Math.floor((processed / windows.length) * 90),
         metadata: {
           videoSourceId,
-          totalClips: timestamps.length,
-          currentClip: { index: processed, total: timestamps.length, startSeconds: start },
+          totalClips: windows.length,
+          currentClip: { index: processed, total: windows.length, startSeconds: start },
         },
       });
     }
@@ -294,14 +318,14 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // cursor, so a slow clip on one lane doesn't hold up the others. This
   // is the dominant speedup — under serial execution the slowest step
   // (usually labeling on a 503 spike) gates everything.
-  const concurrency = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, timestamps.length));
+  const concurrency = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, windows.length));
   let cursor = 0;
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       while (true) {
         const i = cursor++;
-        if (i >= timestamps.length) return;
-        await processOne(i, timestamps[i]);
+        if (i >= windows.length) return;
+        await processOne(i, windows[i]);
       }
     }),
   );
@@ -312,7 +336,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       status: "failed", progress: 100, error: "all clips failed",
       metadata: {
         videoSourceId,
-        totalClips: timestamps.length,
+        totalClips: windows.length,
         succeeded,
         failed,
         droppedJunk,
@@ -328,7 +352,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
     status: "completed", progress: 100,
     metadata: {
       videoSourceId,
-      totalClips: timestamps.length,
+      totalClips: windows.length,
       succeeded,
       failed,
       droppedJunk,
@@ -340,7 +364,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // across many sources = the labeler is over-classifying as junk.
   await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
     "clip.summary", {
-      attempted: timestamps.length,
+      attempted: windows.length,
       succeeded,
       failed,
       droppedJunk,
@@ -359,20 +383,21 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
 
 // Sample evenly across the video, skipping the first 10 seconds (intros).
 // Used as the last-resort fallback when scene detection fails or yields too
-// few candidates.
+// few candidates. Returns start timestamps only — callers wrap each into
+// a SceneClipWindow with the default clip duration.
 //
-// Enforces a minimum stride of CLIP_DURATION_SECONDS so consecutive 5-s
+// Enforces a minimum stride of CLIP_DURATION_DEFAULT_SECONDS so consecutive
 // clips never overlap. If `count` is too high to fit non-overlapping
 // windows in the usable range, we silently cap it — better to return
 // 4 clean clips than 11 overlapping near-duplicates.
 export function pickClipTimestamps(duration: number, count: number): number[] {
   if (count <= 0) return [];
-  const start = Math.min(10, duration - CLIP_DURATION_SECONDS - 1);
-  const end = duration - CLIP_DURATION_SECONDS - 1;
-  if (end <= start) return [Math.max(0, duration / 2 - CLIP_DURATION_SECONDS / 2)];
-  // Cap count so step >= CLIP_DURATION_SECONDS — no overlapping windows.
+  const start = Math.min(10, duration - CLIP_DURATION_DEFAULT_SECONDS - 1);
+  const end = duration - CLIP_DURATION_DEFAULT_SECONDS - 1;
+  if (end <= start) return [Math.max(0, duration / 2 - CLIP_DURATION_DEFAULT_SECONDS / 2)];
+  // Cap count so step >= CLIP_DURATION_DEFAULT_SECONDS — no overlapping windows.
   const span = end - start;
-  const maxNonOverlapping = Math.max(1, Math.floor(span / CLIP_DURATION_SECONDS) + 1);
+  const maxNonOverlapping = Math.max(1, Math.floor(span / CLIP_DURATION_DEFAULT_SECONDS) + 1);
   const n = Math.min(count, maxNonOverlapping);
   if (n === 1) return [Math.floor((start + end) / 2)];
   const step = span / (n - 1);
@@ -383,18 +408,23 @@ export function pickClipTimestamps(duration: number, count: number): number[] {
   return out;
 }
 
-// Merge two timestamp lists into a sorted, dedup'd, gap-respecting list.
-// Used when scene-detect returned partial coverage and we want to fill in
-// the gaps with uniform-sampled timestamps without colliding with the
-// scene picks.
-export function mergeWithMinGap(timestamps: number[], minGap: number, max: number): number[] {
-  const sorted = Array.from(new Set(timestamps)).sort((a, b) => a - b);
-  const out: number[] = [];
+// Merge window lists into a sorted, dedup'd, gap-respecting list. Used when
+// scene-detect returned partial coverage and we want to fill in the gaps
+// with uniform-sampled windows without colliding with the scene picks.
+// Dedup is on `start` (rounded), so a uniform fallback at t=42 won't push
+// out a scene-detected window already at t≈42.
+export function mergeWithMinGap(windows: SceneClipWindow[], minGap: number, max: number): SceneClipWindow[] {
+  const sorted = [...windows].sort((a, b) => a.start - b.start);
+  const out: SceneClipWindow[] = [];
+  const seen = new Set<number>();
   let last = -Infinity;
-  for (const t of sorted) {
-    if (t - last >= minGap) {
-      out.push(t);
-      last = t;
+  for (const w of sorted) {
+    const key = Math.round(w.start * 100) / 100;
+    if (seen.has(key)) continue;
+    if (w.start - last >= minGap) {
+      out.push(w);
+      seen.add(key);
+      last = w.start;
       if (out.length >= max) break;
     }
   }

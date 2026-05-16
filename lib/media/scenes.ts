@@ -33,7 +33,7 @@ export interface DetectScenesOptions {
 
 export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<number[]> {
   const env = getEnv();
-  const threshold = opts.threshold ?? 0.35;
+  const threshold = opts.threshold ?? env.SCENE_DETECT_THRESHOLD;
 
   // Downscale to 320 wide before running the scene filter. Scene detection
   // compares frame-to-frame differences, which is a coarse signal that does
@@ -41,15 +41,17 @@ export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<
   // on shared-CPU hosts and produces near-identical scene timestamps. `-an`
   // skips audio decoding which the filter doesn't read.
   //
-  // -t bounds how much of the source we analyze. Long sources (30+ min) used
-  // to time out at 240s even after downscaling because every frame still has
-  // to be decoded; capping the input to the first 10 minutes (default) gives
-  // plenty of scene boundaries to pick timestamps from and keeps the probe
-  // under ~20s on shared-CPU hosts.
+  // SCENE_DETECT_MAX_INPUT_SECONDS=0 (the default) means scan the full
+  // source — the previous 10-min cap meant every clip from a 30-min source
+  // came from minutes 0–10, which broke matching for long interviews. We
+  // rely on the 320p downscale + SCENE_DETECT_TIMEOUT_SECONDS to bound
+  // wall-time on long sources.
   const args = [
     "-hide_banner",
     "-nostats",
-    "-t", String(env.SCENE_DETECT_MAX_INPUT_SECONDS),
+    ...(env.SCENE_DETECT_MAX_INPUT_SECONDS > 0
+      ? ["-t", String(env.SCENE_DETECT_MAX_INPUT_SECONDS)]
+      : []),
     "-i", opts.inputPath,
     "-an",
     "-vf", `scale=320:-2,select=gt(scene\\,${threshold}),showinfo`,
@@ -115,33 +117,45 @@ function runCapturingStderr(bin: string, args: string[], signal?: AbortSignal): 
   });
 }
 
-// Pick clip start times from a list of scene timestamps. Enforces:
+export interface SceneClipWindow {
+  start: number;
+  // Duration the clip should be cut to. Computed so the clip ends at — or
+  // just before — the next scene boundary, clamped to [minDuration, maxDuration].
+  // This prevents the "first 3.5s is Dave, last 1.5s bleeds into a logo"
+  // problem that fixed-duration clips had.
+  duration: number;
+}
+
+// Pick clip windows (start + duration) from a list of scene timestamps.
+// Enforces:
 //   - skip the first `skipLeadSeconds` (intros)
-//   - leave room for `clipDurationSeconds` at the tail
+//   - leave room for at least `minDuration` at the tail
 //   - require at least `minGapSeconds` between consecutive picks (so we
 //     don't over-cut a section with rapid cuts — e.g. a music-video
 //     intro with cuts every 0.5s)
 //
-// The returned timestamps are scene starts that satisfy all constraints,
-// trimmed/extended to the requested `targetCount`. If the scene list is
-// shorter than targetCount after filtering, returns whatever fits.
+// For each picked start, the clip's duration is set so its end lands on
+// the next scene boundary (or earlier), clamped to [minDuration, maxDuration].
+// On rapid-cut runs, the next boundary may be < minDuration away — in that
+// case we use minDuration anyway and accept some bleed, since the alternative
+// is no clip at all from that section.
 export function pickFromScenes(opts: {
   scenes: number[];
   duration: number;
   targetCount: number;
-  clipDurationSeconds: number;
+  minDuration: number;
+  maxDuration: number;
   minGapSeconds?: number;
   skipLeadSeconds?: number;
-}): number[] {
+}): SceneClipWindow[] {
   const minGap = opts.minGapSeconds ?? 20;
   const skipLead = opts.skipLeadSeconds ?? 10;
-  const tailLimit = opts.duration - opts.clipDurationSeconds - 1;
+  const tailLimit = opts.duration - opts.minDuration - 1;
   if (tailLimit <= skipLead) return [];
 
   // Filter scenes to the usable window, then enforce minimum gap.
-  const eligible = opts.scenes
-    .filter((t) => t >= skipLead && t <= tailLimit)
-    .sort((a, b) => a - b);
+  const sorted = [...opts.scenes].sort((a, b) => a - b);
+  const eligible = sorted.filter((t) => t >= skipLead && t <= tailLimit);
 
   const spaced: number[] = [];
   let lastPick = -Infinity;
@@ -152,15 +166,35 @@ export function pickFromScenes(opts: {
     }
   }
 
-  if (spaced.length <= opts.targetCount) return spaced;
-
-  // We have more eligible scenes than needed — keep an evenly-distributed
-  // subset so coverage spans the whole video (avoid clumping at the start).
-  const stride = spaced.length / opts.targetCount;
-  const out: number[] = [];
-  for (let i = 0; i < opts.targetCount; i++) {
-    const idx = Math.min(spaced.length - 1, Math.floor(i * stride));
-    out.push(spaced[idx]);
+  // Cap to targetCount by subsampling evenly (preserve full-source coverage,
+  // don't clump at the start).
+  let picked: number[];
+  if (spaced.length <= opts.targetCount) {
+    picked = spaced;
+  } else {
+    const stride = spaced.length / opts.targetCount;
+    const out: number[] = [];
+    for (let i = 0; i < opts.targetCount; i++) {
+      const idx = Math.min(spaced.length - 1, Math.floor(i * stride));
+      out.push(spaced[idx]);
+    }
+    picked = Array.from(new Set(out)).sort((a, b) => a - b);
   }
-  return Array.from(new Set(out)).sort((a, b) => a - b);
+
+  // For each picked start, find the next scene boundary in the *full* sorted
+  // list (not just `spaced`) and snap the clip duration to land on it.
+  // Using the full list matters: `spaced` enforces a 20s gap, so the next
+  // entry there might be far past the real next cut. The full list gives us
+  // the actual next boundary.
+  return picked.map((start) => {
+    const nextBoundary = sorted.find((t) => t > start + 0.25);
+    const tailRoom = opts.duration - start - 0.25;
+    let dur = opts.maxDuration;
+    if (nextBoundary !== undefined) {
+      dur = Math.min(dur, nextBoundary - start);
+    }
+    dur = Math.min(dur, tailRoom);
+    dur = Math.max(opts.minDuration, dur);
+    return { start, duration: Math.round(dur * 100) / 100 };
+  });
 }

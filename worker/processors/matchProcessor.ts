@@ -759,9 +759,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   //
   // Scoring rules — straight from the client spec:
   //   +50  full resolved_subject matches person_hint / intended_subject /
-  //        matched_query / source_title
+  //        matched_query / source_title — SCALED by subject_present
+  //        (yes=1.0, uncertain=0.5, no=0.0)
   //   +25  strong name-token match (any token of the subject's name appears
-  //        in those same hint fields)
+  //        in those same hint fields) — SCALED by subject_present
   //   +15  visual labels include interview / talking head / red carpet /
   //        movie / event / person tokens
   //   +10  source is high-quality (intro_candidate flag, or source-intent
@@ -778,23 +779,39 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // as long as it shows the right person.
 
   // Parse provenance from a clip's labels. We persisted "matched_query: X",
-  // "intended_subject: Y", "source_intent: Z" as prefixed tokens in the
-  // clip processor; pull them back out here.
+  // "intended_subject: Y", "source_intent: Z", "subject_present: yes|no|uncertain"
+  // as prefixed tokens in the clip processor; pull them back out here.
+  // subject_present is the visual-truth gate: the labeler saw the frame and
+  // judged whether the title's person is actually visible. Without it, the
+  // matcher's +50 bonus rubber-stamped any clip from a "Dave" source as
+  // a Dave-clip, even when the frame showed a stranger.
   function readProvenance(c: ClipForMatch): {
     matched_query: string;
     intended_subject: string;
     source_intent: string;
     is_intro_candidate: boolean;
+    subject_present: "yes" | "no" | "uncertain";
   } {
     let mq = "", is = "", si = "", intro = false;
+    let sp: "yes" | "no" | "uncertain" = "uncertain";
     for (const l of c.labels ?? []) {
       const low = l.toLowerCase();
       if (low.startsWith("matched_query:")) mq = l.slice("matched_query:".length).trim();
       else if (low.startsWith("intended_subject:")) is = l.slice("intended_subject:".length).trim();
       else if (low.startsWith("source_intent:")) si = l.slice("source_intent:".length).trim();
+      else if (low.startsWith("subject_present:")) {
+        const v = l.slice("subject_present:".length).trim().toLowerCase();
+        if (v === "yes" || v === "no" || v === "uncertain") sp = v;
+      }
       else if (low === "intro_candidate") intro = true;
     }
-    return { matched_query: mq, intended_subject: is, source_intent: si, is_intro_candidate: intro };
+    return {
+      matched_query: mq,
+      intended_subject: is,
+      source_intent: si,
+      is_intro_candidate: intro,
+      subject_present: sp,
+    };
   }
 
   // Junk-ish labels that should never have made it past the clip stage,
@@ -830,14 +847,33 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
     let bonus = 0;
     const reasons: string[] = [];
-    // +50 — full subject name in any hint field
+    // Person-name bonuses are scaled by the labeler's visual judgement.
+    // The base +50 / +25 says "this clip CAME FROM a source about Dave" —
+    // a provenance fact. subject_present says "Dave IS / IS NOT in the
+    // frame" — a visual fact. We trust the visual fact:
+    //   yes       → full bonus (the title's person is on screen, possibly
+    //               with others — both cases are good)
+    //   uncertain → half bonus (could be a B-roll location, could be the
+    //               subject from an angle we couldn't judge — eligible
+    //               filler but not a winner over a confirmed clip)
+    //   no        → zero bonus (frame has people, none of them is the
+    //               title's person — must not impersonate them)
+    let nameBonus = 0;
+    let nameReason = "";
     if (hintHaystack.includes(subjLow)) {
-      bonus += 50;
-      reasons.push("subject_full_match:+50");
+      nameBonus = 50;
+      nameReason = "subject_full_match";
     } else if (subjTokens.length > 0 && subjTokens.some((t) => hintHaystack.includes(t))) {
-      // +25 — at least one strong name token in a hint field
-      bonus += 25;
-      reasons.push("subject_token_match:+25");
+      nameBonus = 25;
+      nameReason = "subject_token_match";
+    }
+    if (nameBonus > 0) {
+      const scale = prov.subject_present === "yes" ? 1
+        : prov.subject_present === "uncertain" ? 0.5
+        : 0;
+      const scaled = Math.round(nameBonus * scale);
+      bonus += scaled;
+      reasons.push(`${nameReason}:+${nameBonus}*${scale}(present=${prov.subject_present})=+${scaled}`);
     }
     // +15 — useful visual content labels
     if (USEFUL_LABEL_RE.test(labelStr)) {
