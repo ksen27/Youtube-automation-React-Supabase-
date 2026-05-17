@@ -236,6 +236,12 @@ export interface BlockPlanHint {
   // Lets the image matcher prefer logos/posters when the reference is a
   // company/show/movie that's also a named entity.
   mentioned_entities?: string[];
+  // Documentary-style person-first axis. Forwarded verbatim from Gemini's
+  // per-block visual_priority. The matcher consults this when deciding
+  // the fallback path: "person_default" blocks fall back to person clips,
+  // "specific_*" blocks fall back to the person image when the exact match
+  // can't be found (never random visuals).
+  visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
 }
 
 export interface PlannedBlockWithHint extends PlannedBlock {
@@ -248,6 +254,7 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   specific_visual_references?: string[];
   mentioned_entities?: string[];
   subject_type?: "person" | "place" | "movie" | "show" | "company" | "event" | "object" | "general";
+  visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
 }
 
 // Approximate 60/40 footage:image balance per the client spec. Title cards
@@ -288,6 +295,7 @@ export function buildBlockSequenceFromHints(
       specific_visual_references: h.specific_visual_references,
       mentioned_entities: h.mentioned_entities,
       subject_type: h.subject_type,
+      visual_priority: h.visual_priority,
     };
   });
 

@@ -512,6 +512,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // image routing and the once-per-video shown-entity dedup. null when the
   // legacy planner is in use (no Gemini hints available).
   let blockSubjectTypes: Array<string | null>;
+  // Person-first documentary axis (forwarded from Gemini's visual_priority).
+  // Drives the fallback chain: "specific_*" blocks fall back to the person
+  // image when their reference search fails, NEVER to random pool entries.
+  // null when the legacy planner is in use.
+  let blockVisualPriorities: Array<string | null>;
   if (planSource === "gemini_hints") {
     const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
@@ -521,6 +526,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockRecommendedTypes = planned.map((p) => p.type);
     blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
     blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
+    blockVisualPriorities = planned.map((p) => p.visual_priority ?? null);
   } else {
     blocks = buildBlockSequence(plan);
     blockHintTexts = blocks.map(() => null);
@@ -529,6 +535,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockRecommendedTypes = blocks.map(() => null);
     blockSpecificRefs = blocks.map(() => []);
     blockSubjectTypes = blocks.map(() => null);
+    blockVisualPriorities = blocks.map(() => null);
   }
 
   // Phase D will add real title_card / split_2 renderers; until then,
@@ -606,7 +613,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // For each block, derive the voiceover text spoken during that window.
   // The scorer treats each block as a "section" — same prompt, but the
   // text now lines up with the block's actual moment in the audio.
-  const blockTexts = buildBlockTexts(transcript, blocks, voiceoverSeconds);
+  //
+  // When Gemini hints are available, prefer the hint's sentence-aligned
+  // text (1–3 complete sentences per block) over re-slicing the transcript
+  // by word offsets. The proportional word-slice in buildBlockTexts splits
+  // mid-sentence, which leaves both halves without the subject context
+  // ("Behind the grand gates of Buckingham Palace lies…" + "…a world few
+  // ever see") and downgrades the matcher's ability to pick a relevant
+  // clip/image. Falling back to buildBlockTexts only when the hint text
+  // is missing keeps the legacy planner working unchanged.
+  const wordSlicedTexts = buildBlockTexts(transcript, blocks, voiceoverSeconds);
+  const blockTexts = blocks.map((_, i) => {
+    const hintText = blockHintTexts[i];
+    return hintText && hintText.trim().length > 0 ? hintText : (wordSlicedTexts[i] ?? "");
+  });
 
   // For each block, find which entities are mentioned in its spoken text.
   // We do a case-insensitive substring search on each entity value. This is
@@ -757,24 +777,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // resolved_subject from Phase A against the clip's source-intent
   // provenance (matched_query / intended_subject) and visual labels.
   //
-  // Scoring rules — straight from the client spec:
-  //   +50  full resolved_subject matches person_hint / intended_subject /
-  //        matched_query / source_title — SCALED by subject_present
-  //        (yes=1.0, uncertain=0.5, no=0.0)
-  //   +25  strong name-token match (any token of the subject's name appears
-  //        in those same hint fields) — SCALED by subject_present
-  //   +15  visual labels include interview / talking head / red carpet /
+  // Scoring rules — straight from the client spec.
+  // Priority axis (per client docs, descending):
+  //   1. resolved_subject  → matches intended_subject / person_hint
+  //   2. matched_query     → query string used to discover the source
+  //   3. source_title      → fallback when provenance is missing
+  //   4. visual_labels     → on-frame interview / red-carpet / movie cues
+  // Bonuses (scaled by subject_present where applicable):
+  //   +60  full resolved_subject matches intended_subject / person_hint
+  //   +35  full resolved_subject matches matched_query
+  //   +25  full resolved_subject matches source_title
+  //   +25  strong name-token match anywhere in those hint fields
+  //   +20  visual labels include interview / talking head / red carpet /
   //        movie / event / person tokens
   //   +10  source is high-quality (intro_candidate flag, or source-intent
   //        explicitly tagged "person")
   //   -30  title card / logo / subscribe / blank / credits / text-only
   //        labels (junk filter at clip stage missed it)
-  //   -50  clip_id already used (enforced by the usedClipIds set; we still
-  //        score the pair so logs show why it was beaten by another)
   //
   // The bonus is added to Gemini's 0-100 score. Final score can exceed 100.
   // Threshold (MIN_RELEVANT_SCORE) still applies post-bonus, so a clip with
-  // zero Gemini score but a +50 person bonus passes Tier 1 — which is what
+  // zero Gemini score but a +60 person bonus passes Tier 1 — which is what
   // the spec wants: footage doesn't need to perfectly match every sentence
   // as long as it shows the right person.
 
@@ -838,18 +861,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const subjTokens = subjLow.split(/\s+/).filter((t) => t.length >= 3);
 
     const prov = readProvenance(clip);
-    const hintHaystack = [
-      prov.matched_query,
-      prov.intended_subject,
-      clip.source_title ?? "",
-    ].join(" | ").toLowerCase();
+    const intendedHay = `${prov.intended_subject}`.toLowerCase();
+    const matchedQueryHay = `${prov.matched_query}`.toLowerCase();
+    const sourceTitleHay = `${clip.source_title ?? ""}`.toLowerCase();
     const labelStr = (clip.labels ?? []).join(" ").toLowerCase();
 
     let bonus = 0;
     const reasons: string[] = [];
     // Person-name bonuses are scaled by the labeler's visual judgement.
-    // The base +50 / +25 says "this clip CAME FROM a source about Dave" —
-    // a provenance fact. subject_present says "Dave IS / IS NOT in the
+    // The base bonus says "this clip CAME FROM a source about Dave" — a
+    // provenance fact. subject_present says "Dave IS / IS NOT in the
     // frame" — a visual fact. We trust the visual fact:
     //   yes       → full bonus (the title's person is on screen, possibly
     //               with others — both cases are good)
@@ -858,14 +879,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     //               filler but not a winner over a confirmed clip)
     //   no        → zero bonus (frame has people, none of them is the
     //               title's person — must not impersonate them)
+    //
+    // Priority order per client spec (highest → lowest): intended_subject /
+    // person_hint > matched_query > source_title. We pick the strongest
+    // hit available rather than summing — a clip that matches all three
+    // gets one bonus (the strongest), not three stacked bonuses.
     let nameBonus = 0;
     let nameReason = "";
-    if (hintHaystack.includes(subjLow)) {
-      nameBonus = 50;
-      nameReason = "subject_full_match";
-    } else if (subjTokens.length > 0 && subjTokens.some((t) => hintHaystack.includes(t))) {
+    if (intendedHay.includes(subjLow)) {
+      nameBonus = 60;
+      nameReason = "intended_subject_full";
+    } else if (matchedQueryHay.includes(subjLow)) {
+      nameBonus = 35;
+      nameReason = "matched_query_full";
+    } else if (sourceTitleHay.includes(subjLow)) {
       nameBonus = 25;
-      nameReason = "subject_token_match";
+      nameReason = "source_title_full";
+    } else if (subjTokens.length > 0) {
+      // Fall back to weaker token-overlap on any of the same fields.
+      const allHay = `${intendedHay} | ${matchedQueryHay} | ${sourceTitleHay}`;
+      if (subjTokens.some((t) => allHay.includes(t))) {
+        nameBonus = 25;
+        nameReason = "subject_token_match";
+      }
     }
     if (nameBonus > 0) {
       const scale = prov.subject_present === "yes" ? 1
@@ -875,10 +911,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       bonus += scaled;
       reasons.push(`${nameReason}:+${nameBonus}*${scale}(present=${prov.subject_present})=+${scaled}`);
     }
-    // +15 — useful visual content labels
+    // +20 — useful visual content labels (interview / red carpet / movie /
+    // event / person tokens). Bumped from +15 so visible-content evidence
+    // matters more relative to provenance-only matches.
     if (USEFUL_LABEL_RE.test(labelStr)) {
-      bonus += 15;
-      reasons.push("useful_labels:+15");
+      bonus += 20;
+      reasons.push("useful_labels:+20");
     }
     // +10 — high-quality source signal
     if (prov.is_intro_candidate || prov.source_intent === "person") {
@@ -893,20 +931,53 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return { bonus, breakdown: reasons.join(",") || "no_bonus" };
   }
 
+  // Person-visible gate. A clip QUALIFIES as a "person clip" when its
+  // labels contain at least one person-visible token AND don't include
+  // hard exclusions like grille/engine/wheel. The intro selector already
+  // defined PERSON_VISIBLE_RE / NOT_PERSON_RE earlier in this function —
+  // reuse them so the rules stay aligned. Subject_present is a secondary
+  // signal: a clip explicitly tagged subject_present=yes still qualifies
+  // even if its labels don't carry an explicit person token (the labeler
+  // sometimes describes a person via clothing/age only).
+  function clipShowsPerson(clip: ClipForMatch): boolean {
+    const prov = readProvenance(clip);
+    if (prov.subject_present === "yes") return true;
+    const labelStr = (clip.labels ?? []).join(" ").toLowerCase();
+    if (NOT_PERSON_RE.test(labelStr) && !PERSON_VISIBLE_RE.test(labelStr)) return false;
+    return PERSON_VISIBLE_RE.test(labelStr);
+  }
+
   // ---- Tier 1: Gemini-scored global assignment -------------------------
   // Greedy-by-best-score across all (block, clip) pairs that cleared
   // MIN_RELEVANT_SCORE after the person-first bonus. Walk triples by score
   // desc; assign each pair to its block IF both block and clip are still
   // free. Each clip used at most once. This produces all the high-confidence
   // matches.
+  //
+  // Hard person-first gate: for blocks whose visual_priority is
+  // "person_default" (the documentary "show the person" rule), reject any
+  // clip whose labels show no person at all — even when its Gemini score
+  // is high. This is what was letting car-grille / workshop-floor / co-host
+  // B-roll land under person-narrating blocks. The gate runs BEFORE the
+  // bonus is computed so the rejected pair never enters the triple list.
   type Triple = { blockIdx: number; clipId: string; score: number; baseScore: number; bonus: number; reason?: string; bonusBreakdown?: string };
   const triples: Triple[] = [];
+  let personGateRejections = 0;
   // Index clips by id for fast bonus lookup inside the triple loop.
   const clipById = new Map<string, ClipForMatch>(clipsForMatch.map((c) => [c.id, c]));
   for (const [blockIdx, cands] of scoresByBlock) {
     const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
+    const visualPriority = blockVisualPriorities[blockIdx] ?? null;
+    // person_default is the documentary default — narration about a person.
+    // null priority (legacy planner) also defaults to person-gated because
+    // those blocks are always footage about the celebrity.
+    const requiresPerson = visualPriority === "person_default" || visualPriority === null;
     for (const c of cands) {
       const clip = clipById.get(c.clip_id);
+      if (requiresPerson && clip && !clipShowsPerson(clip)) {
+        personGateRejections++;
+        continue;
+      }
       const { bonus, breakdown } = clip
         ? personFirstBonus(resolvedSubject, clip)
         : { bonus: 0, breakdown: "missing_clip" };
@@ -989,10 +1060,15 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   function pickFillerForBlock(blockIdx: number): { clipId: string; overlap: number } | null {
     const blockText = blockTexts[blockIdx] ?? "";
+    const visualPriority = blockVisualPriorities[blockIdx] ?? null;
+    const requiresPerson = visualPriority === "person_default" || visualPriority === null;
     if (!blockText) {
-      // No words to compare against — fall back to first unused clip.
+      // No words to compare against — fall back to first unused clip
+      // that satisfies the person-visible gate.
       for (const c of clipsForMatch) {
-        if (!usedClipIds.has(c.id)) return { clipId: c.id, overlap: 0 };
+        if (usedClipIds.has(c.id)) continue;
+        if (requiresPerson && !clipShowsPerson(c)) continue;
+        return { clipId: c.id, overlap: 0 };
       }
       return null;
     }
@@ -1000,6 +1076,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     let best: { clipId: string; overlap: number } | null = null;
     for (const c of clipsForMatch) {
       if (usedClipIds.has(c.id)) continue;
+      if (requiresPerson && !clipShowsPerson(c)) continue;
       const labels = clipTokens.get(c.id) ?? new Set();
       let overlap = 0;
       for (const t of labels) if (blockToks.has(t)) overlap++;
@@ -1010,17 +1087,113 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return best;
   }
 
+  // ---- Block timing (drives reuse cooldown distance) -------------------
+  // Cumulative timeline second at which each block STARTS. The intro is a
+  // prefix segment played BEFORE the timeline begins, so block 0 starts at
+  // t=0 regardless of the intro. We use this to enforce "reuse must be
+  // spread by N minutes" — same clip not within ~3min, same image not
+  // within ~2min — per the client spec.
+  const blockStartSec: number[] = new Array(blocks.length).fill(0);
+  {
+    let acc = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      blockStartSec[i] = acc;
+      acc += blocks[i].duration;
+    }
+  }
+
+  // Same-clip reuse cooldown. Spec says 3-5 minutes; pick 3 minutes (180s)
+  // because longer windows leave too many blocks with no eligible reuse
+  // candidate on shorter videos. Same source video has a SHORTER cooldown
+  // because the spec explicitly allows that ("same source video allowed
+  // more often IF using different clips"); the per-clip-id cooldown above
+  // handles "different clips" — we don't need a separate source-cooldown
+  // for it.
+  const CLIP_REUSE_COOLDOWN_SEC = 180;
+
+  // Map of clip_id → seconds-into-timeline of its last placement. Updated
+  // every time a block is assigned. Used by tier 2 / tier 2.5 to pick a
+  // clip that's outside the cooldown when possible.
+  const clipLastUsedAt = new Map<string, number>();
+  if (introClipId) clipLastUsedAt.set(introClipId, -CLIP_REUSE_COOLDOWN_SEC);   // intro is at t=0 by convention
+  for (const [bIdx, a] of blockAssignments) {
+    clipLastUsedAt.set(a.clipId, blockStartSec[bIdx]);
+  }
+
+  // Tier 2.5 reuse picker. Used when the fresh-pool fill produced no
+  // candidate. Walks every clip; for each, computes the distance between
+  // this block's start time and the clip's last placement; prefers clips
+  // outside the cooldown (largest distance wins) and breaks ties by label
+  // token overlap.
+  function pickReuseClipForBlock(blockIdx: number): { clipId: string; distance: number; overlap: number } | null {
+    if (clipsForMatch.length === 0) return null;
+    const blockText = blockTexts[blockIdx] ?? "";
+    const blockToks = blockText ? tokenize(blockText) : new Set<string>();
+    const now = blockStartSec[blockIdx];
+    const visualPriority = blockVisualPriorities[blockIdx] ?? null;
+    const requiresPerson = visualPriority === "person_default" || visualPriority === null;
+    // Two-pass: first try with the person gate enforced; only when it
+    // produces nothing do we relax the gate and accept an object-only
+    // clip (the truly-degenerate case where the source documentary has
+    // no usable person frames at all).
+    function scan(enforceGate: boolean): { clipId: string; distance: number; overlap: number } | null {
+      let best: { clipId: string; distance: number; overlap: number } | null = null;
+      for (const c of clipsForMatch) {
+        if (enforceGate && !clipShowsPerson(c)) continue;
+        const lastUsed = clipLastUsedAt.get(c.id);
+        const distance = lastUsed === undefined ? Number.POSITIVE_INFINITY : now - lastUsed;
+        if (distance <= 0) continue;
+        const labels = clipTokens.get(c.id) ?? new Set();
+        let overlap = 0;
+        for (const t of labels) if (blockToks.has(t)) overlap++;
+        if (
+          !best
+          || distance > best.distance
+          || (distance === best.distance && overlap > best.overlap)
+        ) {
+          best = { clipId: c.id, distance, overlap };
+        }
+      }
+      return best;
+    }
+    return (requiresPerson ? scan(true) : null) ?? scan(false);
+  }
+
   for (const blockIdx of scorableBlockIdxs) {
     if (blockAssignments.has(blockIdx)) continue;
     const filler = pickFillerForBlock(blockIdx);
-    if (!filler) continue;     // pool exhausted → handled in render loop
+    if (filler) {
+      blockAssignments.set(blockIdx, {
+        clipId: filler.clipId,
+        score: 0,
+        reason: filler.overlap > 0 ? `filler: ${filler.overlap} label tokens` : "filler: no overlap",
+        tier: "filler",
+      });
+      usedClipIds.add(filler.clipId);
+      clipLastUsedAt.set(filler.clipId, blockStartSec[blockIdx]);
+      continue;
+    }
+    // Fresh clips exhausted — fall back to REUSE with cooldown. Per the
+    // spec, reuse is allowed as long as it's spread across the timeline.
+    // Picks the clip whose last use is FURTHEST in the past, breaking
+    // ties on label overlap. A reused clip with distance < cooldown is
+    // still better than a blank image block (which dilutes the
+    // person-first feel), but we tag it so logs surface the warning.
+    const reuse = pickReuseClipForBlock(blockIdx);
+    if (!reuse) continue;     // pool truly empty → handled in render loop
+    const withinCooldown = reuse.distance < CLIP_REUSE_COOLDOWN_SEC;
     blockAssignments.set(blockIdx, {
-      clipId: filler.clipId,
+      clipId: reuse.clipId,
       score: 0,
-      reason: filler.overlap > 0 ? `filler: ${filler.overlap} label tokens` : "filler: no overlap",
+      reason: withinCooldown
+        ? `filler_reuse: ${Math.round(reuse.distance)}s since last use (under ${CLIP_REUSE_COOLDOWN_SEC}s cooldown)`
+        : `filler_reuse: ${Math.round(reuse.distance)}s since last use`,
       tier: "filler",
     });
-    usedClipIds.add(filler.clipId);
+    // NOTE: do NOT add reuse picks to usedClipIds — that set is the
+    // "already-used-once" gate. Reuse picks update clipLastUsedAt only,
+    // so subsequent blocks can re-pick a different clip on cooldown.
+    clipLastUsedAt.set(reuse.clipId, blockStartSec[blockIdx]);
   }
 
   // Diagnostic counters — track the tier so logs reveal whether scoring
@@ -1081,6 +1254,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     recommended_visual_type: blockRecommendedTypes[idx] ?? null,
     hint_text: blockHintTexts[idx] ?? null,
     specific_visual_references: blockSpecificRefs[idx] ?? [],
+    visual_priority: blockVisualPriorities[idx] ?? null,
+    subject_type: blockSubjectTypes[idx] ?? null,
   });
 
   for (let i = 0; i < blocks.length; i++) {
@@ -1315,6 +1490,73 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return out;
   }
 
+  // Image reuse cooldown (per client spec: 2-4 minutes for same image).
+  // Pick 2 minutes (120s) since image holds are short and shorter videos
+  // would otherwise have too few eligible blocks. The reference pass and
+  // the entity pool both honor this when picking.
+  const IMAGE_REUSE_COOLDOWN_SEC = 120;
+  const imageUrlLastUsedAt = new Map<string, number>();
+
+  // Build a list of image-block start seconds, mirroring blockStartSec but
+  // indexed by item position rather than by block index. Items are pushed
+  // in block order with the intro inserted at position 0, so we look up
+  // by item's stored block_index when computing distance.
+  function blockSecForItem(it: Record<string, unknown>): number {
+    const bi = (it.metadata as Record<string, unknown> | undefined)?.block_index;
+    if (typeof bi === "number" && bi >= 0 && bi < blockStartSec.length) {
+      return blockStartSec[bi];
+    }
+    return 0;
+  }
+
+  // Per-block PERSON-image fallback. When a "specific_*" block can't find
+  // an image of its exact reference (a tattoo, a wedding, a courthouse),
+  // the client spec says: fall back to the PERSON image — never to a
+  // random pool entry. This helper builds the bare-name search for the
+  // block's resolved_subject (or the project celebrity when the subject is
+  // unknown). Returns the first non-duplicate image URL respecting the
+  // image cooldown.
+  async function tryPersonImageFallback(blockIdx: number): Promise<{
+    url: string;
+    source: string;
+    query: string;
+  } | null> {
+    const subj = (blockResolvedSubjects[blockIdx] || mainCelebrity || "").trim();
+    if (!subj) return null;
+    const nowSec = blockStartSec[blockIdx];
+    try {
+      const fetched = await fetchImages(subj, 6, { entityType: "celebrity" });
+      // Prefer (a) URL not yet claimed by reference pass AND (b) outside
+      // the image cooldown. If nothing is outside cooldown, accept the
+      // freshest (longest-since-last-used) image — better than no image.
+      let bestFresh: typeof fetched[number] | null = null;
+      let bestReuse: typeof fetched[number] | null = null;
+      let bestReuseDistance = -Infinity;
+      for (const f of fetched) {
+        if (refUrlSet.has(f.url)) continue;
+        const last = imageUrlLastUsedAt.get(f.url);
+        if (last === undefined) {
+          bestFresh = f;
+          break;
+        }
+        const dist = nowSec - last;
+        if (dist >= IMAGE_REUSE_COOLDOWN_SEC) {
+          bestFresh = f;
+          break;
+        }
+        if (dist > bestReuseDistance) {
+          bestReuse = f;
+          bestReuseDistance = dist;
+        }
+      }
+      const pick = bestFresh ?? bestReuse;
+      if (!pick) return null;
+      return { url: pick.url, source: pick.source, query: subj };
+    } catch {
+      return null;
+    }
+  }
+
   // First pass: walk image blocks in order, try to fill from references.
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
@@ -1324,25 +1566,40 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const refs = blockSpecificRefs[blockIdx] ?? [];
     const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
     const subjectType = blockSubjectTypes[blockIdx] ?? null;
+    const visualPriority = blockVisualPriorities[blockIdx] ?? null;
     // Phase D: subject_type alone is enough to generate a logo/poster/place
     // search even when refs and ents are empty — Gemini's per-block
     // subject_type tells us this is a company/place/movie block. Without
     // this, image blocks with no Gemini-emitted references would silently
     // fall through to the entity-pool flow that runs after Phase C.
     const hasTypeRoute = !!subjectType && ["company", "movie", "show", "place", "event", "object"].includes(subjectType);
-    if (refs.length === 0 && ents.length === 0 && !hasTypeRoute) continue;
+    // Person-first axis: if Gemini marked the block as a specific reference
+    // ("specific_event"/"specific_object"), we MUST try a reference search
+    // even when refs/ents are empty (the priority signal is enough). And
+    // when all reference searches fail, we fall back to the PERSON image
+    // (not to the entity pool, per spec).
+    const isSpecificReference = visualPriority === "specific_event" || visualPriority === "specific_object";
+    if (refs.length === 0 && ents.length === 0 && !hasTypeRoute && !isSpecificReference) continue;
     const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
     const queries = buildReferenceQueries(refs, resolvedSubject, ents, subjectType);
+    const nowSec = blockStartSec[blockIdx];
     let filled = false;
     for (const q of queries) {
       try {
         const fetched = await fetchImages(q.query, 4, { imgType: q.imgType });
         // Take the first non-duplicate image. We use a per-pass set to
         // avoid two image blocks landing on the same URL when the script
-        // mentions the same reference twice.
-        const pick = fetched.find((f) => !refUrlSet.has(f.url));
+        // mentions the same reference twice. Also honor the image cooldown
+        // so the same picture doesn't repeat within ~2 minutes.
+        const pick = fetched.find((f) => {
+          if (refUrlSet.has(f.url)) return false;
+          const last = imageUrlLastUsedAt.get(f.url);
+          if (last === undefined) return true;
+          return nowSec - last >= IMAGE_REUSE_COOLDOWN_SEC;
+        });
         if (!pick) continue;
         refUrlSet.add(pick.url);
+        imageUrlLastUsedAt.set(pick.url, nowSec);
         item.image_url = pick.url;
         item.image_query = q.query;
         item.image_source = pick.source;
@@ -1364,13 +1621,47 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           });
       }
     }
-    if (!filled) refImagesFailed++;
+    // Spec fallback: when the specific reference / type-routed search did
+    // NOT produce a usable image, fall back to the PERSON image instead of
+    // letting this block drop through to the entity pool. The entity pool
+    // is a fine LAST resort, but the spec is explicit: "If an exact
+    // image/visual cannot be found → fallback to the person image/footage.
+    // NEVER use random unrelated visuals." Person fallback runs BEFORE
+    // pool assignment so it gets first pick of fresh person images.
+    if (!filled) {
+      refImagesFailed++;
+      const personPick = await tryPersonImageFallback(blockIdx);
+      if (personPick) {
+        refUrlSet.add(personPick.url);
+        imageUrlLastUsedAt.set(personPick.url, nowSec);
+        item.image_url = personPick.url;
+        item.image_query = personPick.query;
+        item.image_source = personPick.source;
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.image_query_used = personPick.query;
+        meta.image_source_url = personPick.url;
+        meta.image_source_provider = personPick.source;
+        meta.image_entity = personPick.query;
+        meta.image_reason = "person_image_fallback";
+        meta.image_pick_source = "person_fallback";
+        item.metadata = meta;
+      }
+    }
   }
 
+  // Count how many blocks ended up using the person-image fallback rather
+  // than a true reference match. High counts here mean Gemini emitted
+  // specific_event/object refs that didn't produce any image — useful
+  // signal for tuning the prompt.
+  const personFallbackCount = items.filter(
+    (it) => it.type === "image"
+      && (it.metadata as Record<string, unknown> | undefined)?.image_pick_source === "person_fallback",
+  ).length;
   await logJob({ projectId, jobId: mediaJobId }, "match.image_ref", {
     refImagesAssigned,
     refImagesFailed,
     refBlocksWithHints: blockSpecificRefs.filter((r) => r.length > 0).length,
+    personFallbackCount,
   });
 
   // ---- Build a project-level image pool, then assign to image blocks ----
@@ -1837,7 +2128,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // their image_url is the specific reference image the script asked
     // for, and we don't want to overwrite it with a generic pool entry.
     if (item.image_url) continue;
+    const nowSec = blockSecForItem(item);
     let idx = pickFreshPoolIdx();
+    // Pre-check: if the freshly-picked candidate violates the image
+    // cooldown (e.g. it was a reused image earlier and is still cooling
+    // down), prefer ANY other fresh entry that doesn't. Cooldown is a
+    // soft constraint — if every fresh entry is within cooldown, we
+    // accept the original pick rather than skipping the block.
+    if (idx >= 0) {
+      const cand = pool[idx];
+      const last = imageUrlLastUsedAt.get(cand.url);
+      if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) {
+        for (let j = 0; j < pool.length; j++) {
+          if (consumed.has(j) || j === idx) continue;
+          const lj = imageUrlLastUsedAt.get(pool[j].url);
+          if (lj === undefined || nowSec - lj >= IMAGE_REUSE_COOLDOWN_SEC) {
+            idx = j;
+            break;
+          }
+        }
+      }
+    }
     if (idx < 0) {
       // Fresh pool exhausted — fall back to reuse. pickFreshPoolIdx returns
       // -1 only when every entry is in `consumed`; that's the trigger for
@@ -1865,6 +2176,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     item.metadata = meta;
     lastEntityKey = `${next.entityType}:${next.query}`;
     lastUsedAt[idx] = useCounter++;
+    imageUrlLastUsedAt.set(next.url, nowSec);
   }
 
   await logJob({ projectId, jobId: mediaJobId }, "match.image_fetch", {
@@ -1891,6 +2203,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     downgradedCount,
     uniqueClipsUsed: usedClipIds.size,
     totalFootageBlocks: footageBlockIdxs.length,
+    personGateRejections,
   });
 
   // ---- Lower-third tagging --------------------------------------------
@@ -2087,6 +2400,11 @@ async function loadBlockHintsFromAnalyze(
         // (company → logo, movie → poster, place → place photo) instead
         // of pattern-matching the literal word "logo" inside references.
         subject_type: b.subject_type,
+        // Person-first documentary axis. The matcher uses this to decide
+        // the fallback chain when a specific image search fails — a
+        // "specific_*" block falls back to the person image, while a
+        // "person_default" block routes a person clip directly.
+        visual_priority: b.visual_priority,
       });
     }
   }

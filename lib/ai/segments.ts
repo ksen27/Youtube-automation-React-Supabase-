@@ -116,6 +116,26 @@ export const VisualType = z.enum([
 ]);
 export type VisualType = z.infer<typeof VisualType>;
 
+// Documentary-editor visual priority per the client spec. Drives the
+// matcher's pick logic with a coarser axis than recommended_visual_type:
+//   - "person_default"  — show the current person (general narration about
+//                         them, their career, abstract topics like lawsuits,
+//                         legal arguments). Always falls back to person clip.
+//   - "specific_event"  — narration references a concrete event/object
+//                         (tattoo, wedding, movie, courthouse). Use exact
+//                         image; fall back to PERSON image (never random).
+//   - "specific_object" — narration references a specific named thing
+//                         (logo, building, document). Same fallback rule.
+//   - "title_card"      — chapter break.
+//   - "split_2"         — pair of named people / entities.
+// This is orthogonal to recommended_visual_type — the matcher uses both:
+// recommended_visual_type drives the block TYPE (footage / image / etc.),
+// visual_priority drives the FALLBACK chain when a specific match fails.
+export const VisualPriority = z.enum([
+  "person_default", "specific_event", "specific_object", "title_card", "split_2",
+]);
+export type VisualPriority = z.infer<typeof VisualPriority>;
+
 export const BlockPlanSchema = z.object({
   text: z.string().min(1),
   // The person/thing the block is "about". For pronoun-only blocks Gemini
@@ -142,6 +162,12 @@ export const BlockPlanSchema = z.object({
   // promote a stretch of footage to title_card when a section title fits)
   // but the recommendation is the starting point.
   recommended_visual_type: VisualType.default("footage"),
+  // Person-first documentary axis. See VisualPriority docs above.
+  // Defaults to "person_default" — the safest fallback when Gemini omits
+  // the field. The matcher uses this to decide WHEN to fall back to the
+  // person on a failed specific match (per the client's "NEVER random"
+  // rule).
+  visual_priority: VisualPriority.default("person_default"),
 });
 export type BlockPlan = z.infer<typeof BlockPlanSchema>;
 
@@ -324,7 +350,8 @@ ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
       "specific_visual_references": ["concrete objects/references that should drive a still-image search, e.g. 'tattoo', 'mother', '1998', 'Frida poster'. Leave [] for blocks that are just general narration about the subject."],
       "pronouns_detected": true,
       "visual_intent": "one short phrase describing what the screen should show here",
-      "recommended_visual_type": "footage | image | title_card | split_2"
+      "recommended_visual_type": "footage | image | title_card | split_2",
+      "visual_priority": "person_default | specific_event | specific_object | title_card | split_2"
     }
   ]
 }
@@ -334,6 +361,33 @@ Rules:
 - Provide 2 to 4 searchIntents that together cover the visual story of THIS section.
 - Skip the section's narration tone and writing style. Focus on what should appear on screen.
 - Skip duplicates. Skip empty arrays — return [] if you have nothing.
+
+PERSON-FIRST DOCUMENTARY PRINCIPLE — read this BEFORE choosing block types.
+This video is edited like a celebrity documentary. The viewer is here to see the
+person. So:
+- DEFAULT — show the current person on screen ("footage" / "person_default").
+  This includes narration about their life, career, business, abstract concepts
+  (innovation, lawsuit, authority, jurisdiction), and any general statement.
+- SPECIFIC REFERENCE — only when the narration calls out a concrete thing or
+  event whose image is a recognizable thing in the world: a tattoo, a wedding,
+  a movie title, a company logo, a courthouse, a specific named building, a
+  specific document, a family. Then "image" + "specific_event" or
+  "specific_object". The visual is that exact thing.
+- FALLBACK — if no exact image exists, the matcher falls back to the person's
+  image. NEVER random unrelated visuals. You don't need to handle the fallback
+  — just mark the block correctly and the matcher does the rest.
+
+visual_priority axis (REQUIRED — drives matcher fallback chain):
+- "person_default"  → person footage / person image. Always the safe default.
+- "specific_event"  → a named event (wedding, tattoo getting, courthouse hearing,
+                      premiere). Pair with recommended_visual_type "image".
+- "specific_object" → a named object/entity (company logo, movie poster,
+                      specific building/document). Pair with "image".
+- "title_card"      → chapter heading. Pair with recommended_visual_type "title_card".
+- "split_2"         → two named people / entities compared. Pair with "split_2".
+When in doubt, choose "person_default". The matcher reuses person footage
+gracefully — it spreads reuse across the timeline so the viewer never sees
+the same shot twice in a row.
 
 Block-level visual rules (these matter — they drive what appears on screen):
 - Split the section into 4-12 blocks. Each block is 1-3 sentences of consecutive narration.
@@ -569,6 +623,7 @@ function fallbackUnderstanding(segment: RawSegment, context: SegmentContext = {}
       pronouns_detected: false,
       visual_intent: "",
       recommended_visual_type: "footage",
+      visual_priority: "person_default",
     }],
   };
 }
