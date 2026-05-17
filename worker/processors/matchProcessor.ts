@@ -1525,7 +1525,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!subj) return null;
     const nowSec = blockStartSec[blockIdx];
     try {
-      const fetched = await fetchImages(subj, 6, { entityType: "celebrity" });
+      const fetched = await fetchImages(subj, 10, { entityType: "celebrity" });
       // Prefer (a) URL not yet claimed by reference pass AND (b) outside
       // the image cooldown. If nothing is outside cooldown, accept the
       // freshest (longest-since-last-used) image — better than no image.
@@ -1586,7 +1586,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     let filled = false;
     for (const q of queries) {
       try {
-        const fetched = await fetchImages(q.query, 4, { imgType: q.imgType });
+        // Fetch more per query (was 4 → now 8) so long sentences that
+        // split into multiple image slots all sharing the same hint can
+        // each claim a distinct image. The refUrlSet dedup below picks
+        // the first not-yet-used URL, so the bigger pool means cloned
+        // blocks don't run out and fall back to the entity pool.
+        const fetched = await fetchImages(q.query, 8, { imgType: q.imgType });
         // Take the first non-duplicate image. We use a per-pass set to
         // avoid two image blocks landing on the same URL when the script
         // mentions the same reference twice. Also honor the image cooldown

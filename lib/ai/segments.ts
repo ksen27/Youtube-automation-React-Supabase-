@@ -390,7 +390,17 @@ gracefully — it spreads reuse across the timeline so the viewer never sees
 the same shot twice in a row.
 
 Block-level visual rules (these matter — they drive what appears on screen):
-- Split the section into 4-12 blocks. Each block is 1-3 sentences of consecutive narration.
+- ONE BLOCK = ONE COMPLETE SENTENCE. Never split a sentence across blocks.
+  Each block's "text" must be a full sentence as it appears in the
+  narration, ending at terminal punctuation (.!?). Quotations and
+  parentheticals that complete the thought stay attached. Block durations
+  are derived from the sentence's spoken length — short sentences become
+  short holds (~3s), long sentences become longer holds (up to ~10s) or
+  multiple back-to-back image holds. Do NOT pre-trim sentences for pacing;
+  emit them as written.
+- The number of blocks per section therefore equals the number of complete
+  sentences. A 10-sentence section produces 10 blocks; a 4-sentence
+  section produces 4 blocks. No 4-12 cap.
 - Choose "recommended_visual_type" per block based on subject_type:
   * When subject_type is "person" or "general" → "footage". The viewer needs to see the person on screen.
   * When subject_type is "company" / "movie" / "show" / "place" / "event" / "object" AND the block names that entity → "image". The visual should be of THE ENTITY (a company logo, a movie poster, a place photo, an event's archival footage), NOT the celebrity. Put the entity name in "mentioned_entities" — downstream code routes "company" entities to logo search, "movie" entities to poster search, "place" entities to place-photo search, etc.

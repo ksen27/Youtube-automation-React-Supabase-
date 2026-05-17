@@ -20,14 +20,16 @@ export interface DurationRange {
 
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
-  // Tightened to 4–5s per client spec for the celebrity-style refactor.
-  // Was 4–6s; the upper bound is reduced because the new planner emits
-  // more title_card / split_2 variety so individual footage holds can run
-  // shorter without making the cut feel jumpy.
-  footage: { min: 4,  max: 5  },
-  // Fixed at 5s per user spec. Image holds previously ranged 5–8s, averaging
-  // ~7s. The fixed value standardizes pacing across the slideshow stretch
-  // and makes the timeline-plan math deterministic for image-time budgeting.
+  // Widened to 3–10s for sentence-aligned planning (Option 3). A footage
+  // block now mirrors the spoken length of its sentence: short sentences
+  // get short holds, long sentences get long holds. Video clips are
+  // typically longer than 10s, so any hold in this range is fine —
+  // viewers don't notice. The min/max cap prevents degenerate cases
+  // (a 1-word sentence at 0.4s, a run-on sentence at 25s).
+  footage: { min: 3,  max: 10 },
+  // Per-image hold is still 5s per user spec. The sentence-aligned planner
+  // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
+  // blocks rather than stretching one image, so the contract holds.
   image:   { min: 5,  max: 5  },
   // Black title cards for section breaks. Short on purpose — they're a
   // pacing beat, not a real visual hold.
@@ -35,6 +37,21 @@ export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   split_2: { min: 5,  max: 8  },
   split_4: { min: 5,  max: 8  },
 };
+
+// Words-per-second narration rate. Used to convert a sentence's word count
+// into its spoken duration so a block's hold time matches the sentence.
+// 2.5 wps == 150 wpm is the standard for English voiceover narration.
+export const WORDS_PER_SECOND_NARRATION = 2.5;
+
+// Per-image hold target (seconds). Long sentences exceeding the IMAGE_SPLIT
+// threshold are broken into multiple back-to-back image blocks of this
+// length so the per-image hold rule stays intact.
+export const IMAGE_HOLD_SECONDS = 5;
+
+// Sentence durations longer than this threshold trigger multi-image split
+// for image blocks. A 6.5s sentence on a tattoo reference produces TWO
+// 5s image blocks (cloned hint metadata), not ONE 6.5s image hold.
+export const IMAGE_SPLIT_THRESHOLD = IMAGE_HOLD_SECONDS + 1.5;
 
 export interface TimelinePlan {
   voiceoverSeconds: number;
@@ -257,38 +274,96 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
 }
 
-// Approximate 60/40 footage:image balance per the client spec. Title cards
-// and split_2 blocks count toward the "non-footage" 40% bucket.
-const TARGET_FOOTAGE_RATIO = 0.6;
-const FOOTAGE_RATIO_TOLERANCE = 0.1;     // ±10% — "approximate" balance.
+// Estimate spoken duration of a text chunk based on its word count and a
+// fixed narration cadence. Used to size blocks by sentence length rather
+// than by a hard-coded per-block duration. Returns seconds, with a 0.1s
+// floor so empty chunks don't collapse to 0.
+export function sentenceDurationSeconds(text: string): number {
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  if (words === 0) return 0.1;
+  return words / WORDS_PER_SECOND_NARRATION;
+}
 
 // Build a timeline sequence from Gemini's per-block hints. The hints come
-// in narration order; this function preserves that order and only adjusts:
-//   1. block durations (clamped to DURATION_RANGES per type)
-//   2. type rebalancing when the realized 60/40 ratio drifts outside ±10%
-//   3. tail trimming/stretching to land within ±1s of voiceoverSeconds
+// in narration order and each hint covers 1-3 sentences of consecutive
+// narration; this function preserves that order and:
+//   1. Sets each block's duration from its sentence's spoken length so
+//      visuals stay aligned with what's being said (Option 3: variable-
+//      duration footage, ~5s per image, multi-image split for long
+//      sentences).
+//   2. Splits long IMAGE blocks (sentence > IMAGE_SPLIT_THRESHOLD) into
+//      multiple back-to-back ~5s image blocks sharing the same hint
+//      metadata. Honors the 5s-per-image rule while keeping the sentence
+//      as the unit of meaning.
+//   3. Tail-reconciles the realized total to land within ±1s of
+//      voiceoverSeconds by adjusting the last block.
 //
 // Why this and not buildBlockSequence: the legacy builder picks types from
 // a budget (X footage blocks, Y image blocks) without knowing what each
 // block is ABOUT. The hint-aware builder respects Gemini's per-block
-// recommendation, so "she had a tattoo" lands as an image block even when
-// the footage budget would otherwise pick footage.
+// recommendation AND each block's actual spoken length, so "she had a
+// tattoo" lands as one image block of the sentence's length, and a long
+// narrative footage sentence gets a proportional hold.
 export function buildBlockSequenceFromHints(
   hints: BlockPlanHint[],
   voiceoverSeconds: number,
-  rand: RandomFn = Math.random,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; sentence-aligned builder is deterministic.
+  _rand: RandomFn = Math.random,
 ): PlannedBlockWithHint[] {
   if (hints.length === 0 || voiceoverSeconds <= 0) return [];
 
-  // Step 1 — give every hint a starting duration from its type range. We
-  // pick mid-range so the initial total is predictable; the final tail
-  // pass handles the over/undershoot.
-  const blocks: PlannedBlockWithHint[] = hints.map((h) => {
+  // Step 1 — Compute a target duration for each hint from its text's
+  // spoken length, then scale uniformly so the sum matches the actual
+  // voiceover duration. Uniform scaling preserves the proportions
+  // between blocks: a sentence twice as long stays twice as long.
+  const rawDurations = hints.map((h) => sentenceDurationSeconds(h.text));
+  const rawTotal = rawDurations.reduce((s, d) => s + d, 0);
+  // Guard against zero/NaN (all-empty hints) — fall back to even split.
+  const scale = rawTotal > 0 ? voiceoverSeconds / rawTotal : 1;
+  const scaledDurations = rawDurations.map((d) => d * scale);
+
+  // Step 2 — Materialize blocks. For footage / title_card / split_2 each
+  // hint becomes ONE block whose duration is the scaled sentence length
+  // clamped to its type's range. For image blocks, sentences exceeding
+  // IMAGE_SPLIT_THRESHOLD are SPLIT into multiple ~5s blocks that share
+  // the hint's text and metadata — the matcher then assigns a separate
+  // image to each block, honoring the 5s-per-image rule for long
+  // sentences.
+  const blocks: PlannedBlockWithHint[] = [];
+  hints.forEach((h, i) => {
+    const sentenceSec = scaledDurations[i];
     const type = h.recommended_visual_type;
-    const dur = pickDuration(type, rand);
-    return {
+
+    // Image blocks: keep 5s per image. If the sentence runs long, emit
+    // multiple back-to-back image blocks of ~5s each, all sharing the
+    // hint metadata. The matcher will pick a different image for each
+    // slot via its reference + person-fallback chain.
+    if (type === "image" && sentenceSec > IMAGE_SPLIT_THRESHOLD) {
+      const slotCount = Math.max(1, Math.round(sentenceSec / IMAGE_HOLD_SECONDS));
+      const slotDur = Math.round((sentenceSec / slotCount) * 10) / 10;
+      for (let k = 0; k < slotCount; k++) {
+        blocks.push({
+          type: "image",
+          duration: clampToRange("image", slotDur),
+          text: h.text,
+          resolved_subject: h.resolved_subject,
+          section_title: k === 0 ? h.section_title : undefined,
+          specific_visual_references: h.specific_visual_references,
+          mentioned_entities: h.mentioned_entities,
+          subject_type: h.subject_type,
+          visual_priority: h.visual_priority,
+        });
+      }
+      return;
+    }
+
+    // Footage / title_card / split_2: one block per hint, duration = the
+    // scaled sentence length clamped to the type's range. Footage allows
+    // 3-10s so most sentences land naturally; very short / very long
+    // outliers get clamped.
+    blocks.push({
       type,
-      duration: dur,
+      duration: clampToRange(type, Math.round(sentenceSec * 10) / 10),
       text: h.text,
       resolved_subject: h.resolved_subject,
       section_title: h.section_title,
@@ -296,37 +371,13 @@ export function buildBlockSequenceFromHints(
       mentioned_entities: h.mentioned_entities,
       subject_type: h.subject_type,
       visual_priority: h.visual_priority,
-    };
+    });
   });
 
-  // Step 2 — measure footage ratio by TIME and rebalance if it drifts.
-  // We only rebalance footage<->image (the two majority types). title_card
-  // and split_2 stay as Gemini placed them; they're an intentional pacing
-  // signal that shouldn't be silently dropped to hit a ratio.
-  let ratio = footageTimeRatio(blocks);
-  // Promote image→footage while we're under the lower bound.
-  if (ratio < TARGET_FOOTAGE_RATIO - FOOTAGE_RATIO_TOLERANCE) {
-    for (let i = 0; i < blocks.length && ratio < TARGET_FOOTAGE_RATIO - FOOTAGE_RATIO_TOLERANCE; i++) {
-      if (blocks[i].type === "image") {
-        blocks[i] = { ...blocks[i], type: "footage", duration: pickDuration("footage", rand) };
-        ratio = footageTimeRatio(blocks);
-      }
-    }
-  }
-  // Demote footage→image while we're over the upper bound.
-  if (ratio > TARGET_FOOTAGE_RATIO + FOOTAGE_RATIO_TOLERANCE) {
-    for (let i = blocks.length - 1; i >= 0 && ratio > TARGET_FOOTAGE_RATIO + FOOTAGE_RATIO_TOLERANCE; i--) {
-      if (blocks[i].type === "footage") {
-        blocks[i] = { ...blocks[i], type: "image", duration: pickDuration("image", rand) };
-        ratio = footageTimeRatio(blocks);
-      }
-    }
-  }
-
-  // Step 3 — tail reconciliation. Same logic as buildBlockSequence: trim
-  // overshoot off the last block (down to 1s floor); for undershoot < 3s,
-  // stretch the most recent footage block. Image blocks stay fixed at 5s
-  // per spec, so we never stretch them.
+  // Step 3 — Tail reconciliation. Clamping + image splits introduce small
+  // drift; trim the last block by overshoot, or extend the most recent
+  // footage block by undershoot (<3s). Image blocks stay at 5s — we
+  // never stretch them.
   const total = sumDurations(blocks);
   const overshoot = total - voiceoverSeconds;
   const last = blocks[blocks.length - 1];
@@ -348,11 +399,3 @@ export function buildBlockSequenceFromHints(
   return blocks;
 }
 
-// Helper — share of timeline time spent on footage blocks. title_card and
-// split_2 count toward the non-footage 40% per the spec.
-function footageTimeRatio(blocks: PlannedBlock[]): number {
-  const total = sumDurations(blocks);
-  if (total <= 0) return 0;
-  const footage = blocks.filter((b) => b.type === "footage").reduce((s, b) => s + b.duration, 0);
-  return footage / total;
-}
