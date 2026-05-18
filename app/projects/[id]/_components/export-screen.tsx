@@ -14,6 +14,7 @@ import {
   type ProjectResp,
   type TimelineRow,
 } from "../_shared";
+import { uploadAudioDirect } from "@/lib/client/upload-audio-direct";
 
 export function ExportScreen({
   projectId,
@@ -188,16 +189,7 @@ function BgMusicCard({
   const [gainPct, setGainPct] = useState(() => Math.round(initialGain * 100));
 
   const upload = useMutation({
-    mutationFn: async (file: File) => {
-      const fd = new FormData();
-      fd.append("file", file);
-      const r = await fetch(`/api/projects/${projectId}/bg-music`, {
-        method: "POST",
-        body: fd,
-      });
-      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
-      return r.json();
-    },
+    mutationFn: (file: File) => uploadAudioDirect("bg-music", projectId, file),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
   });
 
@@ -345,16 +337,7 @@ function SfxCard({
   const urls = project?.sfx_urls ?? [];
 
   const upload = useMutation({
-    mutationFn: async (file: File) => {
-      const fd = new FormData();
-      fd.append("file", file);
-      const r = await fetch(`/api/projects/${projectId}/sfx`, {
-        method: "POST",
-        body: fd,
-      });
-      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
-      return r.json();
-    },
+    mutationFn: (file: File) => uploadAudioDirect("sfx", projectId, file),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["project", projectId] });
       if (fileInputRef.current) fileInputRef.current.value = "";
