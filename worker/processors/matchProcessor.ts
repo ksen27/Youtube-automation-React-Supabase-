@@ -2681,16 +2681,30 @@ async function loadBlockHintsFromAnalyze(
     if (!u) continue;
     const segBlocks: BlockPlan[] = Array.isArray(u.blocks) ? u.blocks : [];
     if (segBlocks.length === 0) continue;
+    // Resolve the section title for this segment's first block. Gemini's
+    // sectionTitle field is conservative — the prompt asks for it ONLY when
+    // the narration "clearly opens a new chapter", so scripts written as
+    // continuous prose (no labelled chapters) often leave it empty and the
+    // black title-card never gets rendered. Fall back to segmentTopic, which
+    // every segment has and which reads like a chapter heading ("lawsuit /
+    // Creative Controls", "early career", "wedding 2019"). Title-case the
+    // first letter so an all-lowercase topic reads as a heading.
+    const rawTitle = (u.sectionTitle && u.sectionTitle.trim())
+      || (u.segmentTopic && u.segmentTopic.trim())
+      || "";
+    const resolvedSectionTitle = rawTitle
+      ? rawTitle.charAt(0).toUpperCase() + rawTitle.slice(1)
+      : undefined;
     for (let i = 0; i < segBlocks.length; i++) {
       const b = segBlocks[i];
       hints.push({
         text: b.text,
         resolved_subject: b.resolved_subject || undefined,
         recommended_visual_type: b.recommended_visual_type,
-        // Only attach section_title to the FIRST block of a segment with a
-        // sectionTitle — that's the chapter boundary. Later blocks in the
-        // same segment continue under the same section.
-        section_title: (i === 0 && u.sectionTitle) ? u.sectionTitle : undefined,
+        // Only attach section_title to the FIRST block of a segment — that's
+        // the chapter boundary. Later blocks in the same segment continue
+        // under the same section.
+        section_title: i === 0 ? resolvedSectionTitle : undefined,
         // Phase C: forward Gemini's per-block visual references and
         // mentioned entities so the image matcher can search for the
         // specific reference ("tattoo", "Frida") instead of falling
