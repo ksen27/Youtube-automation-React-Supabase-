@@ -2512,7 +2512,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // we don't push any row past the source clip's real length and
   // re-introduce the same lie we just fixed.
   if (durationReclaimSeconds > 0.1) {
-    const footageMax = 8; // mirrors DURATION_RANGES.footage.max in timeline-plan
+    // Extended ceiling matches lib/ai/timeline-plan.ts EXTENDED_FOOTAGE_MAX.
+    // The per-row cap is still min(this, clip.duration) so we never claim
+    // more time than the underlying source clip can play.
+    const footageMax = 15;
     const stretchable: typeof items = [];
     for (const it of items) {
       if (it.type !== "footage") continue;

@@ -524,33 +524,55 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
   }
 }
 
-// Close the small residual gap left when individual footage sentences
-// fell outside their 3-10s clamp range. Image / title_card / split_2 time
-// is already exact, so we never touch them here. Each pass spreads the
-// remaining gap evenly across footage blocks with headroom in the right
-// direction; we re-evaluate after each pass because the clamp can leave
-// some blocks pinned at min/max.
+// Extended footage ceiling used only when the normal 8s cap leaves the
+// timeline short of the voiceover. The clip generator produces 5-8s windows
+// in the typical case; in the image-heavy hint mix, footage blocks are the
+// only flexible budget and capping them at 8s strands voiceover time the
+// timeline can never reach. The matcher's reclaim pass further constrains
+// stretched rows by min(EXTENDED_FOOTAGE_MAX, clip.duration), so we never
+// claim more time than the underlying clip can actually play.
+const EXTENDED_FOOTAGE_MAX = 15;
+
+// Close the residual gap left when individual footage sentences fall
+// outside their 3-8s clamp range. Image / title_card / split_2 time is
+// already exact, so we never touch them here. The first phase keeps the
+// strict 8s ceiling; if that can't close a positive gap (image-heavy
+// timeline where every footage block is pinned at 8s), the second phase
+// raises the ceiling to EXTENDED_FOOTAGE_MAX so the planned total reaches
+// voiceoverSeconds. The downstream matcher then clamps each stretched row
+// to the real clip duration before insert, so we never overstate runtime.
 function redistributeFootageResidue(blocks: PlannedBlockWithHint[], target: number): void {
   const footageRange = DURATION_RANGES.footage;
   const MAX_PASSES = 6;
   const EPSILON = 0.1;
 
-  for (let pass = 0; pass < MAX_PASSES; pass++) {
-    const total = sumDurations(blocks);
-    const gap = target - total;
-    if (Math.abs(gap) < EPSILON) return;
+  const runPasses = (ceiling: number) => {
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      const total = sumDurations(blocks);
+      const gap = target - total;
+      if (Math.abs(gap) < EPSILON) return true;
 
-    const adjustable = blocks.filter((b) => {
-      if (b.type !== "footage") return false;
-      return gap > 0 ? b.duration < footageRange.max : b.duration > footageRange.min;
-    });
-    if (adjustable.length === 0) return;
+      const adjustable = blocks.filter((b) => {
+        if (b.type !== "footage") return false;
+        return gap > 0 ? b.duration < ceiling : b.duration > footageRange.min;
+      });
+      if (adjustable.length === 0) return false;
 
-    const perBlock = gap / adjustable.length;
-    for (const b of adjustable) {
-      const next = clampToRange("footage", b.duration + perBlock);
-      b.duration = Math.round(next * 10) / 10;
+      const perBlock = gap / adjustable.length;
+      for (const b of adjustable) {
+        const next = Math.min(ceiling, Math.max(footageRange.min, b.duration + perBlock));
+        b.duration = Math.round(next * 10) / 10;
+      }
     }
-  }
+    return false;
+  };
+
+  // Phase 1: respect the normal 8s ceiling.
+  if (runPasses(footageRange.max)) return;
+  // Phase 2: only used when the gap is positive (timeline under voiceover)
+  // and every footage block is at the 8s ceiling. Negative gaps don't need
+  // the extended ceiling — shrinking already has headroom down to 3s.
+  const remaining = target - sumDurations(blocks);
+  if (remaining > EPSILON) runPasses(EXTENDED_FOOTAGE_MAX);
 }
 
