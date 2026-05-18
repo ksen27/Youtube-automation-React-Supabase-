@@ -111,73 +111,70 @@ export async function buildStillVideo(opts: {
   ], opts.signal, 30);
   const actualInput = transcodedPng;
 
-  // Slow zoom motion using a time-driven crop window. The two critical
-  // pieces that make this jitter-free (and which earlier attempts got
-  // wrong) are:
+  // Slow zoom motion using ffmpeg's `zoompan` filter. Earlier versions of
+  // this function drove zoom by giving `crop` a time-varying w/h expression,
+  // but `crop` rounds w/h to integers every frame — so for slow zooms the
+  // crop window held the same integer size for several frames and then
+  // jumped 1-2 px. That stair-step is what the eye reads as "wobbly" or
+  // "irregular" motion. `zoompan` interpolates the zoom factor in floating
+  // point and does sub-pixel sampling internally, so the motion is smooth
+  // regardless of how slow the zoom is.
   //
-  //   1) `fps=${fps}` is the FIRST filter, BEFORE crop. With `-loop 1` the
-  //      image2 demuxer feeds frames at its own default rate (~25 fps).
+  // Two implementation details that matter:
+  //
+  //   1) `fps=${fps}` is the FIRST filter, BEFORE zoompan. With `-loop 1`
+  //      the image2 demuxer feeds frames at its own default rate (~25 fps).
   //      If `fps=` runs later, ffmpeg duplicates frames to reach 30 — and
-  //      duplicate frames are exactly what produces the visible "every 6th
-  //      frame freezes" stutter pattern. Putting `fps=` first means every
-  //      downstream filter sees a clean 30 fps stream and the crop window
-  //      gets a fresh `t` for every output frame.
+  //      duplicate frames produce the visible "every 6th frame freezes"
+  //      stutter. Putting `fps=` first means zoompan sees a clean 30 fps
+  //      stream and produces a fresh interpolated frame for every output.
   //
-  //   2) The zoom range is large enough that the per-frame crop dimensions
-  //      change by at least ~2px between consecutive frames. crop rounds
-  //      its w/h to integers, so smaller per-frame changes produce a
-  //      stair-step ("same crop for 5 frames then jump 2px") that the eye
-  //      reads as irregular motion. ZOOM_MAX = 1.12 over a short clip
-  //      keeps the per-frame delta well above the rounding floor.
-  //
-  // The UPSCALE factor must be ≥ ZOOM_MAX so that even at peak zoom the
-  // crop window still fits inside the upscaled image.
+  //   2) Pre-scale 4× before zoompan. zoompan samples from the input frame,
+  //      so giving it a much-larger source means its sub-pixel sampling
+  //      has real pixels to read instead of resampling the same 1280×720
+  //      grid. Standard Ken Burns recipe — without this, slow zooms still
+  //      look soft and slightly jittery on detailed sources.
   const ZOOM_MAX = 1.12;
-  const UPSCALE = 1.15;
-  const upW = Math.round(w * UPSCALE);
-  const upH = Math.round(h * UPSCALE);
   const dur = Math.max(0.1, opts.durationSeconds);
-  // Crop window interpolates between full upscaled size (zoom=1.0) and a
-  // smaller window (zoom=ZOOM_MAX). For "in" the window shrinks → visible
-  // zoom in. For "out" the window expands → visible zoom out. Centered, no
-  // pan — just a clean zoom.
+  const totalFrames = Math.max(1, Math.round(dur * fps));
   const zStart = direction === "in" ? 1.0 : ZOOM_MAX;
   const zEnd = direction === "in" ? ZOOM_MAX : 1.0;
-  // Linear time ramp clamped to [0, 1] so the crop dimensions never
-  // overshoot at the last partial frame.
-  const zoomT = `min(t/${dur}\\,1)`;
-  const zExpr = `(${zStart}+(${zEnd}-${zStart})*${zoomT})`;
-  const cropW = `${upW}/${zExpr}`;
-  const cropH = `${upH}/${zExpr}`;
-  // Center the crop window inside the upscaled frame.
-  const cropX = `(in_w-(${cropW}))/2`;
-  const cropY = `(in_h-(${cropH}))/2`;
+  // Linear time ramp on the on-frame counter `on` (0..totalFrames-1).
+  // Clamped so the very last frame doesn't overshoot past zEnd due to
+  // rounding of totalFrames.
+  const tRamp = `min(on/${totalFrames - 1}\\,1)`;
+  const zExpr = `${zStart}+(${zEnd}-${zStart})*${tRamp}`;
 
   // Blurred-background composite: split the input into BG and FG streams.
   // BG covers the full frame (overshoot + center-crop), then heavy gblur so
   // portrait/square images don't show black bars when scaled into 1280×720.
   // BG is static — no zoom — matching how editors typically treat the fill.
-  // FG keeps the existing slow-zoom crop chain but pads with transparency
-  // instead of black so the blurred BG shows through the gutters. Then
-  // overlay FG on BG.
+  // FG runs the slow zoompan and pads with transparency so the blurred BG
+  // shows through the gutters on portrait/square sources. Then overlay FG
+  // on BG.
   //
   // CRITICAL: fps FIRST on every branch. See comment block above for why.
   // The encoder flags below stay identical to normalizeClip() so the final
   // concat can still use -c:v copy.
   const BLUR_SIGMA = 20;
+  const FG_SUPERSAMPLE = 4;
+  const ssW = w * FG_SUPERSAMPLE;
+  const ssH = h * FG_SUPERSAMPLE;
   const vfChain =
     `[0:v]fps=${fps},split=2[bgsrc][fgsrc];` +
     // Background: scale to COVER the target frame, center-crop to exactly
     // w×h, then heavy gaussian blur. Static — the FG zoom carries motion.
     `[bgsrc]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
       `crop=${w}:${h},gblur=sigma=${BLUR_SIGMA},setsar=1[bg];` +
-    // Foreground: same upscale + alternating slow zoom as before, but pad
-    // uses transparent so the blurred BG shows through gutters on portrait/
-    // square sources. format=yuva420p enables the alpha channel.
-    `[fgsrc]scale=${upW}:${upH}:force_original_aspect_ratio=decrease,` +
-      `pad=${upW}:${upH}:-1:-1:color=#00000000,format=yuva420p,` +
-      `crop=w='${cropW}':h='${cropH}':x='${cropX}':y='${cropY}',` +
-      `scale=${w}:${h},setsar=1[fg];` +
+    // Foreground: scale-to-fit into a 4×-supersampled canvas with
+    // transparent padding (so portrait/square gutters reveal the blurred
+    // BG), then zoompan does the smooth slow zoom down to w×h. d=1 emits
+    // exactly one output frame per input frame — without this, zoompan's
+    // default d=25 holds frames and ruins the motion.
+    `[fgsrc]scale=${ssW}:${ssH}:force_original_aspect_ratio=decrease:flags=lanczos,` +
+      `pad=${ssW}:${ssH}:-1:-1:color=#00000000,format=yuva420p,` +
+      `zoompan=z='${zExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'` +
+        `:d=1:s=${w}x${h}:fps=${fps},setsar=1[fg];` +
     `[bg][fg]overlay=0:0:format=auto,format=yuv420p`;
 
   const args = [
