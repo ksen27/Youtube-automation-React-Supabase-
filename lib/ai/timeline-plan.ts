@@ -338,7 +338,14 @@ export function buildBlockSequenceFromHints(
   const blocks: PlannedBlockWithHint[] = [];
   hints.forEach((h, i) => {
     const sentenceSec = scaledDurations[i];
-    const type = h.recommended_visual_type;
+    // Title cards are reserved for chapter boundaries (segment-opener hints
+    // that carry a section_title). Gemini sometimes tags individual mid-
+    // segment sentences as title_card too, which produces a black-card flash
+    // every ~85s in a 10-minute video. Demote those orphans to footage so
+    // title cards stay deliberate section beats.
+    const type = h.recommended_visual_type === "title_card" && !h.section_title
+      ? "footage"
+      : h.recommended_visual_type;
 
     // Image blocks: keep 5s per image. If the sentence runs long, emit
     // multiple back-to-back image blocks of ~5s each, all sharing the

@@ -15,17 +15,20 @@ export const dynamic = "force-dynamic";
 // gross mismatches (e.g. wrong voiceover uploaded).
 const DURATION_TOLERANCE_SECONDS = 3;
 
-// Block types that consume timeline duration (overlays don't). The intro is
-// rendered as a separate prefix segment by the renderer (see renderProcessor —
-// it pulls intro_clip_id from the projects table directly), and the matcher
-// inserts a UI-only intro row whose duration overlaps that prefix. Including
-// it here would double-count the intro and push the timeline outside the
-// ±1.5s tolerance, blocking the render with no clear feedback.
+// Block types that consume timeline duration (overlays don't). Must stay in
+// sync with renderProcessor.processItem — every type the renderer turns into
+// a visible segment with non-zero duration belongs here. The intro is the
+// one deliberate exclusion: it's rendered as a separate prefix segment
+// (renderProcessor pulls intro_clip_id from the projects table) and plays
+// the celebrity's source audio, not the voiceover. The matcher inserts a
+// UI-only intro row whose duration overlaps that prefix, so including it
+// here would double-count.
 const DURATION_BEARING_TYPES = new Set([
   "footage",
   "image",
   "split_2",
   "split_4",
+  "title_card",
 ]);
 
 const VALIDATION_FAILED_MSG =
