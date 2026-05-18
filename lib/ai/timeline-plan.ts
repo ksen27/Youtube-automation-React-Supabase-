@@ -31,10 +31,16 @@ export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
   // blocks rather than stretching one image, so the contract holds.
   image:   { min: 5,  max: 5  },
-  // Black title cards for section breaks. Short on purpose — they're a
-  // pacing beat, not a real visual hold.
-  title_card: { min: 2, max: 4 },
-  split_2: { min: 5,  max: 8  },
+  // Black title cards for section breaks. Fixed 5s hold per client spec —
+  // matches the per-image hold so a card reads as a deliberate beat, not a
+  // flash. The block-builder clamps to this range, so a long sentence on a
+  // section-opening hint still lands at 5s.
+  title_card: { min: 5, max: 5 },
+  // Fixed 6s split-screen hold per client spec — two half-width images
+  // need a beat longer than a single image so the viewer can scan both
+  // halves. Acts the same as the title_card pin: any sentence-derived
+  // duration gets clamped to this constant.
+  split_2: { min: 6,  max: 6  },
   split_4: { min: 5,  max: 8  },
 };
 

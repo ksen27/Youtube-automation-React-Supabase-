@@ -153,13 +153,32 @@ export async function buildStillVideo(opts: {
   const cropX = `(in_w-(${cropW}))/2`;
   const cropY = `(in_h-(${cropH}))/2`;
 
+  // Blurred-background composite: split the input into BG and FG streams.
+  // BG covers the full frame (overshoot + center-crop), then heavy gblur so
+  // portrait/square images don't show black bars when scaled into 1280×720.
+  // BG is static — no zoom — matching how editors typically treat the fill.
+  // FG keeps the existing slow-zoom crop chain but pads with transparency
+  // instead of black so the blurred BG shows through the gutters. Then
+  // overlay FG on BG.
+  //
+  // CRITICAL: fps FIRST on every branch. See comment block above for why.
+  // The encoder flags below stay identical to normalizeClip() so the final
+  // concat can still use -c:v copy.
+  const BLUR_SIGMA = 20;
   const vfChain =
-    // CRITICAL: fps FIRST. See comment block above.
-    `fps=${fps},` +
-    `scale=${upW}:${upH}:force_original_aspect_ratio=decrease,` +
-    `pad=${upW}:${upH}:-1:-1:color=black,` +
-    `crop=w='${cropW}':h='${cropH}':x='${cropX}':y='${cropY}',` +
-    `scale=${w}:${h},setsar=1`;
+    `[0:v]fps=${fps},split=2[bgsrc][fgsrc];` +
+    // Background: scale to COVER the target frame, center-crop to exactly
+    // w×h, then heavy gaussian blur. Static — the FG zoom carries motion.
+    `[bgsrc]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
+      `crop=${w}:${h},gblur=sigma=${BLUR_SIGMA},setsar=1[bg];` +
+    // Foreground: same upscale + alternating slow zoom as before, but pad
+    // uses transparent so the blurred BG shows through gutters on portrait/
+    // square sources. format=yuva420p enables the alpha channel.
+    `[fgsrc]scale=${upW}:${upH}:force_original_aspect_ratio=decrease,` +
+      `pad=${upW}:${upH}:-1:-1:color=#00000000,format=yuva420p,` +
+      `crop=w='${cropW}':h='${cropH}':x='${cropX}':y='${cropY}',` +
+      `scale=${w}:${h},setsar=1[fg];` +
+    `[bg][fg]overlay=0:0:format=auto,format=yuv420p`;
 
   const args = [
     "-y",
@@ -168,7 +187,7 @@ export async function buildStillVideo(opts: {
     "-t", String(opts.durationSeconds),
     "-i", actualInput,
     "-an",
-    "-vf", vfChain,
+    "-filter_complex", vfChain,
     // IMPORTANT: keep these encoder flags identical to normalizeClip(). The
     // final concat uses -c:v copy (mux-only, no re-encode) which requires
     // every input segment to share codec params, GOP structure, and SPS/PPS.
@@ -197,6 +216,201 @@ export async function buildStillVideo(opts: {
       try { await fs.unlink(transcodedPng); } catch { /* ignore */ }
     }
   }
+}
+
+// Build a split-screen still video — two source images placed side-by-side,
+// each filling its half of the frame. Used for blocks Gemini tagged as
+// split_2 ("Salma Hayek and Danny Trejo worked together"). Two inputs,
+// each cropped to half-width with scale=cover behavior so portrait and
+// square sources still fill their slot cleanly.
+//
+// Encoder flags match normalizeClip / buildStillVideo BYTE-FOR-BYTE so the
+// final concat stays on the stream-copy fast path. Single-frame pre-
+// transcode to PNG is the same defense as buildStillVideo — keeps the
+// image2 demuxer from hanging on pathological inputs (AVIF/HEIF, animated
+// WEBPs, oddly-flagged JPEGs).
+export async function buildSplitScreenVideo(opts: {
+  leftImagePath: string;
+  rightImagePath: string;
+  outputPath: string;
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  const halfW = Math.floor(w / 2);
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  // Pre-transcode both inputs to PNG single frames. Same rationale as
+  // buildStillVideo: the image2 + -loop 1 combo hangs on AVIF/HEIF, weird
+  // JPEG markers, oversized PNGs, animated WEBPs. A standalone decode
+  // either succeeds in <1s or fails immediately, so we get clean errors
+  // instead of silent stalls.
+  const leftPng = `${opts.leftImagePath}.normalized.png`;
+  const rightPng = `${opts.rightImagePath}.normalized.png`;
+  await runFFmpeg(env.FFMPEG_PATH, [
+    "-y", "-i", opts.leftImagePath, "-frames:v", "1", leftPng,
+  ], opts.signal, 30);
+  await runFFmpeg(env.FFMPEG_PATH, [
+    "-y", "-i", opts.rightImagePath, "-frames:v", "1", rightPng,
+  ], opts.signal, 30);
+
+  // For each side: scale-to-cover its half (force_original_aspect_ratio=
+  // increase fills the cell without leaving black bars), then center-crop
+  // to exactly halfW × h. setsar=1 keeps the SAR consistent with every
+  // other normalized segment so concat doesn't have to re-mux.
+  //
+  // fps FIRST on each branch, same as buildStillVideo — without it the
+  // image2 demuxer feeds its own ~25fps and downstream filters duplicate
+  // frames to reach 30, producing the visible "every 6th frame freezes"
+  // stutter.
+  const sideChain = (label: string) =>
+    `[${label}]fps=${fps},scale=${halfW}:${h}:force_original_aspect_ratio=increase,` +
+    `crop=${halfW}:${h},setsar=1`;
+  const filter =
+    `${sideChain("0:v")}[L];` +
+    `${sideChain("1:v")}[R];` +
+    `[L][R]hstack=inputs=2,format=yuv420p[v]`;
+
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-loop", "1", "-t", String(opts.durationSeconds), "-i", leftPng,
+    "-loop", "1", "-t", String(opts.durationSeconds), "-i", rightPng,
+    "-an",
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  try {
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  } finally {
+    try { await fs.unlink(leftPng); } catch { /* ignore */ }
+    try { await fs.unlink(rightPng); } catch { /* ignore */ }
+  }
+}
+
+// Build a black title-card segment with white text centered on the frame.
+// Used at section boundaries: Gemini's analyzeSegment emits a sectionTitle
+// (e.g. "The Cancellation", "Marriage") on the first block of every new
+// chapter, and the matcher persists it as a `title_card` timeline item.
+// This renderer turns that item into a fixed-length still video.
+//
+// Encoder flags match normalizeClip / buildStillVideo BYTE-FOR-BYTE so the
+// final concat can still stream-copy. The drawtext text-wrap relies on a
+// pre-computed font line length: ffmpeg's drawtext has no word-wrap, so we
+// pre-wrap in JS (see wrapTitleCardText) and use `\n` literals which
+// drawtext renders as multi-line output.
+export async function buildTitleCardVideo(opts: {
+  text: string;
+  outputPath: string;
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  const font = await resolveLowerThirdFont();
+  // No font available — synthesize a plain black card with no text rather
+  // than failing the whole render. The matcher log records the requested
+  // section_title so operators can see what was supposed to appear.
+  const fontPath = font ? font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:") : null;
+
+  // Title-card type sizing. 56px at 720p reads as a documentary chapter
+  // title at a comfortable viewing distance. Scales linearly with height
+  // so the same call at 1080p (h=1080) lands at ~84px.
+  const fontsize = Math.round(h / 12.8);
+
+  // Pre-wrap the text so a long title like "Michael Jackson, Marriage,
+  // and the Show That Made It Invisible" lines correctly. drawtext does
+  // not word-wrap; without this a long title runs off the side of the
+  // frame. ~22 chars per line is a comfortable read at this font size.
+  //
+  // Escape each line independently and join with the literal two-character
+  // sequence `\n` — drawtext's text parser interprets that as a newline.
+  // We can't pass actual newlines because escapeDrawtextValue strips them
+  // (and a raw \n inside the filtergraph arg also confuses ffmpeg's
+  // shell-free arg list on some platforms).
+  const lines = wrapTitleCardText(opts.text, 22);
+  const escaped = lines.map(escapeDrawtextValue).join("\\n");
+
+  // lavfi `color` source generates a solid black stream at the target
+  // resolution / fps / duration. No input file needed. We chain drawtext
+  // (when a font is available), setsar, and yuv420p so the encoder gets
+  // the same pixel format every other segment uses — concat then keeps
+  // its -c:v copy fast path.
+  //
+  // Centered text via x=(w-text_w)/2 and y=(h-text_h)/2 — drawtext exposes
+  // the rendered text dimensions as text_w / text_h so the expression
+  // centers a multi-line block without us hand-computing its height per
+  // line count.
+  const drawtext = fontPath
+    ? `drawtext=fontfile='${fontPath}':text='${escaped}':` +
+      `fontcolor=white:fontsize=${fontsize}:` +
+      `line_spacing=10:` +
+      `x=(w-text_w)/2:y=(h-text_h)/2,`
+    : "";
+  const vfChain = `${drawtext}setsar=1,format=yuv420p`;
+
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds}`,
+    "-vf", vfChain,
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-t", String(opts.durationSeconds),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// drawtext has no word-wrap, so we pre-split the title at the nearest
+// whitespace before `maxCharsPerLine` and return one entry per line. The
+// caller escapes each line, then joins with the two-character literal `\n`
+// which drawtext's text parser renders as a line break.
+function wrapTitleCardText(text: string, maxCharsPerLine: number): string[] {
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return [];
+  const lines: string[] = [];
+  let current = "";
+  for (const w of words) {
+    if (current.length === 0) {
+      current = w;
+    } else if ((current.length + 1 + w.length) <= maxCharsPerLine) {
+      current += ` ${w}`;
+    } else {
+      lines.push(current);
+      current = w;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
 }
 
 // Cut a window of audio out of a longer audio file. Used by the intro

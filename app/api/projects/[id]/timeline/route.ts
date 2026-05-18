@@ -12,7 +12,7 @@ const TimelineItemPatch = z.object({
   duration: z.number().positive().max(60).optional(),
   script_text: z.string().max(8000).nullable().optional(),
   overlay_text: z.string().max(500).nullable().optional(),
-  type: z.enum(["intro", "footage", "image", "split_2", "split_4", "lower_third", "transition"]).optional(),
+  type: z.enum(["intro", "footage", "image", "title_card", "split_2", "split_4", "lower_third", "transition"]).optional(),
   approved: z.boolean().optional(),
   delete: z.boolean().optional(),
 });

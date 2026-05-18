@@ -538,12 +538,34 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockVisualPriorities = blocks.map(() => null);
   }
 
-  // Phase D will add real title_card / split_2 renderers; until then,
-  // those types downgrade to image so the existing render path still
-  // works. We preserve the hint metadata in parallel arrays so Phase D
-  // can promote them back without re-running Gemini.
+  // Title cards and split-screens now have real renderers — let them pass
+  // through. Hard cap split_2 to at most 2 per 60s of timeline per client
+  // direction ("1-2 per minute, max"); any split_2 blocks beyond that cap
+  // are downgraded to plain image so the rest of the matcher treats them
+  // as ordinary image blocks. Walk in narration order so the EARLIER
+  // split_2 in any over-budget minute keeps its split status.
+  const SPLIT_2_PER_MINUTE_CAP = 2;
+  const SPLIT_2_WINDOW_SEC = 60;
+  let splitCapAcc = 0;
+  const splitTimes: number[] = [];
+  let splitDowngradedByCap = 0;
   for (let i = 0; i < blocks.length; i++) {
-    if (blocks[i].type === "title_card" || blocks[i].type === "split_2") {
+    const dur = blocks[i].duration;
+    if (blocks[i].type === "split_2") {
+      const windowStart = splitCapAcc - SPLIT_2_WINDOW_SEC;
+      const inWindow = splitTimes.filter((t) => t > windowStart).length;
+      if (inWindow >= SPLIT_2_PER_MINUTE_CAP) {
+        blocks[i] = { type: "image", duration: dur };
+        splitDowngradedByCap++;
+      } else {
+        splitTimes.push(splitCapAcc);
+      }
+    }
+    splitCapAcc += dur;
+  }
+  // split_4 has no renderer yet; downgrade it to image as before.
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type === "split_4") {
       blocks[i] = { type: "image", duration: blocks[i].duration };
     }
   }
@@ -1335,7 +1357,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       continue;
     }
 
-    // Image / split blocks — placeholders, no clip.
+    // Image / title_card / split blocks — placeholders, no clip. Title
+    // cards put their section title in overlay_text so the renderer can
+    // pick it up directly (and the review UI can show it without parsing
+    // metadata). For other types overlay_text stays null.
+    const overlayText = block.type === "title_card"
+      ? (blockSectionTitles[i] ?? null)
+      : null;
     items.push({
       project_id: projectId,
       clip_id: null,
@@ -1343,7 +1371,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       position: position++,
       duration: block.duration,
       script_text: blockText || null,
-      overlay_text: null,
+      overlay_text: overlayText,
       metadata: { placeholder: true, planned: true, block_index: i, ...planHintFor(i) },
       approved: false,
     });
@@ -2198,6 +2226,148 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     entitiesFailed: poolFetchStats.entitiesFailed,
   });
 
+  // ---- Split-screen image fill -----------------------------------------
+  // Walk split_2 blocks (cap-survivors from earlier in this function) and
+  // resolve a LEFT and RIGHT image for each. Strategy per side:
+  //   1) Try the corresponding mentioned_entity via the same reference
+  //      query builder used for ordinary image blocks (Tier 1 / Tier 2).
+  //   2) On miss, draw from the project image pool — same pool feeding
+  //      regular image blocks. Per client direction, split-screen halves
+  //      do NOT have to relate to what the narrator is saying; any pool
+  //      image is acceptable.
+  // The LEFT image lives on item.image_url (so existing UI/tooling that
+  // reads image_url still gets a preview), and the RIGHT image is stored
+  // on item.metadata.right_image_url. The renderer consumes both.
+  const POOL_FALLBACK_REASON = "split_pool_fallback";
+  let splitsAssigned = 0;
+  let splitsLeftFailed = 0;
+  let splitsRightFailed = 0;
+  // Track which pool entries we've used for split halves so we don't pick
+  // the same URL for left and right of the same block, and so a later
+  // split doesn't repeat the same pair. We don't consume() from the main
+  // pool — splits get to reuse images already shown elsewhere, which is
+  // fine because they live in a half-width slot.
+  const splitUsedUrls = new Set<string>();
+  async function resolveSplitSide(
+    entity: string | null,
+    blockIdx: number,
+    nowSec: number,
+    forbiddenUrls: Set<string>,
+  ): Promise<{ url: string; query: string; source: string; reason: string } | null> {
+    // Tier 1 — try the entity as a literal query (same shape as the
+    // mentioned_entity branch in buildReferenceQueries). Skip when Gemini
+    // didn't name a second entity for this block.
+    if (entity && entity.trim()) {
+      const q = entity.trim();
+      try {
+        const fetched = await fetchImages(q, 6, {});
+        for (const f of fetched) {
+          if (forbiddenUrls.has(f.url)) continue;
+          if (refUrlSet.has(f.url)) continue;
+          const last = imageUrlLastUsedAt.get(f.url);
+          if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
+          return { url: f.url, query: q, source: f.source, reason: `split_entity:${q}` };
+        }
+      } catch (e) {
+        void logJob({ projectId, jobId: mediaJobId },
+          "match.split.fetch_failed", { blockIndex: blockIdx, query: q, err: (e as Error).message });
+      }
+    }
+    // Tier 2 — pool fallback. Any pool entry that isn't forbidden by the
+    // caller (i.e. already used on the other side) and isn't cooling down.
+    for (const p of pool) {
+      if (forbiddenUrls.has(p.url)) continue;
+      const last = imageUrlLastUsedAt.get(p.url);
+      if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
+      return { url: p.url, query: p.query, source: p.source, reason: POOL_FALLBACK_REASON };
+    }
+    // Tier 3 — pool but ignore cooldown. Better to repeat a recent image
+    // in a half-frame slot than to leave the split half-empty.
+    for (const p of pool) {
+      if (forbiddenUrls.has(p.url)) continue;
+      return { url: p.url, query: p.query, source: p.source, reason: POOL_FALLBACK_REASON };
+    }
+    return null;
+  }
+  for (const item of items) {
+    if (item.type !== "split_2") continue;
+    const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+    if (blockIdx == null) continue;
+    const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
+    const nowSec = blockSecForItem(item);
+    const localForbidden = new Set<string>(splitUsedUrls);
+    // LEFT side: first mentioned entity (if any) or pool.
+    const leftPick = await resolveSplitSide(ents[0] ?? null, blockIdx, nowSec, localForbidden);
+    if (leftPick) {
+      localForbidden.add(leftPick.url);
+    } else {
+      splitsLeftFailed++;
+    }
+    // RIGHT side: second mentioned entity (if any) or pool. Pass LEFT's
+    // URL as forbidden so the two halves are never the same image.
+    const rightPick = await resolveSplitSide(ents[1] ?? null, blockIdx, nowSec, localForbidden);
+    if (rightPick) {
+      localForbidden.add(rightPick.url);
+    } else {
+      splitsRightFailed++;
+    }
+    // If we couldn't resolve ANY image for either side, downgrade this
+    // block to a plain image and let the next render pick a pool entry.
+    // We can't render an empty split-screen.
+    if (!leftPick && !rightPick) continue;
+    // If only one side resolved, downgrade to a single full-frame image
+    // using whichever URL we have. The renderer then treats this as a
+    // normal image block.
+    if (leftPick && !rightPick) {
+      item.type = "image";
+      item.image_url = leftPick.url;
+      item.image_query = leftPick.query;
+      item.image_source = leftPick.source;
+      const meta = (item.metadata ?? {}) as Record<string, unknown>;
+      meta.image_pick_source = "split_downgrade_to_single";
+      item.metadata = meta;
+      continue;
+    }
+    if (!leftPick && rightPick) {
+      item.type = "image";
+      item.image_url = rightPick.url;
+      item.image_query = rightPick.query;
+      item.image_source = rightPick.source;
+      const meta = (item.metadata ?? {}) as Record<string, unknown>;
+      meta.image_pick_source = "split_downgrade_to_single";
+      item.metadata = meta;
+      continue;
+    }
+    // Happy path — both sides resolved. Persist left on the existing
+    // image_url column (so the review UI's existing preview keeps working
+    // for the left half) and right on metadata.
+    item.image_url = leftPick!.url;
+    item.image_query = leftPick!.query;
+    item.image_source = leftPick!.source;
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+    meta.image_pick_source = "split_screen";
+    meta.left_image_url = leftPick!.url;
+    meta.left_image_query = leftPick!.query;
+    meta.left_image_source = leftPick!.source;
+    meta.left_image_reason = leftPick!.reason;
+    meta.right_image_url = rightPick!.url;
+    meta.right_image_query = rightPick!.query;
+    meta.right_image_source = rightPick!.source;
+    meta.right_image_reason = rightPick!.reason;
+    item.metadata = meta;
+    splitUsedUrls.add(leftPick!.url);
+    splitUsedUrls.add(rightPick!.url);
+    splitsAssigned++;
+  }
+  const splitBlocksTotal = items.filter((it) => it.type === "split_2").length;
+  await logJob({ projectId, jobId: mediaJobId }, "match.split_screen", {
+    splitBlocksTotal,
+    splitsAssigned,
+    splitsLeftFailed,
+    splitsRightFailed,
+    splitDowngradedByCap,
+  });
+
   // Diagnostic summary: tells us at a glance whether the matcher is using
   // Gemini scores or silently degrading to insertion-order fallback. If
   // pickSourceCounts.scored_top is 0 and the others are non-zero, scoring
@@ -2213,33 +2383,36 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   // ---- Lower-third tagging --------------------------------------------
   // Stamp metadata.lower_third on items where the client-requested overlay
-  // should burn in during render. Rules (per client spec):
-  //   - Names: only on the FIRST clip that visibly depicts them, never again.
-  //     "Depicts" is approximated by the clip's labels containing the name —
-  //     this is what we have without a structured entity→clip linkage.
-  //   - Years: on every scored clip whose block's spoken text mentions the
-  //     year — i.e. the narrator is saying it right now. blockEntities[i]
-  //     already comes from the transcript window over this block, so the
-  //     existing "block mentions a year" check is exactly that signal.
-  //   - Places: only when the clip VISUALLY depicts the place, not just when
-  //     narration name-drops it. Approximated by the place name appearing in
-  //     the clip's labels (case-insensitive substring), same shape as the
-  //     name sex-contradiction check below.
-  // Only Tier-1 scored picks qualify; filler clips weren't chosen for entity
-  // relevance, so labelling them would mislead the viewer.
-  // Order matters — we walk items by position so "first occurrence" is the
-  // first clip in the final video.
-  const labelsByClipId = new Map<string, string[]>(
-    clipsForMatch.map((c) => [c.id, (c.labels ?? []).map((l) => l.toLowerCase())]),
-  );
-  const introducedNames = new Set<string>();
+  // should burn in during render. Per client spec: at most one lower-third
+  // every 60 seconds of timeline, drawn from the names / years / places
+  // the narrator is mentioning around that moment (these are the red-
+  // highlighted words in the script — celebrities, related_persons, years,
+  // places extracted from the same transcript window).
+  //
+  // We walk items in playback order, accumulating duration. A clip is
+  // eligible only when ≥ 60s has passed since the previous overlay (or it
+  // is the first eligible clip). When eligible, we prefer name → year →
+  // place — a name-on-screen is the strongest signal — and pick from the
+  // block's own entity list so the overlay matches what's being said.
+  //
+  // Only Tier-1 scored picks qualify; filler clips weren't chosen for
+  // entity relevance, so labelling them would mislead the viewer. Earlier
+  // visual-match gates (first-occurrence-only for names, sex contradiction
+  // check, labels-must-contain-place) are gone — the per-minute throttle
+  // replaces them.
+  const LOWER_THIRD_INTERVAL_SEC = 60;
   const lowerThirdCounts = { name: 0, year: 0, place: 0 };
-  // Items are still in insertion order at this point (we haven't sorted).
-  // Sort defensively in case future edits reorder; the array is small.
+  let skippedForCadence = 0;
+  let cumulativeSec = 0;
+  let lastLowerThirdAtSec = Number.NEGATIVE_INFINITY;
   const orderedItems = [...items].sort(
     (a, b) => (a.position as number) - (b.position as number),
   );
   for (const it of orderedItems) {
+    const dur = Number(it.duration ?? 0);
+    const clipStartSec = cumulativeSec;
+    cumulativeSec += dur;
+
     if (it.type !== "footage") continue;
     const meta = it.metadata as Record<string, unknown> | undefined;
     if (!meta || meta.pick_source !== "scored_top") continue;
@@ -2247,39 +2420,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (blockIdx < 0) continue;
     const ents = blockEntities[blockIdx] ?? [];
     if (ents.length === 0) continue;
-    const clipLabels = labelsByClipId.get(it.clip_id as string) ?? [];
-    const labelStr = clipLabels.join(" ");
 
-    // Pick at most one lower-third per clip; names take priority over
-    // years/places because a name-on-screen is the strongest signal we want
-    // to surface. If no name qualifies, fall back to year, then place.
+    if (clipStartSec - lastLowerThirdAtSec < LOWER_THIRD_INTERVAL_SEC) {
+      skippedForCadence++;
+      continue;
+    }
+
     type Candidate = { text: string; type: "name" | "year" | "place" };
     let pick: Candidate | null = null;
 
     for (const ent of ents) {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
-      const key = ent.value.toLowerCase();
-      if (introducedNames.has(key)) continue;
-      // We trust the matcher's block→clip assignment as evidence the clip
-      // is about this person — that's the whole point of having scored it
-      // into this footage block. Earlier versions required sex-agreement
-      // confirmation from labels before burning in the name, which dropped
-      // most main-character overlays whenever Gemini's labeler didn't
-      // tag a man/woman cue (very common for vehicle/B-roll shots) or
-      // when no pronouns sat near the name in transcript.
-      //
-      // Safety net: if we CAN infer the person's sex from transcript
-      // pronouns AND the labels directly contradict it (woman-name on a
-      // clip tagged "man" with no "woman" cue, or vice versa), skip.
-      // This catches the obvious wrong-face-with-name case without
-      // requiring positive confirmation.
-      const personSex = inferPersonSex(ent.value);
-      if (personSex) {
-        const contradicts =
-          (personSex === "woman" && MAN_RE.test(labelStr) && !WOMAN_RE.test(labelStr)) ||
-          (personSex === "man" && WOMAN_RE.test(labelStr) && !MAN_RE.test(labelStr));
-        if (contradicts) continue;
-      }
       pick = { text: ent.value, type: "name" };
       break;
     }
@@ -2293,15 +2444,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
-        if (!labelStr.includes(ent.value.toLowerCase())) continue;
         pick = { text: ent.value, type: "place" };
         break;
       }
     }
 
     if (!pick) continue;
-    if (pick.type === "name") introducedNames.add(pick.text.toLowerCase());
     lowerThirdCounts[pick.type]++;
+    lastLowerThirdAtSec = clipStartSec;
     (it.metadata as Record<string, unknown>) = {
       ...meta,
       lower_third: { text: pick.text, type: pick.type },
@@ -2312,7 +2462,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     name: lowerThirdCounts.name,
     year: lowerThirdCounts.year,
     place: lowerThirdCounts.place,
-    namesIntroduced: introducedNames.size,
+    skippedForCadence,
+    intervalSec: LOWER_THIRD_INTERVAL_SEC,
   });
 
   await setMediaJob(mediaJobId, { progress: 80 });

@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
@@ -38,6 +38,18 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     if (it.type === "intro") return false;
     if (it.clip_id) return true;
     if (it.type === "image" && it.image_url) return true;
+    // Title cards have no clip and no image — they're rendered from a
+    // section title string in overlay_text. Keep them in the renderable
+    // list so the segment appears at the right timeline position.
+    if (it.type === "title_card" && typeof it.overlay_text === "string" && it.overlay_text.trim().length > 0) return true;
+    // Split-screen blocks: matcher persists the left image on image_url
+    // and the right image on metadata.right_image_url. Need BOTH to render
+    // a usable split; if either is missing the matcher downgraded the row
+    // to a plain image already.
+    if (it.type === "split_2") {
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      return !!it.image_url && typeof meta.right_image_url === "string" && (meta.right_image_url as string).length > 0;
+    }
     return false;
   });
   if (renderable.length === 0) {
@@ -92,9 +104,17 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   // boundary stays within ~0.2s of the planned length.
   const IMAGE_XFADE_SECONDS = 0.5;
   const MIXED_FADE_SECONDS = 0.4;
+  // Title cards and split-screens are still frames (no motion), so for
+  // transition purposes they behave like image neighbors: dissolve into
+  // adjacent images, dip-to-black into adjacent footage. The boundary
+  // code below never inspects what's inside the segment, only whether
+  // it's a still or motion source.
   const isImageNeighbor = (i: number): boolean => {
     const it = renderable[i];
-    return it?.type === "image" && !!it.image_url;
+    if (it?.type === "image" && it.image_url) return true;
+    if (it?.type === "title_card") return true;
+    if (it?.type === "split_2") return true;
+    return false;
   };
   const isVideoNeighbor = (i: number): boolean => {
     const it = renderable[i];
@@ -125,7 +145,93 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       const idx = String(i).padStart(3, "0");
       const out = path.join(tmp, `norm_${idx}.mp4`);
 
-      if (it.type === "image" && it.image_url) {
+      if (it.type === "split_2") {
+        // Split-screen: matcher persisted the LEFT image URL on
+        // image_url and the RIGHT URL on metadata.right_image_url.
+        // Download both, then call buildSplitScreenVideo to assemble the
+        // half-width side-by-side composite. Same headroom logic as a
+        // single image — split blocks are still frames, so their
+        // transition partners treat them identically.
+        const leftPartnerImage = isImageNeighbor(i - 1);
+        const leftPartnerVideo = isVideoNeighbor(i - 1);
+        const rightPartnerImage = isImageNeighbor(i + 1);
+        const rightPartnerVideo = isVideoNeighbor(i + 1);
+        const headLeft = leftPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : leftPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
+        const headRight = rightPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : rightPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
+        const renderDur = plannedDur + headLeft + headRight;
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const leftUrl = it.image_url as string;
+        const rightUrl = meta.right_image_url as string;
+        const leftLocal = path.join(tmp, `splitL_${idx}`);
+        const rightLocal = path.join(tmp, `splitR_${idx}`);
+        try {
+          await Promise.all([
+            downloadHttp(leftUrl, leftLocal),
+            downloadHttp(rightUrl, rightLocal),
+          ]);
+          await buildSplitScreenVideo({
+            leftImagePath: leftLocal,
+            rightImagePath: rightLocal,
+            outputPath: out,
+            durationSeconds: renderDur,
+            width: 1280, height: 720, fps: 30,
+          });
+          slots[i] = out;
+          slotDurations[i] = renderDur;
+          imageRendered++;
+        } catch (e) {
+          imageFailed++;
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.split.failed", { idx: i, leftUrl, rightUrl, err: (e as Error).message });
+        } finally {
+          await safeUnlink(leftLocal);
+          await safeUnlink(rightLocal);
+        }
+      } else if (it.type === "title_card") {
+        // Section-break title card: black background with the section
+        // title rendered as centered white text. Source comes from
+        // overlay_text, populated by the matcher from Gemini's per-segment
+        // sectionTitle. We bake the same per-side headroom an image
+        // neighbor would (still frames behave identically through xfades),
+        // so the transition math downstream still adds up.
+        const leftPartnerImage = isImageNeighbor(i - 1);
+        const leftPartnerVideo = isVideoNeighbor(i - 1);
+        const rightPartnerImage = isImageNeighbor(i + 1);
+        const rightPartnerVideo = isVideoNeighbor(i + 1);
+        const headLeft = leftPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : leftPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
+        const headRight = rightPartnerImage
+          ? IMAGE_XFADE_SECONDS / 2
+          : rightPartnerVideo
+            ? MIXED_FADE_SECONDS / 2
+            : 0;
+        const renderDur = plannedDur + headLeft + headRight;
+        const text = String(it.overlay_text ?? "").trim();
+        try {
+          await buildTitleCardVideo({
+            text,
+            outputPath: out,
+            durationSeconds: renderDur,
+            width: 1280, height: 720, fps: 30,
+          });
+          slots[i] = out;
+          slotDurations[i] = renderDur;
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.title_card.failed", { idx: i, text, err: (e as Error).message });
+        }
+      } else if (it.type === "image" && it.image_url) {
         // Bake headroom into the still video on every side that has a
         // transition partner. For image↔image we eat IMAGE_XFADE_SECONDS / 2
         // because the xfade overlaps the tail of A with the head of B; for
