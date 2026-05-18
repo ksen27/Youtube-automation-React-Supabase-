@@ -4,9 +4,21 @@ import { getEnv } from "@/lib/env";
 // SDK to avoid an extra dependency — the surface we need is one POST.
 // Docs: https://developers.deepgram.com/reference/listen-file
 
+interface DeepgramWord {
+  word: string;
+  // Deepgram's smart_format=true returns a `punctuated_word` with the
+  // sentence-end punctuation attached (e.g. "today." vs "today"). We use
+  // it so sentence-boundary matching against the transcript works without
+  // an extra punctuation-strip step.
+  punctuated_word?: string;
+  start: number;
+  end: number;
+  confidence?: number;
+}
 interface DeepgramAlternative {
   transcript: string;
   confidence: number;
+  words?: DeepgramWord[];
 }
 interface DeepgramChannel {
   alternatives: DeepgramAlternative[];
@@ -17,12 +29,26 @@ interface DeepgramListenResponse {
   err_msg?: string;
 }
 
+// Per-word timing surfaced to callers. Stored on projects.transcript_words
+// so the timeline planner can size blocks to the narrator's real spoken
+// duration for each sentence (eliminates the per-sentence drift introduced
+// by the uniform-wpm estimator).
+export interface WordTiming {
+  word: string;
+  start: number;
+  end: number;
+}
+
 export interface TranscribeResult {
   transcript: string;
   // Audio duration in seconds, reported by Deepgram. Used as the primary
   // source of voiceover length on hosts where ffprobe isn't available
   // (e.g. Vercel's serverless Node runtime).
   durationSeconds: number | null;
+  // Per-word timings in the order they appear in the transcript. May be
+  // null on legacy callers that don't request them, but in practice every
+  // current code path needs them for the timeline planner.
+  words: WordTiming[] | null;
 }
 
 function buildListenUrl(): string {
@@ -37,12 +63,23 @@ function buildListenUrl(): string {
 }
 
 function parseListenResponse(json: DeepgramListenResponse): TranscribeResult {
-  const transcript = json.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
+  const alt = json.results?.channels?.[0]?.alternatives?.[0];
+  const transcript = alt?.transcript?.trim();
   if (!transcript) throw new Error("Deepgram returned no transcript");
   const dur = typeof json.metadata?.duration === "number" && json.metadata.duration > 0
     ? json.metadata.duration
     : null;
-  return { transcript, durationSeconds: dur };
+  // Prefer the punctuated form so sentence-boundary matching against the
+  // smart-formatted transcript is straightforward. Fall back to the bare
+  // word for safety, though current Deepgram models always emit both.
+  const words: WordTiming[] | null = Array.isArray(alt?.words)
+    ? alt!.words!.map((w) => ({
+        word: w.punctuated_word ?? w.word,
+        start: Number(w.start),
+        end: Number(w.end),
+      }))
+    : null;
+  return { transcript, durationSeconds: dur, words };
 }
 
 export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<TranscribeResult> {

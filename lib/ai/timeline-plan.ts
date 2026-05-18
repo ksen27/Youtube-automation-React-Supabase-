@@ -297,6 +297,79 @@ export function sentenceDurationSeconds(
   return words / wordsPerSecond;
 }
 
+// Word-timing entry as persisted in projects.transcript_words. Mirrors
+// lib/ai/deepgram.ts WordTiming but kept local so timeline-plan stays a
+// leaf module (no cross-cutting imports from server code).
+export interface PlannerWordTiming {
+  word: string;
+  start: number;
+  end: number;
+}
+
+// Strip everything except letters, digits, and apostrophes so a
+// transcript word ("Today,") and a hint word ("today") compare equal.
+// Lowercase to drop sentence-case differences.
+function normalizeWord(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9']/g, "");
+}
+
+// Consume `text`'s words from `timings` starting at `cursor` and return
+// { duration, nextCursor }. Matching is tolerant: punctuation and case
+// don't have to line up, and a word that fails to match advances the
+// cursor by one anyway (so a single transcription glitch doesn't desync
+// the whole pass). The returned duration is the wall-clock span from the
+// first matched word's start to the last matched word's end — i.e. the
+// real narration time for this sentence in the audio file. Returns null
+// when the text has no matchable words against the remaining timings,
+// which lets the caller fall back to the cadence estimator.
+export function sentenceDurationFromWords(
+  text: string,
+  timings: PlannerWordTiming[],
+  cursor: number,
+): { durationSeconds: number; nextCursor: number } | null {
+  const hintWords = text
+    .trim()
+    .split(/\s+/)
+    .map(normalizeWord)
+    .filter(Boolean);
+  if (hintWords.length === 0) return null;
+
+  let i = cursor;
+  let firstStart: number | null = null;
+  let lastEnd: number | null = null;
+  // Allow a small forward window when a hint word doesn't immediately
+  // match — handles Deepgram inserting filler words or splitting a hint's
+  // contraction. Keeps the cursor advancing without realigning on noise.
+  const LOOKAHEAD = 3;
+
+  for (let h = 0; h < hintWords.length; h++) {
+    const target = hintWords[h];
+    if (!target) continue;
+    let matched = false;
+    const limit = Math.min(timings.length, i + 1 + LOOKAHEAD);
+    for (let k = i; k < limit; k++) {
+      if (normalizeWord(timings[k].word) === target) {
+        if (firstStart === null) firstStart = timings[k].start;
+        lastEnd = timings[k].end;
+        i = k + 1;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      // Hint word missing from timings (e.g. punctuation-only or a
+      // Gemini-paraphrase artifact). Advance i by one to stay roughly
+      // aligned with the narration; the next hint word usually re-syncs.
+      i = Math.min(timings.length, i + 1);
+    }
+  }
+
+  if (firstStart === null || lastEnd === null || lastEnd <= firstStart) {
+    return null;
+  }
+  return { durationSeconds: lastEnd - firstStart, nextCursor: i };
+}
+
 // Build a timeline sequence from Gemini's per-block hints. The hints come
 // in narration order and each hint covers 1-3 sentences of consecutive
 // narration; this function preserves that order and:
@@ -327,6 +400,14 @@ export function buildBlockSequenceFromHints(
   // block durations away from the words they should cover. Pass the full
   // project transcript when calling from the matcher.
   transcript?: string,
+  // Per-word timings from Deepgram. When provided, each hint's raw
+  // duration is computed from the wall-clock span of the words actually
+  // spoken in that hint's text — eliminating the per-sentence drift the
+  // uniform-cadence estimator produces (a 100+ sentence audio compounds
+  // that drift into a multi-second timeline-vs-voiceover gap). Falls back
+  // to the cadence estimator per-hint when a hint's words can't be aligned
+  // (rare — Gemini paraphrasing far enough that the words don't match).
+  wordTimings?: PlannerWordTiming[] | null,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; sentence-aligned builder is deterministic.
   _rand: RandomFn = Math.random,
 ): PlannedBlockWithHint[] {
@@ -334,7 +415,8 @@ export function buildBlockSequenceFromHints(
 
   // Derive the speaker's real cadence from the transcript when available.
   // Falls back to the 2.5 wps constant for legacy callers that don't have
-  // the transcript at hand.
+  // the transcript at hand. Only used for hints whose words can't be
+  // aligned against wordTimings — the timing-based path is exact.
   const transcriptWords = transcript
     ? transcript.trim().split(/\s+/).filter(Boolean).length
     : 0;
@@ -365,51 +447,81 @@ export function buildBlockSequenceFromHints(
   // to absorb whatever voiceover time the pinned blocks didn't consume.
   // Image-split slot count comes from raw (unscaled) sentence duration so
   // it doesn't depend on the scale factor we're trying to compute.
-  const rawDurations = hints.map((h) => sentenceDurationSeconds(h.text, cadence));
+  // Per-hint raw spoken duration. When word timings are available, use the
+  // wall-clock span of the words Deepgram heard for this hint's text —
+  // that's the narrator's actual spoken time, which is what we want each
+  // block to cover. When timings are missing or a hint's words can't be
+  // aligned (Gemini paraphrasing diverged from the transcript), fall back
+  // to the cadence estimator so older projects and edge cases keep working.
+  let wordCursor = 0;
+  const rawDurations: number[] = hints.map((h) => {
+    if (wordTimings && wordTimings.length > 0) {
+      const aligned = sentenceDurationFromWords(h.text, wordTimings, wordCursor);
+      if (aligned) {
+        wordCursor = aligned.nextCursor;
+        return aligned.durationSeconds;
+      }
+    }
+    return sentenceDurationSeconds(h.text, cadence);
+  });
 
-  // Pass A: pinned-time bookkeeping. Each pinned hint contributes exactly
-  // slotCount × typeDuration to the timeline, where slotCount is 1 for
-  // single-slot types (title_card, split_2) and round(rawSec/5) for image
-  // hints longer than the split threshold.
-  let pinnedTime = 0;
-  // Parallel arrays keyed by hint index. slotCounts[i] is the number of
-  // physical blocks hint i will materialize into.
+  // When word timings are available, each hint's rawDuration is the real
+  // wall-clock span the narrator spent on that sentence. We size every
+  // block from that real duration:
+  //
+  // - Footage blocks: duration = rawDuration (no cadence-scaling). The
+  //   visual stays on screen for exactly as long as the narrator speaks
+  //   the sentence. The matcher then clamps to the assigned clip's real
+  //   length downstream — same as before.
+  // - Image blocks: still pinned to 5s holds per client spec, with long
+  //   sentences split into N back-to-back 5s slots (slot count rounded
+  //   from rawDuration / 5). A sentence whose real time doesn't divide
+  //   cleanly by 5 leaves a small per-hint residue.
+  // - Title_card / split_2 blocks: pinned to their spec value (5s / 6s).
+  //
+  // The legacy footage-scale path is preserved as a fallback for the
+  // edge case where every hint failed to align against word timings
+  // (rare, but possible if Gemini paraphrased every sentence). In that
+  // case rawDurations are cadence-estimated and footage gets scaled the
+  // old way so the timeline still lands near voiceoverSeconds.
+  const haveRealTimings = wordTimings != null && wordTimings.length > 0;
+
+  // Slot counts for image hints. Round to nearest whole 5s multiple so
+  // a 7s sentence gets one slot (5s) and a 12s sentence gets two (10s).
+  // Math.round used to gain over Math.floor: a 7.5s sentence becomes
+  // two slots, which is closer to the truth than one.
   const slotCounts = new Array<number>(hints.length).fill(1);
   for (let i = 0; i < hints.length; i++) {
-    const type = effectiveTypes[i];
-    const rawSec = rawDurations[i];
-    if (type === "image") {
-      if (rawSec > IMAGE_SPLIT_THRESHOLD) {
-        slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
-      }
-      pinnedTime += slotCounts[i] * IMAGE_HOLD_SECONDS;
-    } else if (type === "title_card") {
-      pinnedTime += DURATION_RANGES.title_card.min;
-    } else if (type === "split_2") {
-      pinnedTime += DURATION_RANGES.split_2.min;
-    } else if (type === "split_4") {
-      pinnedTime += DURATION_RANGES.split_4.min;
+    if (effectiveTypes[i] === "image") {
+      const rawSec = rawDurations[i];
+      slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
     }
   }
 
-  // Pass B: footage scale. Sum the raw durations of footage hints and
-  // scale them so they soak up the remaining voiceover time. If pinned
-  // blocks already exceed voiceoverSeconds (rare — would require very
-  // many short image-typed sentences), we shrink footage to its 3s floor;
-  // the residual mismatch goes to the post-pass redistributor.
-  let footageRawTotal = 0;
-  for (let i = 0; i < hints.length; i++) {
-    if (effectiveTypes[i] === "footage") footageRawTotal += rawDurations[i];
+  // Footage scale is only used when rawDurations came from the cadence
+  // estimator (no word timings available). With real timings we don't
+  // scale — each footage block stays at its real spoken duration.
+  let footageScale = 1;
+  if (!haveRealTimings) {
+    let pinnedTime = 0;
+    for (let i = 0; i < hints.length; i++) {
+      const type = effectiveTypes[i];
+      if (type === "image") pinnedTime += slotCounts[i] * IMAGE_HOLD_SECONDS;
+      else if (type === "title_card") pinnedTime += DURATION_RANGES.title_card.min;
+      else if (type === "split_2") pinnedTime += DURATION_RANGES.split_2.min;
+      else if (type === "split_4") pinnedTime += DURATION_RANGES.split_4.min;
+    }
+    let footageRawTotal = 0;
+    for (let i = 0; i < hints.length; i++) {
+      if (effectiveTypes[i] === "footage") footageRawTotal += rawDurations[i];
+    }
+    const footageTarget = Math.max(0, voiceoverSeconds - pinnedTime);
+    footageScale =
+      footageRawTotal > 0 && footageTarget > 0
+        ? footageTarget / footageRawTotal
+        : 1;
   }
-  const footageTarget = Math.max(0, voiceoverSeconds - pinnedTime);
-  const footageScale =
-    footageRawTotal > 0 && footageTarget > 0
-      ? footageTarget / footageRawTotal
-      : 1;
 
-  // Step 2 — Materialize blocks. Each hint becomes either one block (most
-  // types) or slotCounts[i] image blocks (long image sentences). Footage
-  // durations come from footageScale; pinned types use their fixed value.
   const blocks: PlannedBlockWithHint[] = [];
   hints.forEach((h, i) => {
     const type = effectiveTypes[i];
@@ -433,10 +545,20 @@ export function buildBlockSequenceFromHints(
       return;
     }
 
-    const duration =
-      type === "footage"
-        ? clampToRange("footage", Math.round(rawDurations[i] * footageScale * 10) / 10)
-        : DURATION_RANGES[type].min;
+    let duration: number;
+    if (type === "footage") {
+      // With real timings: use the spoken duration directly so the visual
+      // is on screen for as long as the narrator speaks the sentence.
+      // Without timings: scale to fit voiceover length as before. Either
+      // way we round to 0.1s precision — finer precision adds no value
+      // because the matcher's clip-clamp is the dominant rounding step.
+      const raw = haveRealTimings
+        ? rawDurations[i]
+        : rawDurations[i] * footageScale;
+      duration = Math.round(raw * 10) / 10;
+    } else {
+      duration = DURATION_RANGES[type].min;
+    }
 
     blocks.push({
       type,
@@ -463,12 +585,15 @@ export function buildBlockSequenceFromHints(
   // follow-up's hint subject is the right anchor for the combined block).
   mergeShortFootage(blocks);
 
-  // Step 4 — Residual cleanup. The footage clamp at min/max can leave a
-  // small mismatch when individual footage sentences land outside 3-10s.
-  // Distribute that residue uniformly across footage blocks (iterative
-  // because the clamp still applies). Image-related drift is zero by
-  // construction because pinned time was reserved upfront.
-  redistributeFootageResidue(blocks, voiceoverSeconds);
+  // Step 4 — Residual cleanup. With real word timings, footage durations
+  // are exact spoken lengths; never shorten them. With cadence-estimated
+  // durations, residue is larger and we can use the legacy redistributor
+  // which clamps to the footage range [3, 8].
+  if (haveRealTimings) {
+    redistributeResidueWithRealTimings(blocks, voiceoverSeconds);
+  } else {
+    redistributeFootageResidue(blocks, voiceoverSeconds);
+  }
 
   return blocks;
 }
@@ -524,55 +649,63 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
   }
 }
 
-// Extended footage ceiling used only when the normal 8s cap leaves the
-// timeline short of the voiceover. The clip generator produces 5-8s windows
-// in the typical case; in the image-heavy hint mix, footage blocks are the
-// only flexible budget and capping them at 8s strands voiceover time the
-// timeline can never reach. The matcher's reclaim pass further constrains
-// stretched rows by min(EXTENDED_FOOTAGE_MAX, clip.duration), so we never
-// claim more time than the underlying clip can actually play.
-const EXTENDED_FOOTAGE_MAX = 15;
+// Real-timing residue path. Footage blocks already hold their real spoken
+// duration so we must not shrink them — that would desync the visual from
+// the narration. We only stretch when the timeline is short, and only by
+// a tiny per-block amount (max +1s) to keep alignment intact. Any residue
+// we can't absorb this way is left for the render-tolerance check (±3s).
+//
+// We split the gap across all footage blocks, not just one tail block,
+// so any single block stretches at most 1s — a hold that's 1s longer than
+// the narration on screen is visually imperceptible, but stretching one
+// block by 10s would be a desync.
+function redistributeResidueWithRealTimings(blocks: PlannedBlockWithHint[], target: number): void {
+  const EPSILON = 0.1;
+  const PER_BLOCK_STRETCH_LIMIT = 1.0;
+  const total = sumDurations(blocks);
+  const gap = target - total;
+  // Negative gap (timeline > voiceover) is rare with real timings — the
+  // narration can't be longer than itself. Skip negative-gap handling to
+  // avoid shortening real-timing blocks.
+  if (gap < EPSILON) return;
 
-// Close the residual gap left when individual footage sentences fall
-// outside their 3-8s clamp range. Image / title_card / split_2 time is
-// already exact, so we never touch them here. The first phase keeps the
-// strict 8s ceiling; if that can't close a positive gap (image-heavy
-// timeline where every footage block is pinned at 8s), the second phase
-// raises the ceiling to EXTENDED_FOOTAGE_MAX so the planned total reaches
-// voiceoverSeconds. The downstream matcher then clamps each stretched row
-// to the real clip duration before insert, so we never overstate runtime.
+  const footage = blocks.filter((b) => b.type === "footage");
+  if (footage.length === 0) return;
+
+  const perBlock = Math.min(PER_BLOCK_STRETCH_LIMIT, gap / footage.length);
+  for (const b of footage) {
+    b.duration = Math.round((b.duration + perBlock) * 10) / 10;
+  }
+}
+
+// Legacy residue path used when word timings are unavailable. The cadence-
+// estimated rawDurations have large per-hint drift; this redistributor
+// soaks it up by stretching/shrinking footage within the [3, 8] range.
+// Image / title_card / split_2 time is already exact, so we never touch
+// them here. Each pass spreads the remaining gap evenly across footage
+// blocks with headroom; we re-evaluate per pass because the clamp can
+// pin some blocks at min/max.
 function redistributeFootageResidue(blocks: PlannedBlockWithHint[], target: number): void {
   const footageRange = DURATION_RANGES.footage;
   const MAX_PASSES = 6;
   const EPSILON = 0.1;
 
-  const runPasses = (ceiling: number) => {
-    for (let pass = 0; pass < MAX_PASSES; pass++) {
-      const total = sumDurations(blocks);
-      const gap = target - total;
-      if (Math.abs(gap) < EPSILON) return true;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const total = sumDurations(blocks);
+    const gap = target - total;
+    if (Math.abs(gap) < EPSILON) return;
 
-      const adjustable = blocks.filter((b) => {
-        if (b.type !== "footage") return false;
-        return gap > 0 ? b.duration < ceiling : b.duration > footageRange.min;
-      });
-      if (adjustable.length === 0) return false;
+    const adjustable = blocks.filter((b) => {
+      if (b.type !== "footage") return false;
+      return gap > 0 ? b.duration < footageRange.max : b.duration > footageRange.min;
+    });
+    if (adjustable.length === 0) return;
 
-      const perBlock = gap / adjustable.length;
-      for (const b of adjustable) {
-        const next = Math.min(ceiling, Math.max(footageRange.min, b.duration + perBlock));
-        b.duration = Math.round(next * 10) / 10;
-      }
+    const perBlock = gap / adjustable.length;
+    for (const b of adjustable) {
+      const next = clampToRange("footage", b.duration + perBlock);
+      b.duration = Math.round(next * 10) / 10;
     }
-    return false;
-  };
-
-  // Phase 1: respect the normal 8s ceiling.
-  if (runPasses(footageRange.max)) return;
-  // Phase 2: only used when the gap is positive (timeline under voiceover)
-  // and every footage block is at the 8s ceiling. Negative gaps don't need
-  // the extended ceiling — shrinking already has headroom down to 3s.
-  const remaining = target - sumDurations(blocks);
-  if (remaining > EPSILON) runPasses(EXTENDED_FOOTAGE_MAX);
+  }
 }
 

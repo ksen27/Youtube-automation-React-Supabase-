@@ -162,10 +162,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   const { data: project } = await sb
     .from("projects")
-    .select("transcript, voiceover_duration_seconds")
+    .select("transcript, voiceover_duration_seconds, transcript_words")
     .eq("id", projectId)
     .single();
   const transcript = project?.transcript ?? "";
+  // Per-word timings persisted at voiceover-upload time. When present
+  // they let the timeline planner size each block to the narrator's
+  // real spoken duration for that sentence (instead of a uniform-wpm
+  // estimate that accumulates drift across 100+ blocks).
+  const transcriptWords = ((): { word: string; start: number; end: number }[] | null => {
+    const raw = (project as { transcript_words?: unknown } | null)?.transcript_words;
+    if (!Array.isArray(raw)) return null;
+    const out: { word: string; start: number; end: number }[] = [];
+    for (const w of raw as Array<Record<string, unknown>>) {
+      const word = String(w.word ?? "");
+      const start = Number(w.start);
+      const end = Number(w.end);
+      if (!word || !Number.isFinite(start) || !Number.isFinite(end)) continue;
+      out.push({ word, start, end });
+    }
+    return out.length > 0 ? out : null;
+  })();
 
   // Voiceover duration drives the whole plan. Prefer the probed audio length;
   // fall back to a word-count estimate if the audio wasn't probed.
@@ -518,7 +535,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // null when the legacy planner is in use.
   let blockVisualPriorities: Array<string | null>;
   if (planSource === "gemini_hints") {
-    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript);
+    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript, transcriptWords);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
     blockHintTexts = planned.map((p) => p.text || null);
     blockSectionTitles = planned.map((p) => p.section_title ?? null);
@@ -2512,20 +2529,37 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // we don't push any row past the source clip's real length and
   // re-introduce the same lie we just fixed.
   if (durationReclaimSeconds > 0.1) {
-    // Extended ceiling matches lib/ai/timeline-plan.ts EXTENDED_FOOTAGE_MAX.
-    // The per-row cap is still min(this, clip.duration) so we never claim
-    // more time than the underlying source clip can play.
+    // With word-timing-driven planning, each footage block's duration is
+    // the real spoken length of its sentence — stretching another footage
+    // row past its sentence breaks A/V alignment for that block. We cap
+    // stretching at +1.5s per row so reclaim can absorb small per-clip
+    // shortages without visibly drifting from the narration; anything
+    // larger is left as residue and surfaces in the render-time tolerance
+    // check (±3s) which prompts the user to re-match with longer clips.
     const footageMax = 15;
+    const PER_ROW_STRETCH_LIMIT = 1.5;
     const stretchable: typeof items = [];
+    const rowCeilings = new Map<string | number, number>();
     for (const it of items) {
       if (it.type !== "footage") continue;
       const meta = (it.metadata as Record<string, unknown> | undefined) ?? {};
       if (meta.duration_clamped === true) continue;
       const clipDur = Number(meta.clip_duration ?? 0);
-      // Headroom on this row = min(footageMax, clipDur) - current duration.
-      // If the clip itself can't support a longer hold, this row stays put.
-      const ceiling = Math.min(footageMax, clipDur > 0 ? clipDur : footageMax);
-      if (Number(it.duration ?? 0) < ceiling) stretchable.push(it);
+      const current = Number(it.duration ?? 0);
+      // Per-row stretch ceiling: don't exceed the clip's real length, the
+      // 15s overall guard, OR the sentence's spoken duration + 1.5s
+      // (so the visual doesn't drift far from the narration). We key the
+      // row by position since items don't have an id yet.
+      const sentenceCap = current + PER_ROW_STRETCH_LIMIT;
+      const ceiling = Math.min(
+        footageMax,
+        clipDur > 0 ? clipDur : footageMax,
+        sentenceCap,
+      );
+      if (current < ceiling) {
+        rowCeilings.set(Number(it.position), ceiling);
+        stretchable.push(it);
+      }
     }
     let remaining = durationReclaimSeconds;
     let safety = 0;
@@ -2534,9 +2568,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       let absorbed = 0;
       for (let k = stretchable.length - 1; k >= 0; k--) {
         const it = stretchable[k];
-        const meta = (it.metadata as Record<string, unknown> | undefined) ?? {};
-        const clipDur = Number(meta.clip_duration ?? 0);
-        const ceiling = Math.min(footageMax, clipDur > 0 ? clipDur : footageMax);
+        const ceiling = rowCeilings.get(Number(it.position)) ?? Number(it.duration ?? 0);
         const current = Number(it.duration ?? 0);
         const headroom = ceiling - current;
         if (headroom <= 0) {

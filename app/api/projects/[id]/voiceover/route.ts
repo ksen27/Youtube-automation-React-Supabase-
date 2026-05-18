@@ -10,7 +10,7 @@ import {
   headObject,
   publicUrlForKey,
 } from "@/lib/storage";
-import { transcribeAudio, transcribeAudioFromUrl } from "@/lib/ai/deepgram";
+import { transcribeAudio, transcribeAudioFromUrl, type WordTiming } from "@/lib/ai/deepgram";
 import { probeFile } from "@/lib/media/probe";
 
 export const runtime = "nodejs";
@@ -75,6 +75,7 @@ async function handleDirectUpload(id: string, req: NextRequest) {
 
   let transcript: string;
   let durationSeconds: number | null = null;
+  let words: WordTiming[] | null = null;
   try {
     // Deepgram pulls the audio itself from the public R2 URL. Our function
     // never holds the bytes, so a 30-min file takes the same memory as a
@@ -84,6 +85,7 @@ async function handleDirectUpload(id: string, req: NextRequest) {
     if (result.durationSeconds != null && result.durationSeconds > 0) {
       durationSeconds = Math.round(result.durationSeconds);
     }
+    words = result.words;
   } catch (err) {
     const message = err instanceof Error ? err.message : "transcription failed";
     return NextResponse.json(
@@ -92,7 +94,7 @@ async function handleDirectUpload(id: string, req: NextRequest) {
     );
   }
 
-  return await persistAndReturn(id, voiceoverPublicUrl, transcript, durationSeconds);
+  return await persistAndReturn(id, voiceoverPublicUrl, transcript, durationSeconds, words);
 }
 
 // Legacy multipart path. Kept for small files (<4MB) where the round-trip
@@ -129,12 +131,14 @@ async function handleMultipartUpload(id: string, req: NextRequest) {
   finally { await safeUnlink(tmpPath); }
 
   let transcript: string;
+  let words: WordTiming[] | null = null;
   try {
     const result = await transcribeAudio(buf, mimeType);
     transcript = result.transcript;
     if (durationSeconds == null && result.durationSeconds != null) {
       durationSeconds = Math.round(result.durationSeconds);
     }
+    words = result.words;
   } catch (err) {
     const message = err instanceof Error ? err.message : "transcription failed";
     return NextResponse.json(
@@ -143,7 +147,7 @@ async function handleMultipartUpload(id: string, req: NextRequest) {
     );
   }
 
-  return await persistAndReturn(id, up.publicUrl, transcript, durationSeconds);
+  return await persistAndReturn(id, up.publicUrl, transcript, durationSeconds, words);
 }
 
 async function persistAndReturn(
@@ -151,6 +155,7 @@ async function persistAndReturn(
   voiceoverUrl: string,
   transcript: string,
   durationSeconds: number | null,
+  words: WordTiming[] | null,
 ) {
   const sb = getServerSupabase();
   const { data, error } = await sb
@@ -159,6 +164,7 @@ async function persistAndReturn(
       voiceover_url: voiceoverUrl,
       transcript,
       voiceover_duration_seconds: durationSeconds,
+      transcript_words: words,
     })
     .eq("id", id)
     .select("*")
