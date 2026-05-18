@@ -186,7 +186,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   const { data: clipRows } = await sb
     .from("video_clips")
-    .select("id, start_time, end_time, labels, video_source_id, status, thumbnail_url")
+    .select("id, start_time, end_time, duration, labels, video_source_id, status, thumbnail_url")
     .eq("project_id", projectId)
     .eq("status", "ready");
   const clips = clipRows ?? [];
@@ -1280,6 +1280,28 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     subject_type: blockSubjectTypes[idx] ?? null,
   });
 
+  // Real-duration lookup for footage clamping. video_clips.duration is the
+  // source-of-truth: the renderer's cutClip uses ffmpeg's -t flag, which
+  // produces a file no longer than the source. If the planner asked for
+  // 10s but the clip is only 5s, the rendered video is 5s — and the editor
+  // would lie about the timeline length unless we record the real 5s here.
+  const clipDurationById = new Map<string, number>(
+    clips.map((c) => {
+      const stored = Number((c as { duration?: number }).duration ?? 0);
+      const derived = Number(c.end_time) - Number(c.start_time);
+      const dur = stored > 0 ? stored : derived;
+      return [c.id as string, dur > 0 ? dur : 0];
+    }),
+  );
+
+  // Track how much voiceover time we lose to clip-shorter-than-planned
+  // clamping so we can redistribute it back into footage blocks below.
+  // Without this redistribution the timeline would end up shorter than the
+  // voiceover by the sum of all clamps, re-introducing the render-time
+  // duration-mismatch we already fixed in the planner.
+  let durationReclaimSeconds = 0;
+  let durationClampedCount = 0;
+
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
     const assigned = blockAssignments.get(i);
@@ -1304,16 +1326,32 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           pickSourceCounts.filler_any++;
           pickSource = "filler_any";
         }
+        // Clamp planned duration to the clip's real length. The renderer's
+        // cutClip uses ffmpeg -t which produces a file no longer than the
+        // source, so anything we record above the clip's real duration is
+        // a lie that surfaces as editor-total ≠ rendered-total. We keep
+        // the clamped seconds in durationReclaimSeconds so a later pass
+        // can stretch other footage blocks to absorb the gap.
+        const clipDur = clipDurationById.get(assigned.clipId) ?? 0;
+        let realDuration = block.duration;
+        if (clipDur > 0 && clipDur < block.duration) {
+          durationReclaimSeconds += block.duration - clipDur;
+          durationClampedCount++;
+          realDuration = Math.round(clipDur * 10) / 10;
+        }
         items.push({
           project_id: projectId,
           clip_id: assigned.clipId,
           type: "footage",
           position: position++,
-          duration: block.duration,
+          duration: realDuration,
           script_text: blockText || null,
           overlay_text: null,
           metadata: {
             planned: true,
+            planned_duration: block.duration,
+            clip_duration: clipDur || null,
+            duration_clamped: realDuration < block.duration,
             match_score: assigned.score,
             match_base_score: assigned.baseScore ?? null,
             match_bonus: assigned.bonus ?? null,
@@ -2465,6 +2503,58 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     skippedForCadence,
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
   });
+
+  // Reclaim time lost to clip-shorter-than-planned clamping by stretching
+  // the unclamped footage rows. Without this, the inserted timeline would
+  // total voiceoverSeconds - durationReclaimSeconds and the duration check
+  // at render time would fail again. We only touch footage rows that
+  // weren't clamped (i.e. their clip is at least as long as planned), so
+  // we don't push any row past the source clip's real length and
+  // re-introduce the same lie we just fixed.
+  if (durationReclaimSeconds > 0.1) {
+    const footageMax = 8; // mirrors DURATION_RANGES.footage.max in timeline-plan
+    const stretchable: typeof items = [];
+    for (const it of items) {
+      if (it.type !== "footage") continue;
+      const meta = (it.metadata as Record<string, unknown> | undefined) ?? {};
+      if (meta.duration_clamped === true) continue;
+      const clipDur = Number(meta.clip_duration ?? 0);
+      // Headroom on this row = min(footageMax, clipDur) - current duration.
+      // If the clip itself can't support a longer hold, this row stays put.
+      const ceiling = Math.min(footageMax, clipDur > 0 ? clipDur : footageMax);
+      if (Number(it.duration ?? 0) < ceiling) stretchable.push(it);
+    }
+    let remaining = durationReclaimSeconds;
+    let safety = 0;
+    while (remaining > 0.1 && stretchable.length > 0 && safety++ < 8) {
+      const perRow = remaining / stretchable.length;
+      let absorbed = 0;
+      for (let k = stretchable.length - 1; k >= 0; k--) {
+        const it = stretchable[k];
+        const meta = (it.metadata as Record<string, unknown> | undefined) ?? {};
+        const clipDur = Number(meta.clip_duration ?? 0);
+        const ceiling = Math.min(footageMax, clipDur > 0 ? clipDur : footageMax);
+        const current = Number(it.duration ?? 0);
+        const headroom = ceiling - current;
+        if (headroom <= 0) {
+          stretchable.splice(k, 1);
+          continue;
+        }
+        const add = Math.min(perRow, headroom);
+        it.duration = Math.round((current + add) * 10) / 10;
+        absorbed += add;
+      }
+      if (absorbed < 0.01) break;
+      remaining -= absorbed;
+    }
+    await logJob({ projectId, jobId: mediaJobId }, "match.duration_reclaim", {
+      reclaimedSecondsRequested: Math.round(durationReclaimSeconds * 10) / 10,
+      reclaimedSecondsAbsorbed: Math.round((durationReclaimSeconds - remaining) * 10) / 10,
+      residualSeconds: Math.round(remaining * 10) / 10,
+      clampedFootageBlocks: durationClampedCount,
+      stretchedFootageBlocks: stretchable.length,
+    });
+  }
 
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);

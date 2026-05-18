@@ -20,13 +20,15 @@ export interface DurationRange {
 
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
-  // Widened to 3–10s for sentence-aligned planning (Option 3). A footage
-  // block now mirrors the spoken length of its sentence: short sentences
-  // get short holds, long sentences get long holds. Video clips are
-  // typically longer than 10s, so any hold in this range is fine —
-  // viewers don't notice. The min/max cap prevents degenerate cases
-  // (a 1-word sentence at 0.4s, a run-on sentence at 25s).
-  footage: { min: 3,  max: 10 },
+  // Footage holds match the spoken length of their sentence: short
+  // sentences → short holds, long sentences → long holds. The max is
+  // capped at CLIP_DURATION_MAX_SECONDS (8s) because the clip generator
+  // produces 5–8s windows and asking for more would require either a
+  // frame-freeze or a clip-loop (both visually bad). Keeping the planner
+  // inside the clip-generator's range means timeline_items.duration
+  // matches what actually gets rendered. The min prevents degenerate
+  // 0.4s flashes from 1-word sentences.
+  footage: { min: 3,  max: 8 },
   // Per-image hold is still 5s per user spec. The sentence-aligned planner
   // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
   // blocks rather than stretching one image, so the contract holds.
