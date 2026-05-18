@@ -12,9 +12,7 @@ export interface YtDlpDownloadResult {
 
 // Parse YTDLP_PROXIES once on first read, then cache. Each entry is
 // `ip:port:user:pass` (Webshare's list-export format). Returns the proxies
-// as ready-to-pass --proxy URLs. If env is unset/empty, returns []. We pick
-// a random entry per yt-dlp invocation so load is spread across the pool —
-// reduces the chance any single residential IP gets rate-limited by YouTube.
+// as ready-to-pass --proxy URLs. If env is unset/empty, returns [].
 let cachedProxies: string[] | null = null;
 function getProxyPool(): string[] {
   if (cachedProxies) return cachedProxies;
@@ -33,11 +31,37 @@ function getProxyPool(): string[] {
   return cachedProxies;
 }
 
-function pickProxy(): string | null {
+// Pick a proxy from the pool, optionally excluding ones already tried in
+// this call. Returns null when no usable proxy exists — caller falls back
+// to running yt-dlp without --proxy (direct outbound IP).
+function pickProxy(excluded: Set<string> = new Set()): string | null {
   const pool = getProxyPool();
-  if (pool.length === 0) return null;
-  return pool[Math.floor(Math.random() * pool.length)];
+  const available = pool.filter((p) => !excluded.has(p));
+  if (available.length === 0) return null;
+  return available[Math.floor(Math.random() * available.length)];
 }
+
+// Errors that indicate the proxy IP got blocked / throttled — retrying
+// the same call with a different proxy is likely to succeed. Anything not
+// in this list (geo-block, age-gated, private video, format negotiation
+// failure) is terminal and rotation won't help, so we surface it
+// immediately instead of burning attempts.
+function isProxyRelatedError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  return (
+    s.includes("sign in to confirm") ||              // YouTube bot challenge
+    s.includes("confirm you're not a bot") ||
+    s.includes("http error 429") ||                  // rate limit
+    s.includes("http error 403") ||                  // forbidden — often proxy-IP-block
+    s.includes("too many requests") ||
+    s.includes("unable to download webpage") ||      // generic network / blocked
+    s.includes("connection reset") ||
+    s.includes("operation timed out") ||
+    s.includes("read timed out")
+  );
+}
+
+const YTDLP_MAX_ATTEMPTS = 3;
 
 export interface YtDlpRunOptions {
   url: string;
@@ -49,7 +73,6 @@ export interface YtDlpRunOptions {
 }
 
 export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlpDownloadResult> {
-  const env = getEnv();
   const maxH = opts.maxHeight ?? 720;
   await fs.mkdir(opts.outputDir, { recursive: true });
   // Output template: <id>.<ext> — yt-dlp picks ext after format selection.
@@ -57,28 +80,30 @@ export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlp
   // Video-only: the final render uses the project's voiceover; source audio is
   // never used. Skipping audio dramatically reduces failure rate (no separate
   // audio fetch, no ffmpeg merge step) and shrinks the on-disk cache.
-  const proxy = pickProxy();
-  const args = [
-    "-f", `bestvideo[height<=${maxH}]/best[height<=${maxH}]/bestvideo/best`,
-    "--no-playlist",
-    "--no-warnings",
-    "--no-progress",
-    "--no-part",
-    "--restrict-filenames",
-    "--socket-timeout", "30",
-    "--retries", "2",
-    "--fragment-retries", "2",
-    // YouTube now requires a JS runtime + remote signature solver to deobfuscate
-    // download URLs; without these, formats list but downloads fail with a
-    // misleading "video not available" error.
-    "--js-runtimes", "node",
-    "--remote-components", "ejs:github",
-    ...(proxy ? ["--proxy", proxy] : []),
-    "-o", outputTemplate,
-    opts.url,
-  ];
-
-  await runYtDlp(env.YTDLP_PATH, args, env.YTDLP_TIMEOUT_SECONDS, opts.signal, opts.onLog);
+  await runYtDlpWithProxyRetry({
+    buildArgs: (proxy) => [
+      "-f", `bestvideo[height<=${maxH}]/best[height<=${maxH}]/bestvideo/best`,
+      "--no-playlist",
+      "--no-warnings",
+      "--no-progress",
+      "--no-part",
+      "--restrict-filenames",
+      "--socket-timeout", "30",
+      "--retries", "2",
+      "--fragment-retries", "2",
+      // YouTube now requires a JS runtime + remote signature solver to deobfuscate
+      // download URLs; without these, formats list but downloads fail with a
+      // misleading "video not available" error.
+      "--js-runtimes", "node",
+      "--remote-components", "ejs:github",
+      ...(proxy ? ["--proxy", proxy] : []),
+      "-o", outputTemplate,
+      opts.url,
+    ],
+    label: `downloadYoutubeVideo[${opts.videoId}]`,
+    signal: opts.signal,
+    onLog: opts.onLog,
+  });
 
   // After successful run, look for the produced file. With video-only formats
   // the extension can vary (mp4, webm, mkv) — scan the dir.
@@ -96,35 +121,83 @@ export async function downloadYoutubeVideo(opts: YtDlpRunOptions): Promise<YtDlp
 // Output is .m4a (AAC) regardless of source codec — uniform ext keeps the
 // downstream ffmpeg-cut step simple.
 export async function downloadYoutubeAudio(opts: YtDlpRunOptions): Promise<YtDlpDownloadResult> {
-  const env = getEnv();
   await fs.mkdir(opts.outputDir, { recursive: true });
   const outputTemplate = path.join(opts.outputDir, `${opts.videoId}.%(ext)s`);
-  const proxy = pickProxy();
-  const args = [
-    "-f", "bestaudio[ext=m4a]/bestaudio",
-    "-x",                          // extract audio
-    "--audio-format", "m4a",
-    "--audio-quality", "5",        // 0=best, 9=worst; 5 is plenty for narration
-    "--no-playlist",
-    "--no-warnings",
-    "--no-progress",
-    "--no-part",
-    "--restrict-filenames",
-    "--socket-timeout", "30",
-    "--retries", "2",
-    "--fragment-retries", "2",
-    "--js-runtimes", "node",
-    "--remote-components", "ejs:github",
-    ...(proxy ? ["--proxy", proxy] : []),
-    "-o", outputTemplate,
-    opts.url,
-  ];
-  await runYtDlp(env.YTDLP_PATH, args, env.YTDLP_TIMEOUT_SECONDS, opts.signal, opts.onLog);
+  await runYtDlpWithProxyRetry({
+    buildArgs: (proxy) => [
+      "-f", "bestaudio[ext=m4a]/bestaudio",
+      "-x",                          // extract audio
+      "--audio-format", "m4a",
+      "--audio-quality", "5",        // 0=best, 9=worst; 5 is plenty for narration
+      "--no-playlist",
+      "--no-warnings",
+      "--no-progress",
+      "--no-part",
+      "--restrict-filenames",
+      "--socket-timeout", "30",
+      "--retries", "2",
+      "--fragment-retries", "2",
+      "--js-runtimes", "node",
+      "--remote-components", "ejs:github",
+      ...(proxy ? ["--proxy", proxy] : []),
+      "-o", outputTemplate,
+      opts.url,
+    ],
+    label: `downloadYoutubeAudio[${opts.videoId}]`,
+    signal: opts.signal,
+    onLog: opts.onLog,
+  });
   const entries = await fs.readdir(opts.outputDir);
   const found = entries.find((f) => f.startsWith(opts.videoId) && f.endsWith(".m4a"))
     ?? entries.find((f) => f.startsWith(opts.videoId));
   if (!found) throw new Error(`yt-dlp audio finished but no output file found for ${opts.videoId}`);
   return { outputPath: path.join(opts.outputDir, found) };
+}
+
+// Run yt-dlp with proxy rotation on retry. The build callback receives the
+// proxy URL (or null when the pool is empty) and returns the arg list — that
+// lets each attempt swap the --proxy flag without rebuilding the rest of
+// the call site. We retry only on errors that look proxy/network-related
+// (see isProxyRelatedError); terminal failures surface immediately so the
+// caller doesn't burn attempts on un-retryable problems.
+//
+// This mirrors what the BullMQ download queue does at job level (3 attempts,
+// each picks a random proxy) but does it inside one yt-dlp call so the intro
+// audio path — which isn't its own queued job — gets the same protection.
+async function runYtDlpWithProxyRetry(opts: {
+  buildArgs: (proxy: string | null) => string[];
+  label: string;
+  signal?: AbortSignal;
+  onLog?: (line: string) => void;
+}): Promise<void> {
+  const env = getEnv();
+  const pool = getProxyPool();
+  const maxAttempts = pool.length > 0 ? Math.min(YTDLP_MAX_ATTEMPTS, pool.length) : 1;
+  const tried = new Set<string>();
+  let lastErr: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const proxy = pickProxy(tried);
+    if (proxy) tried.add(proxy);
+    const args = opts.buildArgs(proxy);
+    try {
+      await runYtDlp(env.YTDLP_PATH, args, env.YTDLP_TIMEOUT_SECONDS, opts.signal, opts.onLog);
+      return;
+    } catch (err) {
+      lastErr = err as Error;
+      const stderr = lastErr.message;
+      // Bail on un-retryable errors so we don't waste proxies on, e.g.,
+      // a private video that returns the same error from every IP.
+      if (!isProxyRelatedError(stderr)) throw lastErr;
+      // Drop the proxy pool cache hint by logging which one failed —
+      // mostly useful when debugging which IP got blocked.
+      opts.onLog?.(`[${opts.label}] attempt ${attempt}/${maxAttempts} failed via ${proxy ?? "direct"}, rotating proxy\n`);
+    }
+  }
+
+  throw new Error(
+    `yt-dlp failed after ${maxAttempts} attempt(s) with proxy rotation: ${lastErr?.message ?? "unknown"}`,
+  );
 }
 
 function runYtDlp(
