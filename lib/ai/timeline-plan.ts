@@ -281,13 +281,18 @@ export interface PlannedBlockWithHint extends PlannedBlock {
 }
 
 // Estimate spoken duration of a text chunk based on its word count and a
-// fixed narration cadence. Used to size blocks by sentence length rather
-// than by a hard-coded per-block duration. Returns seconds, with a 0.1s
-// floor so empty chunks don't collapse to 0.
-export function sentenceDurationSeconds(text: string): number {
+// narration cadence. The cadence is a measured-or-assumed words-per-second
+// value: callers with access to the transcript+voiceover length should
+// pass the real cadence; the default falls back to the 2.5 wps constant
+// for legacy callers. Returns seconds, with a 0.1s floor so empty chunks
+// don't collapse to 0.
+export function sentenceDurationSeconds(
+  text: string,
+  wordsPerSecond: number = WORDS_PER_SECOND_NARRATION,
+): number {
   const words = text.trim().split(/\s+/).filter(Boolean).length;
   if (words === 0) return 0.1;
-  return words / WORDS_PER_SECOND_NARRATION;
+  return words / wordsPerSecond;
 }
 
 // Build a timeline sequence from Gemini's per-block hints. The hints come
@@ -313,53 +318,109 @@ export function sentenceDurationSeconds(text: string): number {
 export function buildBlockSequenceFromHints(
   hints: BlockPlanHint[],
   voiceoverSeconds: number,
+  // Optional. When provided, the planner derives the *actual* narration
+  // cadence from totalWords / voiceoverSeconds and uses it to size each
+  // hint's block. Without this, the planner falls back to the 2.5 wps
+  // constant, which mismatches real audio (faster or slower) and pushes
+  // block durations away from the words they should cover. Pass the full
+  // project transcript when calling from the matcher.
+  transcript?: string,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; sentence-aligned builder is deterministic.
   _rand: RandomFn = Math.random,
 ): PlannedBlockWithHint[] {
   if (hints.length === 0 || voiceoverSeconds <= 0) return [];
 
-  // Step 1 — Compute a target duration for each hint from its text's
-  // spoken length, then scale uniformly so the sum matches the actual
-  // voiceover duration. Uniform scaling preserves the proportions
-  // between blocks: a sentence twice as long stays twice as long.
-  const rawDurations = hints.map((h) => sentenceDurationSeconds(h.text));
-  const rawTotal = rawDurations.reduce((s, d) => s + d, 0);
-  // Guard against zero/NaN (all-empty hints) — fall back to even split.
-  const scale = rawTotal > 0 ? voiceoverSeconds / rawTotal : 1;
-  const scaledDurations = rawDurations.map((d) => d * scale);
+  // Derive the speaker's real cadence from the transcript when available.
+  // Falls back to the 2.5 wps constant for legacy callers that don't have
+  // the transcript at hand.
+  const transcriptWords = transcript
+    ? transcript.trim().split(/\s+/).filter(Boolean).length
+    : 0;
+  const cadence =
+    transcriptWords > 0 && voiceoverSeconds > 0
+      ? transcriptWords / voiceoverSeconds
+      : WORDS_PER_SECOND_NARRATION;
 
-  // Step 2 — Materialize blocks. For footage / title_card / split_2 each
-  // hint becomes ONE block whose duration is the scaled sentence length
-  // clamped to its type's range. For image blocks, sentences exceeding
-  // IMAGE_SPLIT_THRESHOLD are SPLIT into multiple ~5s blocks that share
-  // the hint's text and metadata — the matcher then assigns a separate
-  // image to each block, honoring the 5s-per-image rule for long
-  // sentences.
+  // Demote orphan title_card hints (no section_title) to footage. Title
+  // cards are chapter dividers; Gemini sometimes tags individual mid-
+  // segment sentences as title_card, which produces a black-card flash
+  // every ~85s in a 10-minute video.
+  const effectiveTypes: BlockType[] = hints.map((h) =>
+    h.recommended_visual_type === "title_card" && !h.section_title
+      ? "footage"
+      : h.recommended_visual_type,
+  );
+
+  // Step 1 — Decide each hint's slot count and per-slot duration in two
+  // passes. The earlier single-pass-then-clamp design was the source of
+  // the timeline-vs-voiceover gap: scaling sentence durations and then
+  // clamping pinned types (image=5/5, title_card=5/5, split_2=6/6) silently
+  // discards the fractional seconds left over after each clamp, so the
+  // planned total drifts away from voiceoverSeconds proportionally to how
+  // many pinned blocks the timeline contains.
+  //
+  // The fix is to pin first, then scale only the flexible (footage) blocks
+  // to absorb whatever voiceover time the pinned blocks didn't consume.
+  // Image-split slot count comes from raw (unscaled) sentence duration so
+  // it doesn't depend on the scale factor we're trying to compute.
+  const rawDurations = hints.map((h) => sentenceDurationSeconds(h.text, cadence));
+
+  // Pass A: pinned-time bookkeeping. Each pinned hint contributes exactly
+  // slotCount × typeDuration to the timeline, where slotCount is 1 for
+  // single-slot types (title_card, split_2) and round(rawSec/5) for image
+  // hints longer than the split threshold.
+  let pinnedTime = 0;
+  // Parallel arrays keyed by hint index. slotCounts[i] is the number of
+  // physical blocks hint i will materialize into.
+  const slotCounts = new Array<number>(hints.length).fill(1);
+  for (let i = 0; i < hints.length; i++) {
+    const type = effectiveTypes[i];
+    const rawSec = rawDurations[i];
+    if (type === "image") {
+      if (rawSec > IMAGE_SPLIT_THRESHOLD) {
+        slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
+      }
+      pinnedTime += slotCounts[i] * IMAGE_HOLD_SECONDS;
+    } else if (type === "title_card") {
+      pinnedTime += DURATION_RANGES.title_card.min;
+    } else if (type === "split_2") {
+      pinnedTime += DURATION_RANGES.split_2.min;
+    } else if (type === "split_4") {
+      pinnedTime += DURATION_RANGES.split_4.min;
+    }
+  }
+
+  // Pass B: footage scale. Sum the raw durations of footage hints and
+  // scale them so they soak up the remaining voiceover time. If pinned
+  // blocks already exceed voiceoverSeconds (rare — would require very
+  // many short image-typed sentences), we shrink footage to its 3s floor;
+  // the residual mismatch goes to the post-pass redistributor.
+  let footageRawTotal = 0;
+  for (let i = 0; i < hints.length; i++) {
+    if (effectiveTypes[i] === "footage") footageRawTotal += rawDurations[i];
+  }
+  const footageTarget = Math.max(0, voiceoverSeconds - pinnedTime);
+  const footageScale =
+    footageRawTotal > 0 && footageTarget > 0
+      ? footageTarget / footageRawTotal
+      : 1;
+
+  // Step 2 — Materialize blocks. Each hint becomes either one block (most
+  // types) or slotCounts[i] image blocks (long image sentences). Footage
+  // durations come from footageScale; pinned types use their fixed value.
   const blocks: PlannedBlockWithHint[] = [];
   hints.forEach((h, i) => {
-    const sentenceSec = scaledDurations[i];
-    // Title cards are reserved for chapter boundaries (segment-opener hints
-    // that carry a section_title). Gemini sometimes tags individual mid-
-    // segment sentences as title_card too, which produces a black-card flash
-    // every ~85s in a 10-minute video. Demote those orphans to footage so
-    // title cards stay deliberate section beats.
-    const type = h.recommended_visual_type === "title_card" && !h.section_title
-      ? "footage"
-      : h.recommended_visual_type;
+    const type = effectiveTypes[i];
 
-    // Image blocks: keep 5s per image. If the sentence runs long, emit
-    // multiple back-to-back image blocks of ~5s each, all sharing the
-    // hint metadata. The matcher will pick a different image for each
-    // slot via its reference + person-fallback chain.
-    if (type === "image" && sentenceSec > IMAGE_SPLIT_THRESHOLD) {
-      const slotCount = Math.max(1, Math.round(sentenceSec / IMAGE_HOLD_SECONDS));
-      const slotDur = Math.round((sentenceSec / slotCount) * 10) / 10;
-      for (let k = 0; k < slotCount; k++) {
+    if (type === "image") {
+      const slots = slotCounts[i];
+      for (let k = 0; k < slots; k++) {
         blocks.push({
           type: "image",
-          duration: clampToRange("image", slotDur),
+          duration: IMAGE_HOLD_SECONDS,
           text: h.text,
           resolved_subject: h.resolved_subject,
+          // Section titles only ride the first block of a segment.
           section_title: k === 0 ? h.section_title : undefined,
           specific_visual_references: h.specific_visual_references,
           mentioned_entities: h.mentioned_entities,
@@ -370,13 +431,14 @@ export function buildBlockSequenceFromHints(
       return;
     }
 
-    // Footage / title_card / split_2: one block per hint, duration = the
-    // scaled sentence length clamped to the type's range. Footage allows
-    // 3-10s so most sentences land naturally; very short / very long
-    // outliers get clamped.
+    const duration =
+      type === "footage"
+        ? clampToRange("footage", Math.round(rawDurations[i] * footageScale * 10) / 10)
+        : DURATION_RANGES[type].min;
+
     blocks.push({
       type,
-      duration: clampToRange(type, Math.round(sentenceSec * 10) / 10),
+      duration,
       text: h.text,
       resolved_subject: h.resolved_subject,
       section_title: h.section_title,
@@ -387,28 +449,106 @@ export function buildBlockSequenceFromHints(
     });
   });
 
-  // Step 3 — Tail reconciliation. Clamping + image splits introduce small
-  // drift; trim the last block by overshoot, or extend the most recent
-  // footage block by undershoot (<3s). Image blocks stay at 5s — we
-  // never stretch them.
-  const total = sumDurations(blocks);
-  const overshoot = total - voiceoverSeconds;
-  const last = blocks[blocks.length - 1];
-  if (overshoot > 1) {
-    const minDur = 1;
-    const newDur = Math.max(minDur, last.duration - overshoot);
-    last.duration = Math.round(newDur * 10) / 10;
-  } else if (overshoot < 0 && Math.abs(overshoot) < 3) {
-    const stretch = -overshoot;
-    let stretchIdx = -1;
-    for (let i = blocks.length - 1; i >= 0; i--) {
-      if (blocks[i].type === "footage") { stretchIdx = i; break; }
-    }
-    if (stretchIdx >= 0) {
-      blocks[stretchIdx].duration = Math.round((blocks[stretchIdx].duration + stretch) * 10) / 10;
-    }
-  }
+  // Step 3 — Merge very short adjacent footage blocks. A 3s footage block
+  // means a clip flashes by while the speaker is mid-thought; viewers
+  // perceive that as choppy. Fuse adjacent footage blocks when the first
+  // is short (≤MERGE_SHORT_FOOTAGE_THRESHOLD) and the combined duration
+  // still fits in footage's 3-10s range. We only merge footage — images
+  // need per-slot variety, title cards are deliberate beats, splits are
+  // fixed. The matcher uses the first hint's metadata, so the merged
+  // block searches by the leading sentence's subject (typical case: a
+  // short transition sentence followed by the meatier follow-up — the
+  // follow-up's hint subject is the right anchor for the combined block).
+  mergeShortFootage(blocks);
+
+  // Step 4 — Residual cleanup. The footage clamp at min/max can leave a
+  // small mismatch when individual footage sentences land outside 3-10s.
+  // Distribute that residue uniformly across footage blocks (iterative
+  // because the clamp still applies). Image-related drift is zero by
+  // construction because pinned time was reserved upfront.
+  redistributeFootageResidue(blocks, voiceoverSeconds);
 
   return blocks;
+}
+
+// Threshold below which a footage block is considered "too short" and
+// becomes a merge candidate. 3s is the footage minimum — a block sitting
+// at the floor reads as a visual flash rather than a beat.
+const MERGE_SHORT_FOOTAGE_THRESHOLD = 3.5;
+
+function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
+  const footageMax = DURATION_RANGES.footage.max;
+  let i = 0;
+  while (i < blocks.length - 1) {
+    const a = blocks[i];
+    const b = blocks[i + 1];
+    // Only fuse adjacent footage→footage where the first is short and the
+    // combined duration still fits. Crossing block types breaks visual
+    // contracts (image cadence, section beats).
+    if (
+      a.type === "footage" &&
+      b.type === "footage" &&
+      a.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD &&
+      a.duration + b.duration <= footageMax
+    ) {
+      // Keep the second block's metadata (typically the meatier follow-up
+      // sentence) but concatenate text so anything downstream that reads
+      // the block's text still sees both sentences.
+      const mergedText = [a.text, b.text].filter(Boolean).join(" ");
+      blocks.splice(i, 2, {
+        type: "footage",
+        duration: Math.round((a.duration + b.duration) * 10) / 10,
+        text: mergedText,
+        resolved_subject: b.resolved_subject ?? a.resolved_subject,
+        // Section titles ride the first block of a segment — preserve a's
+        // if present, otherwise use b's.
+        section_title: a.section_title ?? b.section_title,
+        specific_visual_references: [
+          ...(a.specific_visual_references ?? []),
+          ...(b.specific_visual_references ?? []),
+        ].filter((v, k, arr) => arr.indexOf(v) === k),
+        mentioned_entities: [
+          ...(a.mentioned_entities ?? []),
+          ...(b.mentioned_entities ?? []),
+        ].filter((v, k, arr) => arr.indexOf(v) === k),
+        subject_type: b.subject_type ?? a.subject_type,
+        visual_priority: b.visual_priority ?? a.visual_priority,
+      });
+      // Don't advance i — the merged block might now be a merge candidate
+      // with the *next* block (e.g. three 3s footage blocks in a row).
+      continue;
+    }
+    i++;
+  }
+}
+
+// Close the small residual gap left when individual footage sentences
+// fell outside their 3-10s clamp range. Image / title_card / split_2 time
+// is already exact, so we never touch them here. Each pass spreads the
+// remaining gap evenly across footage blocks with headroom in the right
+// direction; we re-evaluate after each pass because the clamp can leave
+// some blocks pinned at min/max.
+function redistributeFootageResidue(blocks: PlannedBlockWithHint[], target: number): void {
+  const footageRange = DURATION_RANGES.footage;
+  const MAX_PASSES = 6;
+  const EPSILON = 0.1;
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const total = sumDurations(blocks);
+    const gap = target - total;
+    if (Math.abs(gap) < EPSILON) return;
+
+    const adjustable = blocks.filter((b) => {
+      if (b.type !== "footage") return false;
+      return gap > 0 ? b.duration < footageRange.max : b.duration > footageRange.min;
+    });
+    if (adjustable.length === 0) return;
+
+    const perBlock = gap / adjustable.length;
+    for (const b of adjustable) {
+      const next = clampToRange("footage", b.duration + perBlock);
+      b.duration = Math.round(next * 10) / 10;
+    }
+  }
 }
 

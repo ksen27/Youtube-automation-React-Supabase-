@@ -518,7 +518,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // null when the legacy planner is in use.
   let blockVisualPriorities: Array<string | null>;
   if (planSource === "gemini_hints") {
-    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds);
+    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
     blockHintTexts = planned.map((p) => p.text || null);
     blockSectionTitles = planned.map((p) => p.section_title ?? null);
