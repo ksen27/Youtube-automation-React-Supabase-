@@ -16,6 +16,15 @@ import {
 } from "../_shared";
 import { uploadAudioDirect } from "@/lib/client/upload-audio-direct";
 
+// Shape of the `details` payload returned by /render when validation fails on
+// the duration check. Keep in sync with the route handler.
+interface RenderErrorDetails {
+  timelineDuration: number;
+  voiceoverSeconds: number;
+  tolerance: number;
+  durationDelta: number;
+}
+
 export function ExportScreen({
   projectId,
   jobs,
@@ -40,7 +49,16 @@ export function ExportScreen({
   const startRender = useMutation({
     mutationFn: async () => {
       const r = await fetch(`/api/projects/${projectId}/render`, { method: "POST" });
-      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        const err = new Error(body.error ?? `failed ${r.status}`) as Error & {
+          details?: RenderErrorDetails;
+        };
+        if (body.details && typeof body.details === "object") {
+          err.details = body.details as RenderErrorDetails;
+        }
+        throw err;
+      }
       return r.json();
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project-jobs", projectId] }),
@@ -150,8 +168,36 @@ export function ExportScreen({
         </Button>
       </div>
       {startRender.error && (
-        <div className="rounded-[10px] border border-danger/40 bg-danger/10 p-3 text-sm text-danger">
-          {(startRender.error as Error).message}
+        <RenderErrorPanel
+          error={startRender.error as Error & { details?: RenderErrorDetails }}
+        />
+      )}
+    </div>
+  );
+}
+
+function RenderErrorPanel({
+  error,
+}: {
+  error: Error & { details?: RenderErrorDetails };
+}) {
+  const d = error.details;
+  // Duration-mismatch errors include details; other errors (e.g. "approve
+  // timeline before rendering") just show their message.
+  const isDurationMismatch =
+    d && typeof d.timelineDuration === "number" && typeof d.voiceoverSeconds === "number";
+
+  return (
+    <div className="rounded-[10px] border border-danger/40 bg-danger/10 p-3 text-sm text-danger space-y-1.5">
+      <div>{error.message}</div>
+      {isDurationMismatch && (
+        <div className="text-xs text-fg-muted tabular-nums">
+          Timeline {d!.timelineDuration.toFixed(1)}s · voiceover{" "}
+          {d!.voiceoverSeconds.toFixed(1)}s · off by {d!.durationDelta.toFixed(1)}s
+          (tolerance ±{d!.tolerance}s).{" "}
+          {d!.timelineDuration > d!.voiceoverSeconds
+            ? "Trim or remove a scene to shorten the timeline."
+            : "Add or extend a scene to match the voiceover length."}
         </div>
       )}
     </div>

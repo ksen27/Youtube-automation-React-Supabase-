@@ -8,9 +8,12 @@ import { estimateDurationSeconds } from "@/lib/ai/segments";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Render-side validation tolerance — ±1s per the planner spec, but we allow a
-// little slack for rounding noise across many blocks.
-const DURATION_TOLERANCE_SECONDS = 1.5;
+// Render-side validation tolerance. The concat pass uses ffmpeg's `-shortest`
+// flag, so excess on either side is clipped: if the timeline is longer the
+// tail plays silent, if the voiceover is longer its last words are cut off.
+// ±3s is forgiving enough for operator-built timelines while still catching
+// gross mismatches (e.g. wrong voiceover uploaded).
+const DURATION_TOLERANCE_SECONDS = 3;
 
 // Block types that consume timeline duration (overlays don't). The intro is
 // rendered as a separate prefix segment by the renderer (see renderProcessor —
