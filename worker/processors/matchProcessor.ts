@@ -2455,11 +2455,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // visual-match gates (first-occurrence-only for names, sex contradiction
   // check, labels-must-contain-place) are gone — the per-minute throttle
   // replaces them.
+  // Cadence: at least LOWER_THIRD_INTERVAL_SEC of timeline between overlays.
+  // The timer (`lastLowerThirdAtSec`) only advances on a SUCCESSFUL placement
+  // — if the minute mark lands on an image / title-card / filler clip, or
+  // on a block whose only entities were already used earlier, we keep
+  // searching and the *next* eligible footage clip claims the slot. This is
+  // what keeps the cadence close to one-per-minute even when the timeline
+  // has gaps (image-heavy stretches, filler runs).
+  //
+  // Dedup: each overlay text is shown at most once across the whole video.
+  // Without this, the same celebrity gets a name card every time the
+  // narrator says their name. We key the dedup set on lowercased text so
+  // "Salma Hayek" and "salma hayek" collapse to one entry.
   const LOWER_THIRD_INTERVAL_SEC = 60;
   const lowerThirdCounts = { name: 0, year: 0, place: 0 };
   let skippedForCadence = 0;
+  let skippedForDuplicate = 0;
   let cumulativeSec = 0;
   let lastLowerThirdAtSec = Number.NEGATIVE_INFINITY;
+  const usedTexts = new Set<string>();
   const orderedItems = [...items].sort(
     (a, b) => (a.position as number) - (b.position as number),
   );
@@ -2486,12 +2500,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
     for (const ent of ents) {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
+      if (usedTexts.has(ent.value.toLowerCase())) continue;
       pick = { text: ent.value, type: "name" };
       break;
     }
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "year") continue;
+        if (usedTexts.has(ent.value.toLowerCase())) continue;
         pick = { text: ent.value, type: "year" };
         break;
       }
@@ -2499,14 +2515,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
+        if (usedTexts.has(ent.value.toLowerCase())) continue;
         pick = { text: ent.value, type: "place" };
         break;
       }
     }
 
-    if (!pick) continue;
+    // No fresh entity in this block — every name/year/place here was
+    // already shown. Don't advance the cadence timer; let the next eligible
+    // footage clip claim this minute's slot.
+    if (!pick) {
+      skippedForDuplicate++;
+      continue;
+    }
     lowerThirdCounts[pick.type]++;
     lastLowerThirdAtSec = clipStartSec;
+    usedTexts.add(pick.text.toLowerCase());
     (it.metadata as Record<string, unknown>) = {
       ...meta,
       lower_third: { text: pick.text, type: pick.type },
@@ -2518,6 +2542,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     year: lowerThirdCounts.year,
     place: lowerThirdCounts.place,
     skippedForCadence,
+    skippedForDuplicate,
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
   });
 
