@@ -134,11 +134,14 @@ export interface SceneClipWindow {
 //     don't over-cut a section with rapid cuts — e.g. a music-video
 //     intro with cuts every 0.5s)
 //
-// For each picked start, the clip's duration is set so its end lands on
-// the next scene boundary (or earlier), clamped to [minDuration, maxDuration].
-// On rapid-cut runs, the next boundary may be < minDuration away — in that
-// case we use minDuration anyway and accept some bleed, since the alternative
-// is no clip at all from that section.
+// For each picked start, the clip duration is set by walking forward
+// through boundaries and choosing the latest one that lands in
+// [start + minDuration, start + maxDuration]. On rapid-cut sources the
+// clip will span 2-4 source scenes — the alternative was every clip
+// pinning at minDuration, which left the matcher unable to fill long-
+// sentence footage blocks and made the timeline come up short of the
+// voiceover. The intra-clip cuts read as a normal multi-shot B-roll
+// montage.
 export function pickFromScenes(opts: {
   scenes: number[];
   duration: number;
@@ -181,20 +184,41 @@ export function pickFromScenes(opts: {
     picked = Array.from(new Set(out)).sort((a, b) => a - b);
   }
 
-  // For each picked start, find the next scene boundary in the *full* sorted
-  // list (not just `spaced`) and snap the clip duration to land on it.
-  // Using the full list matters: `spaced` enforces a 20s gap, so the next
-  // entry there might be far past the real next cut. The full list gives us
-  // the actual next boundary.
+  // For each picked start, find a scene boundary that gives a usable clip
+  // duration. Rather than snapping to the *immediate* next boundary (which
+  // on rapid-cut sources collapses every clip to minDuration), we walk
+  // forward through the boundaries and pick the latest one that still
+  // fits in [minDuration, maxDuration] — preferring closer-to-max so the
+  // clip can cover a long-sentence footage block. On sources with cuts
+  // every 1-2s this means a clip spans 2-4 source scenes (some visual
+  // cuts inside the clip), which is acceptable: the alternative is every
+  // clip being exactly minDuration, leaving long sentences unfillable.
   return picked.map((start) => {
-    const nextBoundary = sorted.find((t) => t > start + 0.25);
     const tailRoom = opts.duration - start - 0.25;
-    let dur = opts.maxDuration;
-    if (nextBoundary !== undefined) {
-      dur = Math.min(dur, nextBoundary - start);
+    const hardMax = Math.min(opts.maxDuration, tailRoom);
+    // Scan boundaries after `start`. Track the latest boundary that lands
+    // within [start + minDuration, start + hardMax]. If none exists (a
+    // very long takes-no-cuts gap, or the very end of the source), fall
+    // back to hardMax. If hardMax itself is below minDuration (source is
+    // ending), fall back to minDuration with the bleed the legacy path
+    // already accepted.
+    let chosenEnd = -1;
+    for (const t of sorted) {
+      if (t <= start + opts.minDuration) continue;
+      if (t > start + hardMax) break;
+      chosenEnd = t;
     }
-    dur = Math.min(dur, tailRoom);
-    dur = Math.max(opts.minDuration, dur);
+    let dur: number;
+    if (chosenEnd > 0) {
+      dur = chosenEnd - start;
+    } else if (hardMax >= opts.minDuration) {
+      // No boundary in the usable window — extend to hardMax. The clip
+      // will bleed past one or more scene boundaries; that's fine for a
+      // generic interview clip and matches how viewers experience B-roll.
+      dur = hardMax;
+    } else {
+      dur = opts.minDuration;
+    }
     return { start, duration: Math.round(dur * 100) / 100 };
   });
 }

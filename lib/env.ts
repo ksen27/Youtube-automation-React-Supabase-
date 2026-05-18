@@ -141,9 +141,16 @@ export function getEnv(): ServerEnv {
 // next boundary so the user never sees a mid-clip scene change. The result
 // is clamped to [MIN, MAX]. Uniform-fallback clips (when scene-detect fails)
 // stay at DEFAULT.
+//
+// Sized so a single clip can cover the longest footage block the planner
+// emits (a 10-12s sentence). When clips were uniformly 5s, the matcher had
+// to clamp every long footage block down to 5s — which made the timeline
+// fall short of the voiceover by tens of seconds even though there was
+// plenty of clip material. The default lands in the middle so uniform
+// fallback gives a usable hold for typical-length sentences.
 export const CLIP_DURATION_MIN_SECONDS = 5;
-export const CLIP_DURATION_MAX_SECONDS = 8;
-export const CLIP_DURATION_DEFAULT_SECONDS = 5;
+export const CLIP_DURATION_MAX_SECONDS = 12;
+export const CLIP_DURATION_DEFAULT_SECONDS = 9;
 // Back-compat alias — anything that still imports this gets the default.
 export const CLIP_DURATION_SECONDS = CLIP_DURATION_DEFAULT_SECONDS;
 

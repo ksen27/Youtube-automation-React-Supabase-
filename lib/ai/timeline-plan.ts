@@ -21,14 +21,16 @@ export interface DurationRange {
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
   // Footage holds match the spoken length of their sentence: short
-  // sentences → short holds, long sentences → long holds. The max is
-  // capped at CLIP_DURATION_MAX_SECONDS (8s) because the clip generator
-  // produces 5–8s windows and asking for more would require either a
-  // frame-freeze or a clip-loop (both visually bad). Keeping the planner
-  // inside the clip-generator's range means timeline_items.duration
-  // matches what actually gets rendered. The min prevents degenerate
-  // 0.4s flashes from 1-word sentences.
-  footage: { min: 3,  max: 8 },
+  // sentences → short holds, long sentences → long holds. The max
+  // mirrors CLIP_DURATION_MAX_SECONDS (12s) so the planner never asks
+  // for a hold longer than what the clip generator can actually produce
+  // — that mismatch was the source of the previous "timeline falls short
+  // of voiceover" bug, because the matcher would clamp long footage
+  // blocks down to whatever the assigned clip's real length was. The
+  // min prevents degenerate 0.4s flashes from 1-word sentences. Used
+  // only on the cadence-fallback path now; word-timing-driven planning
+  // sizes blocks directly from the audio's word timestamps.
+  footage: { min: 3,  max: 12 },
   // Per-image hold is still 5s per user spec. The sentence-aligned planner
   // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
   // blocks rather than stretching one image, so the contract holds.
@@ -465,6 +467,124 @@ export function buildBlockSequenceFromHints(
     return sentenceDurationSeconds(h.text, cadence);
   });
 
+  // Group consecutive same-type sentence hints into blocks whose combined
+  // spoken duration lands in the footage target window. The previous
+  // one-sentence-per-block design accumulated drift two ways:
+  //   - Sentences shorter than the footage minimum got pushed up to the
+  //     minimum (planner overstates).
+  //   - Sentences longer than the assigned clip got clamped down to the
+  //     clip's real length (matcher understates).
+  // Each per-block bias is small but compounds across 100+ blocks into a
+  // 30-60s timeline-vs-voiceover gap.
+  //
+  // Grouping eliminates the bias: each merged block's duration equals the
+  // exact sum of its sentences' wall-clock times, and the sum naturally
+  // falls in [GROUP_MIN, GROUP_MAX] (the footage range) so neither the
+  // planner's clamp nor the matcher's clip-cap discards seconds. Only
+  // adjacent hints of the same effective type merge — that preserves
+  // Gemini's per-sentence visual targeting (image vs. footage vs. title
+  // card) for blocks at type boundaries.
+  //
+  // Pinned-duration types (image=5s, title_card=5s, split_2=6s) don't
+  // merge: their durations are fixed by spec, so merging would either
+  // violate the spec or re-introduce the drift problem. They pass through
+  // as one-sentence blocks.
+  const GROUP_MIN = DURATION_RANGES.footage.min;
+  const GROUP_MAX = DURATION_RANGES.footage.max;
+  const MERGEABLE_TYPES = new Set<BlockType>(["footage"]);
+
+  interface GroupedHint {
+    hint: BlockPlanHint;
+    type: BlockType;
+    duration: number;
+    // Merged sentence text. For single-hint groups this equals hint.text;
+    // for multi-hint groups it concatenates each sentence in order so
+    // downstream code that reads the block's spoken text sees all of it.
+    text: string;
+    // Whether this group merged 2+ sentences. Used by callers for logging.
+    merged: boolean;
+  }
+
+  const groupedHints: GroupedHint[] = [];
+  let cursor = 0;
+  while (cursor < hints.length) {
+    const baseType = effectiveTypes[cursor];
+    const baseHint = hints[cursor];
+    const baseDur = rawDurations[cursor];
+
+    // Non-mergeable types pass through unchanged. So do mergeable hints
+    // whose own duration already sits at or above GROUP_MIN — those have
+    // no drift to amortize and merging would needlessly group them.
+    if (!MERGEABLE_TYPES.has(baseType) || baseDur >= GROUP_MIN) {
+      groupedHints.push({
+        hint: baseHint,
+        type: baseType,
+        duration: baseDur,
+        text: baseHint.text,
+        merged: false,
+      });
+      cursor++;
+      continue;
+    }
+
+    // Walk forward absorbing consecutive same-type hints while the
+    // accumulated duration would still land in [GROUP_MIN, GROUP_MAX].
+    // We stop as soon as adding the next hint would push past GROUP_MAX,
+    // and accept the current accumulation even if it's below GROUP_MIN —
+    // the redistributor at the end of this function closes any small
+    // residual gap.
+    let accDur = baseDur;
+    let accText = baseHint.text;
+    let mergedRefs = [...(baseHint.specific_visual_references ?? [])];
+    let mergedEntities = [...(baseHint.mentioned_entities ?? [])];
+    let lookahead = cursor + 1;
+    while (lookahead < hints.length) {
+      if (effectiveTypes[lookahead] !== baseType) break;
+      const candidate = rawDurations[lookahead];
+      if (accDur + candidate > GROUP_MAX) break;
+      accDur += candidate;
+      accText = `${accText} ${hints[lookahead].text}`;
+      mergedRefs.push(...(hints[lookahead].specific_visual_references ?? []));
+      mergedEntities.push(...(hints[lookahead].mentioned_entities ?? []));
+      lookahead++;
+      // Stop once we've reached the target window. Don't keep merging
+      // past GROUP_MIN — a 5-6s block is the sweet spot for the matcher.
+      if (accDur >= GROUP_MIN) break;
+    }
+
+    // Dedup merged reference lists. The matcher's image search treats
+    // the array as a set; duplicates waste search budget.
+    const dedup = (xs: string[]) => Array.from(new Set(xs));
+    groupedHints.push({
+      hint: {
+        ...baseHint,
+        specific_visual_references: dedup(mergedRefs),
+        mentioned_entities: dedup(mergedEntities),
+      },
+      type: baseType,
+      duration: accDur,
+      text: accText,
+      merged: lookahead > cursor + 1,
+    });
+    cursor = lookahead;
+  }
+
+  // Rebuild the parallel arrays so the rest of this function sees the
+  // post-merge view. After this point, `mergedHints` / `rawDurations` /
+  // `effectiveTypes` indices refer to MERGED groups, not individual
+  // sentences. The slot/scale/materialize passes below use mergedHints
+  // in place of the original hints parameter.
+  const mergedHints: BlockPlanHint[] = groupedHints.map((g) => ({
+    ...g.hint,
+    text: g.text,
+  }));
+  for (let i = 0; i < groupedHints.length; i++) {
+    rawDurations[i] = groupedHints[i].duration;
+    effectiveTypes[i] = groupedHints[i].type;
+  }
+  rawDurations.length = groupedHints.length;
+  effectiveTypes.length = groupedHints.length;
+
   // When word timings are available, each hint's rawDuration is the real
   // wall-clock span the narrator spent on that sentence. We size every
   // block from that real duration:
@@ -490,8 +610,8 @@ export function buildBlockSequenceFromHints(
   // a 7s sentence gets one slot (5s) and a 12s sentence gets two (10s).
   // Math.round used to gain over Math.floor: a 7.5s sentence becomes
   // two slots, which is closer to the truth than one.
-  const slotCounts = new Array<number>(hints.length).fill(1);
-  for (let i = 0; i < hints.length; i++) {
+  const slotCounts = new Array<number>(mergedHints.length).fill(1);
+  for (let i = 0; i < mergedHints.length; i++) {
     if (effectiveTypes[i] === "image") {
       const rawSec = rawDurations[i];
       slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
@@ -504,7 +624,7 @@ export function buildBlockSequenceFromHints(
   let footageScale = 1;
   if (!haveRealTimings) {
     let pinnedTime = 0;
-    for (let i = 0; i < hints.length; i++) {
+    for (let i = 0; i < mergedHints.length; i++) {
       const type = effectiveTypes[i];
       if (type === "image") pinnedTime += slotCounts[i] * IMAGE_HOLD_SECONDS;
       else if (type === "title_card") pinnedTime += DURATION_RANGES.title_card.min;
@@ -512,7 +632,7 @@ export function buildBlockSequenceFromHints(
       else if (type === "split_4") pinnedTime += DURATION_RANGES.split_4.min;
     }
     let footageRawTotal = 0;
-    for (let i = 0; i < hints.length; i++) {
+    for (let i = 0; i < mergedHints.length; i++) {
       if (effectiveTypes[i] === "footage") footageRawTotal += rawDurations[i];
     }
     const footageTarget = Math.max(0, voiceoverSeconds - pinnedTime);
@@ -523,7 +643,7 @@ export function buildBlockSequenceFromHints(
   }
 
   const blocks: PlannedBlockWithHint[] = [];
-  hints.forEach((h, i) => {
+  mergedHints.forEach((h, i) => {
     const type = effectiveTypes[i];
 
     if (type === "image") {
