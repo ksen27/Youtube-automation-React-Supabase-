@@ -26,7 +26,7 @@ const DURATION_BEARING_TYPES = new Set([
 ]);
 
 const VALIDATION_FAILED_MSG =
-  "Timeline duration must match voiceover and use unique clips.";
+  "Timeline duration must match voiceover.";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -82,8 +82,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   }
 
   // ---- Dynamic-duration validation -------------------------------------
-  // 1) Sum of duration-bearing blocks must be within tolerance of voiceover.
-  // 2) No clip_id appears twice on the timeline.
+  // Sum of duration-bearing blocks must be within tolerance of voiceover.
+  // Duplicate clip_ids are permitted — the same source clip may legitimately
+  // appear on the timeline more than once.
   const durationBearing = items.filter((it) =>
     DURATION_BEARING_TYPES.has(String(it.type)),
   );
@@ -91,9 +92,6 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     (s, it) => s + (Number(it.duration) || 0),
     0,
   );
-  const clipIds = renderable.map((it) => String(it.clip_id));
-  const uniqueClipCount = new Set(clipIds).size;
-  const hasDuplicateClips = uniqueClipCount !== clipIds.length;
 
   const durationDelta = voiceoverSeconds
     ? Math.abs(timelineDuration - voiceoverSeconds)
@@ -101,7 +99,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const durationOutOfRange =
     voiceoverSeconds > 0 && durationDelta > DURATION_TOLERANCE_SECONDS;
 
-  if (hasDuplicateClips || durationOutOfRange) {
+  if (durationOutOfRange) {
     return NextResponse.json(
       {
         error: VALIDATION_FAILED_MSG,
@@ -110,7 +108,6 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           voiceoverSeconds,
           tolerance: DURATION_TOLERANCE_SECONDS,
           durationDelta: Math.round(durationDelta * 10) / 10,
-          duplicateClipCount: clipIds.length - uniqueClipCount,
         },
       },
       { status: 400 },

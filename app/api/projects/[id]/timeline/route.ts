@@ -14,6 +14,9 @@ const TimelineItemPatch = z.object({
   overlay_text: z.string().max(500).nullable().optional(),
   type: z.enum(["intro", "footage", "image", "title_card", "split_2", "split_4", "lower_third", "transition"]).optional(),
   approved: z.boolean().optional(),
+  // Updatable so the block-editor swap modal can drop in an image from the
+  // project's existing image pool, including a cross-type swap (footage→image).
+  image_url: z.string().url().nullable().optional(),
   delete: z.boolean().optional(),
 });
 
@@ -63,6 +66,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     if (it.overlay_text !== undefined) patch.overlay_text = it.overlay_text;
     if (it.type !== undefined)         patch.type = it.type;
     if (it.approved !== undefined)     patch.approved = it.approved;
+    if (it.image_url !== undefined)    patch.image_url = it.image_url;
     if (Object.keys(patch).length === 0) continue;
     const { error } = await sb.from("timeline_items").update(patch).eq("id", it.id).eq("project_id", id);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCheck, Play, Plus, RefreshCw, Sparkles } from "lucide-react";
+import { CheckCheck, ImageIcon, Play, Plus, RefreshCw, Sparkles, Video } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { fmtClock, fmtMinutes, type ClipRow, type TimelineRow } from "../_shared";
 import { SceneBlock } from "./blocks/scene-block";
@@ -45,9 +46,13 @@ export function BlockEditorScreen({
   const clips = useMemo(() => clipsQ.data?.clips ?? [], [clipsQ.data?.clips]);
   const clipById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
 
-  const [editingClipFor, setEditingClipFor] = useState<string | null>(null);
+  // The block whose media is being replaced. When non-null, the replace
+  // modal opens. We track the whole row so the modal can decide what tab
+  // to default to (footage → Clips, image → Images).
+  const [replaceTarget, setReplaceTarget] = useState<TimelineRow | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [previewClip, setPreviewClip] = useState<ClipRow | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
 
   const patch = useMutation({
     mutationFn: async (body: {
@@ -108,9 +113,34 @@ export function BlockEditorScreen({
     patch.mutate({ items: [{ id, delete: true }] });
   }
 
-  function replaceClip(itemId: string, clipId: string) {
-    patch.mutate({ items: [{ id: itemId, clip_id: clipId }] });
-    setEditingClipFor(null);
+  // Swap the row's media. The modal lets you pick either a clip or an image
+  // regardless of the row's current type — when crossing types we update
+  // `type` too and clear the old field (clip_id ↔ image_url). The row's
+  // existing duration is preserved so the timeline still matches voiceover.
+  function pickClip(target: TimelineRow, clipId: string) {
+    const patchOne: { id: string; [k: string]: unknown } = {
+      id: target.id,
+      clip_id: clipId,
+    };
+    if (target.type === "image") {
+      patchOne.type = "footage";
+      patchOne.image_url = null;
+    }
+    patch.mutate({ items: [patchOne] });
+    setReplaceTarget(null);
+  }
+
+  function pickImage(target: TimelineRow, imageUrl: string) {
+    const patchOne: { id: string; [k: string]: unknown } = {
+      id: target.id,
+      image_url: imageUrl,
+    };
+    if (target.type !== "image") {
+      patchOne.type = "image";
+      patchOne.clip_id = null;
+    }
+    patch.mutate({ items: [patchOne] });
+    setReplaceTarget(null);
   }
 
   const totalSec = items.reduce((s, i) => s + i.duration, 0);
@@ -222,66 +252,26 @@ export function BlockEditorScreen({
                 selected={selectedId === it.id}
                 onSelect={() => onSelect(selectedId === it.id ? null : it.id)}
                 onPlay={clip?.clip_url ? () => setPreviewClip(clip) : undefined}
-                onReplace={() => setEditingClipFor(editingClipFor === it.id ? null : it.id)}
+                onReplace={() => setReplaceTarget(it)}
                 onDelete={() => removeItem(it.id)}
               />
-
-              {editingClipFor === it.id && (
-                <div className="mt-2 ml-12 rounded-[10px] border border-border bg-bg-elevated p-3">
-                  <div className="mb-2 text-xs font-medium text-fg-muted">
-                    Replace with another clip — click to use, ▶ to preview
-                  </div>
-                  {clips.length === 0 ? (
-                    <p className="text-xs text-fg-subtle">No clips available.</p>
-                  ) : (
-                    <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2 max-h-56 overflow-y-auto">
-                      {clips.map((c) => (
-                        <div
-                          key={c.id}
-                          className="relative group/clip aspect-video bg-bg-elevated rounded overflow-hidden border border-border hover:border-brand-500 transition-colors"
-                        >
-                          <button
-                            type="button"
-                            onClick={() => replaceClip(it.id, c.id)}
-                            aria-label="Use this clip"
-                            className="absolute inset-0"
-                          >
-                            {c.thumbnail_url ? (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img
-                                src={c.thumbnail_url}
-                                alt=""
-                                className="h-full w-full object-cover"
-                                loading="lazy"
-                              />
-                            ) : null}
-                          </button>
-                          {c.clip_url && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setPreviewClip(c);
-                              }}
-                              aria-label="Preview clip"
-                              title="Preview clip"
-                              className="absolute bottom-1 right-1 grid place-items-center h-6 w-6 rounded-full bg-black/70 text-white opacity-0 group-hover/clip:opacity-100 transition-opacity hover:bg-black/90"
-                            >
-                              <Play className="h-3 w-3 ml-0.5" />
-                            </button>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
             </li>
           );
         })}
       </ol>
 
+      <ReplaceMediaDialog
+        target={replaceTarget}
+        clips={clips}
+        items={items}
+        onClose={() => setReplaceTarget(null)}
+        onPickClip={(clipId) => replaceTarget && pickClip(replaceTarget, clipId)}
+        onPickImage={(url) => replaceTarget && pickImage(replaceTarget, url)}
+        onPreviewClip={setPreviewClip}
+        onPreviewImage={setPreviewImage}
+      />
       <ClipPreviewDialog clip={previewClip} onClose={() => setPreviewClip(null)} />
+      <ImagePreviewDialog url={previewImage} onClose={() => setPreviewImage(null)} />
     </div>
   );
 }
@@ -324,5 +314,246 @@ function ClipPreviewDialog({
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function ImagePreviewDialog({
+  url,
+  onClose,
+}: {
+  url: string | null;
+  onClose: () => void;
+}) {
+  const open = url !== null;
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="p-0 overflow-hidden">
+        <div className="px-4 pt-3 pb-2">
+          <DialogTitle>Image preview</DialogTitle>
+        </div>
+        <div className="bg-black aspect-video grid place-items-center">
+          {url ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={url} alt="" className="max-h-full max-w-full object-contain" />
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// Replace-media modal. Lists every clip on the project plus every image
+// currently sitting on an image row, with each tile marked as "Used" if it
+// already appears somewhere on the timeline. The same clip is still
+// selectable when used — duplicates are allowed in the final render.
+//
+// Cross-type swaps are permitted: a footage row can adopt an image and
+// vice-versa. The caller patches `type` accordingly.
+function ReplaceMediaDialog({
+  target,
+  clips,
+  items,
+  onClose,
+  onPickClip,
+  onPickImage,
+  onPreviewClip,
+  onPreviewImage,
+}: {
+  target: TimelineRow | null;
+  clips: ClipRow[];
+  items: TimelineRow[];
+  onClose: () => void;
+  onPickClip: (clipId: string) => void;
+  onPickImage: (url: string) => void;
+  onPreviewClip: (c: ClipRow) => void;
+  onPreviewImage: (url: string) => void;
+}) {
+  const open = target !== null;
+
+  const usedClipIds = useMemo(
+    () => new Set(items.map((it) => it.clip_id).filter((v): v is string => !!v)),
+    [items],
+  );
+  const usedImageUrls = useMemo(
+    () => new Set(items.map((it) => it.image_url).filter((v): v is string => !!v)),
+    [items],
+  );
+
+  // The project's image pool is every image_url that any row currently uses.
+  // Dedupe so the same image doesn't render twice if it's on multiple rows.
+  const imagePool = useMemo(
+    () => Array.from(new Set(items.map((it) => it.image_url).filter((v): v is string => !!v))),
+    [items],
+  );
+
+  const currentTab = target?.type === "image" ? "images" : "clips";
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-3xl p-0 overflow-hidden">
+        <div className="px-4 pt-3 pb-2">
+          <DialogTitle>Replace media</DialogTitle>
+          <DialogDescription>
+            Pick a clip or an image to use in this scene. The
+            <span className="ml-1 inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+              Used
+            </span>{" "}
+            badge marks items already on the timeline — still pickable.
+          </DialogDescription>
+        </div>
+
+        <Tabs defaultValue={currentTab} className="px-4 pb-4">
+          <TabsList>
+            <TabsTrigger value="clips">
+              <Video className="h-3.5 w-3.5 mr-1.5" />
+              Clips
+              <span className="ml-1.5 text-fg-subtle tabular-nums">{clips.length}</span>
+            </TabsTrigger>
+            <TabsTrigger value="images">
+              <ImageIcon className="h-3.5 w-3.5 mr-1.5" />
+              Images
+              <span className="ml-1.5 text-fg-subtle tabular-nums">{imagePool.length}</span>
+            </TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="clips">
+            {clips.length === 0 ? (
+              <p className="text-sm text-fg-subtle py-6 text-center">No clips available.</p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 max-h-[60vh] overflow-y-auto">
+                {clips.map((c) => {
+                  const isUsed = usedClipIds.has(c.id);
+                  const isCurrent = target?.clip_id === c.id;
+                  return (
+                    <MediaTile
+                      key={c.id}
+                      thumbnail={c.thumbnail_url}
+                      durationSec={c.duration}
+                      isUsed={isUsed}
+                      isCurrent={isCurrent}
+                      title={c.source?.title ?? undefined}
+                      onSelect={() => onPickClip(c.id)}
+                      onPreview={c.clip_url ? () => onPreviewClip(c) : undefined}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </TabsContent>
+
+          <TabsContent value="images">
+            {imagePool.length === 0 ? (
+              <p className="text-sm text-fg-subtle py-6 text-center">
+                No images yet — the matcher hasn&apos;t assigned any.
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 max-h-[60vh] overflow-y-auto">
+                {imagePool.map((url) => {
+                  const isUsed = usedImageUrls.has(url);
+                  const isCurrent = target?.image_url === url;
+                  return (
+                    <MediaTile
+                      key={url}
+                      thumbnail={url}
+                      isUsed={isUsed}
+                      isCurrent={isCurrent}
+                      onSelect={() => onPickImage(url)}
+                      onPreview={() => onPreviewImage(url)}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </TabsContent>
+        </Tabs>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function MediaTile({
+  thumbnail,
+  durationSec,
+  isUsed,
+  isCurrent,
+  title,
+  onSelect,
+  onPreview,
+}: {
+  thumbnail: string | null;
+  durationSec?: number;
+  isUsed: boolean;
+  isCurrent: boolean;
+  title?: string;
+  onSelect: () => void;
+  onPreview?: () => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "relative group/tile aspect-video rounded-md overflow-hidden border-2 transition-colors",
+        isCurrent
+          ? "border-brand-500 ring-2 ring-brand-500/40"
+          : isUsed
+            ? "border-amber-500/70 hover:border-amber-400"
+            : "border-border hover:border-brand-500",
+      )}
+      title={title}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-label={isUsed ? "Use this item (already on timeline)" : "Use this item"}
+        className="absolute inset-0 bg-bg-elevated"
+      >
+        {thumbnail ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={thumbnail}
+            alt=""
+            className={cn(
+              "h-full w-full object-cover transition-opacity",
+              isUsed && !isCurrent && "opacity-70 group-hover/tile:opacity-100",
+            )}
+            loading="lazy"
+          />
+        ) : null}
+      </button>
+
+      {durationSec !== undefined && (
+        <span className="absolute bottom-1 left-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white tabular-nums">
+          {Math.round(durationSec)}s
+        </span>
+      )}
+
+      {isCurrent ? (
+        <span className="absolute top-1 left-1 rounded bg-brand-500 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+          Current
+        </span>
+      ) : isUsed ? (
+        <span className="absolute top-1 left-1 rounded bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-black">
+          Used
+        </span>
+      ) : (
+        <span className="absolute top-1 left-1 rounded bg-emerald-500/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+          Free
+        </span>
+      )}
+
+      {onPreview && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onPreview();
+          }}
+          aria-label="Preview"
+          title="Preview"
+          className="absolute bottom-1 right-1 grid place-items-center h-7 w-7 rounded-full bg-black/70 text-white opacity-0 group-hover/tile:opacity-100 transition-opacity hover:bg-black/90"
+        >
+          <Play className="h-3.5 w-3.5 ml-0.5" />
+        </button>
+      )}
+    </div>
   );
 }
