@@ -120,6 +120,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const it = renderable[i];
     return !!it?.clip_id;
   };
+  // SFX cues should only land on REAL photo→photo dissolves, not on
+  // title-card or split-screen transitions. isImageNeighbor lumps all three
+  // together for transition-math purposes (they're all still frames), so we
+  // use this stricter predicate just for the SFX trigger.
+  const isRealImage = (i: number): boolean => {
+    const it = renderable[i];
+    return it?.type === "image" && !!it.image_url;
+  };
   let imageRendered = 0;
   let imageFailed = 0;
 
@@ -343,11 +351,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const mergedSegments: string[] = [];
     const mergedDurations: number[] = [];
     const mergedKinds: SegKind[] = [];
+    // Parallel to mergedKinds: tracks whether the segment that produced the
+    // CURRENT tail of each merged entry is a real photo (type=image). Used by
+    // the SFX cadence so a title-card→image dissolve doesn't get counted as a
+    // photo→photo transition. mergeMixedBoundary and the image-xfade branch
+    // both keep this in sync with whatever last contributed to the tail.
+    const mergedTailIsRealImage: boolean[] = [];
     let xfadeMerges = 0;
     let mixedFades = 0;
     // Boundary index for palette rotation. Incremented every time we apply
     // an image→image xfade so consecutive dissolves cycle through the list.
     let imageBoundaryIdx = 0;
+    // Separate counter for SFX cadence — only ticks on REAL photo→photo
+    // dissolves, so the every-3rd cue rotation doesn't get skewed by
+    // intervening title-card or split-screen transitions.
+    let realImageBoundaryIdx = 0;
     // SFX cue offsets, measured from the start of the rendered timeline
     // (BEFORE any intro is prepended — intro offset is added later when we
     // pass these into concatNormalizedClips). Offsets are computed mid-xfade
@@ -385,6 +403,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // incoming segment — so the next boundary decision sees the right
         // neighbor type.
         mergedKinds[j] = segKind;
+        mergedTailIsRealImage[j] = isRealImage(idx);
         mixedFades++;
         await safeUnlink(a);
         await safeUnlink(seg);
@@ -430,12 +449,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           mergedSegments[mergedSegments.length - 1] = mergedOut;
           mergedDurations[mergedDurations.length - 1] = aDur + slotDurations[i] - IMAGE_XFADE_SECONDS;
           xfadeMerges++;
-          // Cadence: trigger SFX every 3rd image→image xfade. imageBoundaryIdx
-          // is 0-based at this point, so 0, 3, 6, ... fire. The intro offset
-          // is added later when we hand these to concatNormalizedClips.
-          if (imageBoundaryIdx % 3 === 0) {
-            sfxOffsetsAtBoundary.push(boundaryStart + IMAGE_XFADE_SECONDS / 2);
+          // SFX cadence: only fire on REAL photo→photo dissolves (both the
+          // tail of the merged segment AND the incoming segment must be
+          // type=image with an image_url). Title-card and split-screen
+          // dissolves are visually similar but shouldn't trigger SFX. The
+          // tail-was-real-image flag is what the previous merge wrote into
+          // mergedTailIsRealImage; the incoming side uses isRealImage(i).
+          const tailIsRealImage = mergedTailIsRealImage[mergedTailIsRealImage.length - 1] === true;
+          const incomingIsRealImage = isRealImage(i);
+          if (tailIsRealImage && incomingIsRealImage) {
+            if (realImageBoundaryIdx % 3 === 0) {
+              sfxOffsetsAtBoundary.push(boundaryStart + IMAGE_XFADE_SECONDS / 2);
+            }
+            realImageBoundaryIdx++;
           }
+          mergedTailIsRealImage[mergedTailIsRealImage.length - 1] = incomingIsRealImage;
           imageBoundaryIdx++;
           await safeUnlink(a);
           await safeUnlink(seg);
@@ -447,6 +475,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           mergedSegments.push(seg);
           mergedDurations.push(slotDurations[i]);
           mergedKinds.push("image");
+          mergedTailIsRealImage.push(isRealImage(i));
         }
       } else if (
         (itemKind === "image" && prevKind === "video") ||
@@ -463,12 +492,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           mergedSegments.push(seg);
           mergedDurations.push(slotDurations[i]);
           mergedKinds.push(itemKind);
+          mergedTailIsRealImage.push(isRealImage(i));
         }
       } else {
         // First segment, or video↔video — hard cut, append as-is.
         mergedSegments.push(seg);
         mergedDurations.push(slotDurations[i]);
         mergedKinds.push(itemKind);
+        mergedTailIsRealImage.push(isRealImage(i));
       }
     }
     const normalized: string[] = mergedSegments;
