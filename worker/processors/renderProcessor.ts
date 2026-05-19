@@ -8,11 +8,38 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
-import { downloadYoutubeAudio } from "@/lib/media/ytdlp";
+import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
 
 const VALIDATION_FAILED_MSG =
   "Timeline duration must match voiceover and use unique clips.";
+
+// Pull the 11-char video id out of the YouTube URL the user pasted on the
+// intake screen. Accepts watch?v=, youtu.be/, shorts/, embed/, and a bare
+// id. The PATCH route already validates this on save — this helper is the
+// worker-side fallback so we never invoke yt-dlp with an unusable URL.
+function extractIntroVideoId(raw: string): string | null {
+  const s = raw.trim();
+  if (!s) return null;
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  try {
+    const u = new URL(s);
+    const host = u.hostname.replace(/^www\./, "");
+    if (host === "youtu.be") {
+      const id = u.pathname.slice(1).split("/")[0];
+      return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+    }
+    if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
+      const v = u.searchParams.get("v");
+      if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v;
+      const m = u.pathname.match(/^\/(?:shorts|embed|v)\/([A-Za-z0-9_-]{11})/);
+      if (m) return m[1];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export async function processRenderJob(data: RenderJobData): Promise<void> {
   const sb = getServerSupabase();
@@ -517,7 +544,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
 
     // 3) Optional voiceover from project + intro clip selection + bg music + SFX
     const { data: project } = await sb.from("projects")
-      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, bg_music_url, bg_music_gain, sfx_urls, sfx_gain")
+      .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, intro_source_youtube_url, intro_source_start_seconds, bg_music_url, bg_music_gain, sfx_urls, sfx_gain")
       .eq("id", projectId).single();
     let voiceoverLocal: string | undefined;
     if (project?.voiceover_url) {
@@ -569,7 +596,101 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     //     the source audio for the intro window, voiceover for the rest.
     let introAudioPath: string | undefined;
     let introDurationActual = 0;
-    if (project?.intro_clip_id) {
+
+    // User-provided intro source takes priority over the auto-pick path.
+    // When the user pasted a YouTube URL + timestamp on the intake screen
+    // we download THAT video via the proxied yt-dlp pipeline and cut the
+    // intro window from it directly. This fixes the "narrator voiceover
+    // over the celebrity's face" bug — the auto-picker only scored on
+    // visual quality and had no way to verify whose voice was actually
+    // under the chosen frame.
+    const userIntroUrl = (project?.intro_source_youtube_url as string | null | undefined)?.trim();
+    const userIntroStart = project?.intro_source_start_seconds != null
+      ? Number(project.intro_source_start_seconds)
+      : null;
+    if (userIntroUrl && userIntroStart != null && Number.isFinite(userIntroStart) && userIntroStart >= 0) {
+      try {
+        const declaredDur = Number(project?.intro_duration_seconds) || 6;
+        introDurationActual = Math.min(15, Math.max(1, declaredDur));
+
+        const videoId = extractIntroVideoId(userIntroUrl);
+        if (!videoId) throw new Error(`unable to parse YouTube id from ${userIntroUrl}`);
+
+        const introTmp = path.join(tmp, "intro_user");
+        await fs.mkdir(introTmp, { recursive: true });
+
+        // (a) Download full video + audio via the proxied yt-dlp helpers.
+        // These already handle proxy rotation on bot-check / 429 / 403 so
+        // we get the same protection as the regular source-download queue.
+        const [videoDl, audioDl] = await Promise.all([
+          downloadYoutubeVideo({
+            url: userIntroUrl,
+            outputDir: introTmp,
+            videoId,
+          }),
+          downloadYoutubeAudio({
+            url: userIntroUrl,
+            outputDir: introTmp,
+            videoId: `${videoId}_audio`,
+          }),
+        ]);
+
+        // (b) Cut video at the user's window, then normalize to the render
+        // pipeline's canonical 1280x720@30 so concat -c:v copy works.
+        const introTrimmed = path.join(tmp, "intro_user_trim.mp4");
+        await cutClip({
+          inputPath: videoDl.outputPath,
+          outputPath: introTrimmed,
+          startSeconds: userIntroStart,
+          durationSeconds: introDurationActual,
+        });
+        const introNormalized = path.join(tmp, "intro_user_norm.mp4");
+        await normalizeClip({
+          inputPath: introTrimmed, outputPath: introNormalized,
+          width: 1280, height: 720, fps: 30,
+        });
+        normalized.unshift(introNormalized);
+        await safeUnlink(videoDl.outputPath);
+        await safeUnlink(introTrimmed);
+
+        // (c) Cut audio at the same window.
+        const introAudioCut = path.join(tmp, "intro_user_audio.m4a");
+        await cutAudio({
+          inputPath: audioDl.outputPath,
+          outputPath: introAudioCut,
+          startSeconds: userIntroStart,
+          durationSeconds: introDurationActual,
+        });
+        await safeUnlink(audioDl.outputPath);
+        introAudioPath = introAudioCut;
+
+        // (d) Upload cut audio + persist on project for traceability and
+        // so re-renders can skip the yt-dlp step if we ever cache it.
+        const audioDest = `projects/${projectId}/intro/user_audio_${Date.now()}.m4a`;
+        const audioUp = await uploadFile(introAudioCut, audioDest, "audio/mp4");
+        await sb.from("projects").update({
+          intro_audio_url: audioUp.publicUrl,
+          intro_duration_seconds: introDurationActual,
+        }).eq("id", projectId);
+
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.intro.user_ready", {
+            videoId,
+            startSeconds: userIntroStart,
+            introDurationActual,
+            introAudioUrl: audioUp.publicUrl,
+          });
+      } catch (e) {
+        introAudioPath = undefined;
+        introDurationActual = 0;
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.intro.user_failed", {
+            url: userIntroUrl,
+            startSeconds: userIntroStart,
+            err: (e as Error).message,
+          });
+      }
+    } else if (project?.intro_clip_id) {
       try {
         const introClipId = project.intro_clip_id as string;
         const { data: introClip } = await sb

@@ -11,6 +11,9 @@ export interface ProjectResp {
     bg_music_gain: number;
     sfx_urls: string[];
     sfx_gain: number;
+    intro_source_youtube_url: string | null;
+    intro_source_start_seconds: number | null;
+    intro_duration_seconds: number | null;
     status: string;
     created_at: string;
     updated_at: string;

@@ -237,10 +237,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   const { data: project } = await sb
     .from("projects")
-    .select("transcript, voiceover_duration_seconds, transcript_words")
+    .select("transcript, voiceover_duration_seconds, transcript_words, intro_source_youtube_url")
     .eq("id", projectId)
     .single();
   const transcript = project?.transcript ?? "";
+  // When the user pasted their own intro URL on the intake screen, the
+  // renderer will cut the intro directly from that source — we skip the
+  // pool-based heuristic + verifier path entirely and leave intro_clip_id
+  // null. The renderer reads intro_source_youtube_url itself and prepends
+  // the cut video/audio regardless of intro_clip_id.
+  const userIntroProvided = !!(project as { intro_source_youtube_url?: string | null } | null)
+    ?.intro_source_youtube_url?.trim();
   // Per-word timings persisted at voiceover-upload time. When present
   // they let the timeline planner size each block to the narrator's
   // real spoken duration for that sentence (instead of a uniform-wpm
@@ -483,10 +490,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let introVerifierReason: string | null = null;
   let introCandidateCount = 0;
 
-  const ranked = clipsForMatch
-    .map((c) => ({ c, score: scoreIntroCandidate(c) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score);
+  const ranked = userIntroProvided
+    ? []
+    : clipsForMatch
+        .map((c) => ({ c, score: scoreIntroCandidate(c) }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score);
 
   function selectClip(clipId: string, score: number): void {
     introClipId = clipId;
@@ -561,13 +570,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // Persist the intro selection on the project. Render step picks it up.
   // intro_audio_url + intro_duration_seconds get filled by the renderer
   // after yt-dlp + ffmpeg cut the matching audio segment.
-  await sb.from("projects").update({
-    intro_clip_id: introClipId,
-    intro_duration_seconds: introClipDuration || null,
-    // Clear any stale audio URL from a previous run — the renderer will
-    // re-download to match the newly-selected intro clip.
-    intro_audio_url: null,
-  }).eq("id", projectId);
+  //
+  // Skip the write entirely when the user provided their own intro source —
+  // the renderer reads intro_source_youtube_url + intro_source_start_seconds
+  // directly and we must NOT clobber the user's intro_duration_seconds with
+  // 0 / null from this auto-pick path.
+  if (!userIntroProvided) {
+    await sb.from("projects").update({
+      intro_clip_id: introClipId,
+      intro_duration_seconds: introClipDuration || null,
+      // Clear any stale audio URL from a previous run — the renderer will
+      // re-download to match the newly-selected intro clip.
+      intro_audio_url: null,
+    }).eq("id", projectId);
+  }
 
   // ---- Build the block plan first ---------------------------------------
   // The block sequence is the unit of matching now. Each block's wall-clock
@@ -3027,7 +3043,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
 
     const ents = blockEntities[blockIdx] ?? [];
-    const blockText = blockTexts[blockIdx] ?? "";
 
     type Candidate = { text: string; type: "name" | "year" | "place" | "phrase" };
     const isFresh = (text: string): boolean => {
@@ -3035,23 +3050,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       if (prev === undefined) return true;
       return clipStartSec - prev >= LOWER_THIRD_REPEAT_COOLDOWN_SEC;
     };
+    // Proper-noun-only picker. Entity types are taken from project_entities,
+    // which Gemini extracts under a strict PROPER-NOUN RULE (see lib/ai/gemini.ts) —
+    // values must be capitalized, specific things (a named person, place, brand,
+    // titled work, or named event). The "year" tier is the one non-proper-noun
+    // exception we still allow because a standalone year reads as a strong
+    // historical anchor on screen ("1997").
+    //
+    // We previously had a Tier-2 fallback that pulled a multi-word capitalized
+    // phrase straight from the narration when no entity hit was available.
+    // That fallback misfired on sentence-initial conjunctions like "After
+    // Margot…" → it would burn in "After Margot" (or just "After") because
+    // the cap-run scan only filtered a small stopword set. Per client feedback
+    // (lower-thirds must read as proper nouns), we now skip the slot entirely
+    // rather than guess from narration text.
     let pick: Candidate | null = null;
 
-    // Tier 1 — named entity from project_entities, matched against block text.
+    // Tier 1 — person (celebrity / related_person). Strongest signal.
     for (const ent of ents) {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
       if (!isFresh(ent.value)) continue;
       pick = { text: ent.value, type: "name" };
       break;
     }
-    if (!pick) {
-      for (const ent of ents) {
-        if (ent.type !== "year") continue;
-        if (!isFresh(ent.value)) continue;
-        pick = { text: ent.value, type: "year" };
-        break;
-      }
-    }
+    // Tier 2 — named place.
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
@@ -3060,18 +3082,32 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         break;
       }
     }
-
-    // Tier 2 — fall back to a key phrase pulled from the block's narration.
-    // Only proper-noun-like candidates qualify: a multi-word capitalized
-    // phrase ("Buckingham Palace") or a standalone year. The previous
-    // implementation also accepted single capitalized tokens and the
-    // longest non-stopword word in the block, which produced obviously
-    // random overlays like "completely" or "interview" when the narration
-    // had no real proper noun in that minute. We'd rather skip the slot
-    // than show a junk word.
-    if (!pick && blockText) {
-      const phrase = pickPhraseFromBlock(blockText, isFresh);
-      if (phrase) pick = { text: phrase, type: "phrase" };
+    // Tier 3 — other proper-noun entities (company / titled work / event).
+    // These all pass Gemini's PROPER-NOUN RULE so they're safe to overlay.
+    if (!pick) {
+      const otherProperNounTypes = new Set([
+        "company",
+        "movie",
+        "tv_show",
+        "song",
+        "event",
+        "life_event",
+      ]);
+      for (const ent of ents) {
+        if (!otherProperNounTypes.has(ent.type)) continue;
+        if (!isFresh(ent.value)) continue;
+        pick = { text: ent.value, type: "phrase" };
+        break;
+      }
+    }
+    // Tier 4 — standalone year (not a proper noun, but a clean historical anchor).
+    if (!pick) {
+      for (const ent of ents) {
+        if (ent.type !== "year") continue;
+        if (!isFresh(ent.value)) continue;
+        pick = { text: ent.value, type: "year" };
+        break;
+      }
     }
 
     if (!pick) {
@@ -3201,74 +3237,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     },
   });
   await setProjectStatus(projectId, "ready_for_review");
-}
-
-// Pick a lower-third overlay text from a block's spoken narration when no
-// project_entities hit is available. We only return proper-noun-like
-// phrases so the overlay always reads as a name / place / organization,
-// never as a random long word from the narration.
-//   1. Longest consecutive run of TWO OR MORE capitalized words
-//      (e.g. "Buckingham Palace", "Margot Robbie"). Single capitalized
-//      tokens are rejected — too often a sentence-start verb or an
-//      unrelated proper noun that confuses the viewer.
-//   2. A standalone 4-digit year — strong visual anchor on its own.
-// Returns null when neither tier finds a fresh candidate; the caller
-// skips the overlay for this minute rather than burning in a junk word.
-function pickPhraseFromBlock(
-  text: string,
-  isFresh: (s: string) => boolean,
-): string | null {
-  const stopwords = new Set([
-    "the","a","an","and","or","but","of","in","on","at","to","for","with",
-    "by","from","as","is","was","are","were","be","been","being","has","have",
-    "had","do","does","did","this","that","these","those","it","its","they",
-    "them","their","there","here","what","which","who","whom","how","when",
-    "where","why","while","so","because","then","than","just","also","not",
-    "no","yes","one","two","three","very","much","more","most","some","any",
-    "all","every","each","other","another","such","into","over","under","out",
-    "up","down","off","again","still","ever","never","always","you","your",
-    "yours","we","our","ours","i","me","my","mine","he","him","his","she",
-    "her","hers",
-  ]);
-
-  // 1) Multi-word capitalized-phrase scan. Sentence-start words are excluded
-  //    so we don't pick "The" / "When" from "The court ruled...". We do that
-  //    by splitting on sentence terminators first. Single-word runs are
-  //    dropped — they're too often false positives ("I", sentence-start
-  //    verbs, isolated proper nouns the entity extractor already rejected).
-  const sentences = text.split(/[.!?]+/);
-  let bestCapPhrase = "";
-  for (const sentence of sentences) {
-    const tokens = sentence.trim().split(/\s+/);
-    let run: string[] = [];
-    const flush = () => {
-      if (run.length < 2) { run = []; return; }
-      const phrase = run.join(" ").replace(/[^\p{L}\p{N} '-]+$/u, "");
-      if (phrase && phrase.length > bestCapPhrase.length && isFresh(phrase)) {
-        bestCapPhrase = phrase;
-      }
-      run = [];
-    };
-    tokens.forEach((tok, i) => {
-      const clean = tok.replace(/[^\p{L}\p{N}'-]/gu, "");
-      if (!clean) { flush(); return; }
-      const isCap = /^[A-Z]/.test(clean);
-      const isSentenceStart = i === 0;
-      if (isCap && (!isSentenceStart || !stopwords.has(clean.toLowerCase()))) {
-        run.push(clean);
-      } else {
-        flush();
-      }
-    });
-    flush();
-  }
-  if (bestCapPhrase) return bestCapPhrase;
-
-  // 2) Standalone year.
-  const yearMatch = text.match(/\b(1[89]\d{2}|20\d{2})\b/);
-  if (yearMatch && isFresh(yearMatch[0])) return yearMatch[0];
-
-  return null;
 }
 
 // Read the most recent analyze job's payload from media_jobs and flatten

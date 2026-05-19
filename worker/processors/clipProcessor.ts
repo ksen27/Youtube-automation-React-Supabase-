@@ -56,8 +56,14 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // Project clip cap is sized to the voiceover so the matcher has enough
   // footage candidates per timeline block without overshooting on storage.
   const { data: project } = await sb
-    .from("projects").select("voiceover_duration_seconds").eq("id", projectId).single();
+    .from("projects").select("voiceover_duration_seconds, intro_source_youtube_url").eq("id", projectId).single();
   const projectCap = computeProjectClipCap(project?.voiceover_duration_seconds ?? null);
+  // When the user supplied an explicit intro URL + timestamp, the renderer
+  // cuts the intro directly from that source and ignores anything tagged
+  // intro_candidate in the matched pool. Skipping the t=0 candidate here
+  // saves one Gemini vision call per source and stops the matcher from
+  // having to score a candidate it will never use.
+  const userIntroProvided = !!(project?.intro_source_youtube_url as string | null | undefined)?.trim();
 
   // Divide the project cap evenly across all sources so every downloaded
   // source contributes clips, instead of the first few hogging the budget.
@@ -171,6 +177,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const INTRO_CANDIDATE_LABEL = "intro_candidate";
   const introHeadStart = 0;
   const introTimestampIndex = (() => {
+    if (userIntroProvided) return -1;
     if (vs.duration_seconds < CLIP_DURATION_MIN_SECONDS + 1) return -1;
     if (windows.some((w) => Math.abs(w.start - introHeadStart) < 0.5)) return -1;
     windows.unshift({ start: introHeadStart, duration: CLIP_DURATION_DEFAULT_SECONDS });
