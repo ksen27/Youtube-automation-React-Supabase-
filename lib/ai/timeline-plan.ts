@@ -410,10 +410,22 @@ export function buildBlockSequenceFromHints(
   // to the cadence estimator per-hint when a hint's words can't be aligned
   // (rare — Gemini paraphrasing far enough that the words don't match).
   wordTimings?: PlannerWordTiming[] | null,
+  // Seconds reserved for the intro block, which the matcher prepends to
+  // items[] AFTER the planner returns. Without this, the planner targets
+  // the full voiceoverSeconds and the prepended intro pushes the total
+  // past voiceover, but more importantly: the planner's blocks already
+  // cover voiceover[0..N], the intro is shown DURING voiceover[0..6s],
+  // and the matcher relies on the visible total = voiceover. So we shrink
+  // the planner's target by the intro's reserved time. Defaults to 0 for
+  // callers that don't have an intro (legacy / tests).
+  introReservedSeconds: number = 0,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; sentence-aligned builder is deterministic.
   _rand: RandomFn = Math.random,
 ): PlannedBlockWithHint[] {
   if (hints.length === 0 || voiceoverSeconds <= 0) return [];
+  // Target sum the planner aims for. Subtract the intro slot so the
+  // matcher's prepended intro + planner blocks add up to voiceoverSeconds.
+  const targetSeconds = Math.max(0, voiceoverSeconds - Math.max(0, introReservedSeconds));
 
   // Derive the speaker's real cadence from the transcript when available.
   // Falls back to the 2.5 wps constant for legacy callers that don't have
@@ -635,7 +647,7 @@ export function buildBlockSequenceFromHints(
     for (let i = 0; i < mergedHints.length; i++) {
       if (effectiveTypes[i] === "footage") footageRawTotal += rawDurations[i];
     }
-    const footageTarget = Math.max(0, voiceoverSeconds - pinnedTime);
+    const footageTarget = Math.max(0, targetSeconds - pinnedTime);
     footageScale =
       footageRawTotal > 0 && footageTarget > 0
         ? footageTarget / footageRawTotal
@@ -710,9 +722,9 @@ export function buildBlockSequenceFromHints(
   // durations, residue is larger and we can use the legacy redistributor
   // which clamps to the footage range [3, 8].
   if (haveRealTimings) {
-    redistributeResidueWithRealTimings(blocks, voiceoverSeconds);
+    redistributeResidueWithRealTimings(blocks, targetSeconds);
   } else {
-    redistributeFootageResidue(blocks, voiceoverSeconds);
+    redistributeFootageResidue(blocks, targetSeconds);
   }
 
   return blocks;
@@ -781,20 +793,47 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
 // block by 10s would be a desync.
 function redistributeResidueWithRealTimings(blocks: PlannedBlockWithHint[], target: number): void {
   const EPSILON = 0.1;
-  const PER_BLOCK_STRETCH_LIMIT = 1.0;
-  const total = sumDurations(blocks);
-  const gap = target - total;
-  // Negative gap (timeline > voiceover) is rare with real timings — the
-  // narration can't be longer than itself. Skip negative-gap handling to
-  // avoid shortening real-timing blocks.
-  if (gap < EPSILON) return;
-
+  // Hard ceiling per footage block. Real spoken durations are the truth,
+  // so a 2-second stretch is the most we should ever add — beyond that the
+  // visual would noticeably linger past the narrated sentence. The loop
+  // below absorbs the gap across many blocks, so each block typically gets
+  // a fraction of a second; this limit only matters when the gap is very
+  // large relative to the footage count.
+  const PER_BLOCK_STRETCH_LIMIT = 2.0;
+  // Loop until the gap is closed or no further progress can be made. Each
+  // pass distributes whatever's left across footage blocks that still have
+  // headroom (haven't hit the per-block stretch limit). Without this loop,
+  // a single-pass with `gap / footage.length` clamped to the limit leaves
+  // a small residue whenever per-block fractional rounding loses pennies.
+  const MAX_PASSES = 8;
   const footage = blocks.filter((b) => b.type === "footage");
   if (footage.length === 0) return;
-
-  const perBlock = Math.min(PER_BLOCK_STRETCH_LIMIT, gap / footage.length);
+  const ceilings = new Map<PlannedBlockWithHint, number>();
   for (const b of footage) {
-    b.duration = Math.round((b.duration + perBlock) * 10) / 10;
+    ceilings.set(b, b.duration + PER_BLOCK_STRETCH_LIMIT);
+  }
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    const total = sumDurations(blocks);
+    const gap = target - total;
+    // Negative gap (timeline > voiceover) is rare with real timings — the
+    // narration can't be longer than itself. Skip negative-gap handling to
+    // avoid shortening real-timing blocks.
+    if (gap < EPSILON) return;
+    const stretchable = footage.filter((b) => b.duration < (ceilings.get(b) ?? b.duration));
+    if (stretchable.length === 0) return;
+    const perBlock = gap / stretchable.length;
+    let absorbed = 0;
+    for (const b of stretchable) {
+      const ceiling = ceilings.get(b) ?? b.duration;
+      const headroom = ceiling - b.duration;
+      const add = Math.min(perBlock, headroom);
+      const next = Math.round((b.duration + add) * 10) / 10;
+      absorbed += next - b.duration;
+      b.duration = next;
+    }
+    // If a pass produces no measurable change (everything rounded to 0),
+    // bail out instead of looping forever.
+    if (absorbed < 0.01) return;
   }
 }
 

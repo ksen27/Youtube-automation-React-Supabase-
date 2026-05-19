@@ -609,7 +609,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // null when the legacy planner is in use.
   let blockVisualPriorities: Array<string | null>;
   if (planSource === "gemini_hints") {
-    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript, transcriptWords);
+    // Pass the intro slot's reserved time so the planner targets
+    // (voiceoverSeconds - introClipDuration) for its block sum. Without
+    // this the prepended intro item pushed items.duration past voiceover,
+    // showing up in the editor header as a "X scenes · 9:47 / 10:00" gap.
+    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript, transcriptWords, introClipDuration);
     blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
     blockHintTexts = planned.map((p) => p.text || null);
     blockSectionTitles = planned.map((p) => p.section_title ?? null);
@@ -669,15 +673,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
   // Floor pass — promote the first eligible image block in any bucket that
-  // landed with 0 split_2. "Eligible" = currently typed as image. Some
-  // buckets may stay below the floor (only footage / title_card scenes in
-  // that minute); we log them but don't force-promote a footage block,
+  // landed with 0 split_2. "Eligible" = image-typed AND has ≥2 mentioned
+  // entities (so the split-screen fill can find topical left/right images
+  // instead of falling through to pool junk).
+  //
+  // Why the 2-entity gate: split halves with no entities pull from the
+  // project image pool, which contains leftover Brave/CSE search noise
+  // (random brand logos, stock product photos). The result is a split
+  // showing two unrelated images over abstract narration — strictly worse
+  // than a plain image block of the celebrity. Per the client's spec
+  // ("never use random unrelated visuals"), we'd rather skip the floor
+  // for this minute than ship a junk split.
+  //
+  // Some buckets may stay below the floor (no image block with 2+ entities
+  // in that minute); we log them but never force-promote a footage block,
   // since that would steal a clip slot.
   let splitPromotedToFloor = 0;
   let bucketsBelowFloor = 0;
   for (let b = 0; b < totalBuckets; b++) {
     if (splitCountPerBucket[b] >= SPLIT_2_PER_MINUTE_FLOOR) continue;
-    const promoteIdx = blocks.findIndex((blk, i) => blockBucket[i] === b && blk.type === "image");
+    const promoteIdx = blocks.findIndex((blk, i) => {
+      if (blockBucket[i] !== b || blk.type !== "image") return false;
+      const ents = hints[i]?.mentioned_entities ?? [];
+      return ents.length >= 2;
+    });
     if (promoteIdx < 0) {
       bucketsBelowFloor++;
       continue;
@@ -760,6 +779,84 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await logJob({ projectId, jobId: mediaJobId }, "match.entity_dedup", {
     shown_entities: Array.from(shownEntityKeys),
     downgraded_blocks: dedupDowngradedCount,
+  });
+
+  // ---- Visual-rhythm pass: break runs of 3+ same-type blocks -----------
+  // Client direction: "footage clip - footage clip - still image - footage -
+  // splitscreen - footage - footage - still image …". Translates to:
+  // no more than 2 consecutive blocks of the same type. Gemini's per-
+  // sentence recommendation is honored by default — we only override when
+  // a run of 3+ would otherwise read as a monotone block of identical
+  // visuals (the all-image run sentences 70–76 in the editor screenshot).
+  //
+  // Swap rules:
+  //   • 3rd consecutive image → footage (if a clip slot is still available
+  //     in the project budget — otherwise we'd create an unfillable footage
+  //     block downstream).
+  //   • 3rd consecutive footage → image (always safe — image blocks have
+  //     no hard supply cap; the matcher's image-search pipeline can fill
+  //     any block via the entity pool / person fallback).
+  //   • split_2 / title_card / intro runs are not rebalanced — those types
+  //     are deliberate beats; consecutive splits / cards are rare anyway
+  //     because the planner caps splits at 2/minute and title cards are
+  //     section-bound.
+  //
+  // We preserve the block's duration on every swap (5s for image, raw for
+  // footage); downstream phases re-derive `image_url` / `clip_id` from the
+  // post-swap type.
+  let rhythmSwappedImageToFootage = 0;
+  let rhythmSwappedFootageToImage = 0;
+  let rhythmRunsLeftUnbroken = 0;
+  {
+    // Available clip slots = total clips minus what's already reserved as
+    // footage. We deduct one for the intro (it consumes its own clip).
+    const currentFootageCount = blocks.filter((b) => b.type === "footage" || b.type === "intro").length;
+    let footageHeadroom = Math.max(0, clips.length - currentFootageCount);
+    let runType: string | null = null;
+    let runLen = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const t = blocks[i].type;
+      if (t === runType) {
+        runLen++;
+      } else {
+        runType = t;
+        runLen = 1;
+      }
+      if (runLen < 3) continue;
+      // 3+ consecutive same-type. Decide whether to swap this block.
+      if (t === "image") {
+        if (footageHeadroom <= 0) {
+          rhythmRunsLeftUnbroken++;
+          continue;
+        }
+        blocks[i] = { type: "footage", duration: blocks[i].duration };
+        blockRecommendedTypes[i] = "footage";
+        // Clear image-only refs so Phase C doesn't try to image-search a
+        // footage block. mentioned_entities stay valid for clip scoring.
+        blockSpecificRefs[i] = [];
+        footageHeadroom--;
+        rhythmSwappedImageToFootage++;
+      } else if (t === "footage") {
+        blocks[i] = { type: "image", duration: blocks[i].duration };
+        blockRecommendedTypes[i] = "image";
+        footageHeadroom++;
+        rhythmSwappedFootageToImage++;
+      } else {
+        // Other types (split_2 / title_card / intro): don't rebalance.
+        rhythmRunsLeftUnbroken++;
+        continue;
+      }
+      // Reset the run tracking — the post-swap block starts a new run of
+      // length 1 in its new type. Subsequent blocks of the original type
+      // are now a fresh run (length restarts at the next block).
+      runType = blocks[i].type;
+      runLen = 1;
+    }
+  }
+  await logJob({ projectId, jobId: mediaJobId }, "match.visual_rhythm", {
+    swappedImageToFootage: rhythmSwappedImageToFootage,
+    swappedFootageToImage: rhythmSwappedFootageToImage,
+    runsLeftUnbroken: rhythmRunsLeftUnbroken,
   });
 
   // For each block, derive the voiceover text spoken during that window.
@@ -1753,30 +1850,57 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const nowSec = blockStartSec[blockIdx];
     try {
       const fetched = await fetchImages(subj, 10, { entityType: "celebrity" });
-      // Prefer (a) URL not yet claimed by reference pass AND (b) outside
-      // the image cooldown. If nothing is outside cooldown, accept the
-      // freshest (longest-since-last-used) image — better than no image.
-      let bestFresh: typeof fetched[number] | null = null;
-      let bestReuse: typeof fetched[number] | null = null;
-      let bestReuseDistance = -Infinity;
+      if (fetched.length === 0) return null;
+      // Three-tier pick. Per client spec: "If an exact image/visual cannot
+      // be found → fallback to the person image. NEVER use random unrelated
+      // visuals." So we MUST return a person image when any exist — even
+      // when they're already used elsewhere in the timeline. Re-showing the
+      // same celebrity photo twice is strictly better than dropping through
+      // to the entity pool and rendering a random brand logo.
+      //
+      //   Tier A — fresh URL outside the reuse cooldown (or never used).
+      //   Tier B — fresh URL ignoring the cooldown but unused by reference
+      //            pass (refUrlSet) — i.e. seen earlier in the timeline as
+      //            another person-fallback, fine to repeat.
+      //   Tier C — any fetched URL, including ones reference-claimed. This
+      //            is the "we'd rather repeat than ship junk" tier.
+      let bestA: typeof fetched[number] | null = null;
+      let bestB: typeof fetched[number] | null = null;
+      let bestBDistance = -Infinity;
       for (const f of fetched) {
         if (refUrlSet.has(f.url)) continue;
         const last = imageUrlLastUsedAt.get(f.url);
         if (last === undefined) {
-          bestFresh = f;
+          bestA = f;
           break;
         }
         const dist = nowSec - last;
         if (dist >= IMAGE_REUSE_COOLDOWN_SEC) {
-          bestFresh = f;
+          bestA = f;
           break;
         }
-        if (dist > bestReuseDistance) {
-          bestReuse = f;
-          bestReuseDistance = dist;
+        if (dist > bestBDistance) {
+          bestB = f;
+          bestBDistance = dist;
         }
       }
-      const pick = bestFresh ?? bestReuse;
+      let pick = bestA ?? bestB;
+      if (!pick) {
+        // Tier C — every fetched image was already in refUrlSet. Pick the
+        // one used longest ago, ignoring refUrlSet. Better to re-show a
+        // person photo than to leave the block for the entity pool.
+        let bestC: typeof fetched[number] | null = null;
+        let bestCDistance = -Infinity;
+        for (const f of fetched) {
+          const last = imageUrlLastUsedAt.get(f.url);
+          const dist = last === undefined ? Infinity : nowSec - last;
+          if (dist > bestCDistance) {
+            bestCDistance = dist;
+            bestC = f;
+          }
+        }
+        pick = bestC;
+      }
       if (!pick) return null;
       return { url: pick.url, source: pick.source, query: subj };
     } catch {
@@ -1811,12 +1935,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     let filled = false;
     for (const q of queries) {
       try {
+        // Build context tokens from the query's proper-noun words. This
+        // gates out CSE substitutions — e.g. searching "Kindigit Design
+        // logo" used to return "Strong Guard" (similar-shape fist logo)
+        // when CSE couldn't find the exact mark. With context-token
+        // gating, only results whose source page mentions "kindigit" or
+        // "design" survive. Generic words ("logo", "poster") are skipped
+        // since every logo result has "logo" in its URL. We keep the
+        // query's MAIN entity words by requiring tokens ≥4 chars and
+        // dropping a small list of search-modifier words.
+        const QUERY_MODIFIERS = new Set(["logo", "poster", "cover", "album", "movie", "show", "tv", "film", "image", "photo", "picture"]);
+        const ctxTokens = q.query
+          .split(/\s+/)
+          .map((w) => w.replace(/[^a-zA-Z0-9]+/g, "").toLowerCase())
+          .filter((w) => w.length >= 4 && !QUERY_MODIFIERS.has(w));
         // Fetch more per query (was 4 → now 8) so long sentences that
         // split into multiple image slots all sharing the same hint can
         // each claim a distinct image. The refUrlSet dedup below picks
         // the first not-yet-used URL, so the bigger pool means cloned
         // blocks don't run out and fall back to the entity pool.
-        const fetched = await fetchImages(q.query, 8, { imgType: q.imgType });
+        const fetched = await fetchImages(q.query, 8, {
+          imgType: q.imgType,
+          requireContextTokens: ctxTokens.length > 0 ? ctxTokens : undefined,
+        });
         // Take the first non-duplicate image. We use a per-pass set to
         // avoid two image blocks landing on the same URL when the script
         // mentions the same reference twice. Also honor the image cooldown
@@ -2265,10 +2406,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (mainCelebrity && ent.type === "celebrity") continue;
     const spec = buildImageQuery(ent);
     poolFetchStats.entitiesQueried++;
+    // For non-person entities (company, place, movie, etc.), require the
+    // entity name's distinctive words to appear in each result's context
+    // URL. Otherwise CSE substitutes a visually-similar but unrelated
+    // logo/poster — the bug behind "Kindigit Design" returning Strong
+    // Guard logos. The check is bypassed for celebrity-typed entities
+    // (already filtered out above) and for person-typed mentions.
+    const QUERY_MODIFIERS_POOL = new Set(["logo", "poster", "cover", "album", "movie", "show", "tv", "film", "image", "photo", "picture", "ceremony"]);
+    const poolCtxTokens = ent.value
+      .split(/\s+/)
+      .map((w) => w.replace(/[^a-zA-Z0-9]+/g, "").toLowerCase())
+      .filter((w) => w.length >= 4 && !QUERY_MODIFIERS_POOL.has(w));
     try {
       const fetched = await fetchImages(spec.query, IMAGES_PER_ENTITY, {
         entityType: ent.type,
         imgType: spec.imgType,
+        requireContextTokens: poolCtxTokens.length > 0 ? poolCtxTokens : undefined,
       });
       if (fetched.length === 0) {
         poolFetchStats.entitiesFailed++;
@@ -2394,43 +2547,53 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // SAME entity back-to-back. The picker tries to satisfy the no-cluster
   // rule; if that's impossible we accept a cluster rather than a gap.
   const consumed = new Set<number>();
-  let lastEntityKey: string | null = null;
-  // Last-used timestamp per pool index. Tier 2 picks the entry whose last
-  // use is OLDEST (and whose entity isn't equal to lastEntityKey when
-  // possible) so reuse is spread evenly across the pool rather than
+  // Last-used timestamp per pool index. Reuse picks the entry whose last
+  // use is OLDEST so reuse is spread evenly across the pool rather than
   // hammering pool[0]. Initialized to -1 (= never used).
   const lastUsedAt: number[] = new Array(pool.length).fill(-1);
   let useCounter = 0;
-  function pickFreshPoolIdx(): number {
-    let fallback = -1;
-    for (let i = 0; i < pool.length; i++) {
-      if (consumed.has(i)) continue;
-      if (fallback < 0) fallback = i;
-      const key = `${pool[i].entityType}:${pool[i].query}`;
-      if (key !== lastEntityKey) return i;
+  let imagesReused = 0;
+  let poolGatedToPerson = 0;
+  // Pre-build per-pool-entry relevance tokens once. Each pool image is
+  // tied to an entity (Gemini-extracted, e.g. "Kindigit Design"). We use
+  // those tokens to verify the block's narration actually references the
+  // entity before we paste its image onto an otherwise-abstract block.
+  // Without this gate, abstract blocks ("Settlements can save time")
+  // picked up random pool entries ("AirTouch") because the pool was just
+  // walked in order.
+  const poolEntityTokens = pool.map((p) => {
+    const out = new Set<string>();
+    for (const tok of p.query.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (tok.length >= 3) out.add(tok);
     }
-    return fallback;
-  }
-  function pickReusePoolIdx(): number {
-    if (pool.length === 0) return -1;
-    // Walk the pool sorted by lastUsedAt ascending; pick the first whose
-    // entity key differs from lastEntityKey. If none differs, return the
-    // oldest one anyway.
-    let bestDiff = -1;
-    let bestDiffAge = Number.POSITIVE_INFINITY;
-    let bestAny = -1;
-    let bestAnyAge = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < pool.length; i++) {
-      const age = lastUsedAt[i];
-      if (age < bestAnyAge) { bestAnyAge = age; bestAny = i; }
-      const key = `${pool[i].entityType}:${pool[i].query}`;
-      if (key !== lastEntityKey && age < bestDiffAge) {
-        bestDiffAge = age; bestDiff = i;
+    return out;
+  });
+  function blockRelevantToPoolEntry(blockIdx: number, poolIdx: number): boolean {
+    const entry = pool[poolIdx];
+    // Person-typed pool entries (celebrity / related_person) are always
+    // relevant — they're the canonical "show the person" fallback.
+    if (entry.entityType === "celebrity" || entry.entityType === "related_person") {
+      return true;
+    }
+    // Non-person pool entries (company, place, movie, show, song, event,
+    // life_event) must have their entity name appear in the block's text
+    // OR Gemini's hint-extracted entities for this block. Otherwise the
+    // image will be visually orthogonal to the narration.
+    const tokens = poolEntityTokens[poolIdx];
+    if (tokens.size === 0) return true;        // entry had no usable tokens — let it through
+    const scriptText = (blockTexts[blockIdx] ?? "").toLowerCase();
+    for (const tok of tokens) {
+      if (scriptText.includes(tok)) return true;
+    }
+    const ents = hints[blockIdx]?.mentioned_entities ?? [];
+    for (const e of ents) {
+      const el = e.toLowerCase();
+      for (const tok of tokens) {
+        if (el.includes(tok)) return true;
       }
     }
-    return bestDiff >= 0 ? bestDiff : bestAny;
+    return false;
   }
-  let imagesReused = 0;
   for (const item of items) {
     if (item.type !== "image") continue;
     // Phase C: skip blocks the reference-driven pass already filled —
@@ -2438,43 +2601,81 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // for, and we don't want to overwrite it with a generic pool entry.
     if (item.image_url) continue;
     const nowSec = blockSecForItem(item);
-    let idx = pickFreshPoolIdx();
-    // Pre-check: if the freshly-picked candidate violates the image
-    // cooldown (e.g. it was a reused image earlier and is still cooling
-    // down), prefer ANY other fresh entry that doesn't. Cooldown is a
-    // soft constraint — if every fresh entry is within cooldown, we
-    // accept the original pick rather than skipping the block.
-    if (idx >= 0) {
-      const cand = pool[idx];
-      const last = imageUrlLastUsedAt.get(cand.url);
-      if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) {
-        for (let j = 0; j < pool.length; j++) {
-          if (consumed.has(j) || j === idx) continue;
-          const lj = imageUrlLastUsedAt.get(pool[j].url);
-          if (lj === undefined || nowSec - lj >= IMAGE_REUSE_COOLDOWN_SEC) {
-            idx = j;
-            break;
-          }
+    const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+    // Try to find a pool entry whose entity name actually appears in the
+    // block's narration. We scan the pool in priority order (sorted by
+    // entity type + confidence at pool-build time) and prefer:
+    //   1) A fresh entry (not consumed) that's relevant + outside cooldown.
+    //   2) A fresh entry that's relevant but inside cooldown (soft).
+    //   3) Any consumed entry that's relevant (reuse).
+    // If no relevant entry exists at all, fall through to the person
+    // fallback — never paste a brand logo over abstract narration.
+    let idx = -1;
+    if (blockIdx != null) {
+      // Tier 1 — relevant + fresh + outside cooldown.
+      for (let j = 0; j < pool.length; j++) {
+        if (consumed.has(j)) continue;
+        if (!blockRelevantToPoolEntry(blockIdx, j)) continue;
+        const last = imageUrlLastUsedAt.get(pool[j].url);
+        if (last === undefined || nowSec - last >= IMAGE_REUSE_COOLDOWN_SEC) {
+          idx = j;
+          break;
         }
+      }
+      // Tier 2 — relevant + fresh, ignoring cooldown.
+      if (idx < 0) {
+        for (let j = 0; j < pool.length; j++) {
+          if (consumed.has(j)) continue;
+          if (!blockRelevantToPoolEntry(blockIdx, j)) continue;
+          idx = j;
+          break;
+        }
+      }
+      // Tier 3 — relevant + reused. Pick the longest-since-last-used.
+      if (idx < 0) {
+        let bestAge = Number.POSITIVE_INFINITY;
+        for (let j = 0; j < pool.length; j++) {
+          if (!blockRelevantToPoolEntry(blockIdx, j)) continue;
+          const age = lastUsedAt[j];
+          if (age < bestAge) { bestAge = age; idx = j; }
+        }
+        if (idx >= 0) imagesReused++;
       }
     }
     if (idx < 0) {
-      // Fresh pool exhausted — fall back to reuse. pickFreshPoolIdx returns
-      // -1 only when every entry is in `consumed`; that's the trigger for
-      // Tier 2.
-      idx = pickReusePoolIdx();
-      if (idx < 0) break;                 // pool itself is empty — truly nothing to do
-      imagesReused++;
-    } else {
-      consumed.add(idx);
+      // No relevant pool entry — try person fallback (with reuse OK so a
+      // repeated celebrity photo is acceptable). This is the path that
+      // catches abstract narration like "settlements can save time" — the
+      // old behavior here was to paste a random pool image (AirTouch); new
+      // behavior is to show the celebrity instead.
+      poolGatedToPerson++;
+      if (blockIdx != null) {
+        const personPick = await tryPersonImageFallback(blockIdx);
+        if (personPick) {
+          refUrlSet.add(personPick.url);
+          imageUrlLastUsedAt.set(personPick.url, nowSec);
+          item.image_url = personPick.url;
+          item.image_query = personPick.query;
+          item.image_source = personPick.source;
+          const meta = (item.metadata ?? {}) as Record<string, unknown>;
+          meta.image_query_used = personPick.query;
+          meta.image_source_url = personPick.url;
+          meta.image_source_provider = personPick.source;
+          meta.image_entity = personPick.query;
+          meta.image_reason = "person_image_fallback_after_pool_gate";
+          meta.image_pick_source = "person_fallback";
+          item.metadata = meta;
+        }
+      }
+      continue;
     }
+    // We found a relevant pool entry — mark consumed (if fresh) and stamp
+    // metadata. Fresh = not yet picked AND not yet imagesReused-flagged.
+    if (!consumed.has(idx)) consumed.add(idx);
     const next = pool[idx];
     item.image_query = next.query;
     item.image_url = next.url;
     item.image_source = next.source;
-    // Phase C: stamp pool-assigned provenance too so every image_url has
-    // matching metadata. Reference picks use "reference_driven"; pool
-    // picks use "entity_pool".
     const meta = (item.metadata ?? {}) as Record<string, unknown>;
     meta.image_query_used = next.query;
     meta.image_source_url = next.url;
@@ -2483,7 +2684,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     meta.image_reason = `entity_pool:${next.entityType}`;
     meta.image_pick_source = "entity_pool";
     item.metadata = meta;
-    lastEntityKey = `${next.entityType}:${next.query}`;
     lastUsedAt[idx] = useCounter++;
     imageUrlLastUsedAt.set(next.url, nowSec);
   }
@@ -2491,11 +2691,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await logJob({ projectId, jobId: mediaJobId }, "match.image_fetch", {
     totalImageBlocks: imageBlockCount,
     poolSize: pool.length,
-    // Every image block now gets an image_url whenever pool.length > 0
-    // (reuse covers the shortfall). leftBlank is non-zero only in the
-    // truly-degenerate case where no entity produced any image at all.
+    // Some image blocks now route through the person fallback when the
+    // pool has no entity relevant to the block's narration (per spec —
+    // we no longer paste random brand logos onto abstract narration).
+    // The diff (totalImageBlocks - poolGatedToPerson) is what actually
+    // landed on a pool entry; assigned is now imprecise for legacy logs.
     assigned: pool.length > 0 ? imageBlockCount : 0,
     imagesReused,
+    poolGatedToPerson,
     leftBlank: pool.length === 0 ? imageBlockCount : 0,
     entitiesAvailable: poolEntities.length,
     entitiesQueried: poolFetchStats.entitiesQueried,

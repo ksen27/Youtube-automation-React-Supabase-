@@ -110,6 +110,14 @@ export interface FetchOptions {
   // tightens Google CSE results to company logos / marks. Default behavior
   // (imgType=photo) excludes clipart and illustrations.
   imgType?: "photo" | "logo";
+  // Optional tokens that MUST appear in a candidate's context URL (the
+  // source page hosting the image). Used to reject logo-search results
+  // for "Kindigit Design" that come back as random brand logos
+  // ("Strong Guard", "20 Years") — the CSE quietly substitutes a similar-
+  // looking logo when it can't find the exact one. Wikipedia results
+  // bypass this check (they're already entity-canonical). Empty array
+  // disables the check.
+  requireContextTokens?: string[];
 }
 
 export async function fetchImage(query: string, opts: FetchOptions = {}): Promise<FetchedImage | null> {
@@ -249,7 +257,24 @@ export async function fetchImages(
   // editor (404/403 hotlink-blocked) without gutting the pool when a CDN
   // is just being slow.
   const validity = await Promise.all(out.map((img) => validateImageUrl(img.url)));
-  const validated = out.filter((_, i) => validity[i]);
+  let validated = out.filter((_, i) => validity[i]);
+
+  // Optional context-token filter. Drop candidates whose contextUrl
+  // doesn't mention at least one of the required tokens (case-insensitive
+  // substring match against the full URL). Wikipedia results pass
+  // unconditionally — those are already entity-canonical. Empty token
+  // array (or no opts) disables the filter.
+  const tokens = (opts.requireContextTokens ?? [])
+    .map((t) => t.toLowerCase())
+    .filter((t) => t.length >= 3);
+  if (tokens.length > 0) {
+    validated = validated.filter((img) => {
+      if (img.source === "wikipedia") return true;
+      const ctx = (img.contextUrl ?? "").toLowerCase();
+      if (!ctx) return false;
+      return tokens.some((t) => ctx.includes(t));
+    });
+  }
 
   return validated.slice(0, max);
 }
