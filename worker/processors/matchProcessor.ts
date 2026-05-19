@@ -3040,10 +3040,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
     let remaining = durationReclaimSeconds;
     let safety = 0;
-    while (remaining > 0.1 && stretchable.length > 0 && safety++ < 8) {
-      const perRow = remaining / stretchable.length;
+    // 0.1s is the timeline's storage precision. Spreading a small reclaim
+    // across many rows can produce per-row steps below 0.05s that round to
+    // zero — the loop then thinks it absorbed time it never actually wrote.
+    // Force each pass to bump the front rows by at least 0.1s so progress
+    // is real, and bail only when no row has headroom left.
+    const MIN_STEP = 0.1;
+    while (remaining > 0.05 && stretchable.length > 0 && safety++ < 16) {
+      const perRow = Math.max(MIN_STEP, remaining / stretchable.length);
       let absorbed = 0;
       for (let k = stretchable.length - 1; k >= 0; k--) {
+        if (remaining - absorbed <= 0.05) break;
         const it = stretchable[k];
         const ceiling = rowCeilings.get(Number(it.position)) ?? Number(it.duration ?? 0);
         const current = Number(it.duration ?? 0);
@@ -3052,11 +3059,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           stretchable.splice(k, 1);
           continue;
         }
-        const add = Math.min(perRow, headroom);
-        it.duration = Math.round((current + add) * 10) / 10;
-        absorbed += add;
+        const add = Math.min(perRow, headroom, remaining - absorbed);
+        const next = Math.round((current + add) * 10) / 10;
+        const delta = next - current;
+        if (delta <= 0) continue;
+        absorbed += delta;
+        it.duration = next;
       }
-      if (absorbed < 0.01) break;
+      if (absorbed < 0.05) break;
       remaining -= absorbed;
     }
     await logJob({ projectId, jobId: mediaJobId }, "match.duration_reclaim", {

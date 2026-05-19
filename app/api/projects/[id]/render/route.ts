@@ -58,18 +58,24 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const sb = getServerSupabase();
 
   // Pull project for voiceover duration (drives the validation tolerance).
+  // intro_duration_seconds is the prefix segment the renderer plays with the
+  // celebrity's source audio before the voiceover starts; the duration-bearing
+  // timeline rows are planned to cover (voiceover − intro), so we subtract
+  // the intro here for the same reason DURATION_BEARING_TYPES excludes it.
   const { data: project, error: projErr } = await sb
     .from("projects")
-    .select("transcript, voiceover_duration_seconds")
+    .select("transcript, voiceover_duration_seconds, intro_duration_seconds")
     .eq("id", id)
     .single();
   if (projErr || !project) {
     return NextResponse.json({ error: "project not found" }, { status: 404 });
   }
-  const voiceoverSeconds =
+  const rawVoiceoverSeconds =
     Number(project.voiceover_duration_seconds) ||
     estimateDurationSeconds(project.transcript ?? "") ||
     0;
+  const introSeconds = Math.max(0, Number(project.intro_duration_seconds) || 0);
+  const voiceoverSeconds = Math.max(0, rawVoiceoverSeconds - introSeconds);
 
   // Require approved timeline with at least some clips
   const { data: items, error: itemsErr } = await sb
