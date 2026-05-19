@@ -87,6 +87,80 @@ function isDateOnly(s: string): boolean {
   return false;
 }
 
+// Words that look proper-noun-ish at sentence start but are common nouns.
+// Used to drop false-positive capitalized phrases lifted from script text
+// (the matcher considers "Behind The Grand Gates" a phrase otherwise).
+const SCRIPT_PHRASE_STOPWORDS = new Set<string>([
+  "the", "a", "an", "this", "that", "these", "those",
+  "he", "she", "they", "we", "you", "i", "it",
+  "his", "her", "their", "our", "your", "my",
+  "behind", "before", "after", "during", "while", "when", "where", "why", "how",
+  "but", "and", "or", "so", "yet", "still", "even", "just", "only",
+  "then", "now", "today", "yesterday", "tomorrow", "later", "soon",
+]);
+// Connector words allowed INSIDE a capitalized phrase ("District Court of
+// Utah", "Bank of America"). They don't have to be capitalized themselves.
+const SCRIPT_PHRASE_CONNECTORS = new Set<string>([
+  "of", "the", "and", "for", "in", "on", "at", "de", "la", "le", "van", "von",
+]);
+
+// Extract proper-noun-like phrases from narration text. Returns search-ready
+// strings, longest first (so multi-word references like "District Court of
+// Utah" outrank single-word "Utah"). Used as a last-resort visual search
+// when Gemini's reference/entity hints produced nothing for an image block —
+// per spec, we'd rather try a script-derived search than fall through to
+// the entity pool of generic celebrity photos.
+export function extractScriptPhrases(text: string): string[] {
+  if (!text) return [];
+  // Strip punctuation that splits otherwise-valid phrases (commas, periods,
+  // dashes inside phrases). Keep apostrophes for names like "Drew's Garage".
+  const tokens = text.split(/\s+/).map((w) => w.replace(/[.,!?;:"()]+$/g, "")).filter(Boolean);
+  const phrases: string[] = [];
+  let cur: string[] = [];
+  function flush() {
+    if (cur.length === 0) return;
+    // Trim trailing connectors ("District Court of" → "District Court").
+    while (cur.length > 0 && SCRIPT_PHRASE_CONNECTORS.has(cur[cur.length - 1].toLowerCase())) {
+      cur.pop();
+    }
+    if (cur.length > 0) phrases.push(cur.join(" "));
+    cur = [];
+  }
+  for (const tok of tokens) {
+    const stripped = tok.replace(/[.,!?;:"()]+/g, "");
+    if (!stripped) { flush(); continue; }
+    const isCap = /^[A-Z][a-zA-Z'’-]*$/.test(stripped);
+    const isConnector = SCRIPT_PHRASE_CONNECTORS.has(stripped.toLowerCase());
+    if (isCap) {
+      // Reject sentence-start common-noun false positives ("Behind", "The").
+      // We still allow them mid-phrase if they came after another capital.
+      if (cur.length === 0 && SCRIPT_PHRASE_STOPWORDS.has(stripped.toLowerCase())) {
+        continue;
+      }
+      cur.push(stripped);
+    } else if (isConnector && cur.length > 0) {
+      cur.push(stripped.toLowerCase());
+    } else {
+      flush();
+    }
+  }
+  flush();
+  // Dedupe (case-insensitive) and require at least one multi-character word
+  // so we don't search for single initials ("J.").
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of phrases) {
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (p.replace(/\s+/g, "").length < 3) continue;
+    out.push(p);
+  }
+  // Longest first — "District Court of Utah" before "Utah".
+  out.sort((a, b) => b.split(/\s+/).length - a.split(/\s+/).length);
+  return out;
+}
+
 // Splits a transcript into ~sentence/paragraph sections. Retained for
 // backward-compatibility / test imports; the matcher itself no longer uses
 // section-cursor logic. See buildBlockTexts() below for the time-aligned
@@ -556,29 +630,68 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   }
 
   // Title cards and split-screens now have real renderers — let them pass
-  // through. Hard cap split_2 to at most 2 per 60s of timeline per client
-  // direction ("1-2 per minute, max"); any split_2 blocks beyond that cap
-  // are downgraded to plain image so the rest of the matcher treats them
-  // as ordinary image blocks. Walk in narration order so the EARLIER
-  // split_2 in any over-budget minute keeps its split status.
+  // through. Enforce client direction "1-2 split_2 per minute" using FIXED
+  // minute buckets [0,60s), [60,120s), … :
+  //   • Cap = 2  → drop split_2 #3+ inside a bucket to plain image (earlier
+  //                ones win so the first half-minute keeps its split).
+  //   • Floor = 1 → if a bucket has 0 split_2 after the cap pass, promote
+  //                 the first image block in that bucket to split_2.
+  // We use the block's START time to assign a bucket (a block straddling a
+  // boundary belongs to the minute it began in). Footage/title_card blocks
+  // are never promoted — only image blocks — so promotion doesn't disturb
+  // clip/title alignment.
   const SPLIT_2_PER_MINUTE_CAP = 2;
-  const SPLIT_2_WINDOW_SEC = 60;
-  let splitCapAcc = 0;
-  const splitTimes: number[] = [];
-  let splitDowngradedByCap = 0;
-  for (let i = 0; i < blocks.length; i++) {
-    const dur = blocks[i].duration;
-    if (blocks[i].type === "split_2") {
-      const windowStart = splitCapAcc - SPLIT_2_WINDOW_SEC;
-      const inWindow = splitTimes.filter((t) => t > windowStart).length;
-      if (inWindow >= SPLIT_2_PER_MINUTE_CAP) {
-        blocks[i] = { type: "image", duration: dur };
-        splitDowngradedByCap++;
-      } else {
-        splitTimes.push(splitCapAcc);
-      }
+  const SPLIT_2_PER_MINUTE_FLOOR = 1;
+  const SPLIT_2_BUCKET_SEC = 60;
+  const blockStartTimes: number[] = [];
+  {
+    let acc = 0;
+    for (const b of blocks) {
+      blockStartTimes.push(acc);
+      acc += b.duration;
     }
-    splitCapAcc += dur;
+  }
+  const blockBucket = blockStartTimes.map((t) => Math.floor(t / SPLIT_2_BUCKET_SEC));
+  const totalBuckets = blocks.length === 0
+    ? 0
+    : Math.floor(blockStartTimes[blockStartTimes.length - 1] / SPLIT_2_BUCKET_SEC) + 1;
+  // Cap pass — keep at most 2 split_2 per bucket, in narration order.
+  let splitDowngradedByCap = 0;
+  const splitCountPerBucket = new Array<number>(totalBuckets).fill(0);
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].type !== "split_2") continue;
+    const bucket = blockBucket[i];
+    if (splitCountPerBucket[bucket] >= SPLIT_2_PER_MINUTE_CAP) {
+      blocks[i] = { type: "image", duration: blocks[i].duration };
+      splitDowngradedByCap++;
+    } else {
+      splitCountPerBucket[bucket]++;
+    }
+  }
+  // Floor pass — promote the first eligible image block in any bucket that
+  // landed with 0 split_2. "Eligible" = currently typed as image. Some
+  // buckets may stay below the floor (only footage / title_card scenes in
+  // that minute); we log them but don't force-promote a footage block,
+  // since that would steal a clip slot.
+  let splitPromotedToFloor = 0;
+  let bucketsBelowFloor = 0;
+  for (let b = 0; b < totalBuckets; b++) {
+    if (splitCountPerBucket[b] >= SPLIT_2_PER_MINUTE_FLOOR) continue;
+    const promoteIdx = blocks.findIndex((blk, i) => blockBucket[i] === b && blk.type === "image");
+    if (promoteIdx < 0) {
+      bucketsBelowFloor++;
+      continue;
+    }
+    blocks[promoteIdx] = { type: "split_2", duration: blocks[promoteIdx].duration };
+    splitCountPerBucket[b]++;
+    splitPromotedToFloor++;
+    // Reflect the type change on the parallel recommended-type array so
+    // downstream diagnostics tally accurately. The hint payload's other
+    // fields (mentioned_entities, references, subject_type) stay valid —
+    // the split-screen fill step reads them straight from `hints[idx]`.
+    if (promoteIdx < blockRecommendedTypes.length) {
+      blockRecommendedTypes[promoteIdx] = "split_2";
+    }
   }
   // split_4 has no renderer yet; downgrade it to image as before.
   for (let i = 0; i < blocks.length; i++) {
@@ -1573,6 +1686,37 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return out;
   }
 
+  // Build queries from proper-noun phrases lifted from a block's script.
+  // Skips phrases that are just the subject's name (those go through the
+  // person fallback) and phrases that are pure country/state/continent
+  // names (those still produce flags/maps). When a phrase contains the
+  // subject, we keep it — "Salvage Hunters" needs the title alone, but
+  // "Drew Pritchard Salvage Hunters" coming straight from the script is
+  // still a high-precision query for image search.
+  function buildScriptPhraseQueries(
+    scriptText: string,
+    subject: string | null,
+  ): Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> {
+    const phrases = extractScriptPhrases(scriptText);
+    if (phrases.length === 0) return [];
+    const subjLower = (subject ?? "").trim().toLowerCase();
+    const out: Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> = [];
+    for (const p of phrases) {
+      const pl = p.toLowerCase();
+      // Skip subject-name phrases — person fallback handles those, and
+      // they shouldn't consume a "reference" search slot.
+      if (subjLower && (pl === subjLower || pl === subjLower.split(/\s+/).slice(-1)[0])) continue;
+      // Skip pure country/state/region phrases (flag/map noise).
+      if (isCountryOrRegion(p)) continue;
+      // Skip bare dates.
+      if (isDateOnly(p)) continue;
+      out.push({ query: p, reason: `script_phrase:${p}` });
+    }
+    // Cap to 3 queries per block — image fetches cost money and time, and
+    // beyond the top phrases we're typically scraping the barrel.
+    return out.slice(0, 3);
+  }
+
   // Image reuse cooldown (per client spec: 2-4 minutes for same image).
   // Pick 2 minutes (120s) since image holds are short and shorter videos
   // would otherwise have too few eligible blocks. The reference pass and
@@ -1649,22 +1793,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const refs = blockSpecificRefs[blockIdx] ?? [];
     const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
     const subjectType = blockSubjectTypes[blockIdx] ?? null;
-    const visualPriority = blockVisualPriorities[blockIdx] ?? null;
-    // Phase D: subject_type alone is enough to generate a logo/poster/place
-    // search even when refs and ents are empty — Gemini's per-block
-    // subject_type tells us this is a company/place/movie block. Without
-    // this, image blocks with no Gemini-emitted references would silently
-    // fall through to the entity-pool flow that runs after Phase C.
-    const hasTypeRoute = !!subjectType && ["company", "movie", "show", "place", "event", "object"].includes(subjectType);
-    // Person-first axis: if Gemini marked the block as a specific reference
-    // ("specific_event"/"specific_object"), we MUST try a reference search
-    // even when refs/ents are empty (the priority signal is enough). And
-    // when all reference searches fail, we fall back to the PERSON image
-    // (not to the entity pool, per spec).
-    const isSpecificReference = visualPriority === "specific_event" || visualPriority === "specific_object";
-    if (refs.length === 0 && ents.length === 0 && !hasTypeRoute && !isSpecificReference) continue;
     const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
-    const queries = buildReferenceQueries(refs, resolvedSubject, ents, subjectType);
+    const refQueries = buildReferenceQueries(refs, resolvedSubject, ents, subjectType);
+    // Tier 4 (script-derived): proper-noun phrases lifted straight from the
+    // block's narration. This catches references Gemini's hint pipeline
+    // dropped — e.g. "District Court of Utah" gets blocked from the entity
+    // pool because "Utah" is a generic-place stop, but the narrator is
+    // clearly asking for a courthouse image. We extract capitalized phrases
+    // (allowing connector words like "of"/"the") and use them as queries.
+    // Run AFTER the reference-driven queries so Gemini's curated picks win
+    // when they exist, but BEFORE the person fallback so we still try for
+    // a topical image before defaulting to the celebrity.
+    const scriptText = blockTexts[blockIdx] ?? "";
+    const scriptQueries = buildScriptPhraseQueries(scriptText, resolvedSubject ?? mainCelebrity ?? null);
+    const queries = [...refQueries, ...scriptQueries];
     const nowSec = blockStartSec[blockIdx];
     let filled = false;
     for (const q of queries) {
@@ -1697,7 +1839,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         meta.image_source_provider = pick.source;
         meta.image_entity = refs[0] ?? ents[0] ?? null;
         meta.image_reason = q.reason;
-        meta.image_pick_source = "reference_driven";
+        meta.image_pick_source = q.reason.startsWith("script_phrase:") ? "script_phrase" : "reference_driven";
         item.metadata = meta;
         refImagesAssigned++;
         filled = true;
@@ -1903,7 +2045,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   type PoolImage = { url: string; source: string; query: string; entityType: string };
   const pool: PoolImage[] = [];
   const poolUrlSet = new Set<string>();
-  const poolFetchStats = { entitiesQueried: 0, entitiesFailed: 0 };
+  const poolFetchStats = {
+    entitiesQueried: 0,
+    entitiesFailed: 0,
+    // Person-image floor diagnostics. The pool is supposed to feel
+    // person-first (Dave Kindig himself), not logo-heavy — so we track how
+    // many celebrity photos we managed to fetch vs the 50% target. A run
+    // that lands far below the target means Wikipedia/Brave/CSE collapsed
+    // to a handful of unique URLs for this celebrity and the diversified
+    // queries below couldn't backfill — useful signal when the client says
+    // "I see logos more than the person."
+    personImagesPrefetched: 0,
+    personFloorTarget: 0,
+  };
 
   // Per-type query strategy. Different entity types want different framing
   // because the celebrity-name anchor that helps with people/companies HURTS
@@ -2040,8 +2194,75 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
 
+  // Person-image floor: before any other entity is queried, fetch enough
+  // images of the project's main celebrity to cover at least 50% of the
+  // image block count. Without this, the entity loop below stops as soon
+  // as pool.length >= imageBlockCount, which means a celebrity with sparse
+  // search results (2-3 unique URLs after dedup) gets crowded out by
+  // company logos that happen to return cleanly — the pool ends up logo-
+  // dominant and the viewer sees the person rarely on screen.
+  //
+  // We diversify the celebrity query when the strict quoted name returns
+  // less than the floor. Each follow-up query targets a different visual
+  // facet (interview, portrait, shop / set context) so search engines
+  // surface different press shots instead of the same handful of canonical
+  // images at multiple thumbnail sizes (which all collapse to one URL via
+  // normalizeImageUrl). When the celebrity is unknown (rare — non-person-
+  // centric video), the floor is skipped and the legacy entity loop runs
+  // unchanged.
+  const personFloor = mainCelebrity
+    ? Math.min(imageBlockCount, Math.ceil(imageBlockCount * 0.5))
+    : 0;
+  poolFetchStats.personFloorTarget = personFloor;
+  if (mainCelebrity && personFloor > 0) {
+    // Query variants in priority order. The bare quoted name runs first
+    // because it returns the highest-precision results; diversified queries
+    // only run if dedup collapsed the bare query down to too few unique
+    // URLs. We keep the variant set small — three extras — because each
+    // call is an HTTP round-trip and the pool's downstream relaxed pass
+    // already provides a safety net.
+    const celebrityQueries: string[] = [
+      `"${mainCelebrity}"`,
+      `${mainCelebrity} interview`,
+      `${mainCelebrity} portrait`,
+      `${mainCelebrity} shop`,
+    ];
+    for (const cq of celebrityQueries) {
+      if (pool.length >= personFloor) break;
+      poolFetchStats.entitiesQueried++;
+      try {
+        const fetched = await fetchImages(cq, IMAGES_PER_ENTITY, {
+          entityType: "celebrity",
+        });
+        if (fetched.length === 0) {
+          poolFetchStats.entitiesFailed++;
+          continue;
+        }
+        for (const f of fetched) {
+          if (poolUrlSet.has(f.url)) continue;
+          pool.push({ url: f.url, source: f.source, query: cq, entityType: "celebrity" });
+          poolUrlSet.add(f.url);
+          poolFetchStats.personImagesPrefetched++;
+          if (pool.length >= personFloor) break;
+        }
+      } catch (e) {
+        poolFetchStats.entitiesFailed++;
+        void logJob({ projectId, jobId: mediaJobId },
+          "match.image_fetch.failed", { query: cq, personFloor: true, err: (e as Error).message });
+      }
+    }
+  }
+
   for (const ent of poolEntities) {
     if (pool.length >= imageBlockCount) break;       // already have enough
+    // Skip celebrity entities here — they were handled by the person-floor
+    // prefetch above. Running them again would burn a query for the same
+    // URLs the prefetch already dedup-rejected and bias the pool back
+    // toward "celebrity has 2 unique results" → bumping into the rest of
+    // the loop too quickly. The celebrity slot is fully owned by the
+    // prefetch so the main loop's job is filling the remaining ~50% with
+    // related people, companies, places, events, etc.
+    if (mainCelebrity && ent.type === "celebrity") continue;
     const spec = buildImageQuery(ent);
     poolFetchStats.entitiesQueried++;
     try {
@@ -2279,6 +2500,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     entitiesAvailable: poolEntities.length,
     entitiesQueried: poolFetchStats.entitiesQueried,
     entitiesFailed: poolFetchStats.entitiesFailed,
+    personFloorTarget: poolFetchStats.personFloorTarget,
+    personImagesPrefetched: poolFetchStats.personImagesPrefetched,
   });
 
   // ---- Split-screen image fill -----------------------------------------
@@ -2421,6 +2644,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     splitsLeftFailed,
     splitsRightFailed,
     splitDowngradedByCap,
+    splitPromotedToFloor,
+    bucketsBelowFloor,
   });
 
   // Diagnostic summary: tells us at a glance whether the matcher is using
