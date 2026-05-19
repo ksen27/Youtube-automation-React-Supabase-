@@ -2468,12 +2468,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // narrator says their name. We key the dedup set on lowercased text so
   // "Salma Hayek" and "salma hayek" collapse to one entry.
   const LOWER_THIRD_INTERVAL_SEC = 60;
-  const lowerThirdCounts = { name: 0, year: 0, place: 0 };
+  // Cooldown for re-showing the same overlay text. Set to 5 minutes so a
+  // long stretch about one subject still gets minute-cadence overlays
+  // (the same name can repeat after the cooldown elapses) instead of
+  // going dark for the rest of the video on first show.
+  const LOWER_THIRD_REPEAT_COOLDOWN_SEC = 300;
+  const lowerThirdCounts = { name: 0, year: 0, place: 0, phrase: 0 };
   let skippedForCadence = 0;
   let skippedForDuplicate = 0;
   let cumulativeSec = 0;
   let lastLowerThirdAtSec = Number.NEGATIVE_INFINITY;
-  const usedTexts = new Set<string>();
+  // text -> last-shown second. Replaces the previous show-once set so the
+  // same name can return after LOWER_THIRD_REPEAT_COOLDOWN_SEC.
+  const lastShownAt = new Map<string, number>();
   const orderedItems = [...items].sort(
     (a, b) => (a.position as number) - (b.position as number),
   );
@@ -2487,27 +2494,34 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!meta || meta.pick_source !== "scored_top") continue;
     const blockIdx = Number(meta.block_index ?? -1);
     if (blockIdx < 0) continue;
-    const ents = blockEntities[blockIdx] ?? [];
-    if (ents.length === 0) continue;
 
     if (clipStartSec - lastLowerThirdAtSec < LOWER_THIRD_INTERVAL_SEC) {
       skippedForCadence++;
       continue;
     }
 
-    type Candidate = { text: string; type: "name" | "year" | "place" };
+    const ents = blockEntities[blockIdx] ?? [];
+    const blockText = blockTexts[blockIdx] ?? "";
+
+    type Candidate = { text: string; type: "name" | "year" | "place" | "phrase" };
+    const isFresh = (text: string): boolean => {
+      const prev = lastShownAt.get(text.toLowerCase());
+      if (prev === undefined) return true;
+      return clipStartSec - prev >= LOWER_THIRD_REPEAT_COOLDOWN_SEC;
+    };
     let pick: Candidate | null = null;
 
+    // Tier 1 — named entity from project_entities, matched against block text.
     for (const ent of ents) {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
-      if (usedTexts.has(ent.value.toLowerCase())) continue;
+      if (!isFresh(ent.value)) continue;
       pick = { text: ent.value, type: "name" };
       break;
     }
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "year") continue;
-        if (usedTexts.has(ent.value.toLowerCase())) continue;
+        if (!isFresh(ent.value)) continue;
         pick = { text: ent.value, type: "year" };
         break;
       }
@@ -2515,22 +2529,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
-        if (usedTexts.has(ent.value.toLowerCase())) continue;
+        if (!isFresh(ent.value)) continue;
         pick = { text: ent.value, type: "place" };
         break;
       }
     }
 
-    // No fresh entity in this block — every name/year/place here was
-    // already shown. Don't advance the cadence timer; let the next eligible
-    // footage clip claim this minute's slot.
+    // Tier 2 — fall back to a key phrase pulled from the block's narration.
+    // The client wants the lower-third to fire roughly every minute even
+    // when extractEntities didn't catch the moment's subject (long-tail
+    // names, companies it skipped, generic narration). We pick the most
+    // prominent capitalized phrase from the spoken text; if there isn't
+    // one, we use the longest meaningful word.
+    if (!pick && blockText) {
+      const phrase = pickPhraseFromBlock(blockText, isFresh);
+      if (phrase) pick = { text: phrase, type: "phrase" };
+    }
+
     if (!pick) {
       skippedForDuplicate++;
       continue;
     }
     lowerThirdCounts[pick.type]++;
     lastLowerThirdAtSec = clipStartSec;
-    usedTexts.add(pick.text.toLowerCase());
+    lastShownAt.set(pick.text.toLowerCase(), clipStartSec);
     (it.metadata as Record<string, unknown>) = {
       ...meta,
       lower_third: { text: pick.text, type: pick.type },
@@ -2541,9 +2563,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     name: lowerThirdCounts.name,
     year: lowerThirdCounts.year,
     place: lowerThirdCounts.place,
+    phrase: lowerThirdCounts.phrase,
     skippedForCadence,
     skippedForDuplicate,
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
+    repeatCooldownSec: LOWER_THIRD_REPEAT_COOLDOWN_SEC,
   });
 
   // Reclaim time lost to clip-shorter-than-planned clamping by stretching
@@ -2639,6 +2663,81 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     },
   });
   await setProjectStatus(projectId, "ready_for_review");
+}
+
+// Pick a lower-third overlay text from a block's spoken narration when no
+// project_entities hit is available. Order of preference:
+//   1. Longest consecutive run of capitalized words (e.g. "Buckingham Palace",
+//      "Margot Robbie") — most likely a name / place / organization.
+//   2. A standalone 4-digit year — strong visual anchor on its own.
+//   3. The longest non-stopword word in the block — last-resort signal so the
+//      minute mark still fires.
+// Returns null if nothing in the block is usable or every candidate is on
+// cooldown.
+function pickPhraseFromBlock(
+  text: string,
+  isFresh: (s: string) => boolean,
+): string | null {
+  const stopwords = new Set([
+    "the","a","an","and","or","but","of","in","on","at","to","for","with",
+    "by","from","as","is","was","are","were","be","been","being","has","have",
+    "had","do","does","did","this","that","these","those","it","its","they",
+    "them","their","there","here","what","which","who","whom","how","when",
+    "where","why","while","so","because","then","than","just","also","not",
+    "no","yes","one","two","three","very","much","more","most","some","any",
+    "all","every","each","other","another","such","into","over","under","out",
+    "up","down","off","again","still","ever","never","always","you","your",
+    "yours","we","our","ours","i","me","my","mine","he","him","his","she",
+    "her","hers",
+  ]);
+
+  // 1) Capitalized-phrase scan. Sentence-start words are excluded so we
+  //    don't pick "The" / "When" from "The court ruled...". We do that by
+  //    splitting on sentence terminators first.
+  const sentences = text.split(/[.!?]+/);
+  let bestCapPhrase = "";
+  for (const sentence of sentences) {
+    const tokens = sentence.trim().split(/\s+/);
+    let run: string[] = [];
+    const flush = () => {
+      if (run.length === 0) return;
+      const phrase = run.join(" ").replace(/[^\p{L}\p{N} '-]+$/u, "");
+      if (phrase && phrase.length > bestCapPhrase.length && isFresh(phrase)) {
+        bestCapPhrase = phrase;
+      }
+      run = [];
+    };
+    tokens.forEach((tok, i) => {
+      const clean = tok.replace(/[^\p{L}\p{N}'-]/gu, "");
+      if (!clean) { flush(); return; }
+      const isCap = /^[A-Z]/.test(clean);
+      const isSentenceStart = i === 0;
+      // Allow a sentence-start capital ONLY if it's not a common stopword
+      // ("The", "And", "When"...). Other positions accept all caps.
+      if (isCap && (!isSentenceStart || !stopwords.has(clean.toLowerCase()))) {
+        run.push(clean);
+      } else {
+        flush();
+      }
+    });
+    flush();
+  }
+  if (bestCapPhrase) return bestCapPhrase;
+
+  // 2) Standalone year.
+  const yearMatch = text.match(/\b(1[89]\d{2}|20\d{2})\b/);
+  if (yearMatch && isFresh(yearMatch[0])) return yearMatch[0];
+
+  // 3) Longest non-stopword content word.
+  const words = text
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\p{L}\p{N}'-]/gu, ""))
+    .filter((w) => w.length >= 4 && !stopwords.has(w.toLowerCase()));
+  words.sort((a, b) => b.length - a.length);
+  for (const w of words) {
+    if (isFresh(w)) return w;
+  }
+  return null;
 }
 
 // Read the most recent analyze job's payload from media_jobs and flatten
