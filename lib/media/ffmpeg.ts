@@ -882,7 +882,13 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     filter += `[intro][vo]acrossfade=d=${xfade}:c1=tri:c2=tri[mainmix]`;
     if (opts.bgMusicPath) {
       args.push("-stream_loop", "-1", "-i", opts.bgMusicPath);
-      filter += `;[3:a]volume=${opts.bgMusicGain ?? 0.15},asetpts=PTS-STARTPTS[bg];`;
+      // Bg music must NOT play during the intro — only the intro audio is
+      // heard for the first introDur seconds. We delay the bg music so it
+      // starts at the crossfade point (introDur - xfade) and fades in over
+      // the xfade window, matching the voiceover's ramp-up.
+      const bgStart = Math.max(0, introDur - xfade);
+      const bgStartMs = Math.round(bgStart * 1000);
+      filter += `;[3:a]asetpts=PTS-STARTPTS,volume=${opts.bgMusicGain ?? 0.15},adelay=${bgStartMs}|${bgStartMs}:all=1,afade=t=in:st=${bgStart.toFixed(3)}:d=${xfade}[bg];`;
       filter += `[mainmix][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
     } else {
       filter += `;[mainmix]anull[aout]`;

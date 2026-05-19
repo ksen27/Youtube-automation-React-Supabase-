@@ -12,6 +12,7 @@ import {
   buildBlockSequenceFromHints,
   planTimeline,
   sumDurations,
+  IMAGE_HOLD_SECONDS,
   type BlockPlanHint,
   type PlannedBlock,
   type PlannedBlockWithHint,
@@ -584,7 +585,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // we fall back to the legacy duration-only planner. Same downstream
   // contract — every block ends up with a type + duration + text.
   const plan = planTimeline(voiceoverSeconds);
-  const hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds);
+  let hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds);
   const planSource: "gemini_hints" | "legacy_quota" = hints.length > 0 ? "gemini_hints" : "legacy_quota";
 
   let blocks: PlannedBlock[];
@@ -685,18 +686,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // ("never use random unrelated visuals"), we'd rather skip the floor
   // for this minute than ship a junk split.
   //
-  // Some buckets may stay below the floor (no image block with 2+ entities
-  // in that minute); we log them but never force-promote a footage block,
-  // since that would steal a clip slot.
+  // Promote with a tiered preference so we hit the 1-per-minute spec even
+  // when Gemini's entity coverage is sparse. The split fill step (further
+  // down) already handles the no-entity case by drawing both halves from
+  // the project image pool — per client direction split halves don't have
+  // to match the narration — so we no longer gate promotion on having 2
+  // entities upfront. Tiers, in order of preference within each bucket:
+  //   T1: image block with ≥2 entities (entity-driven left AND right)
+  //   T2: image block with ≥1 entity (entity-driven one side, pool other)
+  //   T3: any image block (both sides drawn from the project pool)
+  // Footage blocks are still never promoted — that would steal a clip slot
+  // and break the 60/40 footage/image ratio downstream.
   let splitPromotedToFloor = 0;
   let bucketsBelowFloor = 0;
   for (let b = 0; b < totalBuckets; b++) {
     if (splitCountPerBucket[b] >= SPLIT_2_PER_MINUTE_FLOOR) continue;
-    const promoteIdx = blocks.findIndex((blk, i) => {
-      if (blockBucket[i] !== b || blk.type !== "image") return false;
-      const ents = hints[i]?.mentioned_entities ?? [];
-      return ents.length >= 2;
-    });
+    const findImageInBucket = (minEntities: number) =>
+      blocks.findIndex((blk, i) => {
+        if (blockBucket[i] !== b || blk.type !== "image") return false;
+        const ents = hints[i]?.mentioned_entities ?? [];
+        return ents.length >= minEntities;
+      });
+    let promoteIdx = findImageInBucket(2);
+    if (promoteIdx < 0) promoteIdx = findImageInBucket(1);
+    if (promoteIdx < 0) promoteIdx = findImageInBucket(0);
     if (promoteIdx < 0) {
       bucketsBelowFloor++;
       continue;
@@ -858,6 +871,91 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     swappedFootageToImage: rhythmSwappedFootageToImage,
     runsLeftUnbroken: rhythmRunsLeftUnbroken,
   });
+
+  // Split oversized image blocks into back-to-back 5s holds. Image blocks
+  // longer than IMAGE_HOLD_SECONDS only appear after a footage→image
+  // downgrade (surplus pass, rhythm-pass swap) carried the footage block's
+  // spoken-sentence duration over. A 13s static image is uncomfortable to
+  // watch; splitting it into ~5s segments restores the documentary pacing
+  // while keeping the total timeline length intact so the voiceover still
+  // lines up.
+  //
+  // The same subject hint metadata is cloned to every fragment so the image
+  // matcher routes each fragment using the same entities/references — it
+  // may pick the same photo or different photos of the same subject; either
+  // way the viewer sees fresh framing every ~5s. We expand every parallel
+  // per-block array in lock-step so downstream indexing stays valid.
+  {
+    const SPLIT_THRESHOLD = IMAGE_HOLD_SECONDS + 1.5;
+    const newBlocks: PlannedBlock[] = [];
+    const newHintTexts: typeof blockHintTexts = [];
+    const newSectionTitles: typeof blockSectionTitles = [];
+    const newResolvedSubjects: typeof blockResolvedSubjects = [];
+    const newRecommendedTypes: typeof blockRecommendedTypes = [];
+    const newSpecificRefs: typeof blockSpecificRefs = [];
+    const newSubjectTypes: typeof blockSubjectTypes = [];
+    const newVisualPriorities: typeof blockVisualPriorities = [];
+    const newHints: typeof hints = [];
+    let splitFragmentsCreated = 0;
+    let splitSourceBlocks = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      if (b.type !== "image" || b.duration <= SPLIT_THRESHOLD) {
+        newBlocks.push(b);
+        newHintTexts.push(blockHintTexts[i] ?? null);
+        newSectionTitles.push(blockSectionTitles[i] ?? null);
+        newResolvedSubjects.push(blockResolvedSubjects[i] ?? null);
+        newRecommendedTypes.push(blockRecommendedTypes[i] ?? null);
+        newSpecificRefs.push(blockSpecificRefs[i] ?? []);
+        newSubjectTypes.push(blockSubjectTypes[i] ?? null);
+        newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        if (i < hints.length) newHints.push(hints[i]);
+        continue;
+      }
+      // Slot the duration into N fragments. Math.round biases toward an
+      // even split (13s → 3 fragments of ~4.3s, 11s → 2 of 5.5s) so no
+      // fragment lands too far from the IMAGE_HOLD_SECONDS target.
+      const slots = Math.max(2, Math.round(b.duration / IMAGE_HOLD_SECONDS));
+      const perSlot = Math.round((b.duration / slots) * 10) / 10;
+      // Last fragment absorbs the rounding residue so the sum exactly
+      // matches the source duration (no drift in total timeline length).
+      let remaining = b.duration;
+      for (let k = 0; k < slots; k++) {
+        const isLast = k === slots - 1;
+        const dur = isLast ? Math.round(remaining * 10) / 10 : perSlot;
+        remaining = Math.round((remaining - dur) * 10) / 10;
+        newBlocks.push({ type: "image", duration: dur });
+        newHintTexts.push(blockHintTexts[i] ?? null);
+        // Section titles only ride the FIRST fragment so we don't render
+        // the same title card multiple times in a row.
+        newSectionTitles.push(k === 0 ? (blockSectionTitles[i] ?? null) : null);
+        newResolvedSubjects.push(blockResolvedSubjects[i] ?? null);
+        newRecommendedTypes.push(blockRecommendedTypes[i] ?? null);
+        newSpecificRefs.push(blockSpecificRefs[i] ?? []);
+        newSubjectTypes.push(blockSubjectTypes[i] ?? null);
+        newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        if (i < hints.length) newHints.push(hints[i]);
+      }
+      splitFragmentsCreated += slots;
+      splitSourceBlocks++;
+    }
+    blocks = newBlocks;
+    blockHintTexts = newHintTexts;
+    blockSectionTitles = newSectionTitles;
+    blockResolvedSubjects = newResolvedSubjects;
+    blockRecommendedTypes = newRecommendedTypes;
+    blockSpecificRefs = newSpecificRefs;
+    blockSubjectTypes = newSubjectTypes;
+    blockVisualPriorities = newVisualPriorities;
+    hints = newHints;
+    if (splitSourceBlocks > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.image_block_split", {
+        sourceBlocks: splitSourceBlocks,
+        fragmentsCreated: splitFragmentsCreated,
+        threshold: SPLIT_THRESHOLD,
+      });
+    }
+  }
 
   // For each block, derive the voiceover text spoken during that window.
   // The scorer treats each block as a "section" — same prompt, but the
@@ -2964,11 +3062,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
 
     // Tier 2 — fall back to a key phrase pulled from the block's narration.
-    // The client wants the lower-third to fire roughly every minute even
-    // when extractEntities didn't catch the moment's subject (long-tail
-    // names, companies it skipped, generic narration). We pick the most
-    // prominent capitalized phrase from the spoken text; if there isn't
-    // one, we use the longest meaningful word.
+    // Only proper-noun-like candidates qualify: a multi-word capitalized
+    // phrase ("Buckingham Palace") or a standalone year. The previous
+    // implementation also accepted single capitalized tokens and the
+    // longest non-stopword word in the block, which produced obviously
+    // random overlays like "completely" or "interview" when the narration
+    // had no real proper noun in that minute. We'd rather skip the slot
+    // than show a junk word.
     if (!pick && blockText) {
       const phrase = pickPhraseFromBlock(blockText, isFresh);
       if (phrase) pick = { text: phrase, type: "phrase" };
@@ -3104,14 +3204,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 }
 
 // Pick a lower-third overlay text from a block's spoken narration when no
-// project_entities hit is available. Order of preference:
-//   1. Longest consecutive run of capitalized words (e.g. "Buckingham Palace",
-//      "Margot Robbie") — most likely a name / place / organization.
+// project_entities hit is available. We only return proper-noun-like
+// phrases so the overlay always reads as a name / place / organization,
+// never as a random long word from the narration.
+//   1. Longest consecutive run of TWO OR MORE capitalized words
+//      (e.g. "Buckingham Palace", "Margot Robbie"). Single capitalized
+//      tokens are rejected — too often a sentence-start verb or an
+//      unrelated proper noun that confuses the viewer.
 //   2. A standalone 4-digit year — strong visual anchor on its own.
-//   3. The longest non-stopword word in the block — last-resort signal so the
-//      minute mark still fires.
-// Returns null if nothing in the block is usable or every candidate is on
-// cooldown.
+// Returns null when neither tier finds a fresh candidate; the caller
+// skips the overlay for this minute rather than burning in a junk word.
 function pickPhraseFromBlock(
   text: string,
   isFresh: (s: string) => boolean,
@@ -3129,16 +3231,18 @@ function pickPhraseFromBlock(
     "her","hers",
   ]);
 
-  // 1) Capitalized-phrase scan. Sentence-start words are excluded so we
-  //    don't pick "The" / "When" from "The court ruled...". We do that by
-  //    splitting on sentence terminators first.
+  // 1) Multi-word capitalized-phrase scan. Sentence-start words are excluded
+  //    so we don't pick "The" / "When" from "The court ruled...". We do that
+  //    by splitting on sentence terminators first. Single-word runs are
+  //    dropped — they're too often false positives ("I", sentence-start
+  //    verbs, isolated proper nouns the entity extractor already rejected).
   const sentences = text.split(/[.!?]+/);
   let bestCapPhrase = "";
   for (const sentence of sentences) {
     const tokens = sentence.trim().split(/\s+/);
     let run: string[] = [];
     const flush = () => {
-      if (run.length === 0) return;
+      if (run.length < 2) { run = []; return; }
       const phrase = run.join(" ").replace(/[^\p{L}\p{N} '-]+$/u, "");
       if (phrase && phrase.length > bestCapPhrase.length && isFresh(phrase)) {
         bestCapPhrase = phrase;
@@ -3150,8 +3254,6 @@ function pickPhraseFromBlock(
       if (!clean) { flush(); return; }
       const isCap = /^[A-Z]/.test(clean);
       const isSentenceStart = i === 0;
-      // Allow a sentence-start capital ONLY if it's not a common stopword
-      // ("The", "And", "When"...). Other positions accept all caps.
       if (isCap && (!isSentenceStart || !stopwords.has(clean.toLowerCase()))) {
         run.push(clean);
       } else {
@@ -3166,15 +3268,6 @@ function pickPhraseFromBlock(
   const yearMatch = text.match(/\b(1[89]\d{2}|20\d{2})\b/);
   if (yearMatch && isFresh(yearMatch[0])) return yearMatch[0];
 
-  // 3) Longest non-stopword content word.
-  const words = text
-    .split(/\s+/)
-    .map((w) => w.replace(/[^\p{L}\p{N}'-]/gu, ""))
-    .filter((w) => w.length >= 4 && !stopwords.has(w.toLowerCase()));
-  words.sort((a, b) => b.length - a.length);
-  for (const w of words) {
-    if (isFresh(w)) return w;
-  }
   return null;
 }
 
