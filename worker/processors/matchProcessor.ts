@@ -2775,7 +2775,8 @@ async function loadBlockHintsFromAnalyze(
   // the segment's sectionTitle for title_card blocks. The hint stream is
   // segments concatenated in order.
   const hints: BlockPlanHint[] = [];
-  for (const seg of segments) {
+  for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+    const seg = segments[segIdx];
     const u = seg.understanding;
     if (!u) continue;
     const segBlocks: BlockPlan[] = Array.isArray(u.blocks) ? u.blocks : [];
@@ -2794,12 +2795,26 @@ async function loadBlockHintsFromAnalyze(
     const resolvedSectionTitle = rawTitle
       ? rawTitle.charAt(0).toUpperCase() + rawTitle.slice(1)
       : undefined;
+    // Force the first block of each segment (except segment 0, which is the
+    // hook/opening) to be a title_card ONLY when Gemini explicitly emitted a
+    // sectionTitle for the segment — that is its signal that the narration
+    // opens a real chapter. We deliberately do NOT promote on the
+    // segmentTopic fallback: every segment has a topic, and promoting on
+    // that would drop a black card every ~60-90s and bury the narration. The
+    // overlay_text still uses resolvedSectionTitle (which can fall back to
+    // segmentTopic), so the few promoted cards always render with readable
+    // heading text.
+    const hasExplicitSectionTitle = !!(u.sectionTitle && u.sectionTitle.trim());
     for (let i = 0; i < segBlocks.length; i++) {
       const b = segBlocks[i];
+      const promoteToTitleCard =
+        i === 0 && segIdx > 0 && hasExplicitSectionTitle;
       hints.push({
         text: b.text,
         resolved_subject: b.resolved_subject || undefined,
-        recommended_visual_type: b.recommended_visual_type,
+        recommended_visual_type: promoteToTitleCard
+          ? "title_card"
+          : b.recommended_visual_type,
         // Only attach section_title to the FIRST block of a segment — that's
         // the chapter boundary. Later blocks in the same segment continue
         // under the same section.
