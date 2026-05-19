@@ -341,13 +341,21 @@ export async function buildTitleCardVideo(opts: {
   // not word-wrap; without this a long title runs off the side of the
   // frame. ~22 chars per line is a comfortable read at this font size.
   //
-  // Escape each line independently and join with the literal two-character
-  // sequence `\n` — drawtext's text parser interprets that as a newline.
-  // We can't pass actual newlines because escapeDrawtextValue strips them
-  // (and a raw \n inside the filtergraph arg also confuses ffmpeg's
-  // shell-free arg list on some platforms).
+  // We write the wrapped text to a temp file and load it via drawtext's
+  // `textfile=` option. The previous approach used `text='line1\nline2'`
+  // with a literal two-char `\n`, but ffmpeg's filter-arg lexer ate the
+  // backslash on some builds, leaving the `n` glued to neighboring words
+  // ("dispute in the" became "disputeinnthe"). Real newlines in a textfile
+  // are unambiguous and render the same across platforms.
   const lines = wrapTitleCardText(opts.text, 22);
-  const escaped = lines.map(escapeDrawtextValue).join("\\n");
+  const textfilePath = `${opts.outputPath}.title.txt`;
+  await fs.writeFile(textfilePath, lines.join("\n"), "utf8");
+  // drawtext's textfile= argument needs the same path-escaping treatment
+  // as fontfile= (backslashes, single quotes, colons).
+  const escapedTextfile = textfilePath
+    .replace(/\\/g, "/")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:");
 
   // lavfi `color` source generates a solid black stream at the target
   // resolution / fps / duration. No input file needed. We chain drawtext
@@ -360,7 +368,7 @@ export async function buildTitleCardVideo(opts: {
   // centers a multi-line block without us hand-computing its height per
   // line count.
   const drawtext = fontPath
-    ? `drawtext=fontfile='${fontPath}':text='${escaped}':` +
+    ? `drawtext=fontfile='${fontPath}':textfile='${escapedTextfile}':` +
       `fontcolor=white:fontsize=${fontsize}:` +
       `line_spacing=10:` +
       `x=(w-text_w)/2:y=(h-text_h)/2,`
@@ -384,7 +392,11 @@ export async function buildTitleCardVideo(opts: {
     "-movflags", "+faststart",
     opts.outputPath,
   ];
-  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  try {
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  } finally {
+    await fs.unlink(textfilePath).catch(() => {});
+  }
 }
 
 // drawtext has no word-wrap, so we pre-split the title at the nearest
