@@ -120,7 +120,22 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   await setProjectStatus(id, "extracting");
 
   try {
-    const segments = splitTranscriptIntoSegments(transcript);
+    // Load any script-doc title_card markers up-front. When present, their
+    // text doubles as topic boundaries for the transcript splitter — the
+    // analyzer cuts a new segment at each title so each Gemini analysis
+    // call sees a focused chapter ("the lawsuit", "the wedding") instead
+    // of an arbitrary 5-minute slice that may span two unrelated topics.
+    // Falls back to the legacy word-count split when no titles align.
+    const { data: titleCardRows } = await sb
+      .from("project_script_markers")
+      .select("text, ordinal")
+      .eq("project_id", id)
+      .eq("kind", "title_card")
+      .order("ordinal");
+    const topicBoundaries = (titleCardRows ?? [])
+      .map((r) => (r.text as string | null) ?? "")
+      .filter((s) => s.trim().length > 0);
+    const segments = splitTranscriptIntoSegments(transcript, { topicBoundaries });
     const estimatedDurationSeconds = estimateDurationSeconds(transcript);
     // Prefer the probed voiceover duration; fall back to the word-count
     // estimate so the UI can still show a plan before any audio is uploaded.
@@ -133,6 +148,16 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       totalDurationSeconds,
       avgBlockSeconds: plan.avgBlockSeconds,
       totalBlocks: plan.totalBlocks,
+      topicBoundariesProvided: topicBoundaries.length,
+      // The splitter falls back to word-count when fewer than 2 topic
+      // boundaries land in the transcript. A discrepancy between
+      // topicBoundariesProvided > 0 and a non-topic split here is the
+      // signal that the matcher couldn't align the doc's titles to what
+      // Deepgram heard.
+      splitStrategy:
+        topicBoundaries.length >= 1 && segments.length >= 2 && segments.length === topicBoundaries.length + 1
+          ? "topic"
+          : "word_count",
     });
 
     // 1a) Project-level entity extraction. We need this BEFORE segment work
