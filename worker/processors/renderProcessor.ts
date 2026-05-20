@@ -65,6 +65,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   const renderable = (items ?? []).filter((it) => {
     if (it.type === "intro") return false;
     if (it.clip_id) return true;
+    // Forced clip from a script-doc title-card marker. No clip_id (we never
+    // ran search/match for these), no image_url — but a YouTube URL + window
+    // on metadata.forced_clip that the render step downloads on demand.
+    if (it.type === "footage") {
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const fc = meta.forced_clip as { youtube_url?: string } | undefined;
+      if (fc?.youtube_url) return true;
+    }
     if (it.type === "image" && it.image_url) return true;
     // Title cards have no clip and no image — they're rendered from a
     // section title string in overlay_text. Keep them in the renderable
@@ -316,6 +324,65 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           imageFailed++;
           await logJob({ projectId, jobId: mediaJobId },
             "render.image.failed", { idx: i, url: it.image_url, err: (e as Error).message });
+        }
+      } else if (it.type === "footage" && (((it.metadata ?? {}) as Record<string, unknown>).forced_clip as { youtube_url?: string } | undefined)?.youtube_url) {
+        // Forced clip from a script-doc title-card marker. We download the
+        // YouTube source via the proxied yt-dlp pipeline, cut the window the
+        // doc specified, and normalize — same shape as the user-intro path
+        // above, but for a mid-timeline footage segment. clip_id stays null
+        // because there's no video_clips row for this content.
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const fc = meta.forced_clip as { youtube_url: string; start_seconds?: number; end_seconds?: number };
+        const videoId = extractIntroVideoId(fc.youtube_url);
+        if (!videoId) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.forced_clip.bad_url", { idx: i, url: fc.youtube_url });
+          return;
+        }
+        const startSeconds = Number(fc.start_seconds ?? 0);
+        const endSeconds = Number(fc.end_seconds ?? startSeconds + plannedDur);
+        const windowDur = Math.max(1, endSeconds - startSeconds);
+        const leftIsImage = isImageNeighbor(i - 1);
+        const rightIsImage = isImageNeighbor(i + 1);
+        const headLeft = leftIsImage ? MIXED_FADE_SECONDS / 2 : 0;
+        const headRight = rightIsImage ? MIXED_FADE_SECONDS / 2 : 0;
+        const renderDur = windowDur + headLeft + headRight;
+        const dlDir = path.join(tmp, `forced_${idx}`);
+        const trimmed = path.join(tmp, `forced_cut_${idx}.mp4`);
+        try {
+          await fs.mkdir(dlDir, { recursive: true });
+          const dl = await downloadYoutubeVideo({
+            url: fc.youtube_url,
+            outputDir: dlDir,
+            videoId,
+          });
+          await cutClip({
+            inputPath: dl.outputPath, outputPath: trimmed,
+            startSeconds, durationSeconds: renderDur,
+          });
+          const lt = meta.lower_third as { text?: string } | undefined;
+          await normalizeClip({
+            inputPath: trimmed, outputPath: out,
+            width: 1280, height: 720, fps: 30,
+            lowerThird: lt?.text ? { text: lt.text } : undefined,
+          });
+          slots[i] = out;
+          let actualDur = renderDur;
+          try {
+            const probed = await probeFile(out);
+            if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
+          } catch { /* keep renderDur fallback */ }
+          slotDurations[i] = actualDur;
+          await safeUnlink(dl.outputPath);
+          await safeUnlink(trimmed);
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.forced_clip.failed", {
+              idx: i,
+              url: fc.youtube_url,
+              videoId,
+              err: (e as Error).message,
+            });
         }
       } else if (it.clip_id) {
         const url = clipUrlById.get(it.clip_id as string);

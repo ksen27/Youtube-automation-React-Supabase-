@@ -3210,6 +3210,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
+  // Script-doc markers (title cards + lower-thirds parsed from the Google
+  // Doc the user pasted at intake). The post-processor mutates `items` in
+  // place: inserts a title_card + forced-footage pair at each blue-bold
+  // marker's spoken moment, and stamps metadata.lower_third on whichever
+  // item is playing at each red marker's moment. Forced footage rows carry
+  // metadata.forced_clip = { youtube_url, start_seconds, end_seconds }; the
+  // renderer downloads the window via the proxied yt-dlp pipeline at render
+  // time, same way the user-supplied intro works today.
+  const { data: markerRows } = await sb
+    .from("project_script_markers")
+    .select("id, kind, text, ordinal, paragraph_index, char_offset, youtube_url, start_seconds, end_seconds")
+    .eq("project_id", projectId)
+    .order("ordinal");
+  if (markerRows && markerRows.length > 0) {
+    const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
+    const stats = applyScriptMarkers(
+      items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
+      markerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
+      transcriptWords,
+      projectId,
+    );
+    await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
+  }
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);

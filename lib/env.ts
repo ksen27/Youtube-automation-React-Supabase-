@@ -110,6 +110,13 @@ const ServerEnvSchema = z.object({
   // need a slice. 0 = disabled (default for local dev / Windows where the
   // binary doesn't exist). 10 = cooperative on Fly.
   NICE_LEVEL: z.coerce.number().int().min(0).max(19).default(0),
+  // Google Docs API key. Used by the script-doc intake to read formatted
+  // content (bold, foreground colors, hyperlinks) out of a "anyone with the
+  // link" Google Doc. Get one from Google Cloud Console → enable "Google
+  // Docs API" → create an API key. Restrict the key to the Docs API only.
+  // Without this set, the script-doc intake returns 503 and the user is
+  // told the feature is unavailable.
+  GOOGLE_DOCS_API_KEY: z.string().optional(),
   // Residential proxy pool for yt-dlp. YouTube blocks downloads from cloud
   // IPs (Fly/AWS/GCP) with a "Sign in to confirm you're not a bot" wall, so
   // every yt-dlp call has to egress through a residential proxy. Format is
