@@ -110,13 +110,19 @@ const ServerEnvSchema = z.object({
   // need a slice. 0 = disabled (default for local dev / Windows where the
   // binary doesn't exist). 10 = cooperative on Fly.
   NICE_LEVEL: z.coerce.number().int().min(0).max(19).default(0),
-  // Google Docs API key. Used by the script-doc intake to read formatted
-  // content (bold, foreground colors, hyperlinks) out of a "anyone with the
-  // link" Google Doc. Get one from Google Cloud Console → enable "Google
-  // Docs API" → create an API key. Restrict the key to the Docs API only.
-  // Without this set, the script-doc intake returns 503 and the user is
-  // told the feature is unavailable.
-  GOOGLE_DOCS_API_KEY: z.string().optional(),
+  // Service-account JSON for the Google Docs API. The Docs API does NOT
+  // accept plain API keys (returns 401 UNAUTHENTICATED), so we authenticate
+  // with a service-account-minted OAuth2 access token instead. Setup:
+  //   1. Google Cloud Console → enable "Google Docs API"
+  //   2. IAM & Admin → Service Accounts → Create service account
+  //   3. Keys → Add key → JSON → download
+  //   4. Paste the entire downloaded JSON into this env var (single line is
+  //      fine; the parser handles newlines either way)
+  //   5. Share each script doc with the service account's email
+  //      (something@<project>.iam.gserviceaccount.com), OR set the doc to
+  //      "Anyone with the link can view" — either works.
+  // Without this set, the script-doc intake returns 503.
+  GOOGLE_SERVICE_ACCOUNT_JSON: z.string().optional(),
   // Residential proxy pool for yt-dlp. YouTube blocks downloads from cloud
   // IPs (Fly/AWS/GCP) with a "Sign in to confirm you're not a bot" wall, so
   // every yt-dlp call has to egress through a residential proxy. Format is
