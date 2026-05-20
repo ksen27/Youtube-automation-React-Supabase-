@@ -271,6 +271,14 @@ export function applyScriptMarkers(
       const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
       const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
       const dur = Math.max(1, end - start);
+      // Cheap YouTube thumbnail derived from the URL. The editor UI picks
+      // this up from metadata.thumbnail_url and shows it on the block
+      // instead of the empty grey-box-with-"footage" placeholder. It's
+      // the source video's poster frame, not the exact cut window, but
+      // it's free and immediate — no extra ffmpeg work at ingest time.
+      const ytIdMatch = m.youtube_url?.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|v\/)([A-Za-z0-9_-]{11})/);
+      const ytId = ytIdMatch?.[1] ?? null;
+      const thumbnailUrl = ytId ? `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg` : null;
       return {
         project_id: projectId,
         clip_id: null,
@@ -284,6 +292,7 @@ export function applyScriptMarkers(
           planned: false,
           pick_source: "doc_marker_forced",
           doc_marker_id: m.id,
+          thumbnail_url: thumbnailUrl,
           forced_clip: {
             youtube_url: m.youtube_url,
             start_seconds: start,
@@ -329,6 +338,30 @@ export function applyScriptMarkers(
     items.splice(k, 0, ...rows);
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
+  }
+
+  // Bookkeeping: surface how many title_card_clip rows the matcher saw but
+  // couldn't attach to a parent title_card. Most often this is benign (the
+  // parser invariant says every title_card_clip immediately follows its
+  // parent by ordinal), but a missing parent can sneak in if the parent's
+  // phrase failed to align in the spoken audio. Logging this catches the
+  // "user added a second timestamp but only one clip appears in the final
+  // video" case cleanly.
+  const orphanedClipCount = orderedResolutions.filter((r, idx) => {
+    if (r.marker.kind !== "title_card_clip") return false;
+    // An extra is "orphaned" if the preceding ordinal isn't a title_card
+    // OR that title_card was skipped (no t, no youtube_url).
+    const prev = orderedResolutions[idx - 1];
+    if (!prev) return true;
+    if (prev.marker.kind === "title_card") {
+      return prev.t == null || !prev.marker.youtube_url;
+    }
+    if (prev.marker.kind === "title_card_clip") return false; // chain
+    return true;
+  }).length;
+  if (orphanedClipCount > 0) {
+    (result as ApplyMarkersResult & { orphanedTitleCardClips: number })
+      .orphanedTitleCardClips = orphanedClipCount;
   }
 
   // Re-number positions across the final array.

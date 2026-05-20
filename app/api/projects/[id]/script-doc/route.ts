@@ -87,6 +87,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   updates.intro_source_start_seconds = null;
   updates.intro_duration_seconds = null;
 
+  // Mark the project as having received a Google Doc ingest. The workspace
+  // uses this together with voiceover_url to gate the move from intake to
+  // analyze — without this column an audio-only project advanced as soon
+  // as Deepgram filled in transcript, letting the user skip the doc.
+  updates.script_doc_ingested_at = new Date().toISOString();
+
   const { data: project, error: projErr } = await sb
     .from("projects")
     .update(updates)

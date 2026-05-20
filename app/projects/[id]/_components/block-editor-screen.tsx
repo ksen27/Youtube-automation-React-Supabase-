@@ -221,9 +221,17 @@ export function BlockEditorScreen({
           const clip = it.clip_id ? clipById.get(it.clip_id) : null;
           // Image blocks have no clip_id but may carry a fetched image_url
           // populated by the matcher's image-pool step. Prefer the clip
-          // thumbnail when present (footage/intro), otherwise fall back to
-          // the image-block's own image_url.
-          const thumbnail = clip?.thumbnail_url ?? it.image_url ?? null;
+          // thumbnail when present (footage/intro), then the image-block's
+          // own image_url, then any metadata.thumbnail_url set by the
+          // doc-driven flow (intro_card markers + title_card forced footage
+          // both write a YouTube poster URL into metadata so the editor
+          // can render a tile instead of an empty grey box).
+          const metaThumb =
+            (it.metadata as Record<string, unknown> | null | undefined)?.thumbnail_url;
+          const thumbnail =
+            clip?.thumbnail_url ??
+            it.image_url ??
+            (typeof metaThumb === "string" ? metaThumb : null);
           return (
             <li
               key={it.id}

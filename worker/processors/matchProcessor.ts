@@ -246,8 +246,34 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // pool-based heuristic + verifier path entirely and leave intro_clip_id
   // null. The renderer reads intro_source_youtube_url itself and prepends
   // the cut video/audio regardless of intro_clip_id.
-  const userIntroProvided = !!(project as { intro_source_youtube_url?: string | null } | null)
+  const legacyIntroUrlProvided = !!(project as { intro_source_youtube_url?: string | null } | null)
     ?.intro_source_youtube_url?.trim();
+
+  // Script-doc intro_card markers (one per blue-bold timestamp block at the
+  // top of the Google Doc). When any exist, they ARE the pre-roll — we
+  // suppress the auto-pick path so the heuristic + Gemini verifier don't
+  // burn API spend choosing a clip that won't be used. We also insert a
+  // type='intro' timeline_items row per doc intro below so the editor UI
+  // reflects what the renderer is actually going to play.
+  const { data: introCardMarkers } = await sb
+    .from("project_script_markers")
+    .select("id, ordinal, text, youtube_url, start_seconds, end_seconds, clip_storage_url")
+    .eq("project_id", projectId)
+    .eq("kind", "intro_card")
+    .order("ordinal");
+  const docIntroCards = (introCardMarkers ?? []) as Array<{
+    id: string;
+    ordinal: number;
+    text: string | null;
+    youtube_url: string | null;
+    start_seconds: number | null;
+    end_seconds: number | null;
+    clip_storage_url: string | null;
+  }>;
+  const hasDocIntros = docIntroCards.some((m) => !!m.youtube_url);
+  // Combined gate: any user-supplied intro source (doc markers OR legacy
+  // intro_source_* columns) suppresses the auto-pick path.
+  const userIntroProvided = legacyIntroUrlProvided || hasDocIntros;
   // Per-word timings persisted at voiceover-upload time. When present
   // they let the timeline planner size each block to the narrator's
   // real spoken duration for that sentence (instead of a uniform-wpm
@@ -1576,13 +1602,52 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let assignedFootageCount = 0;
   let downgradedCount = 0;
 
-  // Prepend the intro as a UI-only timeline item. The renderer ignores
-  // type='intro' rows (it pulls intro_clip_id directly from the projects
-  // table) — this row exists so the matcher UI can show the intro card
-  // at the top of the list. The script_text is intentionally NOT a
-  // voiceover slice; the intro plays the celebrity's source audio with
-  // voiceover silent for the first 5–6s.
-  if (introClipId) {
+  // Prepend the intro segments as UI-only timeline items. Renderer
+  // ignores type='intro' rows (it reads its own intro sources directly
+  // from project_script_markers / projects.intro_source_*). These rows
+  // exist so the editor UI shows the intro pre-roll at the top of the
+  // timeline, matching what the user will see in the final video.
+  if (hasDocIntros) {
+    // Doc-driven intros — one UI row per intro_card marker. The
+    // YouTube-derived thumbnail makes the block visually distinguishable
+    // in the editor instead of showing a blank "intro" tile.
+    for (const m of docIntroCards) {
+      if (!m.youtube_url) continue;
+      const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
+      const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
+      const duration = Math.max(1, end - start);
+      const videoIdMatch = m.youtube_url.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|v\/)([A-Za-z0-9_-]{11})/);
+      const ytVideoId = videoIdMatch?.[1] ?? null;
+      const thumbUrl = ytVideoId ? `https://i.ytimg.com/vi/${ytVideoId}/mqdefault.jpg` : null;
+      const labelText = m.text?.trim()
+        ? `Intro — ${m.text.trim()} (${Math.round(duration)}s, original audio)`
+        : `Intro clip ${m.ordinal + 1} (${Math.round(duration)}s, original audio)`;
+      items.push({
+        project_id: projectId,
+        clip_id: null,
+        type: "intro",
+        position: position++,
+        duration,
+        script_text: labelText,
+        overlay_text: null,
+        metadata: {
+          is_intro: true,
+          intro_source: "script_doc",
+          doc_marker_id: m.id,
+          marker_ordinal: m.ordinal,
+          plays_source_audio: true,
+          ui_only: true,
+          youtube_url: m.youtube_url,
+          start_seconds: start,
+          end_seconds: end,
+          thumbnail_url: thumbUrl,
+          clip_storage_url: m.clip_storage_url ?? null,
+        },
+        approved: false,
+      });
+    }
+  } else if (introClipId) {
+    // Legacy auto-pick intro — only used when no doc intros were declared.
     const introCaption = mainCelebrity
       ? `Intro — ${mainCelebrity} speaking (${introClipDuration}s, original audio)`
       : `Intro — celebrity speaking (${introClipDuration}s, original audio)`;

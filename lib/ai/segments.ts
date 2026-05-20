@@ -235,20 +235,37 @@ function splitByTopicBoundaries(
     if (uniq.length === 0 || c > uniq[uniq.length - 1]) uniq.push(c);
   }
 
-  // Build segments.
-  const out: RawSegment[] = [];
-  const slices: string[] = [];
+  // Build raw slices first.
+  const rawSlices: string[] = [];
   let prev = 0;
   for (const c of uniq) {
-    slices.push(transcript.slice(prev, c).trim());
+    rawSlices.push(transcript.slice(prev, c).trim());
     prev = c;
   }
-  slices.push(transcript.slice(prev).trim());
+  rawSlices.push(transcript.slice(prev).trim());
 
+  // Fold the LEADING slice (everything before the first title card) into
+  // slice[1]. That leading slice is "hook" narration with no chapter
+  // heading — the user wrote chapters as title-card-marked sections, so
+  // anything before the first card is preamble to chapter 1, not its own
+  // chapter. Merging the hook forward gives chapter 1's Gemini call the
+  // hook's entity context (names, places mentioned in the opening) without
+  // burning a separate analysis pass on a chapterless preamble.
+  //
+  // Slices 1..N (post-first-title) stay separate even when short — each
+  // one has its own title card defining its identity, so a 30-second
+  // chapter is still a real chapter.
+  const slices = rawSlices.filter((s) => s.length > 0);
+  if (slices.length >= 2) {
+    const leading = slices.shift() as string;
+    slices[0] = `${leading} ${slices[0]}`.trim();
+  }
+  if (slices.length < 2) return []; // caller falls back to word-count split
+
+  const out: RawSegment[] = [];
   let priorWords = 0;
   for (let i = 0; i < slices.length; i++) {
     const text = slices[i];
-    if (!text) continue; // skip empty leading slice when first boundary is at start
     const words = countWords(text);
     out.push(buildSegment(out.length, text, priorWords, words));
     priorWords += words;

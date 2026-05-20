@@ -14,6 +14,10 @@ export interface ProjectResp {
     intro_source_youtube_url: string | null;
     intro_source_start_seconds: number | null;
     intro_duration_seconds: number | null;
+    // Timestamp of the last successful script-doc ingest. Set by the
+    // script-doc route, read by derivePhase to gate intake -> analyze.
+    // Null means the user hasn't pasted a Google Doc URL yet.
+    script_doc_ingested_at: string | null;
     status: string;
     created_at: string;
     updated_at: string;
@@ -79,6 +83,11 @@ export interface TimelineRow {
   image_url: string | null;
   image_source: string | null;
   image_query: string | null;
+  // Free-form metadata jsonb. Doc-driven rows (intro / title-card forced
+  // footage) stash a YouTube-derived thumbnail_url here so the editor UI
+  // can display a poster image even though clip_id is null. The shape is
+  // intentionally loose — different timeline types write different keys.
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface ClipRow {
@@ -111,11 +120,17 @@ export function jobsBusy(d: JobsResp | undefined): boolean {
  * Decide which workspace screen to render. Order matters — earliest phase
  * the data is in wins.
  *
- * - intake:     no transcript saved yet
- * - analysis:   transcript exists but no source has been confirmed
+ * - intake:     audio OR Google Doc still missing
+ * - analysis:   both inputs supplied but no source has been confirmed
  * - processing: sources confirmed, media jobs still running and timeline is empty
  * - export:     a render job exists (queued/running/completed)
  * - editor:     timeline has rows and no render is active
+ *
+ * Intake gating used to check transcript presence alone, but the voiceover
+ * upload route writes a Deepgram-generated transcript automatically — so
+ * an audio-only project would silently advance to analyze, letting the
+ * user skip the Google Doc (which carries the intro / title-card /
+ * lower-third structure). We now gate on the two explicit signals.
  */
 export function derivePhase(
   project: ProjectResp | undefined,
@@ -124,8 +139,9 @@ export function derivePhase(
 ): WorkspacePhase {
   if (!project?.project) return "intake";
 
-  const hasTranscript = !!project.project.transcript?.trim();
-  if (!hasTranscript) return "intake";
+  const hasVoiceover = !!project.project.voiceover_url;
+  const hasScriptDoc = !!project.project.script_doc_ingested_at;
+  if (!hasVoiceover || !hasScriptDoc) return "intake";
 
   const hasConfirmedSources = (project.search_results ?? []).some((s) => s.status === "selected");
   if (!hasConfirmedSources) return "analysis";
