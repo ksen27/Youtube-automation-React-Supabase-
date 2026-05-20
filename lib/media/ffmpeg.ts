@@ -339,6 +339,12 @@ export async function buildTitleCardVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
+  // When "typewriter", the text is typed in character-by-character across
+  // the full segment duration so the last character lands as the card ends.
+  // When omitted (default "static"), the entire text shows for the full
+  // duration — the original chapter-card behavior used by the analyze
+  // pipeline. Script-doc title cards pass "typewriter".
+  animation?: "static" | "typewriter";
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -384,22 +390,84 @@ export async function buildTitleCardVideo(opts: {
   // total height is lines.length * fontsize + (lines.length - 1) * spacing.
   const lineSpacing = 10;
   const blockHeight = lines.length * fontsize + Math.max(0, lines.length - 1) * lineSpacing;
-  const drawtext = fontPath && lines.length > 0
-    ? lines
-        .map((line, idx) => {
-          // Y for this line: center the block, then step down by line index.
-          // Use the same `(h-blockHeight)/2 + idx*(fontsize+spacing)` formula
-          // for every build — pure arithmetic, no filter options.
-          const yOffset = (idx * (fontsize + lineSpacing));
-          const yExpr = `(h-${blockHeight})/2+${yOffset}`;
-          return (
-            `drawtext=fontfile='${fontPath}':text='${escapeDrawtext(line)}':` +
-            `fontcolor=white:fontsize=${fontsize}:` +
-            `x=(w-text_w)/2:y=${yExpr}`
-          );
-        })
-        .join(",") + ","
-    : "";
+  const animation = opts.animation ?? "static";
+
+  // Build the line layout helper used by both static and typewriter modes.
+  // Each "line draw" is one drawtext filter at a fixed Y. The text may be
+  // a prefix of the full line (typewriter) or the full line (static).
+  function buildLineDrawtext(line: string, lineIdx: number, enableExpr: string | null): string {
+    const yOffset = lineIdx * (fontsize + lineSpacing);
+    const yExpr = `(h-${blockHeight})/2+${yOffset}`;
+    const enable = enableExpr ? `:enable='${enableExpr}'` : "";
+    return (
+      `drawtext=fontfile='${fontPath}':text='${escapeDrawtext(line)}':` +
+      `fontcolor=white:fontsize=${fontsize}:` +
+      `x=(w-text_w)/2:y=${yExpr}${enable}`
+    );
+  }
+
+  let drawtext = "";
+  if (fontPath && lines.length > 0) {
+    if (animation === "typewriter") {
+      // Typewriter mode: build N "snapshot" frames where snapshot k shows
+      // the first k characters of the full text (re-wrapped onto the same
+      // lines as the final text — the wrap targets fixed columns, so a
+      // partial text wraps onto a subset of the final lines and never
+      // breaks differently).
+      //
+      // Total characters drives the per-character time slice. We treat the
+      // total as the visible length of the wrapped lines joined by single
+      // spaces — this includes the inter-word spaces that drawtext renders
+      // as a moving cursor between words.
+      const totalText = lines.join(" ");
+      const totalChars = totalText.length;
+      if (totalChars > 0) {
+        const dt = opts.durationSeconds / totalChars;
+        const filters: string[] = [];
+        for (let k = 1; k <= totalChars; k++) {
+          // Compute the prefix of `totalText` of length k, then re-split it
+          // back onto the line widths from `lines`. The simplest robust
+          // splitter: walk the original lines consuming `k` characters in
+          // order, plus 1 character per inter-line separator (the space).
+          const partialLines: string[] = [];
+          let remaining = k;
+          for (let li = 0; li < lines.length && remaining > 0; li++) {
+            const lineText = lines[li];
+            if (remaining >= lineText.length) {
+              partialLines.push(lineText);
+              remaining -= lineText.length;
+              // Consume the inter-line space if there's another line.
+              if (li + 1 < lines.length) {
+                if (remaining > 0) remaining -= 1;
+              }
+            } else {
+              partialLines.push(lineText.slice(0, remaining));
+              remaining = 0;
+            }
+          }
+          // enable window: from (k-1)*dt to either k*dt (intermediate) or
+          // the very end (last frame, so the finished text holds through
+          // the tail without a 1/30s gap before card-end).
+          const tStart = ((k - 1) * dt).toFixed(3);
+          const tEnd = k === totalChars
+            ? opts.durationSeconds.toFixed(3)
+            : (k * dt).toFixed(3);
+          const enableExpr = `between(t,${tStart},${tEnd})`;
+          for (let li = 0; li < partialLines.length; li++) {
+            const t = partialLines[li];
+            if (!t) continue;
+            filters.push(buildLineDrawtext(t, li, enableExpr));
+          }
+        }
+        drawtext = filters.join(",") + ",";
+      }
+    } else {
+      // Static mode: one drawtext per final line, no enable expression.
+      drawtext = lines
+        .map((line, idx) => buildLineDrawtext(line, idx, null))
+        .join(",") + ",";
+    }
+  }
   const vfChain = `${drawtext}setsar=1,format=yuv420p`;
 
   const args = [

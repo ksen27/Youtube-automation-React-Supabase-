@@ -265,12 +265,20 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             : 0;
         const renderDur = plannedDur + headLeft + headRight;
         const text = String(it.overlay_text ?? "").trim();
+        // Script-doc title cards opt in to typewriter animation by stamping
+        // metadata.animation = "typewriter". Cards inserted by the analyze
+        // pipeline (chapter breaks) leave it unset and get the static
+        // treatment they had before.
+        const tcMeta = (it.metadata ?? {}) as Record<string, unknown>;
+        const tcAnimation: "static" | "typewriter" =
+          tcMeta.animation === "typewriter" ? "typewriter" : "static";
         try {
           await buildTitleCardVideo({
             text,
             outputPath: out,
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
+            animation: tcAnimation,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;

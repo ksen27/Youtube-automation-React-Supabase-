@@ -54,11 +54,15 @@ export interface ScriptMarkerRow {
   end_seconds: number | null;
 }
 
-// Default duration for a freshly-inserted title_card row when the marker
-// itself doesn't pin the on-screen time (only the FOLLOWING clip carries
-// the YouTube window's start/end). 3s is enough to read a short heading
-// without making the card overstay its welcome.
-const TITLE_CARD_DEFAULT_DURATION = 3;
+// Fallback duration when we can't measure the title phrase's spoken time
+// (Deepgram words missing, exact match failed before falling back to a
+// best-effort anchor). 3s reads a short heading comfortably.
+const TITLE_CARD_FALLBACK_DURATION = 3;
+// Floor on the typewriter card so a very short title ("Go.", "Now.") still
+// has enough on-screen time to register. The renderer types the text in
+// over the card's full duration, so the floor is also the minimum total
+// animation time the viewer sees.
+const TITLE_CARD_MIN_DURATION = 1.5;
 
 // Token-strip: lowercased word with surrounding punctuation removed. Both
 // sides (Deepgram words and marker phrases) go through this so "Walliams,"
@@ -151,29 +155,38 @@ export function applyScriptMarkers(
   };
   if (!words || words.length === 0 || markers.length === 0) return result;
 
-  // Resolve each marker's spoken-time `t` once. Multiple markers may share
-  // the same phrase (e.g. a person's name appearing many times) — we walk
-  // forward, only matching each phrase the Nth time per (phrase, ordinal)
-  // so duplicate phrases align to distinct spoken instances.
+  // Resolve each marker's spoken-time window once. We store both the start
+  // (`t`) — the moment the narrator begins saying the phrase — and the end
+  // (`tEnd`) — the moment they finish. The title card uses tEnd to pin its
+  // own duration so the typewriter animation completes in sync with the
+  // narrator. Multiple markers may share the same phrase (e.g. a person's
+  // name appearing many times) — we walk forward, only matching each
+  // phrase the Nth time so duplicate phrases align to distinct spoken
+  // instances.
   const phraseSearchCursor = new Map<string, number>();
-  const resolved: Array<{ marker: ScriptMarkerRow; t: number | null }> = [];
+  const resolved: Array<{ marker: ScriptMarkerRow; t: number | null; tEnd: number | null }> = [];
   // Sort by ordinal so the cursor walk respects doc order across kinds.
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
   for (const m of ordered) {
     const tokens = tokenize(m.text);
     if (tokens.length === 0) {
-      resolved.push({ marker: m, t: null });
+      resolved.push({ marker: m, t: null, tEnd: null });
       continue;
     }
     const key = tokens.join(" ");
     const from = phraseSearchCursor.get(key) ?? 0;
     const idx = findPhraseIndex(words, tokens, from);
     if (idx < 0) {
-      resolved.push({ marker: m, t: null });
+      resolved.push({ marker: m, t: null, tEnd: null });
       continue;
     }
     phraseSearchCursor.set(key, idx + tokens.length);
-    resolved.push({ marker: m, t: words[idx].start });
+    const lastIdx = idx + tokens.length - 1;
+    resolved.push({
+      marker: m,
+      t: words[idx].start,
+      tEnd: words[lastIdx].end,
+    });
   }
 
   // Apply lower-thirds first because they only mutate existing items'
@@ -181,6 +194,7 @@ export function applyScriptMarkers(
   // and must happen second, after we've taken metadata reads.
   const starts = computeStarts(items);
   for (const { marker, t } of resolved) {
+    // tEnd is only used by title cards; ignore here.
     if (marker.kind !== "lower_third") continue;
     if (t == null) { result.lowerThirdsSkipped++; continue; }
     const k = findItemIndexAtTime(starts, items, t);
@@ -211,6 +225,12 @@ export function applyScriptMarkers(
   interface TitleCardGroup {
     parent: ScriptMarkerRow;
     parentT: number;
+    // Card duration in seconds — measured from Deepgram word timings as
+    // (last word end - first word start) so the typewriter animation
+    // finishes when the narrator finishes saying the phrase. Floored at
+    // TITLE_CARD_MIN_DURATION for very short titles. Null only when the
+    // resolution lacked a tEnd (shouldn't happen when t is set, but defensive).
+    parentDuration: number;
     extras: ScriptMarkerRow[];
   }
   const groups: TitleCardGroup[] = [];
@@ -221,6 +241,10 @@ export function applyScriptMarkers(
       result.titleCardsSkipped++;
       continue;
     }
+    const spokenDuration = r.tEnd != null && r.tEnd > r.t ? r.tEnd - r.t : null;
+    const parentDuration = spokenDuration != null
+      ? Math.max(TITLE_CARD_MIN_DURATION, spokenDuration)
+      : TITLE_CARD_FALLBACK_DURATION;
     const extras: ScriptMarkerRow[] = [];
     // Walk forward collecting title_card_clip siblings. Stop at the next
     // non-clip marker (another title_card, lower_third with intervening
@@ -232,7 +256,7 @@ export function applyScriptMarkers(
       if (sib.youtube_url) extras.push(sib);
       h++;
     }
-    groups.push({ parent: r.marker, parentT: r.t, extras });
+    groups.push({ parent: r.marker, parentT: r.t, parentDuration, extras });
   }
 
   // Insert groups in reverse spoken-time order so an earlier insertion
@@ -275,7 +299,7 @@ export function applyScriptMarkers(
       clip_id: null,
       type: "title_card",
       position: 0, // re-numbered below
-      duration: TITLE_CARD_DEFAULT_DURATION,
+      duration: group.parentDuration,
       script_text: null,
       overlay_text: group.parent.text,
       metadata: {
@@ -284,6 +308,10 @@ export function applyScriptMarkers(
         pick_source: "doc_marker",
         doc_marker_id: group.parent.id,
         doc_marker_kind: "title_card",
+        // Signal to the renderer that this card should be typed in,
+        // animating across the full segment duration. The renderer reads
+        // this in buildTitleCardVideo to switch from static to typewriter.
+        animation: "typewriter",
       },
       approved: false,
     };
