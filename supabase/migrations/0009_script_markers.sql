@@ -23,7 +23,7 @@
 create table if not exists public.project_script_markers (
   id uuid primary key default gen_random_uuid(),
   project_id uuid not null references public.projects(id) on delete cascade,
-  kind text not null check (kind in ('intro_card', 'title_card', 'lower_third')),
+  kind text not null check (kind in ('intro_card', 'title_card', 'title_card_clip', 'lower_third')),
   -- Plain text of the run as it appears in the doc — also what we look for
   -- in the Deepgram-aligned word stream. Casing/punctuation may differ;
   -- the matcher normalizes both sides before comparison.

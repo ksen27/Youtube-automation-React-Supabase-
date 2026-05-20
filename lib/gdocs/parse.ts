@@ -25,7 +25,19 @@ import type {
 // JSON, output = ParsedScript) so it's trivially unit-testable without a
 // network call or API key.
 
-export type ScriptMarkerKind = "intro_card" | "title_card" | "lower_third";
+export type ScriptMarkerKind =
+  | "intro_card"
+  // First clip after a blue-bold title in the doc. Carries the title text
+  // (rendered as the on-screen card) plus its own YouTube URL + window.
+  | "title_card"
+  // Additional bare-timestamp lines stacked under the same title. Each one
+  // becomes a forced-footage clip played BACK-TO-BACK after the title card
+  // and the first clip — no separate title card is shown for these. The
+  // matcher pairs them with the preceding title_card marker by ordinal
+  // adjacency: title_card_clip rows always immediately follow their
+  // title_card row in the ordinal stream.
+  | "title_card_clip"
+  | "lower_third";
 
 export interface ScriptMarker {
   kind: ScriptMarkerKind;
@@ -321,26 +333,60 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
     const p = rawParagraphs[i];
 
     // Title card detection: blue-bold paragraph followed (after blanks) by
-    // a timestamp range with a URL.
+    // ONE OR MORE consecutive bare-timestamp lines. The first timestamp
+    // pairs with the title text to form a title_card marker; any additional
+    // stacked timestamps under the same title become title_card_clip
+    // markers that play back-to-back after the first clip with no extra
+    // card flash. URL for each clip comes from the hyperlink on its own
+    // timestamp line (fallback: regex-find inside that line's text;
+    // fallback: the title paragraph's hyperlink).
     if (isTitleParagraph(p)) {
       let j = i + 1;
       while (j < rawParagraphs.length && rawParagraphs[j].text.trim() === "") j++;
       if (j < rawParagraphs.length) {
-        const range = parseTimestampRange(rawParagraphs[j].text);
-        const url = findParagraphYoutubeUrl(rawParagraphs[j]) ?? findParagraphYoutubeUrl(p);
-        if (range && url) {
+        const firstBare = bareTimestampInfo(rawParagraphs[j]);
+        // Allow the title to fall back to its own paragraph for URL only if
+        // the first timestamp line itself has no link/URL — most docs put
+        // the link on the timestamp, but the older single-line "title + url"
+        // pattern is still supported.
+        const firstUrl = firstBare?.url
+          ?? (parseTimestampRange(rawParagraphs[j].text.trim())
+              ? findParagraphYoutubeUrl(rawParagraphs[j]) ?? findParagraphYoutubeUrl(p)
+              : null);
+        const firstRange = firstBare?.range ?? parseTimestampRange(rawParagraphs[j].text);
+        if (firstRange && firstUrl) {
           titleCards.push({
             kind: "title_card",
             text: titleParagraphText(p),
-            youtubeUrl: url,
-            startSeconds: range.start,
-            endSeconds: range.end,
+            youtubeUrl: firstUrl,
+            startSeconds: firstRange.start,
+            endSeconds: firstRange.end,
             paragraphIndex: transcriptParagraphTexts.length,
             ordinal: titleOrdinal++,
           });
-          // Consume both the title and the timestamp paragraph — neither
-          // belongs in the plain transcript.
-          i = j + 1;
+          // Consume the title paragraph + the first timestamp paragraph.
+          let k = j + 1;
+          // Walk forward collecting any ADDITIONAL bare-timestamp lines
+          // immediately stacked under the first one. Blank paragraphs are
+          // allowed between stacked timestamps but anything else (prose,
+          // another title block) ends the run.
+          while (k < rawParagraphs.length) {
+            const candidate = rawParagraphs[k];
+            if (candidate.text.trim() === "") { k++; continue; }
+            const extra = bareTimestampInfo(candidate);
+            if (!extra) break;
+            titleCards.push({
+              kind: "title_card_clip",
+              text: "",
+              youtubeUrl: extra.url,
+              startSeconds: extra.range.start,
+              endSeconds: extra.range.end,
+              paragraphIndex: transcriptParagraphTexts.length,
+              ordinal: titleOrdinal++,
+            });
+            k++;
+          }
+          i = k;
           continue;
         }
       }

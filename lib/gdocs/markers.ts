@@ -38,7 +38,13 @@ export interface ScriptMarkerRow {
   // applyScriptMarkers — intros are pre-roll, never aligned to the
   // narrator's spoken audio. The matchProcessor's loader drops them so
   // this type only ever sees the in-script kinds.
-  kind: "title_card" | "lower_third";
+  //
+  // title_card_clip rows are extra timestamps stacked under a title_card in
+  // the doc. They share the title_card's spoken-audio anchor (we don't try
+  // to align them independently — there's no text to align). The matcher
+  // appends them as forced-footage rows immediately after the title_card's
+  // own forced-footage row, with no second card flash between them.
+  kind: "title_card" | "title_card_clip" | "lower_third";
   text: string;
   ordinal: number;
   paragraph_index: number | null;
@@ -122,6 +128,10 @@ function findItemIndexAtTime(starts: number[], items: TimelineItemDraft[], t: nu
 export interface ApplyMarkersResult {
   titleCardsInserted: number;
   titleCardsSkipped: number;
+  // Count of extra title_card_clip rows that successfully attached to their
+  // parent title_card. Reported separately from titleCardsInserted so logs
+  // can show how many doc-stacked clips actually got into the timeline.
+  titleCardExtraClipsInserted: number;
   lowerThirdsApplied: number;
   lowerThirdsSkipped: number;
 }
@@ -135,6 +145,7 @@ export function applyScriptMarkers(
   const result: ApplyMarkersResult = {
     titleCardsInserted: 0,
     titleCardsSkipped: 0,
+    titleCardExtraClipsInserted: 0,
     lowerThirdsApplied: 0,
     lowerThirdsSkipped: 0,
   };
@@ -187,21 +198,77 @@ export function applyScriptMarkers(
     result.lowerThirdsApplied++;
   }
 
-  // Title cards: insert in reverse spoken-time order so an earlier
-  // insertion doesn't shift the index of a later one.
-  const titleCardResolutions = resolved
-    .filter((r) => r.marker.kind === "title_card" && r.t != null && r.marker.youtube_url)
-    .sort((a, b) => (b.t as number) - (a.t as number));
+  // Group title_card + its following title_card_clip rows together. The
+  // doc author can stack multiple timestamps under one blue title; each
+  // stacked timestamp becomes its own forced footage clip played
+  // back-to-back after the title card, with no second card flash. The
+  // parser persists those stacked entries as title_card_clip rows
+  // immediately after the parent title_card in the ordinal stream — so
+  // adjacency by ordinal is what we look for here.
+  const orderedResolutions = [...resolved].sort(
+    (a, b) => a.marker.ordinal - b.marker.ordinal,
+  );
+  interface TitleCardGroup {
+    parent: ScriptMarkerRow;
+    parentT: number;
+    extras: ScriptMarkerRow[];
+  }
+  const groups: TitleCardGroup[] = [];
+  for (let g = 0; g < orderedResolutions.length; g++) {
+    const r = orderedResolutions[g];
+    if (r.marker.kind !== "title_card") continue;
+    if (r.t == null || !r.marker.youtube_url) {
+      result.titleCardsSkipped++;
+      continue;
+    }
+    const extras: ScriptMarkerRow[] = [];
+    // Walk forward collecting title_card_clip siblings. Stop at the next
+    // non-clip marker (another title_card, lower_third with intervening
+    // text, etc) or end of stream.
+    let h = g + 1;
+    while (h < orderedResolutions.length
+        && orderedResolutions[h].marker.kind === "title_card_clip") {
+      const sib = orderedResolutions[h].marker;
+      if (sib.youtube_url) extras.push(sib);
+      h++;
+    }
+    groups.push({ parent: r.marker, parentT: r.t, extras });
+  }
 
-  for (const { marker, t } of titleCardResolutions) {
-    const tt = t as number;
+  // Insert groups in reverse spoken-time order so an earlier insertion
+  // doesn't shift the index of a later one.
+  const groupsByTimeDesc = [...groups].sort((a, b) => b.parentT - a.parentT);
+  for (const group of groupsByTimeDesc) {
     const currentStarts = computeStarts(items);
-    const k = findItemIndexAtTime(currentStarts, items, tt);
+    const k = findItemIndexAtTime(currentStarts, items, group.parentT);
     if (k < 0) { result.titleCardsSkipped++; continue; }
 
-    const start = marker.start_seconds != null ? Number(marker.start_seconds) : 0;
-    const end = marker.end_seconds != null ? Number(marker.end_seconds) : start + 6;
-    const forcedDuration = Math.max(1, end - start);
+    function forcedFootageFromMarker(m: ScriptMarkerRow): TimelineItemDraft {
+      const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
+      const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
+      const dur = Math.max(1, end - start);
+      return {
+        project_id: projectId,
+        clip_id: null,
+        type: "footage",
+        position: 0, // re-numbered below
+        duration: dur,
+        script_text: null,
+        overlay_text: null,
+        metadata: {
+          placeholder: false,
+          planned: false,
+          pick_source: "doc_marker_forced",
+          doc_marker_id: m.id,
+          forced_clip: {
+            youtube_url: m.youtube_url,
+            start_seconds: start,
+            end_seconds: end,
+          },
+        },
+        approved: false,
+      };
+    }
 
     const titleCardRow: TimelineItemDraft = {
       project_id: projectId,
@@ -210,46 +277,30 @@ export function applyScriptMarkers(
       position: 0, // re-numbered below
       duration: TITLE_CARD_DEFAULT_DURATION,
       script_text: null,
-      overlay_text: marker.text,
+      overlay_text: group.parent.text,
       metadata: {
         placeholder: false,
         planned: false,
         pick_source: "doc_marker",
-        doc_marker_id: marker.id,
+        doc_marker_id: group.parent.id,
         doc_marker_kind: "title_card",
       },
       approved: false,
     };
-    const forcedFootageRow: TimelineItemDraft = {
-      project_id: projectId,
-      clip_id: null,
-      type: "footage",
-      position: 0, // re-numbered below
-      duration: forcedDuration,
-      script_text: null,
-      overlay_text: null,
-      metadata: {
-        placeholder: false,
-        planned: false,
-        pick_source: "doc_marker_forced",
-        doc_marker_id: marker.id,
-        forced_clip: {
-          youtube_url: marker.youtube_url,
-          start_seconds: start,
-          end_seconds: end,
-        },
-      },
-      approved: false,
-    };
+    const rows: TimelineItemDraft[] = [titleCardRow, forcedFootageFromMarker(group.parent)];
+    for (const extra of group.extras) {
+      rows.push(forcedFootageFromMarker(extra));
+    }
 
-    // Insert just BEFORE the item that's playing at `tt`. We intentionally
-    // don't try to split the host item — the host gets pushed back, and the
-    // total timeline grows by (title_card + forced_footage) seconds. The
-    // matcher's duration-reclaim already happens before we run, so growing
-    // the timeline here is acceptable: the render simply pushes the audio
-    // tail back; the voiceover speaker doesn't care about the gap.
-    items.splice(k, 0, titleCardRow, forcedFootageRow);
+    // Insert just BEFORE the item that's playing at `parentT`. We
+    // intentionally don't try to split the host item — the host gets pushed
+    // back, and the total timeline grows by the sum of inserted durations.
+    // The matcher's duration-reclaim already happened before we run, so
+    // growing the timeline here is acceptable: the render simply pushes
+    // the audio tail back.
+    items.splice(k, 0, ...rows);
     result.titleCardsInserted++;
+    result.titleCardExtraClipsInserted += group.extras.length;
   }
 
   // Re-number positions across the final array.
