@@ -213,12 +213,15 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             downloadHttp(leftUrl, leftLocal),
             downloadHttp(rightUrl, rightLocal),
           ]);
+          const splitMeta = (it.metadata ?? {}) as Record<string, unknown>;
+          const splitLt = splitMeta.lower_third as { text?: string } | undefined;
           await buildSplitScreenVideo({
             leftImagePath: leftLocal,
             rightImagePath: rightLocal,
             outputPath: out,
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
+            lowerThird: splitLt?.text ? { text: splitLt.text } : undefined,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
@@ -293,6 +296,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         try {
           const localImg = path.join(tmp, `img_${idx}`);
           await downloadHttp(it.image_url as string, localImg);
+          const imgMeta = (it.metadata ?? {}) as Record<string, unknown>;
+          const imgLt = imgMeta.lower_third as { text?: string } | undefined;
           await buildStillVideo({
             inputImagePath: localImg,
             outputPath: out,
@@ -301,6 +306,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             // Alternate zoom direction by timeline index so consecutive
             // image blocks don't all push the viewer the same way.
             motionDirection: i % 2 === 0 ? "in" : "out",
+            lowerThird: imgLt?.text ? { text: imgLt.text } : undefined,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;

@@ -74,6 +74,10 @@ export async function buildStillVideo(opts: {
   // "out" crops an expanding window (zoom-out feel). Caller alternates per
   // image so consecutive stills don't move identically. Defaults to "in".
   motionDirection?: "in" | "out";
+  // Optional lower-third overlay. Same semantics as normalizeClip — when the
+  // matcher's minute-cadence picker lands on an image block, the renderer
+  // burns the proper-noun text in via the shared drawtext recipe.
+  lowerThird?: { text: string };
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -160,6 +164,14 @@ export async function buildStillVideo(opts: {
   const FG_SUPERSAMPLE = 4;
   const ssW = w * FG_SUPERSAMPLE;
   const ssH = h * FG_SUPERSAMPLE;
+  // Optional lower-third drawtext, built from the same recipe normalizeClip
+  // uses. Appended to the final composite stage so the overlay sits on top
+  // of the blurred-bg + zoomed-fg composite.
+  const ltFilter = opts.lowerThird?.text
+    ? await buildLowerThirdFilter(opts.lowerThird.text, h)
+    : null;
+  const ltSuffix = ltFilter ? `,${ltFilter}` : "";
+
   const vfChain =
     `[0:v]fps=${fps},split=2[bgsrc][fgsrc];` +
     // Background: scale to COVER the target frame, center-crop to exactly
@@ -175,7 +187,7 @@ export async function buildStillVideo(opts: {
       `pad=${ssW}:${ssH}:-1:-1:color=#00000000,format=yuva420p,` +
       `zoompan=z='${zExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'` +
         `:d=1:s=${w}x${h}:fps=${fps},setsar=1[fg];` +
-    `[bg][fg]overlay=0:0:format=auto,format=yuv420p`;
+    `[bg][fg]overlay=0:0:format=auto,format=yuv420p${ltSuffix}`;
 
   const args = [
     "-y",
@@ -234,6 +246,10 @@ export async function buildSplitScreenVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
+  // Optional lower-third overlay. Same recipe as normalizeClip /
+  // buildStillVideo — when the matcher's minute-cadence picker lands on a
+  // split_2 block, the renderer burns the proper-noun text in.
+  lowerThird?: { text: string };
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -269,10 +285,16 @@ export async function buildSplitScreenVideo(opts: {
   const sideChain = (label: string) =>
     `[${label}]fps=${fps},scale=${halfW}:${h}:force_original_aspect_ratio=increase,` +
     `crop=${halfW}:${h},setsar=1`;
+  // Lower-third drawn after the hstack so it spans both halves of the
+  // composite. Skipped when no font is available on the host.
+  const ltFilter = opts.lowerThird?.text
+    ? await buildLowerThirdFilter(opts.lowerThird.text, h)
+    : null;
+  const ltSuffix = ltFilter ? `,${ltFilter}` : "";
   const filter =
     `${sideChain("0:v")}[L];` +
     `${sideChain("1:v")}[R];` +
-    `[L][R]hstack=inputs=2,format=yuv420p[v]`;
+    `[L][R]hstack=inputs=2,format=yuv420p${ltSuffix}[v]`;
 
   const args = [
     "-y",
@@ -341,42 +363,42 @@ export async function buildTitleCardVideo(opts: {
   // not word-wrap; without this a long title runs off the side of the
   // frame. ~22 chars per line is a comfortable read at this font size.
   //
-  // We write the wrapped text to a temp file and load it via drawtext's
-  // `textfile=` option. The previous approach used `text='line1\nline2'`
-  // with a literal two-char `\n`, but ffmpeg's filter-arg lexer ate the
-  // backslash on some builds, leaving the `n` glued to neighboring words
-  // ("dispute in the" became "disputeinnthe"). Real newlines in a textfile
-  // are unambiguous and render the same across platforms.
+  // Pre-wrap the title. We render one drawtext per line and center each
+  // line independently via x=(w-text_w)/2. This avoids drawtext's
+  // text_align=center option, which only landed in ffmpeg 6.0 — the Fly
+  // worker image is on 4.4 (libavfilter 8.44) where text_align trips
+  // "Option not found" and the whole render fails. Per-line drawtext also
+  // sidesteps the older `textfile=` + `\n` lexer bug that mangled words on
+  // some builds.
   const lines = wrapTitleCardText(opts.text, 22);
-  const textfilePath = `${opts.outputPath}.title.txt`;
-  await fs.writeFile(textfilePath, lines.join("\n"), "utf8");
-  // drawtext's textfile= argument needs the same path-escaping treatment
-  // as fontfile= (backslashes, single quotes, colons).
-  const escapedTextfile = textfilePath
-    .replace(/\\/g, "/")
-    .replace(/'/g, "\\'")
-    .replace(/:/g, "\\:");
-
-  // lavfi `color` source generates a solid black stream at the target
-  // resolution / fps / duration. No input file needed. We chain drawtext
-  // (when a font is available), setsar, and yuv420p so the encoder gets
-  // the same pixel format every other segment uses — concat then keeps
-  // its -c:v copy fast path.
-  //
-  // Centered text via x=(w-text_w)/2 and y=(h-text_h)/2 — drawtext exposes
-  // the rendered text dimensions as text_w / text_h so the expression
-  // centers a multi-line block without us hand-computing its height per
-  // line count.
-  // text_align=center centers each line individually within the block.
-  // Without it, drawtext only centers the bounding box via x=(w-text_w)/2
-  // and lines inside render left-aligned — so a short second line like
-  // "IP Disputes" hangs flush-left under a longer first line. Requires
-  // ffmpeg 6.0+ for the text_align option.
-  const drawtext = fontPath
-    ? `drawtext=fontfile='${fontPath}':textfile='${escapedTextfile}':` +
-      `fontcolor=white:fontsize=${fontsize}:` +
-      `line_spacing=10:text_align=center:` +
-      `x=(w-text_w)/2:y=(h-text_h)/2,`
+  // Each line's text needs the drawtext quoting treatment: backslashes
+  // first, then single quotes, then colons. drawtext's filter-arg parser
+  // treats : and ' as separators inside the option value.
+  const escapeDrawtext = (s: string): string =>
+    s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/:/g, "\\:");
+  // Stack lines vertically around the frame center. Each line is
+  // (fontsize + line_spacing) tall in flowed text; we approximate by
+  // measuring with text_h at draw time per line, but the simplest stable
+  // layout is to compute Y offsets in JS from line index. fontsize is the
+  // glyph height for line_h; line_spacing widens that gap. The block's
+  // total height is lines.length * fontsize + (lines.length - 1) * spacing.
+  const lineSpacing = 10;
+  const blockHeight = lines.length * fontsize + Math.max(0, lines.length - 1) * lineSpacing;
+  const drawtext = fontPath && lines.length > 0
+    ? lines
+        .map((line, idx) => {
+          // Y for this line: center the block, then step down by line index.
+          // Use the same `(h-blockHeight)/2 + idx*(fontsize+spacing)` formula
+          // for every build — pure arithmetic, no filter options.
+          const yOffset = (idx * (fontsize + lineSpacing));
+          const yExpr = `(h-${blockHeight})/2+${yOffset}`;
+          return (
+            `drawtext=fontfile='${fontPath}':text='${escapeDrawtext(line)}':` +
+            `fontcolor=white:fontsize=${fontsize}:` +
+            `x=(w-text_w)/2:y=${yExpr}`
+          );
+        })
+        .join(",") + ","
     : "";
   const vfChain = `${drawtext}setsar=1,format=yuv420p`;
 
@@ -397,11 +419,7 @@ export async function buildTitleCardVideo(opts: {
     "-movflags", "+faststart",
     opts.outputPath,
   ];
-  try {
-    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
-  } finally {
-    await fs.unlink(textfilePath).catch(() => {});
-  }
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
 // drawtext has no word-wrap, so we pre-split the title at the nearest

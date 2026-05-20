@@ -3011,8 +3011,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const lowerThirdCounts = { name: 0, year: 0, place: 0, phrase: 0 };
   let skippedForCadence = 0;
   let skippedForNoEntity = 0;
+  let fallbackReuseCount = 0;
   let cumulativeSec = 0;
   let lastLowerThirdAtSec = Number.NEGATIVE_INFINITY;
+  // Most recently placed lower-third — used as a fallback when the block at
+  // a minute mark has no proper-noun entities of its own. Per client
+  // direction ("any noun word, repeat is fine"), we'd rather re-show the
+  // last name than skip a minute mark and let the cadence drift.
+  let lastPick: { text: string; type: "name" | "year" | "place" | "phrase" } | null = null;
   const orderedItems = [...items].sort(
     (a, b) => (a.position as number) - (b.position as number),
   );
@@ -3091,11 +3097,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
 
     if (!pick) {
-      skippedForNoEntity++;
-      continue;
+      // Fallback: reuse the previously placed lower-third so the minute mark
+      // still gets an overlay. Client wants every-minute cadence even when
+      // the narration at that beat doesn't introduce a fresh proper noun.
+      // If we've never placed one yet (very start of the video had no
+      // entities), we genuinely have to skip — there's nothing to repeat.
+      if (lastPick) {
+        pick = lastPick;
+        fallbackReuseCount++;
+      } else {
+        skippedForNoEntity++;
+        continue;
+      }
     }
     lowerThirdCounts[pick.type]++;
     lastLowerThirdAtSec = clipStartSec;
+    lastPick = pick;
     (it.metadata as Record<string, unknown>) = {
       ...meta,
       lower_third: { text: pick.text, type: pick.type },
@@ -3109,6 +3126,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     phrase: lowerThirdCounts.phrase,
     skippedForCadence,
     skippedForNoEntity,
+    fallbackReuseCount,
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
   });
 
