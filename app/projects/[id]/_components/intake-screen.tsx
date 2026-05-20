@@ -2,13 +2,14 @@
 
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { FileText, Loader2, Sparkles } from "lucide-react";
+import { Loader2, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { ProjectResp } from "../_shared";
 import { uploadVoiceoverDirect } from "@/lib/client/upload-voiceover";
+import { ScriptMarkersPanel } from "./script-markers-panel";
 
 export function IntakeScreen({
   projectId,
@@ -24,13 +25,6 @@ export function IntakeScreen({
       project={project}
     />
   );
-}
-
-interface ScriptDocResponse {
-  project: ProjectResp["project"];
-  introCards: Array<{ text: string; startSeconds?: number; endSeconds?: number }>;
-  titleCards: Array<{ text: string }>;
-  lowerThirds: Array<{ text: string }>;
 }
 
 function IntakeForm({
@@ -59,29 +53,30 @@ function IntakeForm({
   });
 
   // Script doc ingest -------------------------------------------------------
+  // The response is intentionally discarded: ScriptMarkersPanel polls
+  // /api/projects/[id]/script-markers for live status, and the project
+  // query refresh below picks up the new transcript. Invalidating the
+  // markers query forces the panel to refetch on the very next tick so
+  // the user sees the new clip list immediately after the doc parses.
   const [docUrl, setDocUrl] = useState("");
-  const [lastIngest, setLastIngest] = useState<ScriptDocResponse | null>(null);
   const ingestDoc = useMutation({
-    mutationFn: async (url: string): Promise<ScriptDocResponse> => {
+    mutationFn: async (url: string): Promise<void> => {
       const r = await fetch(`/api/projects/${projectId}/script-doc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ doc: url }),
       });
-      const json = await r.json();
-      if (!r.ok) throw new Error(json.error ?? `failed ${r.status}`);
-      return json as ScriptDocResponse;
+      if (!r.ok) throw new Error((await r.json()).error ?? `failed ${r.status}`);
     },
-    onSuccess: (data) => {
-      setLastIngest(data);
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["project", projectId] });
+      qc.invalidateQueries({ queryKey: ["script-markers", projectId] });
     },
   });
 
   const transcribing = uploadVoiceover.isPending;
   const parsingDoc = ingestDoc.isPending;
   const hasVoiceover = !!project?.voiceover_url;
-  const hasTranscript = !!project?.transcript?.trim();
 
   return (
     <div className="max-w-4xl mx-auto space-y-4">
@@ -172,34 +167,11 @@ function IntakeForm({
                 <p className="text-xs text-danger">{(ingestDoc.error as Error).message}</p>
               )}
             </div>
-            {lastIngest && (
-              <div className="rounded-md border border-border bg-bg-elevated p-3 text-xs space-y-1">
-                <div className="flex items-center gap-1.5 font-medium">
-                  <FileText className="h-3.5 w-3.5" /> Doc parsed
-                </div>
-                {lastIngest.introCards.length > 0 ? (
-                  <p className="text-fg-muted">
-                    Intro clips: <span className="text-fg">{lastIngest.introCards.length}</span>
-                    {" — "}
-                    {lastIngest.introCards
-                      .map((c) =>
-                        c.startSeconds != null && c.endSeconds != null
-                          ? `${c.startSeconds}s–${c.endSeconds}s`
-                          : "?")
-                      .join(", ")}
-                  </p>
-                ) : (
-                  <p className="text-fg-muted">Intro clips: none detected at the top of the doc.</p>
-                )}
-                <p className="text-fg-muted">Title cards: <span className="text-fg">{lastIngest.titleCards.length}</span></p>
-                <p className="text-fg-muted">Lower-thirds: <span className="text-fg">{lastIngest.lowerThirds.length}</span></p>
-              </div>
-            )}
-            {hasTranscript && !lastIngest && (
-              <p className="text-xs text-fg-muted">
-                Transcript saved — re-ingest the doc if you&apos;ve changed the source.
-              </p>
-            )}
+            {/* Live status panel — polls the markers endpoint so the user
+                sees clips transition through pending → downloading → ready
+                without reloading the page. Re-ingests replace the row set,
+                which the panel picks up on the next poll. */}
+            <ScriptMarkersPanel projectId={projectId} />
           </CardContent>
         </Card>
       </div>

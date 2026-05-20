@@ -11,11 +11,12 @@ import { Worker } from "bullmq";
 import { QUEUE_NAMES, getRedisConnection } from "@/lib/jobs/queue";
 import { getEnv } from "@/lib/env";
 
-import { processSearchJob }   from "./processors/searchProcessor";
-import { processDownloadJob } from "./processors/downloadProcessor";
-import { processClipJob }     from "./processors/clipProcessor";
-import { processMatchJob }    from "./processors/matchProcessor";
-import { processRenderJob }   from "./processors/renderProcessor";
+import { processSearchJob }     from "./processors/searchProcessor";
+import { processDownloadJob }   from "./processors/downloadProcessor";
+import { processClipJob }       from "./processors/clipProcessor";
+import { processMatchJob }      from "./processors/matchProcessor";
+import { processRenderJob }     from "./processors/renderProcessor";
+import { processScriptClipJob } from "./processors/scriptClipProcessor";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -96,11 +97,16 @@ function startWorker<T>(
   return w;
 }
 
-workers.push(startWorker(QUEUE_NAMES.search,   processSearchJob,   1));
-workers.push(startWorker(QUEUE_NAMES.download, processDownloadJob, downloadConcurrency));
-workers.push(startWorker(QUEUE_NAMES.clip,     processClipJob,     concurrency));
-workers.push(startWorker(QUEUE_NAMES.match,    processMatchJob,    1));
-workers.push(startWorker(QUEUE_NAMES.render,   processRenderJob,   1));
+workers.push(startWorker(QUEUE_NAMES.search,     processSearchJob,     1));
+workers.push(startWorker(QUEUE_NAMES.download,   processDownloadJob,   downloadConcurrency));
+workers.push(startWorker(QUEUE_NAMES.clip,       processClipJob,       concurrency));
+workers.push(startWorker(QUEUE_NAMES.match,      processMatchJob,      1));
+workers.push(startWorker(QUEUE_NAMES.render,     processRenderJob,     1));
+// script_clip jobs share the same proxy-rotated yt-dlp pipeline as the
+// source-pool downloads, so they tolerate the same level of parallelism.
+// downloadConcurrency keeps the marker batch from saturating residential
+// proxies during a heavy ingest of a script-doc with many title cards.
+workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadConcurrency));
 
 async function shutdown(signal: string) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.shutdown", signal }));

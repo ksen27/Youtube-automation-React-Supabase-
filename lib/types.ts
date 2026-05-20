@@ -149,7 +149,12 @@ export type MediaJobType =
   | "download"
   | "clip"
   | "match"
-  | "render";
+  | "render"
+  // Pre-downloads one script-doc marker's YouTube window into R2 (clip
+  // .mp4 always; .m4a audio for intro_card kinds). The script-doc API
+  // enqueues one job per marker right after persisting them so the user
+  // can watch download progress on the intake screen before generate.
+  | "script_clip";
 export type MediaJobStatus = "queued" | "running" | "completed" | "failed";
 
 export interface MediaJob {

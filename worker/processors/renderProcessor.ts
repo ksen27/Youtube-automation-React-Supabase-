@@ -10,37 +10,11 @@ import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeCl
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
+import { extractYoutubeVideoId } from "@/lib/youtube/url";
 import { getEnv } from "@/lib/env";
 
 const VALIDATION_FAILED_MSG =
   "Timeline duration must match voiceover and use unique clips.";
-
-// Pull the 11-char video id out of the YouTube URL the user pasted on the
-// intake screen. Accepts watch?v=, youtu.be/, shorts/, embed/, and a bare
-// id. The PATCH route already validates this on save — this helper is the
-// worker-side fallback so we never invoke yt-dlp with an unusable URL.
-function extractIntroVideoId(raw: string): string | null {
-  const s = raw.trim();
-  if (!s) return null;
-  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
-  try {
-    const u = new URL(s);
-    const host = u.hostname.replace(/^www\./, "");
-    if (host === "youtu.be") {
-      const id = u.pathname.slice(1).split("/")[0];
-      return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
-    }
-    if (host === "youtube.com" || host === "m.youtube.com" || host === "music.youtube.com") {
-      const v = u.searchParams.get("v");
-      if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v;
-      const m = u.pathname.match(/^\/(?:shorts|embed|v)\/([A-Za-z0-9_-]{11})/);
-      if (m) return m[1];
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
 
 export async function processRenderJob(data: RenderJobData): Promise<void> {
   const sb = getServerSupabase();
@@ -334,19 +308,17 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             "render.image.failed", { idx: i, url: it.image_url, err: (e as Error).message });
         }
       } else if (it.type === "footage" && (((it.metadata ?? {}) as Record<string, unknown>).forced_clip as { youtube_url?: string } | undefined)?.youtube_url) {
-        // Forced clip from a script-doc title-card marker. We download the
-        // YouTube source via the proxied yt-dlp pipeline, cut the window the
-        // doc specified, and normalize — same shape as the user-intro path
-        // above, but for a mid-timeline footage segment. clip_id stays null
-        // because there's no video_clips row for this content.
+        // Forced clip from a script-doc title-card marker. Two paths:
+        //   • Pre-downloaded (preferred): the script_clip worker has
+        //     already pulled the YouTube source, cut the doc's window,
+        //     normalized to 1280x720@30, and uploaded the result to R2.
+        //     The marker row carries clip_storage_url. We just downloadHttp
+        //     it and re-encode if a lower_third overlay needs baking in.
+        //   • Fallback: the pre-download didn't run or failed. We do the
+        //     full yt-dlp + cut + normalize at render time, paying the
+        //     same cost the script_clip worker would have.
         const meta = (it.metadata ?? {}) as Record<string, unknown>;
         const fc = meta.forced_clip as { youtube_url: string; start_seconds?: number; end_seconds?: number };
-        const videoId = extractIntroVideoId(fc.youtube_url);
-        if (!videoId) {
-          await logJob({ projectId, jobId: mediaJobId },
-            "render.forced_clip.bad_url", { idx: i, url: fc.youtube_url });
-          return;
-        }
         const startSeconds = Number(fc.start_seconds ?? 0);
         const endSeconds = Number(fc.end_seconds ?? startSeconds + plannedDur);
         const windowDur = Math.max(1, endSeconds - startSeconds);
@@ -355,42 +327,105 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const headLeft = leftIsImage ? MIXED_FADE_SECONDS / 2 : 0;
         const headRight = rightIsImage ? MIXED_FADE_SECONDS / 2 : 0;
         const renderDur = windowDur + headLeft + headRight;
-        const dlDir = path.join(tmp, `forced_${idx}`);
-        const trimmed = path.join(tmp, `forced_cut_${idx}.mp4`);
-        try {
-          await fs.mkdir(dlDir, { recursive: true });
-          const dl = await downloadYoutubeVideo({
-            url: fc.youtube_url,
-            outputDir: dlDir,
-            videoId,
-          });
-          await cutClip({
-            inputPath: dl.outputPath, outputPath: trimmed,
-            startSeconds, durationSeconds: renderDur,
-          });
-          const lt = meta.lower_third as { text?: string } | undefined;
-          await normalizeClip({
-            inputPath: trimmed, outputPath: out,
-            width: 1280, height: 720, fps: 30,
-            lowerThird: lt?.text ? { text: lt.text } : undefined,
-          });
-          slots[i] = out;
-          let actualDur = renderDur;
+
+        // Look up the marker's pre-downloaded URL if metadata points to one.
+        const docMarkerId = (meta.doc_marker_id as string | null | undefined) ?? null;
+        let preClipUrl: string | null = null;
+        if (docMarkerId) {
+          const { data: markerRow } = await sb
+            .from("project_script_markers")
+            .select("clip_storage_url")
+            .eq("id", docMarkerId)
+            .maybeSingle();
+          preClipUrl = (markerRow?.clip_storage_url as string | null) ?? null;
+        }
+        const lt = meta.lower_third as { text?: string } | undefined;
+
+        if (preClipUrl) {
+          // Pre-downloaded path. The asset on R2 is already cut + normalized
+          // so we only re-encode when we need to bake a lower-third overlay
+          // or when the renderer's mixed-boundary headroom adds duration.
+          const localPre = path.join(tmp, `forced_pre_${idx}.mp4`);
           try {
-            const probed = await probeFile(out);
-            if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
-          } catch { /* keep renderDur fallback */ }
-          slotDurations[i] = actualDur;
-          await safeUnlink(dl.outputPath);
-          await safeUnlink(trimmed);
-        } catch (e) {
-          await logJob({ projectId, jobId: mediaJobId },
-            "render.forced_clip.failed", {
-              idx: i,
+            await downloadHttp(preClipUrl, localPre);
+            if (lt?.text || headLeft > 0 || headRight > 0) {
+              const trimmedPre = path.join(tmp, `forced_pretrim_${idx}.mp4`);
+              await cutClip({
+                inputPath: localPre, outputPath: trimmedPre,
+                startSeconds: 0, durationSeconds: renderDur,
+              });
+              await normalizeClip({
+                inputPath: trimmedPre, outputPath: out,
+                width: 1280, height: 720, fps: 30,
+                lowerThird: lt?.text ? { text: lt.text } : undefined,
+              });
+              await safeUnlink(trimmedPre);
+            } else {
+              // No re-encode needed — the pre-download already matches the
+              // final shape. Just rename into the slot.
+              await fs.rename(localPre, out);
+            }
+            slots[i] = out;
+            let actualDur = renderDur;
+            try {
+              const probed = await probeFile(out);
+              if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
+            } catch { /* keep renderDur fallback */ }
+            slotDurations[i] = actualDur;
+            await safeUnlink(localPre);
+          } catch (e) {
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.forced_clip.pre.failed", {
+                idx: i,
+                docMarkerId,
+                preClipUrl,
+                err: (e as Error).message,
+              });
+          }
+        } else {
+          // Fallback: do the whole yt-dlp dance at render time.
+          const videoId = extractYoutubeVideoId(fc.youtube_url);
+          if (!videoId) {
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.forced_clip.bad_url", { idx: i, url: fc.youtube_url });
+            return;
+          }
+          const dlDir = path.join(tmp, `forced_${idx}`);
+          const trimmed = path.join(tmp, `forced_cut_${idx}.mp4`);
+          try {
+            await fs.mkdir(dlDir, { recursive: true });
+            const dl = await downloadYoutubeVideo({
               url: fc.youtube_url,
+              outputDir: dlDir,
               videoId,
-              err: (e as Error).message,
             });
+            await cutClip({
+              inputPath: dl.outputPath, outputPath: trimmed,
+              startSeconds, durationSeconds: renderDur,
+            });
+            await normalizeClip({
+              inputPath: trimmed, outputPath: out,
+              width: 1280, height: 720, fps: 30,
+              lowerThird: lt?.text ? { text: lt.text } : undefined,
+            });
+            slots[i] = out;
+            let actualDur = renderDur;
+            try {
+              const probed = await probeFile(out);
+              if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
+            } catch { /* keep renderDur fallback */ }
+            slotDurations[i] = actualDur;
+            await safeUnlink(dl.outputPath);
+            await safeUnlink(trimmed);
+          } catch (e) {
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.forced_clip.failed", {
+                idx: i,
+                url: fc.youtube_url,
+                videoId,
+                err: (e as Error).message,
+              });
+          }
         }
       } else if (it.clip_id) {
         const url = clipUrlById.get(it.clip_id as string);
@@ -715,7 +750,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // voiceover.
     const { data: introCardRows } = await sb
       .from("project_script_markers")
-      .select("id, text, ordinal, youtube_url, start_seconds, end_seconds")
+      .select("id, text, ordinal, youtube_url, start_seconds, end_seconds, clip_storage_url, audio_storage_url")
       .eq("project_id", projectId)
       .eq("kind", "intro_card")
       .order("ordinal");
@@ -736,24 +771,43 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             youtube_url: string | null;
             start_seconds: number | null;
             end_seconds: number | null;
+            clip_storage_url: string | null;
+            audio_storage_url: string | null;
           };
           const url = row.youtube_url?.trim();
           if (!url) continue;
           const start = Number(row.start_seconds ?? 0);
           const end = Number(row.end_seconds ?? start + 6);
           const dur = Math.max(1, end - start);
-          const videoId = extractIntroVideoId(url);
-          if (!videoId) {
-            await logJob({ projectId, jobId: mediaJobId },
-              "render.intro_card.bad_url", { ordinal: row.ordinal, url });
-            continue;
-          }
           try {
+            // Fast path: the script-clip pre-download produced cut +
+            // normalized assets on R2. Pull them via HTTP and we're done —
+            // no yt-dlp, no ffmpeg cut, no normalize pass.
+            const preClipUrl = row.clip_storage_url?.trim();
+            const preAudioUrl = row.audio_storage_url?.trim();
+            if (preClipUrl && preAudioUrl) {
+              const localClip = path.join(introTmp, `pre_card_${row.ordinal}.mp4`);
+              const localAudio = path.join(introTmp, `pre_audio_${row.ordinal}.m4a`);
+              await Promise.all([
+                downloadHttp(preClipUrl, localClip),
+                downloadHttp(preAudioUrl, localAudio),
+              ]);
+              builtVideos.push(localClip);
+              builtAudios.push(localAudio);
+              accumulatedDuration += dur;
+              continue;
+            }
+
+            // Fallback: pre-download didn't run or partially failed. Fetch
+            // via proxied yt-dlp like the original path.
+            const videoId = extractYoutubeVideoId(url);
+            if (!videoId) {
+              await logJob({ projectId, jobId: mediaJobId },
+                "render.intro_card.bad_url", { ordinal: row.ordinal, url });
+              continue;
+            }
             const cardDir = path.join(introTmp, `card_${row.ordinal}`);
             await fs.mkdir(cardDir, { recursive: true });
-            // Use a per-card subdirectory so concurrent multi-intro renders
-            // don't collide on the yt-dlp output filename (it derives from
-            // videoId only).
             const [videoDl, audioDl] = await Promise.all([
               downloadYoutubeVideo({ url, outputDir: cardDir, videoId }),
               downloadYoutubeAudio({ url, outputDir: cardDir, videoId: `${videoId}_audio` }),
@@ -841,7 +895,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const declaredDur = Number(project?.intro_duration_seconds) || 6;
         introDurationActual = Math.min(15, Math.max(1, declaredDur));
 
-        const videoId = extractIntroVideoId(userIntroUrl);
+        const videoId = extractYoutubeVideoId(userIntroUrl);
         if (!videoId) throw new Error(`unable to parse YouTube id from ${userIntroUrl}`);
 
         const introTmp = path.join(tmp, "intro_user");

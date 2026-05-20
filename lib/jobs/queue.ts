@@ -8,6 +8,12 @@ export const QUEUE_NAMES = {
   clip: "video-automation-clip",
   match: "video-automation-match",
   render: "video-automation-render",
+  // One job per script-doc marker that has a youtube_url. Runs in parallel
+  // because each marker is independent (different sources, no shared
+  // local-state). Lives on its own queue rather than reusing `download` so
+  // bursts of script_clip jobs from a doc with many title cards don't
+  // starve the source-pool downloads the matcher depends on.
+  scriptClip: "video-automation-script-clip",
 } as const;
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
@@ -16,6 +22,10 @@ export interface DownloadJobData  { projectId: string; mediaJobId: string; youtu
 export interface ClipJobData      { projectId: string; mediaJobId: string; videoSourceId: string; }
 export interface MatchJobData     { projectId: string; mediaJobId: string; }
 export interface RenderJobData    { projectId: string; mediaJobId: string; renderJobId: string; }
+// One job per script-doc marker that has a youtube_url. The processor
+// looks up the marker row by markerId to read its URL + window + kind so
+// the queued payload stays small (no need to re-pickle URLs on retry).
+export interface ScriptClipJobData { projectId: string; mediaJobId: string; markerId: string; }
 
 // Idle BullMQ workers sit on a long blocking BRPOP. On Fly, idle TCP sockets
 // to the colocated Redis get torn down by the network layer after a few
@@ -92,4 +102,7 @@ export async function enqueueMatch(data: MatchJobData) {
 }
 export async function enqueueRender(data: RenderJobData) {
   return getQueue<RenderJobData>(QUEUE_NAMES.render).add("render", data, { jobId: data.mediaJobId });
+}
+export async function enqueueScriptClip(data: ScriptClipJobData) {
+  return getQueue<ScriptClipJobData>(QUEUE_NAMES.scriptClip).add("script_clip", data, { jobId: data.mediaJobId });
 }

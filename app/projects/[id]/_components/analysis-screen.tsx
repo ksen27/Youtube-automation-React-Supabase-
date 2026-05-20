@@ -22,6 +22,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { fmtMinutes } from "../_shared";
+import { ScriptMarkersPanel, type ScriptMarkersResponse } from "./script-markers-panel";
 
 interface PreviewCandidate {
   videoId: string;
@@ -129,6 +130,27 @@ export function AnalysisScreen({
     staleTime: 60_000,
   });
 
+  // Script-doc clip download state. We block the "Analyze & Search" button
+  // while any doc clip is still being downloaded so the user can't kick off
+  // generate before their forced footage is ready. The render path has its
+  // own fallback (yt-dlp at render time) but failing during a 10-minute
+  // render is much worse UX than waiting an extra few seconds here.
+  const markersQ = useQuery<ScriptMarkersResponse>({
+    queryKey: ["script-markers", projectId],
+    queryFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/script-markers`);
+      if (!r.ok) throw new Error(`load script markers: ${r.status}`);
+      return r.json();
+    },
+    refetchInterval: (query) => {
+      const d = query.state.data as ScriptMarkersResponse | undefined;
+      if (!d) return 2000;
+      return d.summary.stillDownloading > 0 ? 2000 : 10_000;
+    },
+  });
+  const clipsStillDownloading = (markersQ.data?.summary.stillDownloading ?? 0) > 0;
+  const hasScriptMarkers = (markersQ.data?.summary.total ?? 0) > 0;
+
   const runAnalyze = useMutation<AnalyzeResponse, Error, void>({
     mutationFn: async () => {
       setPhase("understanding");
@@ -198,9 +220,13 @@ export function AnalysisScreen({
       setPhase("results");
       return;
     }
-    if (autoStart) runAnalyze.mutate();
+    // Hold the auto-start trigger until all script-doc clips have settled
+    // (ready or failed). Without this, the doc-driven matcher can race the
+    // forced-clip downloads and emit timeline rows that point at not-yet-
+    // uploaded clips.
+    if (autoStart && !clipsStillDownloading) runAnalyze.mutate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart, savedQ.isLoading, savedQ.data]);
+  }, [autoStart, savedQ.isLoading, savedQ.data, clipsStillDownloading]);
 
   const totals = useMemo(() => {
     if (!data) return { selected: 0, segments: 0, durationSec: 0 };
@@ -213,7 +239,8 @@ export function AnalysisScreen({
 
   if (phase === "idle") {
     return (
-      <div className="max-w-3xl mx-auto">
+      <div className="max-w-3xl mx-auto space-y-4">
+        {hasScriptMarkers && <ScriptMarkersPanel projectId={projectId} />}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -223,10 +250,20 @@ export function AnalysisScreen({
               We&apos;ll read your content, break it into parts, and find source videos for each part. You confirm the sources before anything is downloaded.
             </CardDescription>
           </CardHeader>
-          <CardContent>
-            <Button variant="gradient" size="lg" onClick={() => runAnalyze.mutate()}>
+          <CardContent className="space-y-2">
+            <Button
+              variant="gradient"
+              size="lg"
+              onClick={() => runAnalyze.mutate()}
+              disabled={clipsStillDownloading}
+            >
               <Sparkles className="h-4 w-4" /> Analyze &amp; Search
             </Button>
+            {clipsStillDownloading && (
+              <p className="text-xs text-fg-muted">
+                Waiting for {markersQ.data?.summary.stillDownloading ?? 0} script-doc clip(s) to finish downloading before analysis.
+              </p>
+            )}
           </CardContent>
         </Card>
       </div>

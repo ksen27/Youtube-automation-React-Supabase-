@@ -4,6 +4,8 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { estimateDurationSeconds } from "@/lib/ai/segments";
 import { extractDocumentId, fetchGoogleDoc, GoogleDocsFetchError } from "@/lib/gdocs/fetch";
 import { parseScriptDoc, type ScriptMarker } from "@/lib/gdocs/parse";
+import { createMediaJob, logJob } from "@/lib/jobs/db";
+import { enqueueScriptClip } from "@/lib/jobs/queue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -94,7 +96,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (projErr) return NextResponse.json({ error: projErr.message }, { status: 500 });
 
   // Wipe and re-write the marker table for this project. Re-running the
-  // script-doc ingest replaces the previous markers.
+  // script-doc ingest replaces the previous markers — and BullMQ jobs
+  // referencing the deleted markerIds will no-op when the processor's
+  // load step finds them missing.
   await sb.from("project_script_markers").delete().eq("project_id", id);
 
   const markerRows = [
@@ -102,10 +106,43 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     ...parsedScript.titleCards.map(markerToRow.bind(null, id)),
     ...parsedScript.lowerThirds.map(markerToRow.bind(null, id)),
   ];
+  let insertedMarkers: Array<{ id: string; kind: string; youtube_url: string | null; ordinal: number }> = [];
   if (markerRows.length > 0) {
-    const { error: markersErr } = await sb.from("project_script_markers").insert(markerRows);
+    const { data: inserted, error: markersErr } = await sb
+      .from("project_script_markers")
+      .insert(markerRows)
+      .select("id, kind, youtube_url, ordinal");
     if (markersErr) {
       return NextResponse.json({ error: markersErr.message }, { status: 500 });
+    }
+    insertedMarkers = (inserted ?? []) as typeof insertedMarkers;
+  }
+
+  // Dispatch one script_clip job per marker that has a YouTube URL. The
+  // worker handles the download/cut/upload and writes the result back onto
+  // the marker row. We do this here (synchronously dispatching, asynchronously
+  // processing) instead of waiting in the request because some docs have 10+
+  // clips that would blow past the request timeout.
+  let jobsEnqueued = 0;
+  for (const m of insertedMarkers) {
+    if (!m.youtube_url) continue;
+    try {
+      const mediaJobId = await createMediaJob({
+        projectId: id,
+        type: "script_clip",
+        metadata: { markerId: m.id, kind: m.kind, ordinal: m.ordinal },
+      });
+      await enqueueScriptClip({ projectId: id, mediaJobId, markerId: m.id });
+      jobsEnqueued++;
+    } catch (e) {
+      // A queue-side failure here means the marker stays at 'pending' —
+      // the UI's retry button can recover it. We don't fail the whole
+      // ingest because the markers themselves are persisted.
+      await logJob({ projectId: id }, "script_doc.enqueue_failed", {
+        markerId: m.id,
+        kind: m.kind,
+        err: (e as Error).message,
+      });
     }
   }
 
@@ -114,6 +151,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     introCards: parsedScript.introCards,
     titleCards: parsedScript.titleCards,
     lowerThirds: parsedScript.lowerThirds,
+    jobsEnqueued,
   });
 }
 
