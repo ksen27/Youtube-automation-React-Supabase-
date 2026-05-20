@@ -28,7 +28,7 @@ export function IntakeScreen({
 
 interface ScriptDocResponse {
   project: ProjectResp["project"];
-  intro: { text: string; youtubeUrl?: string; startSeconds?: number; endSeconds?: number } | null;
+  introCards: Array<{ text: string; startSeconds?: number; endSeconds?: number }>;
   titleCards: Array<{ text: string }>;
   lowerThirds: Array<{ text: string }>;
 }
@@ -177,15 +177,19 @@ function IntakeForm({
                 <div className="flex items-center gap-1.5 font-medium">
                   <FileText className="h-3.5 w-3.5" /> Doc parsed
                 </div>
-                {lastIngest.intro ? (
+                {lastIngest.introCards.length > 0 ? (
                   <p className="text-fg-muted">
-                    Intro: <span className="text-fg">{lastIngest.intro.text || "(untitled)"}</span>
-                    {lastIngest.intro.startSeconds != null && lastIngest.intro.endSeconds != null && (
-                      <> ({lastIngest.intro.startSeconds}s–{lastIngest.intro.endSeconds}s)</>
-                    )}
+                    Intro clips: <span className="text-fg">{lastIngest.introCards.length}</span>
+                    {" — "}
+                    {lastIngest.introCards
+                      .map((c) =>
+                        c.startSeconds != null && c.endSeconds != null
+                          ? `${c.startSeconds}s–${c.endSeconds}s`
+                          : "?")
+                      .join(", ")}
                   </p>
                 ) : (
-                  <p className="text-fg-muted">Intro: none detected — the doc had no leading blue-bold title with a timestamp.</p>
+                  <p className="text-fg-muted">Intro clips: none detected at the top of the doc.</p>
                 )}
                 <p className="text-fg-muted">Title cards: <span className="text-fg">{lastIngest.titleCards.length}</span></p>
                 <p className="text-fg-muted">Lower-thirds: <span className="text-fg">{lastIngest.lowerThirds.length}</span></p>

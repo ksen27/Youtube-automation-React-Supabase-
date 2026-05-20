@@ -3218,16 +3218,21 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // metadata.forced_clip = { youtube_url, start_seconds, end_seconds }; the
   // renderer downloads the window via the proxied yt-dlp pipeline at render
   // time, same way the user-supplied intro works today.
-  const { data: markerRows } = await sb
+  //
+  // intro_card markers live in the same table but are pre-roll only —
+  // never aligned to spoken audio — so we filter them out here. The
+  // renderer queries them directly when building the pre-roll segment.
+  const { data: allMarkerRows } = await sb
     .from("project_script_markers")
     .select("id, kind, text, ordinal, paragraph_index, char_offset, youtube_url, start_seconds, end_seconds")
     .eq("project_id", projectId)
+    .in("kind", ["title_card", "lower_third"])
     .order("ordinal");
-  if (markerRows && markerRows.length > 0) {
+  if (allMarkerRows && allMarkerRows.length > 0) {
     const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
     const stats = applyScriptMarkers(
       items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
-      markerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
+      allMarkerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
       transcriptWords,
       projectId,
     );

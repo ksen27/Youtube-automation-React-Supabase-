@@ -25,7 +25,7 @@ import type {
 // JSON, output = ParsedScript) so it's trivially unit-testable without a
 // network call or API key.
 
-export type ScriptMarkerKind = "intro" | "title_card" | "lower_third";
+export type ScriptMarkerKind = "intro_card" | "title_card" | "lower_third";
 
 export interface ScriptMarker {
   kind: ScriptMarkerKind;
@@ -50,7 +50,12 @@ export interface ParsedScript {
   // saved to projects.transcript so the existing Gemini/search pipeline
   // works unchanged.
   transcript: string;
-  intro: ScriptMarker | null;
+  // Intro pre-roll. Plays back-to-back BEFORE the voiceover begins. Each
+  // entry corresponds to a blue-bold timestamp block at the top of the doc.
+  // No title text is rendered on screen for intros — only the clip + its
+  // original audio. Multiple intros = multiple clips concatenated as the
+  // pre-roll, in doc order.
+  introCards: ScriptMarker[];
   titleCards: ScriptMarker[];
   lowerThirds: ScriptMarker[];
 }
@@ -192,6 +197,22 @@ function titleParagraphText(p: ParsedParagraph): string {
   return parts.join("").replace(/\s+/g, " ").trim();
 }
 
+// A paragraph is a "bare timestamp line" when its trimmed text is
+// *exclusively* a parseable timestamp range (optionally surrounded by
+// whitespace or a hyperlink URL). The two-intros-stacked screenshot from
+// the user has lines like "0.00-0.08" carrying a hyperlink — these are
+// intro clips with no title text. We pull the YouTube URL from the
+// run-level hyperlink since the visible text is just the timestamp.
+function bareTimestampInfo(p: ParsedParagraph): { range: { start: number; end: number }; url: string } | null {
+  const trimmed = p.text.trim();
+  if (!trimmed) return null;
+  const range = parseTimestampRange(trimmed);
+  if (!range) return null;
+  const url = findParagraphYoutubeUrl(p);
+  if (!url) return null;
+  return { range, url };
+}
+
 export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
   const rawParagraphs: ParsedParagraph[] = [];
   for (const el of doc.body?.content ?? []) {
@@ -200,33 +221,77 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
     rawParagraphs.push(parsed);
   }
 
-  // Step 1: locate the intro pair. The first title paragraph + the next
-  // paragraph that carries a parseable timestamp range form the intro. We
-  // also keep their indices so they get stripped from the plain transcript.
-  let introTitleIdx = -1;
-  let introTimestampIdx = -1;
-  let intro: ScriptMarker | null = null;
-  for (let i = 0; i < rawParagraphs.length; i++) {
-    if (!isTitleParagraph(rawParagraphs[i])) continue;
-    // Look at the next non-empty paragraph for a timestamp range.
-    let j = i + 1;
-    while (j < rawParagraphs.length && rawParagraphs[j].text.trim() === "") j++;
-    if (j >= rawParagraphs.length) break;
-    const range = parseTimestampRange(rawParagraphs[j].text);
-    if (!range) break;
-    const url = findParagraphYoutubeUrl(rawParagraphs[j]) ?? findParagraphYoutubeUrl(rawParagraphs[i]);
-    if (!url) break;
-    introTitleIdx = i;
-    introTimestampIdx = j;
-    intro = {
-      kind: "intro",
-      text: titleParagraphText(rawParagraphs[i]),
-      youtubeUrl: url,
-      startSeconds: range.start,
-      endSeconds: range.end,
-      ordinal: 0,
-    };
-    break;
+  // Step 1: walk the top of the doc collecting intro clips. Every blue-bold
+  // block we recognize as an intro is consumed. The walk stops at the first
+  // paragraph that's neither a bare timestamp line nor a (title + timestamp)
+  // pair, AND has non-empty prose text — that paragraph is the first line of
+  // the narrator's script. Empty paragraphs at the top are skipped.
+  //
+  // We support two doc patterns:
+  //   • Pattern A — bare timestamp line. The paragraph's text is just the
+  //     range (e.g. "0.00-0.08") and the hyperlink on that line carries the
+  //     YouTube URL. One intro clip per such line.
+  //   • Pattern B — title + timestamp pair. A blue-bold title paragraph
+  //     followed (after any blank lines) by a bare timestamp line. The
+  //     title text is captured for reference but NEVER rendered — intros
+  //     are silent visual cuts. One intro clip per pair.
+  //
+  // Either pattern can repeat; the screenshot the user shared stacks two
+  // Pattern-A lines (two bare timestamps back-to-back) before any prose.
+  const introCards: ScriptMarker[] = [];
+  // Indices of paragraphs consumed by the intro walk, so they're excluded
+  // from the transcript pass below.
+  const consumedAsIntro = new Set<number>();
+  let introOrdinal = 0;
+  {
+    let i = 0;
+    while (i < rawParagraphs.length) {
+      const p = rawParagraphs[i];
+      if (p.text.trim() === "") {
+        consumedAsIntro.add(i);
+        i++;
+        continue;
+      }
+      // Pattern A: bare timestamp line.
+      const bare = bareTimestampInfo(p);
+      if (bare) {
+        introCards.push({
+          kind: "intro_card",
+          text: "",
+          youtubeUrl: bare.url,
+          startSeconds: bare.range.start,
+          endSeconds: bare.range.end,
+          ordinal: introOrdinal++,
+        });
+        consumedAsIntro.add(i);
+        i++;
+        continue;
+      }
+      // Pattern B: blue-bold title followed by a bare timestamp line.
+      if (isTitleParagraph(p)) {
+        let j = i + 1;
+        while (j < rawParagraphs.length && rawParagraphs[j].text.trim() === "") j++;
+        if (j < rawParagraphs.length) {
+          const nextBare = bareTimestampInfo(rawParagraphs[j]);
+          if (nextBare) {
+            introCards.push({
+              kind: "intro_card",
+              text: titleParagraphText(p),
+              youtubeUrl: nextBare.url,
+              startSeconds: nextBare.range.start,
+              endSeconds: nextBare.range.end,
+              ordinal: introOrdinal++,
+            });
+            consumedAsIntro.add(i);
+            for (let k = i + 1; k <= j; k++) consumedAsIntro.add(k);
+            i = j + 1;
+            continue;
+          }
+        }
+      }
+      // First non-intro, non-blank paragraph — prose begins here. Stop.
+      break;
+    }
   }
 
   // Step 2: walk the remaining paragraphs. Title paragraphs (with a
@@ -249,7 +314,7 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
 
   let i = 0;
   while (i < rawParagraphs.length) {
-    if (i === introTitleIdx || i === introTimestampIdx) {
+    if (consumedAsIntro.has(i)) {
       i++;
       continue;
     }
@@ -315,5 +380,5 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
   // don't add extra separators.
   const transcript = transcriptParagraphTexts.join("").replace(/\n{3,}/g, "\n\n").trim();
 
-  return { transcript, intro, titleCards, lowerThirds };
+  return { transcript, introCards, titleCards, lowerThirds };
 }

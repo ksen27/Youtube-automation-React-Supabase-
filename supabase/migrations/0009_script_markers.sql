@@ -1,12 +1,14 @@
 -- Script-doc markers. The intake flow no longer accepts a pasted transcript
 -- — the user provides a Google Docs link whose formatting carries editorial
 -- intent:
---   • The first blue-bold line at the top + a timestamp range underneath +
---     a YouTube link is the *intro* (persisted on projects.intro_source_*
---     columns from 0008_intro_user_source.sql — not stored here).
---   • Subsequent blue-bold lines + a timestamp range below + a YouTube link
---     are title cards. After the card flashes on screen, the renderer must
---     cut and play exactly that YouTube window — no search, no ranking.
+--   • Blue-bold blocks at the TOP of the doc, before any prose paragraph,
+--     are intro clips. Each one plays back-to-back as a pre-roll with its
+--     own original audio; the title text (if any) is captured but never
+--     shown on screen. Multiple intros = multiple clips concatenated.
+--   • Blue-bold blocks AFTER prose begins are title cards. The blue text
+--     flashes as an overlay when its phrase is spoken in the voiceover,
+--     then the renderer cuts and plays exactly the YouTube window listed
+--     under the title — no search, no ranking.
 --   • Red text runs inline in regular paragraphs are lower-thirds. While the
 --     narrator says these words, a drawtext overlay shows them.
 --
@@ -21,7 +23,7 @@
 create table if not exists public.project_script_markers (
   id uuid primary key default gen_random_uuid(),
   project_id uuid not null references public.projects(id) on delete cascade,
-  kind text not null check (kind in ('title_card', 'lower_third')),
+  kind text not null check (kind in ('intro_card', 'title_card', 'lower_third')),
   -- Plain text of the run as it appears in the doc — also what we look for
   -- in the Deepgram-aligned word stream. Casing/punctuation may differ;
   -- the matcher normalizes both sides before comparison.
@@ -37,8 +39,8 @@ create table if not exists public.project_script_markers (
   -- Character offset of the marker's first character within its paragraph.
   -- Combined with paragraph_index this uniquely places the marker.
   char_offset int,
-  -- Title-card markers carry a forced YouTube source + window. Lower-third
-  -- markers leave all three null.
+  -- Intro-card and title-card markers carry a forced YouTube source +
+  -- window. Lower-third markers leave all three null.
   youtube_url text,
   start_seconds numeric,
   end_seconds numeric,

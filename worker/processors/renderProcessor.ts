@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -697,6 +697,120 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     let introAudioPath: string | undefined;
     let introDurationActual = 0;
 
+    // Multi-clip intro from script-doc markers takes priority over
+    // everything else. Each intro_card row in project_script_markers is a
+    // blue-bold timestamp block at the top of the user's Google Doc; we
+    // download each one's YouTube source, cut its window, and prepend them
+    // back-to-back as the pre-roll. Original-source audio is concatenated
+    // into a single intro audio track that concatNormalizedClips uses for
+    // the first introDurationActual seconds before crossfading into the
+    // voiceover.
+    const { data: introCardRows } = await sb
+      .from("project_script_markers")
+      .select("id, text, ordinal, youtube_url, start_seconds, end_seconds")
+      .eq("project_id", projectId)
+      .eq("kind", "intro_card")
+      .order("ordinal");
+
+    if (introCardRows && introCardRows.length > 0) {
+      const introTmp = path.join(tmp, "intro_cards");
+      try {
+        await fs.mkdir(introTmp, { recursive: true });
+        const builtVideos: string[] = []; // in doc order, prepended in reverse below
+        const builtAudios: string[] = []; // in doc order
+        let accumulatedDuration = 0;
+
+        for (let k = 0; k < introCardRows.length; k++) {
+          const row = introCardRows[k] as {
+            id: string;
+            text: string | null;
+            ordinal: number;
+            youtube_url: string | null;
+            start_seconds: number | null;
+            end_seconds: number | null;
+          };
+          const url = row.youtube_url?.trim();
+          if (!url) continue;
+          const start = Number(row.start_seconds ?? 0);
+          const end = Number(row.end_seconds ?? start + 6);
+          const dur = Math.max(1, end - start);
+          const videoId = extractIntroVideoId(url);
+          if (!videoId) {
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.intro_card.bad_url", { ordinal: row.ordinal, url });
+            continue;
+          }
+          try {
+            const cardDir = path.join(introTmp, `card_${row.ordinal}`);
+            await fs.mkdir(cardDir, { recursive: true });
+            // Use a per-card subdirectory so concurrent multi-intro renders
+            // don't collide on the yt-dlp output filename (it derives from
+            // videoId only).
+            const [videoDl, audioDl] = await Promise.all([
+              downloadYoutubeVideo({ url, outputDir: cardDir, videoId }),
+              downloadYoutubeAudio({ url, outputDir: cardDir, videoId: `${videoId}_audio` }),
+            ]);
+            const trimmed = path.join(introTmp, `trim_${row.ordinal}.mp4`);
+            await cutClip({
+              inputPath: videoDl.outputPath, outputPath: trimmed,
+              startSeconds: start, durationSeconds: dur,
+            });
+            const normalizedCard = path.join(introTmp, `norm_${row.ordinal}.mp4`);
+            await normalizeClip({
+              inputPath: trimmed, outputPath: normalizedCard,
+              width: 1280, height: 720, fps: 30,
+            });
+            builtVideos.push(normalizedCard);
+            await safeUnlink(videoDl.outputPath);
+            await safeUnlink(trimmed);
+
+            const audioCut = path.join(introTmp, `audio_${row.ordinal}.m4a`);
+            await cutAudio({
+              inputPath: audioDl.outputPath, outputPath: audioCut,
+              startSeconds: start, durationSeconds: dur,
+            });
+            builtAudios.push(audioCut);
+            await safeUnlink(audioDl.outputPath);
+
+            accumulatedDuration += dur;
+          } catch (e) {
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.intro_card.failed", {
+                ordinal: row.ordinal, url, err: (e as Error).message,
+              });
+          }
+        }
+
+        if (builtVideos.length > 0 && builtAudios.length > 0) {
+          // Prepend videos in doc order (so first card plays first).
+          // unshift in reverse pushes them into normalized[] in the right
+          // order — same trick the single-intro path uses.
+          for (let k = builtVideos.length - 1; k >= 0; k--) {
+            normalized.unshift(builtVideos[k]);
+          }
+          // Concatenate intro audios into one m4a so the existing intro
+          // audio crossfade in concatNormalizedClips works unchanged.
+          const introAudioMerged = path.join(tmp, "intro_cards_audio.m4a");
+          await concatAudioFiles({ inputPaths: builtAudios, outputPath: introAudioMerged });
+          for (const a of builtAudios) await safeUnlink(a);
+          introAudioPath = introAudioMerged;
+          introDurationActual = accumulatedDuration;
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.intro_cards.ready", {
+              count: builtVideos.length,
+              totalDurationSeconds: Math.round(accumulatedDuration * 10) / 10,
+            });
+        }
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.intro_cards.failed", { err: (e as Error).message });
+        introAudioPath = undefined;
+        introDurationActual = 0;
+      }
+    }
+
+    // Legacy single-intro path. Only runs when no intro_card markers exist
+    // (old projects, or projects whose doc had no leading blue-bold blocks).
     // User-provided intro source takes priority over the auto-pick path.
     // When the user pasted a YouTube URL + timestamp on the intake screen
     // we download THAT video via the proxied yt-dlp pipeline and cut the
@@ -708,7 +822,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const userIntroStart = project?.intro_source_start_seconds != null
       ? Number(project.intro_source_start_seconds)
       : null;
-    if (userIntroUrl && userIntroStart != null && Number.isFinite(userIntroStart) && userIntroStart >= 0) {
+    // Skip the legacy single-intro path entirely if the multi-intro
+    // markers path already produced an intro — both writing to
+    // normalized.unshift would stack a second intro on top.
+    const introAlreadyBuilt = introDurationActual > 0;
+    if (introAlreadyBuilt) {
+      // No-op — multi-intro path already populated normalized + introAudioPath.
+    } else if (userIntroUrl && userIntroStart != null && Number.isFinite(userIntroStart) && userIntroStart >= 0) {
       try {
         const declaredDur = Number(project?.intro_duration_seconds) || 6;
         introDurationActual = Math.min(15, Math.max(1, declaredDur));

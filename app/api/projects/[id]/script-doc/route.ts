@@ -74,21 +74,16 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     if (est > 0) updates.voiceover_duration_seconds = est;
   }
 
-  if (parsedScript.intro && parsedScript.intro.youtubeUrl) {
-    updates.intro_source_youtube_url = parsedScript.intro.youtubeUrl;
-    updates.intro_source_start_seconds = parsedScript.intro.startSeconds ?? 0;
-    const introDuration =
-      parsedScript.intro.endSeconds != null && parsedScript.intro.startSeconds != null
-        ? Math.max(1, parsedScript.intro.endSeconds - parsedScript.intro.startSeconds)
-        : 6;
-    updates.intro_duration_seconds = introDuration;
-  } else {
-    // Doc didn't have a leading title block — clear any prior intro so the
-    // user doesn't get a stale value from a previous upload.
-    updates.intro_source_youtube_url = null;
-    updates.intro_source_start_seconds = null;
-    updates.intro_duration_seconds = null;
-  }
+  // Always null the legacy single-intro columns — new ingests express
+  // intros as a list of project_script_markers (kind='intro_card') so
+  // multi-clip pre-rolls work. The renderer reads from markers first and
+  // only falls back to projects.intro_source_* for old projects that
+  // haven't been re-ingested. Clearing here makes the source of truth
+  // unambiguous: if any intro_card markers exist for this project, those
+  // are what the renderer plays.
+  updates.intro_source_youtube_url = null;
+  updates.intro_source_start_seconds = null;
+  updates.intro_duration_seconds = null;
 
   const { data: project, error: projErr } = await sb
     .from("projects")
@@ -103,6 +98,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   await sb.from("project_script_markers").delete().eq("project_id", id);
 
   const markerRows = [
+    ...parsedScript.introCards.map(markerToRow.bind(null, id)),
     ...parsedScript.titleCards.map(markerToRow.bind(null, id)),
     ...parsedScript.lowerThirds.map(markerToRow.bind(null, id)),
   ];
@@ -115,7 +111,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   return NextResponse.json({
     project,
-    intro: parsedScript.intro,
+    introCards: parsedScript.introCards,
     titleCards: parsedScript.titleCards,
     lowerThirds: parsedScript.lowerThirds,
   });

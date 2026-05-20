@@ -34,6 +34,10 @@ export interface TimelineItemDraft {
 
 export interface ScriptMarkerRow {
   id: string;
+  // intro_card rows are filtered out by the caller before being passed to
+  // applyScriptMarkers — intros are pre-roll, never aligned to the
+  // narrator's spoken audio. The matchProcessor's loader drops them so
+  // this type only ever sees the in-script kinds.
   kind: "title_card" | "lower_third";
   text: string;
   ordinal: number;

@@ -472,6 +472,55 @@ export async function cutAudio(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// Concatenate N AAC audio segments into a single .m4a. Uses the concat
+// filter (re-encodes once) instead of the concat demuxer because the input
+// files come from different sources (different YouTube videos for each intro
+// clip) and may not share the exact same codec parameters — the demuxer's
+// stream-copy mode would error out on mismatched container metadata.
+//
+// Used by the multi-intro pre-roll: each intro clip's audio is cut to its
+// own window via cutAudio, then this function stitches them into one track
+// that aligns with the prepended silent intro videos.
+export async function concatAudioFiles(opts: {
+  inputPaths: string[];
+  outputPath: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  if (opts.inputPaths.length === 0) throw new Error("concatAudioFiles: no inputs");
+  const env = getEnv();
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  // Single input: just copy through (no need to spend an encode pass).
+  if (opts.inputPaths.length === 1) {
+    const args = [
+      "-y",
+      "-threads", String(env.FFMPEG_THREADS),
+      "-i", opts.inputPaths[0],
+      "-vn",
+      "-c:a", "copy",
+      opts.outputPath,
+    ];
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+    return;
+  }
+  const inputArgs: string[] = [];
+  for (const p of opts.inputPaths) {
+    inputArgs.push("-i", p);
+  }
+  const audioInputs = opts.inputPaths.map((_, i) => `[${i}:a:0]`).join("");
+  const filter = `${audioInputs}concat=n=${opts.inputPaths.length}:v=0:a=1[a]`;
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    ...inputArgs,
+    "-filter_complex", filter,
+    "-map", "[a]",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 export interface ThumbnailOptions {
   inputPath: string;
   outputPath: string;
