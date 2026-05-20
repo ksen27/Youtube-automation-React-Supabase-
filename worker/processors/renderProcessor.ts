@@ -7,6 +7,7 @@ import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { getEnv } from "@/lib/env";
@@ -321,9 +322,20 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const trimmed = path.join(tmp, `cut_${idx}.mp4`);
         try {
           await downloadHttp(url, local);
+          // Bake MIXED_FADE_SECONDS / 2 of headroom on each side that
+          // borders an image neighbor. The image side already extends
+          // itself by the same amount; without this, the xfaceFadeBlack
+          // pass subtracts MIXED_FADE_SECONDS of wall-clock time but only
+          // one side contributed headroom, leaving the timeline short by
+          // 0.2s per mixed boundary (compounds to 13s+ on a 10-min video).
+          const leftIsImage = isImageNeighbor(i - 1);
+          const rightIsImage = isImageNeighbor(i + 1);
+          const headLeft = leftIsImage ? MIXED_FADE_SECONDS / 2 : 0;
+          const headRight = rightIsImage ? MIXED_FADE_SECONDS / 2 : 0;
+          const renderDur = plannedDur + headLeft + headRight;
           await cutClip({
             inputPath: local, outputPath: trimmed,
-            startSeconds: 0, durationSeconds: plannedDur,
+            startSeconds: 0, durationSeconds: renderDur,
           });
           // Lower-third stamped by the matcher: { text, type } on
           // metadata.lower_third when this clip should introduce a name
@@ -338,7 +350,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             lowerThird: lt?.text ? { text: lt.text } : undefined,
           });
           slots[i] = out;
-          slotDurations[i] = plannedDur;
+          // Probe the actually-produced clip. When the source footage is
+          // shorter than renderDur, cutClip silently outputs the available
+          // tail — the matcher's clampedFootageBlocks counter sees this on
+          // the planning side, but slotDurations[i] used to record the
+          // REQUESTED renderDur regardless. That lie made every downstream
+          // SFX cue land later than its visual transition, because the cue
+          // offsets are computed by walking mergedDurations. Use the probed
+          // duration so the timeline arithmetic matches the bytes on disk.
+          // Fallback to renderDur if probing fails (best-effort).
+          let actualDur = renderDur;
+          try {
+            const probed = await probeFile(out);
+            if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
+          } catch { /* keep renderDur fallback */ }
+          slotDurations[i] = actualDur;
           await safeUnlink(trimmed);
         } catch (e) {
           await logJob({ projectId, jobId: mediaJobId },
@@ -423,8 +449,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         });
         mergedSegments[j] = out;
         // xfade output length = aDur + segDur - transitionDuration. Total
-        // visible content time matches the planned timeline because the
-        // image side already baked MIXED_FADE_SECONDS / 2 of headroom.
+        // visible content time matches the planned timeline because BOTH
+        // sides baked MIXED_FADE_SECONDS / 2 of headroom on the touching
+        // edge (image side via buildStillVideo, video side via cutClip).
         mergedDurations[j] = aDur + slotDurations[idx] - MIXED_FADE_SECONDS;
         // Kind tracks what plays AFTER the transition midpoint — i.e. the
         // incoming segment — so the next boundary decision sees the right
@@ -848,6 +875,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const OUTRO_FADE_SECONDS = 1.5;
     const lastIdx = normalized.length - 1;
     const lastSegDur = mergedDurations[mergedDurations.length - 1] ?? 0;
+    const totalVideoDurationSeconds = introDurationActual + mergedDurations.reduce((a, b) => a + b, 0);
     let outroFadeStartSeconds = 0;
     if (lastSegDur > OUTRO_FADE_SECONDS) {
       const fadedLast = path.join(tmp, "outro_fade.mp4");
@@ -861,8 +889,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         });
         await safeUnlink(normalized[lastIdx]);
         normalized[lastIdx] = fadedLast;
-        const totalDur = introDurationActual + mergedDurations.reduce((a, b) => a + b, 0);
-        outroFadeStartSeconds = Math.max(0, totalDur - OUTRO_FADE_SECONDS);
+        outroFadeStartSeconds = Math.max(0, totalVideoDurationSeconds - OUTRO_FADE_SECONDS);
       } catch (e) {
         // Fade failure shouldn't kill the render — ship without the polish.
         await logJob({ projectId, jobId: mediaJobId },
@@ -882,6 +909,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       sfxCues,
       outroFadeSeconds: outroFadeStartSeconds > 0 ? OUTRO_FADE_SECONDS : undefined,
       outroFadeStartSeconds: outroFadeStartSeconds > 0 ? outroFadeStartSeconds : undefined,
+      totalVideoDurationSeconds,
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);

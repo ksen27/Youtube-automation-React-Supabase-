@@ -2992,37 +2992,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // place — a name-on-screen is the strongest signal — and pick from the
   // block's own entity list so the overlay matches what's being said.
   //
-  // Only Tier-1 scored picks qualify; filler clips weren't chosen for
-  // entity relevance, so labelling them would mislead the viewer. Earlier
-  // visual-match gates (first-occurrence-only for names, sex contradiction
-  // check, labels-must-contain-place) are gone — the per-minute throttle
-  // replaces them.
+  // Eligible block types: footage, image, split_2. The earlier rule limited
+  // overlays to Tier-1 scored footage rows, which left long stretches of the
+  // video without any lower-third whenever a minute window happened to be
+  // image-heavy or filled with filler clips. Per client direction the overlay
+  // text is what the narrator is saying — not a label for the visual — so any
+  // block whose narration mentions a fresh proper-noun entity is fair game.
+  // Title cards and intros are still excluded (those have their own on-screen
+  // text and the overlay would clash visually).
   // Cadence: at least LOWER_THIRD_INTERVAL_SEC of timeline between overlays.
-  // The timer (`lastLowerThirdAtSec`) only advances on a SUCCESSFUL placement
-  // — if the minute mark lands on an image / title-card / filler clip, or
-  // on a block whose only entities were already used earlier, we keep
-  // searching and the *next* eligible footage clip claims the slot. This is
-  // what keeps the cadence close to one-per-minute even when the timeline
-  // has gaps (image-heavy stretches, filler runs).
-  //
-  // Dedup: each overlay text is shown at most once across the whole video.
-  // Without this, the same celebrity gets a name card every time the
-  // narrator says their name. We key the dedup set on lowercased text so
-  // "Salma Hayek" and "salma hayek" collapse to one entry.
+  // Per client direction the overlay must appear roughly every minute, so
+  // we no longer gate on freshness — if a tier yields any proper-noun entity
+  // we take it, even if the same text was shown earlier. Single-subject
+  // videos (one company, one celebrity) used to go dark for 5 minutes after
+  // the first card because every block's entity list was the same name; now
+  // the name simply repeats at the minute mark.
   const LOWER_THIRD_INTERVAL_SEC = 60;
-  // Cooldown for re-showing the same overlay text. Set to 5 minutes so a
-  // long stretch about one subject still gets minute-cadence overlays
-  // (the same name can repeat after the cooldown elapses) instead of
-  // going dark for the rest of the video on first show.
-  const LOWER_THIRD_REPEAT_COOLDOWN_SEC = 300;
   const lowerThirdCounts = { name: 0, year: 0, place: 0, phrase: 0 };
   let skippedForCadence = 0;
-  let skippedForDuplicate = 0;
+  let skippedForNoEntity = 0;
   let cumulativeSec = 0;
   let lastLowerThirdAtSec = Number.NEGATIVE_INFINITY;
-  // text -> last-shown second. Replaces the previous show-once set so the
-  // same name can return after LOWER_THIRD_REPEAT_COOLDOWN_SEC.
-  const lastShownAt = new Map<string, number>();
   const orderedItems = [...items].sort(
     (a, b) => (a.position as number) - (b.position as number),
   );
@@ -3031,10 +3021,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const clipStartSec = cumulativeSec;
     cumulativeSec += dur;
 
-    if (it.type !== "footage") continue;
+    // Footage / image / split_2 blocks can host an overlay; title_card,
+    // intro, transition, and lower_third-only rows cannot. We need a block
+    // index either way so the picker can look up the narration's entity
+    // list for that sentence.
+    if (it.type !== "footage" && it.type !== "image" && it.type !== "split_2") continue;
     const meta = it.metadata as Record<string, unknown> | undefined;
-    if (!meta || meta.pick_source !== "scored_top") continue;
-    const blockIdx = Number(meta.block_index ?? -1);
+    const blockIdx = Number(meta?.block_index ?? -1);
     if (blockIdx < 0) continue;
 
     if (clipStartSec - lastLowerThirdAtSec < LOWER_THIRD_INTERVAL_SEC) {
@@ -3045,31 +3038,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const ents = blockEntities[blockIdx] ?? [];
 
     type Candidate = { text: string; type: "name" | "year" | "place" | "phrase" };
-    const isFresh = (text: string): boolean => {
-      const prev = lastShownAt.get(text.toLowerCase());
-      if (prev === undefined) return true;
-      return clipStartSec - prev >= LOWER_THIRD_REPEAT_COOLDOWN_SEC;
-    };
-    // Proper-noun-only picker. Entity types are taken from project_entities,
-    // which Gemini extracts under a strict PROPER-NOUN RULE (see lib/ai/gemini.ts) —
-    // values must be capitalized, specific things (a named person, place, brand,
-    // titled work, or named event). The "year" tier is the one non-proper-noun
-    // exception we still allow because a standalone year reads as a strong
-    // historical anchor on screen ("1997").
+    // Proper-noun picker, ranked person → place → other proper noun → year.
+    // Entity types come from project_entities, which Gemini extracts under a
+    // strict PROPER-NOUN RULE (see lib/ai/gemini.ts) — capitalized, specific
+    // things (named person, place, brand, titled work, event). The "year"
+    // tier is the one non-proper-noun exception because a standalone year
+    // reads as a strong historical anchor on screen ("1997").
     //
-    // We previously had a Tier-2 fallback that pulled a multi-word capitalized
-    // phrase straight from the narration when no entity hit was available.
-    // That fallback misfired on sentence-initial conjunctions like "After
-    // Margot…" → it would burn in "After Margot" (or just "After") because
-    // the cap-run scan only filtered a small stopword set. Per client feedback
-    // (lower-thirds must read as proper nouns), we now skip the slot entirely
-    // rather than guess from narration text.
+    // No freshness gate: the client wants an overlay roughly every minute
+    // regardless of whether the same text appeared earlier. For a video
+    // about one celebrity, that means the celebrity's name repeats at each
+    // minute mark — that is the intended behavior, not a bug.
     let pick: Candidate | null = null;
 
     // Tier 1 — person (celebrity / related_person). Strongest signal.
     for (const ent of ents) {
       if (ent.type !== "celebrity" && ent.type !== "related_person") continue;
-      if (!isFresh(ent.value)) continue;
       pick = { text: ent.value, type: "name" };
       break;
     }
@@ -3077,13 +3061,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "place") continue;
-        if (!isFresh(ent.value)) continue;
         pick = { text: ent.value, type: "place" };
         break;
       }
     }
     // Tier 3 — other proper-noun entities (company / titled work / event).
-    // These all pass Gemini's PROPER-NOUN RULE so they're safe to overlay.
     if (!pick) {
       const otherProperNounTypes = new Set([
         "company",
@@ -3095,28 +3077,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       ]);
       for (const ent of ents) {
         if (!otherProperNounTypes.has(ent.type)) continue;
-        if (!isFresh(ent.value)) continue;
         pick = { text: ent.value, type: "phrase" };
         break;
       }
     }
-    // Tier 4 — standalone year (not a proper noun, but a clean historical anchor).
+    // Tier 4 — standalone year.
     if (!pick) {
       for (const ent of ents) {
         if (ent.type !== "year") continue;
-        if (!isFresh(ent.value)) continue;
         pick = { text: ent.value, type: "year" };
         break;
       }
     }
 
     if (!pick) {
-      skippedForDuplicate++;
+      skippedForNoEntity++;
       continue;
     }
     lowerThirdCounts[pick.type]++;
     lastLowerThirdAtSec = clipStartSec;
-    lastShownAt.set(pick.text.toLowerCase(), clipStartSec);
     (it.metadata as Record<string, unknown>) = {
       ...meta,
       lower_third: { text: pick.text, type: pick.type },
@@ -3129,9 +3108,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     place: lowerThirdCounts.place,
     phrase: lowerThirdCounts.phrase,
     skippedForCadence,
-    skippedForDuplicate,
+    skippedForNoEntity,
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
-    repeatCooldownSec: LOWER_THIRD_REPEAT_COOLDOWN_SEC,
   });
 
   // Reclaim time lost to clip-shorter-than-planned clamping by stretching

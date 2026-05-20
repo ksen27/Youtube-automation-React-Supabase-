@@ -367,10 +367,15 @@ export async function buildTitleCardVideo(opts: {
   // the rendered text dimensions as text_w / text_h so the expression
   // centers a multi-line block without us hand-computing its height per
   // line count.
+  // text_align=center centers each line individually within the block.
+  // Without it, drawtext only centers the bounding box via x=(w-text_w)/2
+  // and lines inside render left-aligned — so a short second line like
+  // "IP Disputes" hangs flush-left under a longer first line. Requires
+  // ffmpeg 6.0+ for the text_align option.
   const drawtext = fontPath
     ? `drawtext=fontfile='${fontPath}':textfile='${escapedTextfile}':` +
       `fontcolor=white:fontsize=${fontsize}:` +
-      `line_spacing=10:` +
+      `line_spacing=10:text_align=center:` +
       `x=(w-text_w)/2:y=(h-text_h)/2,`
     : "";
   const vfChain = `${drawtext}setsar=1,format=yuv420p`;
@@ -824,6 +829,14 @@ export interface ConcatOptions {
   // total output duration so afade knows when to start.
   outroFadeSeconds?: number;
   outroFadeStartSeconds?: number;
+  // Total video timeline duration in seconds (intro + all merged segments).
+  // When provided, the audio mix is padded with apad to match this length and
+  // the encoder uses `-t` to pin output duration instead of `-shortest`. This
+  // prevents the audio from getting truncated when the mix is fractionally
+  // shorter than the video — e.g. the intro acrossfade trims 0.3s from the
+  // voiceover tail, which used to make `-shortest` cut the last few seconds
+  // of narration off the final file.
+  totalVideoDurationSeconds?: number;
   signal?: AbortSignal;
 }
 
@@ -1071,6 +1084,41 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     }
   }
 
+  // Pad the final audio mix with silence so it can never be the limiting
+  // stream at encode time. Two ways the mix can come up short vs the video:
+  //   (a) the intro acrossfade subtracts 0.3s from voiceover+intro
+  //   (b) per-clip duration rounding leaves small gaps the reclaim step
+  //       couldn't fully absorb
+  // Without a pad, the encoder's -shortest would clip the final seconds of
+  // narration off the file (audio ends at 9:54 even though the video and
+  // voiceover are both 10:00). apad with whole_dur lets us extend to the
+  // exact video length; the encoder then uses -t to pin the output. apad
+  // must come AFTER afade so we don't fade into silence we just added.
+  const totalDur = opts.totalVideoDurationSeconds ?? 0;
+  if (hasAudioOutput && totalDur > 0) {
+    const filterIdx3 = args.indexOf("-filter_complex");
+    if (filterIdx3 >= 0) {
+      const existing = args[filterIdx3 + 1];
+      const rerouted = existing.replace(/\[aout\]\s*$/, "[aoutpre3]");
+      args[filterIdx3 + 1] =
+        rerouted +
+        (rerouted.endsWith(";") ? "" : ";") +
+        `[aoutpre3]apad=whole_dur=${totalDur.toFixed(3)}[aout]`;
+    } else {
+      // Voiceover-only-no-SFX, no outro fade. Same rewire pattern as above.
+      args.push(
+        "-filter_complex",
+        `[1:a]apad=whole_dur=${totalDur.toFixed(3)}[aout]`,
+      );
+      for (let k = 0; k < audioMap.length - 1; k++) {
+        if (audioMap[k] === "-map" && audioMap[k + 1] === "1:a:0") {
+          audioMap[k + 1] = "[aout]";
+          break;
+        }
+      }
+    }
+  }
+
   // Final concat: stream-copy the video (no re-encode). All input segments
   // are already H.264 1280x720 30fps yuv420p with identical encoder params
   // (see normalizeClip + buildStillVideo) and start with an IDR keyframe,
@@ -1091,7 +1139,16 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
     "-c:v", "copy",
   );
   if (hasAudioOutput) {
-    args.push("-c:a", "aac", "-b:a", "192k", "-shortest");
+    args.push("-c:a", "aac", "-b:a", "192k");
+    // When the caller passed totalVideoDurationSeconds we apad'd the audio
+    // to that exact length, so pin output duration with -t. Falling back to
+    // -shortest only when the duration is unknown preserves the old behavior
+    // for any caller that hasn't been updated.
+    if (totalDur > 0) {
+      args.push("-t", totalDur.toFixed(3));
+    } else {
+      args.push("-shortest");
+    }
   } else {
     args.push("-an");
   }
