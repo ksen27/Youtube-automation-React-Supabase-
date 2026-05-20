@@ -94,7 +94,7 @@ export default async function DashboardPage() {
             Turn a script into a <span className="gradient-text">finished video</span>.
           </h1>
           <p className="mt-2 text-sm text-fg-muted">
-            Paste a transcript or upload a voiceover. We analyze, find sources, and assemble it into scenes you can edit.
+            Upload a voiceover and paste your Google Docs script. We analyze, pull sources, and assemble it into scenes you can edit.
           </p>
         </div>
       </section>
@@ -103,7 +103,7 @@ export default async function DashboardPage() {
       <Card>
         <CardHeader>
           <CardTitle>New project</CardTitle>
-          <CardDescription>Start from a script or upload a voiceover.</CardDescription>
+          <CardDescription>Name it now — you&apos;ll attach the voiceover and Google Docs script next.</CardDescription>
         </CardHeader>
         <CardContent>
           <NewProjectForm />
