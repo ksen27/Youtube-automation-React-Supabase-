@@ -288,6 +288,10 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   mentioned_entities?: string[];
   subject_type?: "person" | "place" | "movie" | "show" | "company" | "event" | "object" | "general";
   visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
+  // Doc paragraph this block's narration came from. Forwarded from the
+  // source hint so post-build passes (mergeShortFootage, etc.) can keep
+  // the no-merge-across-paragraph invariant intact.
+  paragraph_index?: number | null;
 }
 
 // Estimate spoken duration of a text chunk based on its word count and a
@@ -690,6 +694,7 @@ export function buildBlockSequenceFromHints(
           mentioned_entities: h.mentioned_entities,
           subject_type: h.subject_type,
           visual_priority: h.visual_priority,
+          paragraph_index: h.paragraph_index,
         });
       }
       return;
@@ -720,6 +725,7 @@ export function buildBlockSequenceFromHints(
       mentioned_entities: h.mentioned_entities,
       subject_type: h.subject_type,
       visual_priority: h.visual_priority,
+      paragraph_index: h.paragraph_index,
     });
   });
 
@@ -761,10 +767,21 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
     const b = blocks[i + 1];
     // Only fuse adjacent footage→footage where the first is short and the
     // combined duration still fits. Crossing block types breaks visual
-    // contracts (image cadence, section beats).
+    // contracts (image cadence, section beats). Also refuse to fuse across
+    // doc paragraph boundaries — a paragraph break is the script author's
+    // signal that the visual context shifts, and merging hides it from the
+    // matcher and the editor UI. (e.g. "This is the full story." + the
+    // opening of the next paragraph "Private conversations between
+    // friends..." would otherwise collapse into one scene.) When either
+    // side lacks a known paragraph_index, fall through to the legacy rule.
+    const sameParagraph =
+      a.paragraph_index == null
+      || b.paragraph_index == null
+      || a.paragraph_index === b.paragraph_index;
     if (
       a.type === "footage" &&
       b.type === "footage" &&
+      sameParagraph &&
       a.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD &&
       a.duration + b.duration <= footageMax
     ) {
@@ -790,6 +807,9 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
         ].filter((v, k, arr) => arr.indexOf(v) === k),
         subject_type: b.subject_type ?? a.subject_type,
         visual_priority: b.visual_priority ?? a.visual_priority,
+        // Both a and b are in the same paragraph (enforced above), so the
+        // merged block inherits that paragraph index.
+        paragraph_index: a.paragraph_index ?? b.paragraph_index,
       });
       // Don't advance i — the merged block might now be a merge candidate
       // with the *next* block (e.g. three 3s footage blocks in a row).

@@ -150,6 +150,13 @@ export function applyScriptMarkers(
   markers: ScriptMarkerRow[],
   words: WordTiming[] | null | undefined,
   projectId: string,
+  // Saved transcript paragraphs, in order. Used to translate a marker's
+  // doc paragraph_index into a spoken-time window so the title-text
+  // search is scoped to where the narrator is actually reading that
+  // paragraph (instead of being free to false-match across the whole
+  // audio). When omitted/empty, falls back to whole-audio search — same
+  // behaviour as before this change.
+  paragraphs: string[] = [],
 ): ApplyMarkersResult {
   const result: ApplyMarkersResult = {
     titleCardsInserted: 0,
@@ -160,6 +167,53 @@ export function applyScriptMarkers(
     itemsConsumed: 0,
   };
   if (!words || words.length === 0 || markers.length === 0) return result;
+
+  // Pre-compute word-index ranges for each doc paragraph. The narrator
+  // speaks paragraphs in order, so paragraph N occupies Deepgram words
+  // [wordStart_N, wordEnd_N). We use this to scope a marker's title-text
+  // search to the audio window for the paragraph it belongs to — the
+  // marker's paragraph_index from parse.ts says exactly which paragraph
+  // the title introduces.
+  //
+  // We find each paragraph's START by searching for its first ~5 tokens
+  // in the Deepgram word stream (forward from the previous paragraph's
+  // start). Naive word-count cumulation drifts because Deepgram word
+  // counts diverge from doc word counts (filler words, contraction
+  // splits, punctuation-attached tokens), and a drift of even 5 words
+  // can land the title card a full sentence too early in the paragraph.
+  const paragraphWordRanges: Array<{ start: number; end: number }> = [];
+  if (paragraphs.length > 0) {
+    let cursor = 0;
+    for (let p = 0; p < paragraphs.length; p++) {
+      const paraTokens = tokenize(paragraphs[p]);
+      // Use 5 tokens as the anchor needle. Most paragraphs start with a
+      // distinctive proper noun or sentence opener; 5 tokens is enough
+      // to avoid false matches from short common phrases.
+      const needleLen = Math.min(5, paraTokens.length);
+      const needle = paraTokens.slice(0, needleLen);
+      let foundStart = -1;
+      if (needle.length > 0) {
+        foundStart = findPhraseIndex(words, needle, cursor);
+      }
+      // Compute end as next paragraph's start (set in the next iteration)
+      // or, for now, an estimate based on the paragraph's own word count.
+      // We overwrite end below once we know the next paragraph's start.
+      const start = foundStart >= 0 ? foundStart : cursor;
+      const wordCount = paraTokens.length;
+      const end = Math.min(words.length, start + wordCount);
+      paragraphWordRanges.push({ start, end });
+      cursor = Math.max(cursor, start + 1);
+    }
+    // Snap each paragraph's `end` to the next paragraph's `start` (when
+    // available) so the search window for paragraph N covers everything
+    // up to paragraph N+1's first word.
+    for (let p = 0; p < paragraphWordRanges.length - 1; p++) {
+      const nextStart = paragraphWordRanges[p + 1].start;
+      if (nextStart > paragraphWordRanges[p].start) {
+        paragraphWordRanges[p].end = nextStart;
+      }
+    }
+  }
 
   // Resolve each marker's spoken-time window once. We store both the start
   // (`t`) — the moment the narrator begins saying the phrase — and the end
@@ -175,6 +229,67 @@ export function applyScriptMarkers(
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
   for (const m of ordered) {
     const tokens = tokenize(m.text);
+    // Determine the search window for this marker. Title cards anchor at
+    // the paragraph they introduce: search starts at that paragraph's
+    // first word. Lower-thirds keep the old whole-audio walk because they
+    // are commonly short phrases that may legitimately appear anywhere
+    // their text matches the narration.
+    const paraIdx = m.paragraph_index;
+    const useParagraphWindow =
+      (m.kind === "title_card" || m.kind === "title_card_clip")
+      && paraIdx != null
+      && paraIdx >= 0
+      && paraIdx < paragraphWordRanges.length;
+    // For a title_card, the spoken anchor is the FIRST WORD of the
+    // paragraph the title introduces — that is what the doc structure
+    // says: "title sits between paragraph N-1 and paragraph N, so it
+    // appears on screen as the narrator begins paragraph N". The title
+    // text itself may or may not be spoken verbatim by the narrator;
+    // we still try to find it inside the paragraph window to derive a
+    // real duration, but the position is anchored by the doc.
+    if (m.kind === "title_card_clip") {
+      // Extras share the parent's anchor (no own text). The grouping
+      // pass below uses the parent's resolved t.
+      resolved.push({ marker: m, t: null, tEnd: null });
+      continue;
+    }
+    if (useParagraphWindow && m.kind === "title_card") {
+      const range = paragraphWordRanges[paraIdx as number];
+      // Anchor position = paragraph's first word.
+      const anchorT = words[range.start]?.start ?? null;
+      if (anchorT == null) {
+        resolved.push({ marker: m, t: null, tEnd: null });
+        continue;
+      }
+      // Try to find the title text WITHIN the paragraph window so we can
+      // size the card to the spoken length. If found, use that range.
+      // If not, leave tEnd null — the title-card pass uses
+      // TITLE_CARD_FALLBACK_DURATION in that case.
+      let foundT: number | null = null;
+      let foundTEnd: number | null = null;
+      if (tokens.length > 0) {
+        const searchEnd = Math.max(range.start + tokens.length, range.end);
+        for (let i = range.start; i + tokens.length <= searchEnd && i + tokens.length <= words.length; i++) {
+          let ok = true;
+          for (let j = 0; j < tokens.length; j++) {
+            if (normalizeToken(words[i + j].word) !== tokens[j]) { ok = false; break; }
+          }
+          if (ok) {
+            foundT = words[i].start;
+            foundTEnd = words[i + tokens.length - 1].end;
+            break;
+          }
+        }
+      }
+      resolved.push({
+        marker: m,
+        t: foundT ?? anchorT,
+        tEnd: foundTEnd,
+      });
+      continue;
+    }
+    // Legacy whole-audio search path: lower_thirds, and title_cards
+    // without a usable paragraph_index (pre-fix markers).
     if (tokens.length === 0) {
       resolved.push({ marker: m, t: null, tEnd: null });
       continue;

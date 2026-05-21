@@ -323,6 +323,13 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
   // pair and any title paragraphs we consume — the matchProcessor uses this
   // index to scope its alignment search.
   const transcriptParagraphTexts: string[] = [];
+  // Count of CONTENT (non-blank) paragraphs pushed so far. Used as the
+  // marker's `paragraphIndex` so a marker's index lines up 1:1 with the
+  // saved transcript's content-paragraph index (transcript.split(/\n\n+/)).
+  // The raw transcriptParagraphTexts.length counts blank-separator rows too,
+  // so it drifts away from the saved transcript by the number of blanks
+  // before each marker — the matcher relies on these two staying in sync.
+  let contentParagraphCount = 0;
 
   let i = 0;
   while (i < rawParagraphs.length) {
@@ -361,7 +368,12 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
             youtubeUrl: firstUrl,
             startSeconds: firstRange.start,
             endSeconds: firstRange.end,
-            paragraphIndex: transcriptParagraphTexts.length,
+            // Index of the FIRST content paragraph that will follow this
+            // title in the saved transcript. The title belongs between
+            // saved-transcript paragraphs [contentParagraphCount - 1] and
+            // [contentParagraphCount] (the latter being the one whose
+            // narration the title introduces).
+            paragraphIndex: contentParagraphCount,
             ordinal: titleOrdinal++,
           });
           // Consume the title paragraph + the first timestamp paragraph.
@@ -381,7 +393,7 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
               youtubeUrl: extra.url,
               startSeconds: extra.range.start,
               endSeconds: extra.range.end,
-              paragraphIndex: transcriptParagraphTexts.length,
+              paragraphIndex: contentParagraphCount,
               ordinal: titleOrdinal++,
             });
             k++;
@@ -396,8 +408,11 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
     }
 
     // Regular paragraph. Pull any red runs out as lower-third markers
-    // before persisting the plain text.
-    const pIndex = transcriptParagraphTexts.length;
+    // before persisting the plain text. Use the content-paragraph counter
+    // (skips blank-line paragraphs) so the marker's paragraphIndex maps
+    // 1:1 to transcript.split(/\n\n+/) at match time.
+    const isBlank = p.text.trim().length === 0;
+    const pIndex = contentParagraphCount;
     let charOffset = 0;
     for (const r of p.runs) {
       if (r.red && r.text.trim().length > 0) {
@@ -418,6 +433,7 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
       charOffset += r.text.length;
     }
     transcriptParagraphTexts.push(p.text);
+    if (!isBlank) contentParagraphCount++;
     i++;
   }
 
