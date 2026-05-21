@@ -356,42 +356,80 @@ export function sentenceDurationFromWords(
     .filter(Boolean);
   if (hintWords.length === 0) return null;
 
-  let i = cursor;
-  let firstStart: number | null = null;
-  let lastEnd: number | null = null;
-  // Allow a small forward window when a hint word doesn't immediately
-  // match — handles Deepgram inserting filler words or splitting a hint's
-  // contraction. Keeps the cursor advancing without realigning on noise.
-  const LOOKAHEAD = 3;
+  // Strategy: find the hint's FIRST and LAST distinctive tokens in the
+  // Deepgram word stream and use those to bracket the sentence. The old
+  // per-word walk with LOOKAHEAD=3 was too brittle — a single filler
+  // word or contraction split in the audio would desync the cursor and
+  // collapse `lastEnd` back onto the first matched word, returning a
+  // microscopic "duration" that completely misrepresents the sentence's
+  // actual spoken span.
+  //
+  // We bracket-search instead: pick a 3-token needle from the START of
+  // the hint and walk forward from `cursor` until it matches — that's
+  // firstStart. Then pick a 3-token needle from the END of the hint and
+  // search forward from firstStart's match — that's lastEnd. This is
+  // robust to mid-sentence misalignment because we only need the
+  // brackets to match, not every word.
+  const HEAD_LEN = Math.min(3, hintWords.length);
+  const TAIL_LEN = Math.min(3, hintWords.length);
+  const head = hintWords.slice(0, HEAD_LEN);
+  const tail = hintWords.slice(hintWords.length - TAIL_LEN);
 
-  for (let h = 0; h < hintWords.length; h++) {
-    const target = hintWords[h];
-    if (!target) continue;
-    let matched = false;
-    const limit = Math.min(timings.length, i + 1 + LOOKAHEAD);
-    for (let k = i; k < limit; k++) {
-      if (normalizeWord(timings[k].word) === target) {
-        if (firstStart === null) firstStart = timings[k].start;
-        lastEnd = timings[k].end;
-        i = k + 1;
-        matched = true;
-        break;
+  function findContiguous(needle: string[], from: number): number {
+    if (needle.length === 0) return -1;
+    const limit = timings.length - needle.length;
+    for (let i = from; i <= limit; i++) {
+      let ok = true;
+      for (let j = 0; j < needle.length; j++) {
+        if (normalizeWord(timings[i + j].word) !== needle[j]) { ok = false; break; }
       }
+      if (ok) return i;
     }
-    if (!matched) {
-      // Hint word missing from timings (e.g. punctuation-only or a
-      // Gemini-paraphrase artifact). Advance i by one to stay roughly
-      // aligned with the narration; the next hint word usually re-syncs.
-      i = Math.min(timings.length, i + 1);
-    }
+    return -1;
   }
 
-  if (firstStart === null || lastEnd === null || lastEnd <= firstStart) {
-    return null;
+  const headIdx = findContiguous(head, cursor);
+  if (headIdx < 0) return null;
+  const firstStart = timings[headIdx].start;
+
+  // For single-sentence hints where head === tail (very short text),
+  // lastEnd is just the head's last word's end.
+  if (hintWords.length <= HEAD_LEN) {
+    const lastEnd = timings[headIdx + hintWords.length - 1].end;
+    return {
+      durationSeconds: lastEnd - firstStart,
+      nextCursor: headIdx + hintWords.length,
+      firstStart,
+      lastEnd,
+    };
   }
+
+  const tailIdx = findContiguous(tail, headIdx + HEAD_LEN);
+  if (tailIdx < 0) {
+    // Tail not found — narrator paraphrased the end of the sentence.
+    // Estimate the spoken duration from the hint's word count vs the
+    // local cadence around the head. Better than returning null (which
+    // would leave the block without a real vo window).
+    const cadenceWords = Math.min(20, timings.length - headIdx);
+    if (cadenceWords < 2) return null;
+    const cadenceSpan =
+      timings[headIdx + cadenceWords - 1].end - timings[headIdx].start;
+    const wordsPerSecond = cadenceWords / cadenceSpan;
+    const estimatedSeconds = hintWords.length / wordsPerSecond;
+    const lastEnd = firstStart + estimatedSeconds;
+    return {
+      durationSeconds: estimatedSeconds,
+      nextCursor: headIdx + HEAD_LEN,
+      firstStart,
+      lastEnd,
+    };
+  }
+
+  const lastEnd = timings[tailIdx + tail.length - 1].end;
+  if (lastEnd <= firstStart) return null;
   return {
     durationSeconds: lastEnd - firstStart,
-    nextCursor: i,
+    nextCursor: tailIdx + tail.length,
     firstStart,
     lastEnd,
   };
