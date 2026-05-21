@@ -35,7 +35,23 @@ function countWords(s: string): number {
   return s.trim().split(/\s+/).filter(Boolean).length;
 }
 
-export function splitTranscriptIntoSegments(transcript: string): RawSegment[] {
+export interface SplitOptions {
+  // Topic boundary phrases — typically the text of each blue-bold title
+  // card in the user's Google Doc. When provided, the splitter searches
+  // for each boundary's text in the transcript and starts a new segment
+  // at every match it finds. Boundaries that don't appear in the
+  // transcript (because Deepgram heard them slightly differently than the
+  // doc reads them, or the title is purely an editorial label not spoken
+  // aloud) are silently ignored — the splitter still cuts at the matches
+  // it DID find, and falls back to the word-count split only when no
+  // boundaries matched at all.
+  topicBoundaries?: string[];
+}
+
+export function splitTranscriptIntoSegments(
+  transcript: string,
+  options: SplitOptions = {},
+): RawSegment[] {
   const cleaned = transcript.trim();
   if (!cleaned) return [];
   const totalWords = countWords(cleaned);
@@ -47,6 +63,23 @@ export function splitTranscriptIntoSegments(transcript: string): RawSegment[] {
       startSeconds: 0,
       endSeconds: Math.round((totalWords / WORDS_PER_MINUTE) * 60),
     }];
+  }
+
+  // Topic-driven split. We try this first when boundaries are provided —
+  // the doc's chapter structure usually gives Gemini much tighter context
+  // than an arbitrary 5-minute split (queries get the chapter's actual
+  // subject instead of mixing two unrelated topics), AND it keeps the
+  // first-block-of-segment title_card promotion (matchProcessor) aligned
+  // with the actual blue-bold title positions in the source doc.
+  const boundaries = (options.topicBoundaries ?? [])
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (boundaries.length > 0) {
+    const topicSegments = splitByTopicBoundaries(cleaned, boundaries);
+    if (topicSegments.length >= 2) return topicSegments;
+    // If only one boundary matched, the result is effectively a single
+    // segment — that's worse than the word-count split for long scripts,
+    // so fall through.
   }
 
   const targetWords = TARGET_SEGMENT_MINUTES * WORDS_PER_MINUTE;     // ~750
@@ -77,6 +110,136 @@ export function splitTranscriptIntoSegments(transcript: string): RawSegment[] {
   }
   if (buffer.length) {
     out.push(buildSegment(out.length, buffer.join(" "), cursorWords, bufferWords));
+  }
+  return out;
+}
+
+// Locate each topic boundary phrase in the transcript and cut a new
+// segment at every match. Matching is fuzzy-ish: punctuation and case are
+// ignored on both sides, and we look at the first 6–10 normalized words of
+// the boundary so a slightly longer doc title still anchors against the
+// spoken opening. Returns segments in order, including the leading
+// portion (before the first boundary) as segment 0.
+function splitByTopicBoundaries(
+  transcript: string,
+  boundaries: string[],
+): RawSegment[] {
+  // Normalize: lowercase + collapse whitespace + strip non-letter chars.
+  // We keep apostrophes so "didn't" stays "didnt" not "didn t".
+  function normalize(s: string): string {
+    return s
+      .toLowerCase()
+      .replace(/[‘’`]/g, "")
+      .replace(/[^a-z0-9\s]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  const normTranscript = normalize(transcript);
+  // Build a parallel index that maps each character in normTranscript
+  // back to its position in the original transcript. We walk the original
+  // once, applying the same normalization rules and recording for each
+  // emitted character which original-index it came from.
+  const indexMap: number[] = [];
+  let normBuf = "";
+  let prevWasSpace = true;
+  for (let i = 0; i < transcript.length; i++) {
+    const ch = transcript[i];
+    const code = ch.charCodeAt(0);
+    // Same character class logic as normalize() — keep this in sync.
+    const isApostrophe = ch === "'" || ch === "‘" || ch === "’" || ch === "`";
+    const isLetterOrDigit =
+      (code >= 97 && code <= 122) || // a-z
+      (code >= 65 && code <= 90)  || // A-Z (we lowercase below)
+      (code >= 48 && code <= 57);   // 0-9
+    const isWs = /\s/.test(ch);
+    if (isApostrophe) continue; // dropped by normalize
+    if (isLetterOrDigit) {
+      normBuf += ch.toLowerCase();
+      indexMap.push(i);
+      prevWasSpace = false;
+    } else if (isWs || !isLetterOrDigit) {
+      // Coalesce runs of separators to a single space.
+      if (!prevWasSpace) {
+        normBuf += " ";
+        indexMap.push(i);
+        prevWasSpace = true;
+      }
+    }
+  }
+  while (normBuf.endsWith(" ")) {
+    normBuf = normBuf.slice(0, -1);
+    indexMap.pop();
+  }
+  if (normBuf.length !== indexMap.length) return [];
+  if (normBuf !== normTranscript) return [];
+
+  function boundaryNeedle(b: string): string {
+    const n = normalize(b);
+    const words = n.split(" ").slice(0, 8);
+    return words.join(" ");
+  }
+
+  const cuts: number[] = []; // original-transcript character positions
+  let searchFrom = 0;
+  for (const b of boundaries) {
+    const needle = boundaryNeedle(b);
+    if (!needle) continue;
+    const found = normTranscript.indexOf(needle, searchFrom);
+    if (found < 0) continue;
+    const origPos = indexMap[found];
+    cuts.push(origPos);
+    searchFrom = found + needle.length;
+  }
+  if (cuts.length === 0) return [];
+
+  function snapToSentenceStart(pos: number): number {
+    const minPos = Math.max(0, pos - 200);
+    for (let k = pos - 1; k >= minPos; k--) {
+      const ch = transcript[k];
+      if (ch === "\n") return k + 1;
+      if ((ch === "." || ch === "!" || ch === "?") && /\s/.test(transcript[k + 1] ?? "")) {
+        let j = k + 1;
+        while (j < transcript.length && /\s/.test(transcript[j])) j++;
+        return j;
+      }
+    }
+    return pos;
+  }
+  const snappedCuts = cuts.map(snapToSentenceStart);
+
+  const uniq: number[] = [];
+  for (const c of snappedCuts) {
+    if (uniq.length === 0 || c > uniq[uniq.length - 1]) uniq.push(c);
+  }
+
+  const rawSlices: string[] = [];
+  let prev = 0;
+  for (const c of uniq) {
+    rawSlices.push(transcript.slice(prev, c).trim());
+    prev = c;
+  }
+  rawSlices.push(transcript.slice(prev).trim());
+
+  // Fold the LEADING slice (everything before the first title card) into
+  // slice[1]. That leading slice is "hook" narration with no chapter
+  // heading — the user wrote chapters as title-card-marked sections, so
+  // anything before the first card is preamble to chapter 1, not its own
+  // chapter.
+  const slices = rawSlices.filter((s) => s.length > 0);
+  if (slices.length >= 2) {
+    const leading = slices.shift() as string;
+    slices[0] = `${leading} ${slices[0]}`.trim();
+  }
+  if (slices.length < 2) return []; // caller falls back to word-count split
+
+  const out: RawSegment[] = [];
+  let priorWords = 0;
+  for (let i = 0; i < slices.length; i++) {
+    const text = slices[i];
+    const words = countWords(text);
+    out.push(buildSegment(out.length, text, priorWords, words));
+    priorWords += words;
   }
   return out;
 }
@@ -359,7 +522,7 @@ ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
 Rules:
 - Use plain language in "label" — like "Looking for award show clips", not "youtube.com search 'Oscars'".
 - Provide 2 to 4 searchIntents that together cover the visual story of THIS section.
-- Skip the section's narration tone and writing style. Focus on what should appear on screen.
+- For searchIntents ONLY: skip the section's narration tone and writing style and focus on what should appear on screen. This rule does NOT apply to blocks — blocks must cover every sentence (see COMPLETENESS below).
 - Skip duplicates. Skip empty arrays — return [] if you have nothing.
 
 PERSON-FIRST DOCUMENTARY PRINCIPLE — read this BEFORE choosing block types.
@@ -390,6 +553,17 @@ gracefully — it spreads reuse across the timeline so the viewer never sees
 the same shot twice in a row.
 
 Block-level visual rules (these matter — they drive what appears on screen):
+- COMPLETENESS (HARD REQUIREMENT — read this twice). You MUST emit a block
+  for EVERY complete sentence in the SECTION text below, in the order they
+  appear. Do NOT skip, summarize, merge, paraphrase, or drop sentences for
+  any reason — not because the sentence is "narration framing", not because
+  it "recaps", not because it has no obvious visual, not because it feels
+  like a transition. Recap sentences, transition sentences, and "tone"
+  sentences each get their OWN block with subject_type "general",
+  recommended_visual_type "footage", visual_priority "person_default". The
+  matcher handles the fallback — you must not pre-filter the script. Before
+  returning, count the sentences in SECTION (each terminal .!? marks one)
+  and confirm blocks.length equals that count. If it does not, fix it.
 - ONE BLOCK = ONE COMPLETE SENTENCE. Never split a sentence across blocks.
   Each block's "text" must be a full sentence as it appears in the
   narration, ending at terminal punctuation (.!?). Quotations and
@@ -506,7 +680,19 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     query: buildSegmentQuery(it.query, context, resolved.segmentSubject),
   }));
 
-  const blocks = applySubjectContinuity(safe.data.blocks, resolved.segmentSubject || context.mainSubject);
+  // Reconcile Gemini's blocks against the section's actual sentences.
+  // Gemini occasionally drops "recap" or "transition" sentences from blocks[]
+  // even when the prompt forbids it (LLMs are bad at count-and-verify
+  // contracts). This pass guarantees every spoken sentence in the section
+  // ends up as a block — uncovered sentences get a default footage block
+  // synthesized in their correct narration position so nothing in the
+  // audio is missing from the timeline.
+  const reconciledBlocks = reconcileBlocksAgainstSection(
+    segment.text,
+    applySubjectContinuity(safe.data.blocks, resolved.segmentSubject || context.mainSubject),
+    resolved.segmentSubject || context.mainSubject || "",
+  );
+  const blocks = applySubjectContinuity(reconciledBlocks, resolved.segmentSubject || context.mainSubject);
   return {
     ...safe.data,
     segmentSubject: resolved.segmentSubject,
@@ -515,6 +701,102 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     searchIntents: rewrittenIntents,
     blocks,
   };
+}
+
+// Split a section's text into sentences using the same regex as the
+// segmenter ([^.!?]+[.!?]+(\s|$)|[^.!?]+$). Trim, drop empties.
+function splitSectionIntoSentences(text: string): string[] {
+  const matches = text.match(/[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g) ?? [text];
+  return matches.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+// Normalize a span of text for inclusion comparison: lowercase, drop all
+// non-alphanumeric characters, collapse whitespace. We strip punctuation
+// rather than just normalising it because Gemini sometimes paraphrases
+// punctuation (e.g. swaps a period for a comma when merging sentences).
+function normalizeForComparison(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Build a default footage block for an uncovered sentence. Uses the
+// segment's subject when known so the downstream matcher routes it to a
+// person clip; falls back to the schema defaults otherwise.
+function makeDefaultBlock(text: string, subject: string): BlockPlan {
+  return {
+    text,
+    resolved_subject: subject,
+    subject_type: subject ? "person" : "general",
+    mentioned_entities: [],
+    specific_visual_references: [],
+    pronouns_detected: false,
+    visual_intent: "",
+    recommended_visual_type: "footage",
+    visual_priority: "person_default",
+  };
+}
+
+// Walk every sentence in `sectionText` and confirm it appears (verbatim
+// or as a substring after normalization) inside some block's text. For
+// sentences with no covering block, splice a default footage block into
+// the position immediately after the last block that DID cover an earlier
+// sentence — preserving narration order. When Gemini's blocks happen to
+// be in a different order than the section text (rare), uncovered
+// sentences land at the end.
+export function reconcileBlocksAgainstSection(
+  sectionText: string,
+  blocks: BlockPlan[],
+  segmentSubject: string,
+): BlockPlan[] {
+  const sentences = splitSectionIntoSentences(sectionText);
+  if (sentences.length === 0) return blocks;
+
+  // Precompute normalized block texts once.
+  const blockNorms = blocks.map((b) => normalizeForComparison(b.text));
+
+  // For each section sentence, find the first block whose normalized text
+  // contains the sentence's normalized form (covers exact and merged cases).
+  // Track the "last covering block index" so we can insert new blocks at
+  // the right position to keep narration order.
+  interface Insertion { afterBlockIdx: number; block: BlockPlan; }
+  const insertions: Insertion[] = [];
+  let lastCoveringBlockIdx = -1;
+  for (const sentence of sentences) {
+    const norm = normalizeForComparison(sentence);
+    if (!norm) continue;
+    // Use first 10 normalized words as the needle so a Gemini-paraphrased
+    // tail (e.g. trailing quote stripped) still matches its block.
+    const needle = norm.split(" ").slice(0, 10).join(" ");
+    let coveringIdx = -1;
+    for (let i = 0; i < blockNorms.length; i++) {
+      if (blockNorms[i].includes(needle)) {
+        coveringIdx = i;
+        break;
+      }
+    }
+    if (coveringIdx >= 0) {
+      lastCoveringBlockIdx = Math.max(lastCoveringBlockIdx, coveringIdx);
+    } else {
+      insertions.push({
+        afterBlockIdx: lastCoveringBlockIdx,
+        block: makeDefaultBlock(sentence, segmentSubject),
+      });
+    }
+  }
+
+  if (insertions.length === 0) return blocks;
+
+  // Insert from highest position to lowest so earlier insertions don't
+  // shift the indices of later ones.
+  const out = blocks.slice();
+  insertions.sort((a, b) => b.afterBlockIdx - a.afterBlockIdx);
+  for (const ins of insertions) {
+    out.splice(ins.afterBlockIdx + 1, 0, ins.block);
+  }
+  return out;
 }
 
 // Decide what subject the segment is "about" and whether it was inherited.
