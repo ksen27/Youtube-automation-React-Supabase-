@@ -138,6 +138,11 @@ export interface ApplyMarkersResult {
   titleCardExtraClipsInserted: number;
   lowerThirdsApplied: number;
   lowerThirdsSkipped: number;
+  // Total script items removed from the timeline because their narration
+  // window was consumed by an inserted title_card + forced_footage overlay
+  // (their script_text is being spoken under the overlay; rendering them
+  // as separate scenes would duplicate the narration's visible position).
+  itemsConsumed: number;
 }
 
 export function applyScriptMarkers(
@@ -152,6 +157,7 @@ export function applyScriptMarkers(
     titleCardExtraClipsInserted: 0,
     lowerThirdsApplied: 0,
     lowerThirdsSkipped: 0,
+    itemsConsumed: 0,
   };
   if (!words || words.length === 0 || markers.length === 0) return result;
 
@@ -329,13 +335,50 @@ export function applyScriptMarkers(
       rows.push(forcedFootageFromMarker(extra));
     }
 
-    // Insert just BEFORE the item that's playing at `parentT`. We
-    // intentionally don't try to split the host item — the host gets pushed
-    // back, and the total timeline grows by the sum of inserted durations.
-    // The matcher's duration-reclaim already happened before we run, so
-    // growing the timeline here is acceptable: the render simply pushes
-    // the audio tail back.
-    items.splice(k, 0, ...rows);
+    // Consume-and-trim: the narrator's voiceover plays continuously under
+    // the title card + forced footage. The script items in the window
+    // [parentT, parentT + overlayDuration) are being spoken under the
+    // overlay; rendering them as separate scenes would duplicate the
+    // narration's visible position and grow the timeline past the
+    // voiceover. So we REMOVE those items and splice the overlay in their
+    // place, preserving total timeline length.
+    //
+    // Last consumed item may overshoot — keep only the residual seconds
+    // after the overlay window so the narration AFTER the overlay still
+    // has a scene tied to it.
+    const overlayDuration = rows.reduce((s, r) => s + r.duration, 0);
+    const overlayStart = currentStarts[k];
+    const overlayEnd = overlayStart + overlayDuration;
+    let consumedCount = 0;
+    let trimmedResidualDuration: number | null = null;
+    for (let c = k; c < items.length; c++) {
+      const itemStart = currentStarts[c];
+      const itemEnd = itemStart + items[c].duration;
+      if (itemEnd <= overlayEnd + 0.01) {
+        // Item fully inside overlay window — consume entirely.
+        consumedCount++;
+        continue;
+      }
+      // Item straddles the overlay end — trim its head, keep the residual.
+      // The narration after the overlay reads the tail of this item's
+      // script_text, so we keep script_text intact and just shrink duration.
+      trimmedResidualDuration = Math.round((itemEnd - overlayEnd) * 10) / 10;
+      consumedCount++;
+      break;
+    }
+    if (trimmedResidualDuration != null && trimmedResidualDuration > 0.05) {
+      // Mutate the straddling item to its residual length BEFORE splicing
+      // so the splice indices are stable.
+      items[k + consumedCount - 1].duration = trimmedResidualDuration;
+      // Splice in overlay rows BEFORE the residual, removing (consumedCount - 1)
+      // fully-consumed items in the same call.
+      items.splice(k, consumedCount - 1, ...rows);
+      result.itemsConsumed += consumedCount - 1;
+    } else {
+      // No residual — every overlapping item is fully inside the overlay.
+      items.splice(k, consumedCount, ...rows);
+      result.itemsConsumed += consumedCount;
+    }
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
   }

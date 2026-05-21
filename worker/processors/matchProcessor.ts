@@ -627,7 +627,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // we fall back to the legacy duration-only planner. Same downstream
   // contract — every block ends up with a type + duration + text.
   const plan = planTimeline(voiceoverSeconds);
-  let hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds);
+  let hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds, transcript);
   const planSource: "gemini_hints" | "legacy_quota" = hints.length > 0 ? "gemini_hints" : "legacy_quota";
 
   let blocks: PlannedBlock[];
@@ -3195,6 +3195,42 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     intervalSec: LOWER_THIRD_INTERVAL_SEC,
   });
 
+  // Script-doc markers (title cards + lower-thirds parsed from the Google
+  // Doc the user pasted at intake). MUST run BEFORE duration_reclaim so the
+  // marker positioner sees item durations that still equal their hint's
+  // word-timed spoken length — reclaim would stretch footage rows and
+  // desynchronize computeStarts(items) from real spoken time, causing
+  // findItemIndexAtTime to land each title card on the wrong item.
+  //
+  // The post-processor mutates `items` in place: inserts a title_card +
+  // forced-footage pair at each blue-bold marker's spoken moment, CONSUMING
+  // the script items playing under that overlay window so the timeline does
+  // not grow past the voiceover length. Stamps metadata.lower_third on
+  // whichever item is playing at each red marker's moment. Forced footage
+  // rows carry metadata.forced_clip = { youtube_url, start_seconds,
+  // end_seconds }; the renderer downloads the window via the proxied yt-dlp
+  // pipeline at render time, same way the user-supplied intro works today.
+  //
+  // intro_card markers live in the same table but are pre-roll only —
+  // never aligned to spoken audio — so we filter them out here. The
+  // renderer queries them directly when building the pre-roll segment.
+  const { data: allMarkerRows } = await sb
+    .from("project_script_markers")
+    .select("id, kind, text, ordinal, paragraph_index, char_offset, youtube_url, start_seconds, end_seconds")
+    .eq("project_id", projectId)
+    .in("kind", ["title_card", "title_card_clip", "lower_third"])
+    .order("ordinal");
+  if (allMarkerRows && allMarkerRows.length > 0) {
+    const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
+    const stats = applyScriptMarkers(
+      items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
+      allMarkerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
+      transcriptWords,
+      projectId,
+    );
+    await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
+  }
+
   // Reclaim time lost to clip-shorter-than-planned clamping by stretching
   // the unclamped footage rows. Without this, the inserted timeline would
   // total voiceoverSeconds - durationReclaimSeconds and the duration check
@@ -3275,35 +3311,6 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
-  // Script-doc markers (title cards + lower-thirds parsed from the Google
-  // Doc the user pasted at intake). The post-processor mutates `items` in
-  // place: inserts a title_card + forced-footage pair at each blue-bold
-  // marker's spoken moment, and stamps metadata.lower_third on whichever
-  // item is playing at each red marker's moment. Forced footage rows carry
-  // metadata.forced_clip = { youtube_url, start_seconds, end_seconds }; the
-  // renderer downloads the window via the proxied yt-dlp pipeline at render
-  // time, same way the user-supplied intro works today.
-  //
-  // intro_card markers live in the same table but are pre-roll only —
-  // never aligned to spoken audio — so we filter them out here. The
-  // renderer queries them directly when building the pre-roll segment.
-  const { data: allMarkerRows } = await sb
-    .from("project_script_markers")
-    .select("id, kind, text, ordinal, paragraph_index, char_offset, youtube_url, start_seconds, end_seconds")
-    .eq("project_id", projectId)
-    .in("kind", ["title_card", "title_card_clip", "lower_third"])
-    .order("ordinal");
-  if (allMarkerRows && allMarkerRows.length > 0) {
-    const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
-    const stats = applyScriptMarkers(
-      items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
-      allMarkerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
-      transcriptWords,
-      projectId,
-    );
-    await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
-  }
-
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
@@ -3329,6 +3336,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await setProjectStatus(projectId, "ready_for_review");
 }
 
+// Strip punctuation, lowercase, collapse whitespace. Used to compare a
+// hint's narration text against doc paragraphs when assigning each hint
+// to the paragraph it came from. Same normalization shape as
+// reconcileBlocksAgainstSection in lib/ai/segments.ts so a hint that was
+// already matched there will match here too.
+function normalizeForParagraphMatch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // Read the most recent analyze job's payload from media_jobs and flatten
 // every segment's Gemini-supplied blocks into a single ordered hint stream.
 //
@@ -3347,6 +3367,7 @@ async function loadBlockHintsFromAnalyze(
   sb: ReturnType<typeof getServerSupabase>,
   projectId: string,
   voiceoverSeconds: number,
+  transcript: string,
 ): Promise<BlockPlanHint[]> {
   const { data } = await sb
     .from("media_jobs")
@@ -3359,6 +3380,35 @@ async function loadBlockHintsFromAnalyze(
   const payload = (data?.metadata as { payload?: { segments?: Array<{ understanding?: SegmentUnderstanding; startSeconds?: number; endSeconds?: number }> } } | null)?.payload;
   const segments = payload?.segments ?? [];
   if (segments.length === 0) return [];
+
+  // Pre-compute per-paragraph normalized text so each hint can be tagged
+  // with the doc paragraph its narration came from. The planner uses this
+  // to refuse to merge hints from different paragraphs. We split on \n
+  // because parse.ts joins paragraphs with single newlines (see
+  // lib/gdocs/parse.ts:transcript).
+  const paragraphNorms = transcript
+    .split(/\n+/)
+    .map((p) => normalizeForParagraphMatch(p))
+    .filter((p) => p.length > 0);
+  // Cursor walks forward across paragraphs as we resolve hints in narration
+  // order — a hint's first 10 normalized words can appear in many places
+  // verbatim (small "the", "and" tokens), but it can only legitimately
+  // belong to a paragraph at-or-after the previous hint's paragraph.
+  let paragraphCursor = 0;
+  function paragraphIndexForHintText(hintText: string): number | null {
+    if (paragraphNorms.length === 0) return null;
+    const norm = normalizeForParagraphMatch(hintText);
+    if (!norm) return null;
+    const needle = norm.split(" ").slice(0, 10).join(" ");
+    if (!needle) return null;
+    for (let p = paragraphCursor; p < paragraphNorms.length; p++) {
+      if (paragraphNorms[p].includes(needle)) {
+        paragraphCursor = p;
+        return p;
+      }
+    }
+    return null;
+  }
 
   // We need to know which segment each block belongs to so we can recover
   // the segment's sectionTitle for title_card blocks. The hint stream is
@@ -3428,6 +3478,9 @@ async function loadBlockHintsFromAnalyze(
         // "specific_*" block falls back to the person image, while a
         // "person_default" block routes a person clip directly.
         visual_priority: b.visual_priority,
+        // Doc paragraph this hint's narration came from. Drives the
+        // planner's no-merge-across-paragraph rule.
+        paragraph_index: paragraphIndexForHintText(b.text),
       });
     }
   }

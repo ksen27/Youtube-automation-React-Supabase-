@@ -269,6 +269,12 @@ export interface BlockPlanHint {
   // "specific_*" blocks fall back to the person image when the exact match
   // can't be found (never random visuals).
   visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
+  // Doc-paragraph the hint's narration came from (0-based, counted across
+  // the project transcript split on "\n"). When set, the planner's grouping
+  // pass refuses to merge hints from different paragraphs so a single block
+  // never spans a doc paragraph boundary. null/undefined means "unknown" —
+  // grouping falls back to the legacy type-only merge rule.
+  paragraph_index?: number | null;
 }
 
 export interface PlannedBlockWithHint extends PlannedBlock {
@@ -550,8 +556,20 @@ export function buildBlockSequenceFromHints(
     let mergedRefs = [...(baseHint.specific_visual_references ?? [])];
     let mergedEntities = [...(baseHint.mentioned_entities ?? [])];
     let lookahead = cursor + 1;
+    // Doc paragraph the base hint came from. When both base and candidate
+    // have a known paragraph_index, they must match — a single block must
+    // never span two doc paragraphs (e.g. "This is the full story."
+    // + "Private conversations between friends..." were getting merged
+    // across the blank-line that separates them, hiding the paragraph
+    // break from the editor and the renderer). When either side's index
+    // is unknown (null/undefined — older payloads, or a hint whose first
+    // 10 words couldn't be located against the doc), fall through to the
+    // legacy type-only rule so the planner stays usable.
+    const baseParagraph = baseHint.paragraph_index;
     while (lookahead < hints.length) {
       if (effectiveTypes[lookahead] !== baseType) break;
+      const candidateParagraph = hints[lookahead].paragraph_index;
+      if (baseParagraph != null && candidateParagraph != null && candidateParagraph !== baseParagraph) break;
       const candidate = rawDurations[lookahead];
       if (accDur + candidate > GROUP_MAX) break;
       accDur += candidate;
