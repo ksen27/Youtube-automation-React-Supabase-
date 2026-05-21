@@ -101,6 +101,37 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     .single();
   if (projErr) return NextResponse.json({ error: projErr.message }, { status: 500 });
 
+  // Snapshot the existing ready clips BEFORE we wipe markers, so a
+  // re-ingest of the same doc (or one with most clips unchanged) can reuse
+  // the previously-downloaded MP4/M4A instead of re-running yt-dlp. The
+  // reuse key is (kind, youtube_url, start_seconds, end_seconds) — kind
+  // matters because intro_card clips also carry audio that title cards
+  // don't, so reusing across kinds would either over-fetch audio or leave
+  // intros without it. start/end are normalised to one decimal place so
+  // benign float noise from the parser doesn't miss a cache hit.
+  const { data: priorReady } = await sb
+    .from("project_script_markers")
+    .select("kind, youtube_url, start_seconds, end_seconds, clip_storage_url, audio_storage_url")
+    .eq("project_id", id)
+    .eq("download_status", "ready")
+    .not("clip_storage_url", "is", null);
+  const cacheKey = (kind: string, url: string | null, s: number | null, e: number | null) => {
+    if (!url) return null;
+    const sNorm = s == null ? "" : Number(s).toFixed(1);
+    const eNorm = e == null ? "" : Number(e).toFixed(1);
+    return `${kind}|${url.trim()}|${sNorm}|${eNorm}`;
+  };
+  const clipCache = new Map<string, { clip: string; audio: string | null }>();
+  for (const row of priorReady ?? []) {
+    const key = cacheKey(row.kind as string, row.youtube_url as string | null,
+      row.start_seconds as number | null, row.end_seconds as number | null);
+    if (!key) continue;
+    clipCache.set(key, {
+      clip: row.clip_storage_url as string,
+      audio: (row.audio_storage_url as string | null) ?? null,
+    });
+  }
+
   // Wipe and re-write the marker table for this project. Re-running the
   // script-doc ingest replaces the previous markers — and BullMQ jobs
   // referencing the deleted markerIds will no-op when the processor's
@@ -112,26 +143,61 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     ...parsedScript.titleCards.map(markerToRow.bind(null, id)),
     ...parsedScript.lowerThirds.map(markerToRow.bind(null, id)),
   ];
-  let insertedMarkers: Array<{ id: string; kind: string; youtube_url: string | null; ordinal: number }> = [];
+  let insertedMarkers: Array<{
+    id: string;
+    kind: string;
+    youtube_url: string | null;
+    ordinal: number;
+    start_seconds: number | null;
+    end_seconds: number | null;
+  }> = [];
   if (markerRows.length > 0) {
     const { data: inserted, error: markersErr } = await sb
       .from("project_script_markers")
       .insert(markerRows)
-      .select("id, kind, youtube_url, ordinal");
+      .select("id, kind, youtube_url, ordinal, start_seconds, end_seconds");
     if (markersErr) {
       return NextResponse.json({ error: markersErr.message }, { status: 500 });
     }
     insertedMarkers = (inserted ?? []) as typeof insertedMarkers;
   }
 
-  // Dispatch one script_clip job per marker that has a YouTube URL. The
-  // worker handles the download/cut/upload and writes the result back onto
-  // the marker row. We do this here (synchronously dispatching, asynchronously
-  // processing) instead of waiting in the request because some docs have 10+
-  // clips that would blow past the request timeout.
+  // Dispatch one script_clip job per marker that has a YouTube URL — UNLESS
+  // we have a cache hit from the prior snapshot, in which case copy the
+  // storage URLs straight onto the new marker and skip the job. Cache hits
+  // turn a re-ingest of "same doc / same clips" from 10× yt-dlp downloads
+  // into 10× sub-second UPDATEs.
   let jobsEnqueued = 0;
+  let clipsReused = 0;
   for (const m of insertedMarkers) {
     if (!m.youtube_url) continue;
+    const key = cacheKey(m.kind, m.youtube_url, m.start_seconds, m.end_seconds);
+    const hit = key ? clipCache.get(key) : null;
+    if (hit) {
+      // Reuse path: stamp the existing URLs onto the new row and mark it
+      // ready immediately. No worker hop, no proxy rotation, no spend.
+      const { error: updErr } = await sb
+        .from("project_script_markers")
+        .update({
+          download_status: "ready",
+          download_error: null,
+          clip_storage_url: hit.clip,
+          audio_storage_url: hit.audio,
+          download_updated_at: new Date().toISOString(),
+        })
+        .eq("id", m.id);
+      if (updErr) {
+        // Fall through to the normal download path — the marker is still
+        // 'pending' from insert defaults so enqueueScriptClip below will
+        // pick it up.
+        await logJob({ projectId: id }, "script_doc.reuse_failed", {
+          markerId: m.id, kind: m.kind, err: updErr.message,
+        });
+      } else {
+        clipsReused++;
+        continue;
+      }
+    }
     try {
       const mediaJobId = await createMediaJob({
         projectId: id,
@@ -152,12 +218,21 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     }
   }
 
+  if (clipsReused > 0 || jobsEnqueued > 0) {
+    await logJob({ projectId: id }, "script_doc.clips_dispatched", {
+      jobsEnqueued,
+      clipsReused,
+      cacheCandidates: clipCache.size,
+    });
+  }
+
   return NextResponse.json({
     project,
     introCards: parsedScript.introCards,
     titleCards: parsedScript.titleCards,
     lowerThirds: parsedScript.lowerThirds,
     jobsEnqueued,
+    clipsReused,
   });
 }
 
