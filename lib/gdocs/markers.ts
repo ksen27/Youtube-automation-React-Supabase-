@@ -169,16 +169,39 @@ function spokenTextInWindow(
   return joined.length > 0 ? joined : null;
 }
 
-// Find the item index whose [start, start+duration) window contains time t.
-// Returns -1 if t is past the end of the timeline.
+// Find the splice index for inserting a marker spoken at voiceover time
+// `t`. Returns the first item whose voiceover start is at-or-after t —
+// so an `items.splice(k, 0, ...marker)` call lands the marker AFTER the
+// last item that finished before t, and BEFORE the next item the
+// narrator hasn't reached yet.
+//
+// Why not "find the item whose window contains t": the narration has
+// short gaps between sentences. A marker spoken at t=47.75s might fall
+// 0.24s after one sentence ends (item ending 47.51s) and 2.88s before
+// the next sentence begins (item starting 50.63s). The marker belongs
+// AFTER the finished sentence, not before it. The old "first item
+// whose end > t" rule returned the FINISHED sentence's index — landing
+// the marker in front of an item that should appear before it.
+//
+// type='intro' rows live on a different time axis (pre-roll); they
+// don't compete for placement against voiceover-time markers. They're
+// skipped here so a marker at voiceover t=1s lands after the intros,
+// not before them.
 function findItemIndexAtTime(starts: number[], items: TimelineItemDraft[], t: number): number {
   if (items.length === 0) return -1;
-  if (t < starts[0]) return 0;
-  for (let i = 0; i < items.length; i++) {
-    const end = starts[i] + items[i].duration;
-    if (t < end) return i;
+  // First skip past any intro items at the head — they don't have
+  // voiceover-time positions.
+  let firstScript = 0;
+  while (firstScript < items.length && items[firstScript].type === "intro") {
+    firstScript++;
   }
-  return -1;
+  if (firstScript >= items.length) return -1;
+  for (let i = firstScript; i < items.length; i++) {
+    if (items[i].type === "intro") continue;
+    if (starts[i] >= t - 0.01) return i;
+  }
+  // Marker is past the start of every item — splice at the end.
+  return items.length;
 }
 
 export interface ApplyMarkersResult {
@@ -433,24 +456,33 @@ export function applyScriptMarkers(
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
 
-    // De-dup pass: any script item whose stored vo window is fully
-    // inside [overlayWindowStart, overlayWindowEnd) is redundant — the
-    // overlay rows we just inserted already cover that narration.
-    // Walk forward from just after the inserted rows and splice such
-    // items out. We only remove items that have a stored vo_start —
-    // items without one can't be reliably classified and stay put.
+    // De-dup pass: any script item whose narration falls inside the
+    // overlay window is redundant — the overlay rows we just inserted
+    // already display that narration in their own script_text fields
+    // (spokenTextInWindow extracts the narrator's words during each
+    // overlay row's duration). Leaving the original script items in
+    // place shows the same line of narration twice in the editor.
+    //
+    // We use itStart as the test: an item whose vo START is inside the
+    // overlay window has its narration playing under the overlay (even
+    // if its stored vo_end overshoots slightly past the overlay end —
+    // a 0.3s overshoot still represents the same spoken sentence the
+    // forced-footage row already captured).
+    //
+    // Walk forward from just after the inserted rows. Stop as soon as
+    // we hit an item whose start is past the overlay end — items in
+    // narration order beyond that point can't be inside the overlay.
+    // Items without stored vo_start are left alone (they predate the
+    // vo_start metadata and can't be reliably classified).
     const afterOverlayIdx = k + rows.length;
     for (let r = afterOverlayIdx; r < items.length; ) {
       const it = items[r];
       if (it.type === "intro") { r++; continue; }
       const meta = (it.metadata ?? {}) as Record<string, unknown>;
       const itStart = meta.vo_start_seconds;
-      const itEnd = meta.vo_end_seconds;
-      if (typeof itStart !== "number" || typeof itEnd !== "number") { r++; continue; }
-      // Stop once we're past the overlay window — items in narration
-      // order beyond this point can't be inside it.
-      if (itStart >= overlayWindowEnd) break;
-      if (itStart >= overlayWindowStart && itEnd <= overlayWindowEnd + 0.05) {
+      if (typeof itStart !== "number") { r++; continue; }
+      if (itStart >= overlayWindowEnd - 0.05) break;
+      if (itStart >= overlayWindowStart - 0.05) {
         items.splice(r, 1);
         continue;
       }
