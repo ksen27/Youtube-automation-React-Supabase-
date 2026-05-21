@@ -105,21 +105,39 @@ function findPhraseIndex(
   return -1;
 }
 
-// Given the ordered items list, compute each item's voiceover-relative
-// start time. type='intro' rows are pre-roll: they play the source-clip's
-// own YouTube audio BEFORE the voiceover starts, so they don't share the
-// time axis the marker anchors live on (those come from Deepgram
-// word.start, measured from the voiceover's t=0). Treating intros as
-// zero-duration here keeps the two clocks aligned, so a marker spoken at
-// voiceover t=50s lands at the script item playing at voiceover 50s
-// (and not at the script item playing 16s earlier, because two 8s
-// intros pushed the timeline forward).
+// Compute each item's voiceover-relative start time.
+//
+// Prefer metadata.vo_start_seconds when the matcher recorded it (this is
+// the REAL spoken-audio start of the narration the item covers, derived
+// from Deepgram word timings via the planner). Falling back to a
+// cumulative-duration sum is wrong because item durations don't
+// faithfully add up to spoken time — Gemini's per-block hints don't
+// cover every word in the audio, and the planner rounds each block to
+// 0.1s. With a 60-block timeline those small gaps compound into
+// 10–20s of drift, which is enough to land a marker on the wrong item.
+//
+// type='intro' rows are pre-roll (their own YouTube audio plays BEFORE
+// the voiceover starts), so they're not on the voiceover time axis at
+// all. They get start=0 and don't advance the cumulative cursor — same
+// as treating them as zero-duration. Items without vo_start_seconds in
+// metadata (very old data, or fallback path) fall through to the
+// cumulative-duration estimate so legacy projects keep working.
 function computeStarts(items: TimelineItemDraft[]): number[] {
   const out: number[] = new Array(items.length);
   let acc = 0;
   for (let i = 0; i < items.length; i++) {
+    if (items[i].type === "intro") {
+      out[i] = acc;
+      continue;
+    }
+    const meta = (items[i].metadata ?? {}) as Record<string, unknown>;
+    const stored = meta.vo_start_seconds;
+    if (typeof stored === "number" && Number.isFinite(stored)) {
+      out[i] = stored;
+      acc = stored + items[i].duration;
+      continue;
+    }
     out[i] = acc;
-    if (items[i].type === "intro") continue;
     acc += items[i].duration;
   }
   return out;
@@ -395,6 +413,16 @@ export function applyScriptMarkers(
       rows.push(forcedFootageFromMarker(extra));
     }
 
+    // Compute the overlay window in voiceover-time before we mutate
+    // items. We use this below to remove any subsequent script items
+    // whose narration falls entirely inside the overlay — their
+    // script_text already appears on the title card / forced footage
+    // rows (those rows pulled the spoken words via spokenTextInWindow
+    // above), so leaving them as separate scenes shows the same line
+    // of narration twice in the editor.
+    const overlayWindowStart = group.parentT;
+    const overlayWindowEnd = group.parentT + rows.reduce((s, r) => s + r.duration, 0);
+
     // Insert the title card + forced footage BEFORE the script item playing
     // at the title's spoken moment. The narrator reaches the title text at
     // voiceover time `parentT`; the item at index k is whatever scene the
@@ -404,6 +432,30 @@ export function applyScriptMarkers(
     items.splice(k, 0, ...rows);
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
+
+    // De-dup pass: any script item whose stored vo window is fully
+    // inside [overlayWindowStart, overlayWindowEnd) is redundant — the
+    // overlay rows we just inserted already cover that narration.
+    // Walk forward from just after the inserted rows and splice such
+    // items out. We only remove items that have a stored vo_start —
+    // items without one can't be reliably classified and stay put.
+    const afterOverlayIdx = k + rows.length;
+    for (let r = afterOverlayIdx; r < items.length; ) {
+      const it = items[r];
+      if (it.type === "intro") { r++; continue; }
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const itStart = meta.vo_start_seconds;
+      const itEnd = meta.vo_end_seconds;
+      if (typeof itStart !== "number" || typeof itEnd !== "number") { r++; continue; }
+      // Stop once we're past the overlay window — items in narration
+      // order beyond this point can't be inside it.
+      if (itStart >= overlayWindowEnd) break;
+      if (itStart >= overlayWindowStart && itEnd <= overlayWindowEnd + 0.05) {
+        items.splice(r, 1);
+        continue;
+      }
+      r++;
+    }
   }
 
   // Bookkeeping: surface how many title_card_clip rows the matcher saw but

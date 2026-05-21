@@ -292,6 +292,16 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   // source hint so post-build passes (mergeShortFootage, etc.) can keep
   // the no-merge-across-paragraph invariant intact.
   paragraph_index?: number | null;
+  // Voiceover-relative spoken-time window for this block's narration,
+  // derived from Deepgram word timings. The matcher copies these onto
+  // the timeline item's metadata so downstream code (script marker
+  // positioning, per-block text slicing) can map between audio time
+  // and item position WITHOUT relying on cumulative block.duration
+  // sums — those drift away from real spoken time because Gemini
+  // hints don't cover every word in the audio. Null when word timings
+  // weren't available at plan time.
+  vo_start_seconds?: number | null;
+  vo_end_seconds?: number | null;
 }
 
 // Estimate spoken duration of a text chunk based on its word count and a
@@ -338,7 +348,7 @@ export function sentenceDurationFromWords(
   text: string,
   timings: PlannerWordTiming[],
   cursor: number,
-): { durationSeconds: number; nextCursor: number } | null {
+): { durationSeconds: number; nextCursor: number; firstStart: number; lastEnd: number } | null {
   const hintWords = text
     .trim()
     .split(/\s+/)
@@ -379,7 +389,12 @@ export function sentenceDurationFromWords(
   if (firstStart === null || lastEnd === null || lastEnd <= firstStart) {
     return null;
   }
-  return { durationSeconds: lastEnd - firstStart, nextCursor: i };
+  return {
+    durationSeconds: lastEnd - firstStart,
+    nextCursor: i,
+    firstStart,
+    lastEnd,
+  };
 }
 
 // Build a timeline sequence from Gemini's per-block hints. The hints come
@@ -478,16 +493,28 @@ export function buildBlockSequenceFromHints(
   // aligned (Gemini paraphrasing diverged from the transcript), fall back
   // to the cadence estimator so older projects and edge cases keep working.
   let wordCursor = 0;
-  const rawDurations: number[] = hints.map((h) => {
+  const rawDurations: number[] = [];
+  // Per-hint voiceover spoken-time window from Deepgram. Null when the
+  // hint's words can't be aligned. These flow through grouping/splitting
+  // below and end up on each PlannedBlockWithHint so the matcher can
+  // pin items to real audio positions.
+  const rawVoStart: Array<number | null> = [];
+  const rawVoEnd: Array<number | null> = [];
+  for (const h of hints) {
     if (wordTimings && wordTimings.length > 0) {
       const aligned = sentenceDurationFromWords(h.text, wordTimings, wordCursor);
       if (aligned) {
         wordCursor = aligned.nextCursor;
-        return aligned.durationSeconds;
+        rawDurations.push(aligned.durationSeconds);
+        rawVoStart.push(aligned.firstStart);
+        rawVoEnd.push(aligned.lastEnd);
+        continue;
       }
     }
-    return sentenceDurationSeconds(h.text, cadence);
-  });
+    rawDurations.push(sentenceDurationSeconds(h.text, cadence));
+    rawVoStart.push(null);
+    rawVoEnd.push(null);
+  }
 
   // Group consecutive same-type sentence hints into blocks whose combined
   // spoken duration lands in the footage target window. The previous
@@ -525,6 +552,12 @@ export function buildBlockSequenceFromHints(
     text: string;
     // Whether this group merged 2+ sentences. Used by callers for logging.
     merged: boolean;
+    // Real spoken-audio window for this group's narration (from Deepgram
+    // word timings). Used downstream to pin items to actual voiceover
+    // positions; null when none of the hints in the group could be
+    // aligned.
+    voStart: number | null;
+    voEnd: number | null;
   }
 
   const groupedHints: GroupedHint[] = [];
@@ -544,6 +577,8 @@ export function buildBlockSequenceFromHints(
         duration: baseDur,
         text: baseHint.text,
         merged: false,
+        voStart: rawVoStart[cursor] ?? null,
+        voEnd: rawVoEnd[cursor] ?? null,
       });
       cursor++;
       continue;
@@ -559,6 +594,8 @@ export function buildBlockSequenceFromHints(
     let accText = baseHint.text;
     let mergedRefs = [...(baseHint.specific_visual_references ?? [])];
     let mergedEntities = [...(baseHint.mentioned_entities ?? [])];
+    let accVoStart: number | null = rawVoStart[cursor] ?? null;
+    let accVoEnd: number | null = rawVoEnd[cursor] ?? null;
     let lookahead = cursor + 1;
     // Doc paragraph the base hint came from. When both base and candidate
     // have a known paragraph_index, they must match — a single block must
@@ -580,6 +617,14 @@ export function buildBlockSequenceFromHints(
       accText = `${accText} ${hints[lookahead].text}`;
       mergedRefs.push(...(hints[lookahead].specific_visual_references ?? []));
       mergedEntities.push(...(hints[lookahead].mentioned_entities ?? []));
+      // Extend the group's vo window to include this hint's window. If
+      // the base had no alignment but a later hint did, accept the
+      // later hint's start so the group still gets at least the partial
+      // window. End always advances to the latest aligned hint.
+      const candStart = rawVoStart[lookahead];
+      const candEnd = rawVoEnd[lookahead];
+      if (candStart != null && accVoStart == null) accVoStart = candStart;
+      if (candEnd != null) accVoEnd = candEnd;
       lookahead++;
       // Stop once we've reached the target window. Don't keep merging
       // past GROUP_MIN — a 5-6s block is the sweet spot for the matcher.
@@ -599,6 +644,8 @@ export function buildBlockSequenceFromHints(
       duration: accDur,
       text: accText,
       merged: lookahead > cursor + 1,
+      voStart: accVoStart,
+      voEnd: accVoEnd,
     });
     cursor = lookahead;
   }
@@ -612,6 +659,11 @@ export function buildBlockSequenceFromHints(
     ...g.hint,
     text: g.text,
   }));
+  // Per-merged-hint voiceover window. Same length as mergedHints. Will be
+  // forwarded onto each materialized block below so the matcher can pin
+  // items to actual audio positions instead of cumulative-duration sums.
+  const mergedVoStart: Array<number | null> = groupedHints.map((g) => g.voStart);
+  const mergedVoEnd: Array<number | null> = groupedHints.map((g) => g.voEnd);
   for (let i = 0; i < groupedHints.length; i++) {
     rawDurations[i] = groupedHints[i].duration;
     effectiveTypes[i] = groupedHints[i].type;
@@ -682,7 +734,24 @@ export function buildBlockSequenceFromHints(
 
     if (type === "image") {
       const slots = slotCounts[i];
+      // Split the merged hint's spoken-audio window evenly across slots.
+      // Slot k of N covers [voStart + k*span/N, voStart + (k+1)*span/N).
+      // When the hint had no aligned vo window, slot windows are null.
+      const hintVoStart = mergedVoStart[i];
+      const hintVoEnd = mergedVoEnd[i];
+      const hintSpan =
+        hintVoStart != null && hintVoEnd != null && hintVoEnd > hintVoStart
+          ? hintVoEnd - hintVoStart
+          : null;
       for (let k = 0; k < slots; k++) {
+        const slotStart =
+          hintVoStart != null && hintSpan != null
+            ? hintVoStart + (k * hintSpan) / slots
+            : null;
+        const slotEnd =
+          hintVoStart != null && hintSpan != null
+            ? hintVoStart + ((k + 1) * hintSpan) / slots
+            : null;
         blocks.push({
           type: "image",
           duration: IMAGE_HOLD_SECONDS,
@@ -695,6 +764,8 @@ export function buildBlockSequenceFromHints(
           subject_type: h.subject_type,
           visual_priority: h.visual_priority,
           paragraph_index: h.paragraph_index,
+          vo_start_seconds: slotStart,
+          vo_end_seconds: slotEnd,
         });
       }
       return;
@@ -726,6 +797,8 @@ export function buildBlockSequenceFromHints(
       subject_type: h.subject_type,
       visual_priority: h.visual_priority,
       paragraph_index: h.paragraph_index,
+      vo_start_seconds: mergedVoStart[i],
+      vo_end_seconds: mergedVoEnd[i],
     });
   });
 
@@ -810,6 +883,9 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
         // Both a and b are in the same paragraph (enforced above), so the
         // merged block inherits that paragraph index.
         paragraph_index: a.paragraph_index ?? b.paragraph_index,
+        // Merged voiceover window spans a's start through b's end.
+        vo_start_seconds: a.vo_start_seconds ?? b.vo_start_seconds,
+        vo_end_seconds: b.vo_end_seconds ?? a.vo_end_seconds,
       });
       // Don't advance i — the merged block might now be a merge candidate
       // with the *next* block (e.g. three 3s footage blocks in a row).

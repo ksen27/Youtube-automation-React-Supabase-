@@ -651,6 +651,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // image when their reference search fails, NEVER to random pool entries.
   // null when the legacy planner is in use.
   let blockVisualPriorities: Array<string | null>;
+  // Real voiceover-time window for each block, from Deepgram word timings
+  // via the planner. The matcher writes these onto each timeline item's
+  // metadata so script-marker positioning and per-block text slicing can
+  // map to the actual audio position instead of relying on cumulative
+  // duration sums (which drift away from real spoken time because Gemini
+  // hints don't cover every word and the planner rounds to 0.1s).
+  let blockVoStart: Array<number | null>;
+  let blockVoEnd: Array<number | null>;
   if (planSource === "gemini_hints") {
     // Pass the intro slot's reserved time so the planner targets
     // (voiceoverSeconds - introClipDuration) for its block sum. Without
@@ -665,6 +673,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
     blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
     blockVisualPriorities = planned.map((p) => p.visual_priority ?? null);
+    blockVoStart = planned.map((p) => p.vo_start_seconds ?? null);
+    blockVoEnd = planned.map((p) => p.vo_end_seconds ?? null);
   } else {
     blocks = buildBlockSequence(plan);
     blockHintTexts = blocks.map(() => null);
@@ -674,6 +684,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = blocks.map(() => []);
     blockSubjectTypes = blocks.map(() => null);
     blockVisualPriorities = blocks.map(() => null);
+    blockVoStart = blocks.map(() => null);
+    blockVoEnd = blocks.map(() => null);
   }
 
   // Title cards and split-screens now have real renderers — let them pass
@@ -937,6 +949,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const newSpecificRefs: typeof blockSpecificRefs = [];
     const newSubjectTypes: typeof blockSubjectTypes = [];
     const newVisualPriorities: typeof blockVisualPriorities = [];
+    const newVoStart: typeof blockVoStart = [];
+    const newVoEnd: typeof blockVoEnd = [];
     const newHints: typeof hints = [];
     let splitFragmentsCreated = 0;
     let splitSourceBlocks = 0;
@@ -951,6 +965,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         newSpecificRefs.push(blockSpecificRefs[i] ?? []);
         newSubjectTypes.push(blockSubjectTypes[i] ?? null);
         newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        newVoStart.push(blockVoStart[i] ?? null);
+        newVoEnd.push(blockVoEnd[i] ?? null);
         if (i < hints.length) newHints.push(hints[i]);
         continue;
       }
@@ -959,6 +975,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // fragment lands too far from the IMAGE_HOLD_SECONDS target.
       const slots = Math.max(2, Math.round(b.duration / IMAGE_HOLD_SECONDS));
       const perSlot = Math.round((b.duration / slots) * 10) / 10;
+      // Split the source block's voiceover window across the fragments
+      // proportionally so each fragment knows the spoken-time slice it
+      // covers (used downstream for script-marker placement and
+      // per-block text slicing).
+      const srcVoStart = blockVoStart[i];
+      const srcVoEnd = blockVoEnd[i];
+      const srcSpan =
+        srcVoStart != null && srcVoEnd != null && srcVoEnd > srcVoStart
+          ? srcVoEnd - srcVoStart
+          : null;
       // Last fragment absorbs the rounding residue so the sum exactly
       // matches the source duration (no drift in total timeline length).
       let remaining = b.duration;
@@ -983,6 +1009,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         newSpecificRefs.push(blockSpecificRefs[i] ?? []);
         newSubjectTypes.push(blockSubjectTypes[i] ?? null);
         newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        if (srcVoStart != null && srcSpan != null) {
+          newVoStart.push(srcVoStart + (k * srcSpan) / slots);
+          newVoEnd.push(srcVoStart + ((k + 1) * srcSpan) / slots);
+        } else {
+          newVoStart.push(null);
+          newVoEnd.push(null);
+        }
         if (i < hints.length) newHints.push(hints[i]);
       }
       splitFragmentsCreated += slots;
@@ -996,6 +1029,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = newSpecificRefs;
     blockSubjectTypes = newSubjectTypes;
     blockVisualPriorities = newVisualPriorities;
+    blockVoStart = newVoStart;
+    blockVoEnd = newVoEnd;
     hints = newHints;
     if (splitSourceBlocks > 0) {
       await logJob({ projectId, jobId: mediaJobId }, "match.image_block_split", {
@@ -1018,6 +1053,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // ever see") and downgrades the matcher's ability to pick a relevant
   // clip/image. Falling back to buildBlockTexts only when the hint text
   // is missing keeps the legacy planner working unchanged.
+  //
+  // The proportional fallback is also used to bridge the rare case where
+  // a block has no aligned vo_start/vo_end (a hint whose words don't match
+  // the transcript at all). Most blocks should take the hint-text path.
   const wordSlicedTexts = buildBlockTexts(transcript, blocks, voiceoverSeconds);
   const blockTexts = blocks.map((_, i) => {
     const hintText = blockHintTexts[i];
@@ -1691,6 +1730,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     specific_visual_references: blockSpecificRefs[idx] ?? [],
     visual_priority: blockVisualPriorities[idx] ?? null,
     subject_type: blockSubjectTypes[idx] ?? null,
+    // Real voiceover-time window for this block's narration. Used by
+    // markers.ts (script marker placement) and by buildBlockTexts (per-
+    // block text slicing) to map between audio time and item position
+    // without drifting from cumulative duration sums.
+    vo_start_seconds: blockVoStart[idx] ?? null,
+    vo_end_seconds: blockVoEnd[idx] ?? null,
   });
 
   // Real-duration lookup for footage clamping. video_clips.duration is the
