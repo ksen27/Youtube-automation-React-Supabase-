@@ -105,16 +105,50 @@ function findPhraseIndex(
   return -1;
 }
 
-// Given the ordered items list, compute the cumulative start_time of each
-// (so a marker timestamp can be mapped to the item whose window contains it).
+// Given the ordered items list, compute each item's voiceover-relative
+// start time. type='intro' rows are pre-roll: they play the source-clip's
+// own YouTube audio BEFORE the voiceover starts, so they don't share the
+// time axis the marker anchors live on (those come from Deepgram
+// word.start, measured from the voiceover's t=0). Treating intros as
+// zero-duration here keeps the two clocks aligned, so a marker spoken at
+// voiceover t=50s lands at the script item playing at voiceover 50s
+// (and not at the script item playing 16s earlier, because two 8s
+// intros pushed the timeline forward).
 function computeStarts(items: TimelineItemDraft[]): number[] {
   const out: number[] = new Array(items.length);
   let acc = 0;
   for (let i = 0; i < items.length; i++) {
     out[i] = acc;
+    if (items[i].type === "intro") continue;
     acc += items[i].duration;
   }
   return out;
+}
+
+// Extract the spoken narration in [tStart, tEnd) from the Deepgram word
+// stream and return it as a single space-joined sentence. Used to populate
+// the script_text of overlay rows (title card + forced footage) so the
+// editor shows which words the narrator is saying under each clip — without
+// this, those rows render as "No script text" even though the voiceover is
+// playing continuously underneath them.
+function spokenTextInWindow(
+  words: WordTiming[],
+  tStart: number,
+  tEnd: number,
+): string | null {
+  if (!(tEnd > tStart)) return null;
+  const picked: string[] = [];
+  for (const w of words) {
+    // A word counts as inside the window if it starts before the window
+    // ends AND ends after the window starts — captures partials at both
+    // boundaries so a word straddling the cut still appears as one or the
+    // other clip's script_text.
+    if (w.start >= tEnd) break;
+    if (w.end <= tStart) continue;
+    picked.push(w.word);
+  }
+  const joined = picked.join(" ").replace(/\s+/g, " ").trim();
+  return joined.length > 0 ? joined : null;
 }
 
 // Find the item index whose [start, start+duration) window contains time t.
@@ -138,11 +172,6 @@ export interface ApplyMarkersResult {
   titleCardExtraClipsInserted: number;
   lowerThirdsApplied: number;
   lowerThirdsSkipped: number;
-  // Total script items removed from the timeline because their narration
-  // window was consumed by an inserted title_card + forced_footage overlay
-  // (their script_text is being spoken under the overlay; rendering them
-  // as separate scenes would duplicate the narration's visible position).
-  itemsConsumed: number;
 }
 
 export function applyScriptMarkers(
@@ -150,13 +179,6 @@ export function applyScriptMarkers(
   markers: ScriptMarkerRow[],
   words: WordTiming[] | null | undefined,
   projectId: string,
-  // Saved transcript paragraphs, in order. Used to translate a marker's
-  // doc paragraph_index into a spoken-time window so the title-text
-  // search is scoped to where the narrator is actually reading that
-  // paragraph (instead of being free to false-match across the whole
-  // audio). When omitted/empty, falls back to whole-audio search — same
-  // behaviour as before this change.
-  paragraphs: string[] = [],
 ): ApplyMarkersResult {
   const result: ApplyMarkersResult = {
     titleCardsInserted: 0,
@@ -164,132 +186,33 @@ export function applyScriptMarkers(
     titleCardExtraClipsInserted: 0,
     lowerThirdsApplied: 0,
     lowerThirdsSkipped: 0,
-    itemsConsumed: 0,
   };
   if (!words || words.length === 0 || markers.length === 0) return result;
+  // Local non-null alias so TS narrows inside nested closures (the
+  // `words` parameter is typed as nullable for the public API).
+  const wordsNN: WordTiming[] = words;
 
-  // Pre-compute word-index ranges for each doc paragraph. The narrator
-  // speaks paragraphs in order, so paragraph N occupies Deepgram words
-  // [wordStart_N, wordEnd_N). We use this to scope a marker's title-text
-  // search to the audio window for the paragraph it belongs to — the
-  // marker's paragraph_index from parse.ts says exactly which paragraph
-  // the title introduces.
-  //
-  // We find each paragraph's START by searching for its first ~5 tokens
-  // in the Deepgram word stream (forward from the previous paragraph's
-  // start). Naive word-count cumulation drifts because Deepgram word
-  // counts diverge from doc word counts (filler words, contraction
-  // splits, punctuation-attached tokens), and a drift of even 5 words
-  // can land the title card a full sentence too early in the paragraph.
-  const paragraphWordRanges: Array<{ start: number; end: number }> = [];
-  if (paragraphs.length > 0) {
-    let cursor = 0;
-    for (let p = 0; p < paragraphs.length; p++) {
-      const paraTokens = tokenize(paragraphs[p]);
-      // Use 5 tokens as the anchor needle. Most paragraphs start with a
-      // distinctive proper noun or sentence opener; 5 tokens is enough
-      // to avoid false matches from short common phrases.
-      const needleLen = Math.min(5, paraTokens.length);
-      const needle = paraTokens.slice(0, needleLen);
-      let foundStart = -1;
-      if (needle.length > 0) {
-        foundStart = findPhraseIndex(words, needle, cursor);
-      }
-      // Compute end as next paragraph's start (set in the next iteration)
-      // or, for now, an estimate based on the paragraph's own word count.
-      // We overwrite end below once we know the next paragraph's start.
-      const start = foundStart >= 0 ? foundStart : cursor;
-      const wordCount = paraTokens.length;
-      const end = Math.min(words.length, start + wordCount);
-      paragraphWordRanges.push({ start, end });
-      cursor = Math.max(cursor, start + 1);
-    }
-    // Snap each paragraph's `end` to the next paragraph's `start` (when
-    // available) so the search window for paragraph N covers everything
-    // up to paragraph N+1's first word.
-    for (let p = 0; p < paragraphWordRanges.length - 1; p++) {
-      const nextStart = paragraphWordRanges[p + 1].start;
-      if (nextStart > paragraphWordRanges[p].start) {
-        paragraphWordRanges[p].end = nextStart;
-      }
-    }
-  }
-
-  // Resolve each marker's spoken-time window once. We store both the start
-  // (`t`) — the moment the narrator begins saying the phrase — and the end
-  // (`tEnd`) — the moment they finish. The title card uses tEnd to pin its
-  // own duration so the typewriter animation completes in sync with the
-  // narrator. Multiple markers may share the same phrase (e.g. a person's
-  // name appearing many times) — we walk forward, only matching each
-  // phrase the Nth time so duplicate phrases align to distinct spoken
-  // instances.
+  // Resolve each marker's spoken-time window by finding its text in the
+  // Deepgram word stream. The narrator speaks the title text aloud in the
+  // audio (e.g. "the moment that changed everything the walliams recording"
+  // is spoken between the end of one paragraph and the start of the next);
+  // we anchor the card at that exact spoken moment. Walking a cursor
+  // forward through `words` keeps duplicate phrases (a name appearing many
+  // times) aligned to distinct spoken instances rather than all snapping
+  // to the first hit.
   const phraseSearchCursor = new Map<string, number>();
   const resolved: Array<{ marker: ScriptMarkerRow; t: number | null; tEnd: number | null }> = [];
   // Sort by ordinal so the cursor walk respects doc order across kinds.
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
   for (const m of ordered) {
-    const tokens = tokenize(m.text);
-    // Determine the search window for this marker. Title cards anchor at
-    // the paragraph they introduce: search starts at that paragraph's
-    // first word. Lower-thirds keep the old whole-audio walk because they
-    // are commonly short phrases that may legitimately appear anywhere
-    // their text matches the narration.
-    const paraIdx = m.paragraph_index;
-    const useParagraphWindow =
-      (m.kind === "title_card" || m.kind === "title_card_clip")
-      && paraIdx != null
-      && paraIdx >= 0
-      && paraIdx < paragraphWordRanges.length;
-    // For a title_card, the spoken anchor is the FIRST WORD of the
-    // paragraph the title introduces — that is what the doc structure
-    // says: "title sits between paragraph N-1 and paragraph N, so it
-    // appears on screen as the narrator begins paragraph N". The title
-    // text itself may or may not be spoken verbatim by the narrator;
-    // we still try to find it inside the paragraph window to derive a
-    // real duration, but the position is anchored by the doc.
+    // title_card_clip rows are doc-stacked extra timestamps under a title
+    // — they share the parent title's spoken anchor and have no own text
+    // to search for. Resolution is deferred to the grouping pass below.
     if (m.kind === "title_card_clip") {
-      // Extras share the parent's anchor (no own text). The grouping
-      // pass below uses the parent's resolved t.
       resolved.push({ marker: m, t: null, tEnd: null });
       continue;
     }
-    if (useParagraphWindow && m.kind === "title_card") {
-      const range = paragraphWordRanges[paraIdx as number];
-      // Anchor position = paragraph's first word.
-      const anchorT = words[range.start]?.start ?? null;
-      if (anchorT == null) {
-        resolved.push({ marker: m, t: null, tEnd: null });
-        continue;
-      }
-      // Try to find the title text WITHIN the paragraph window so we can
-      // size the card to the spoken length. If found, use that range.
-      // If not, leave tEnd null — the title-card pass uses
-      // TITLE_CARD_FALLBACK_DURATION in that case.
-      let foundT: number | null = null;
-      let foundTEnd: number | null = null;
-      if (tokens.length > 0) {
-        const searchEnd = Math.max(range.start + tokens.length, range.end);
-        for (let i = range.start; i + tokens.length <= searchEnd && i + tokens.length <= words.length; i++) {
-          let ok = true;
-          for (let j = 0; j < tokens.length; j++) {
-            if (normalizeToken(words[i + j].word) !== tokens[j]) { ok = false; break; }
-          }
-          if (ok) {
-            foundT = words[i].start;
-            foundTEnd = words[i + tokens.length - 1].end;
-            break;
-          }
-        }
-      }
-      resolved.push({
-        marker: m,
-        t: foundT ?? anchorT,
-        tEnd: foundTEnd,
-      });
-      continue;
-    }
-    // Legacy whole-audio search path: lower_thirds, and title_cards
-    // without a usable paragraph_index (pre-fix markers).
+    const tokens = tokenize(m.text);
     if (tokens.length === 0) {
       resolved.push({ marker: m, t: null, tEnd: null });
       continue;
@@ -388,6 +311,12 @@ export function applyScriptMarkers(
     const k = findItemIndexAtTime(currentStarts, items, group.parentT);
     if (k < 0) { result.titleCardsSkipped++; continue; }
 
+    // Voiceover-time cursor: advanced as we build each row so every row's
+    // script_text reflects what the narrator is saying during its own
+    // window. Title card starts at `parentT` (the title's spoken moment),
+    // forced footage continues from where the title ends, and stacked
+    // extras chain after the first forced footage.
+    let voCursor = group.parentT;
     function forcedFootageFromMarker(m: ScriptMarkerRow): TimelineItemDraft {
       const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
       const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
@@ -400,13 +329,20 @@ export function applyScriptMarkers(
       const ytIdMatch = m.youtube_url?.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|v\/)([A-Za-z0-9_-]{11})/);
       const ytId = ytIdMatch?.[1] ?? null;
       const thumbnailUrl = ytId ? `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg` : null;
+      // Capture the narration spoken in this clip's voiceover window so
+      // the editor shows the script text the user will hear under this
+      // clip, instead of "No script text".
+      const voStart = voCursor;
+      const voEnd = voCursor + dur;
+      const scriptText = spokenTextInWindow(wordsNN, voStart, voEnd);
+      voCursor = voEnd;
       return {
         project_id: projectId,
         clip_id: null,
         type: "footage",
         position: 0, // re-numbered below
         duration: dur,
-        script_text: null,
+        script_text: scriptText,
         overlay_text: null,
         metadata: {
           placeholder: false,
@@ -424,13 +360,22 @@ export function applyScriptMarkers(
       };
     }
 
+    // Title card's spoken window: [parentT, parentT + parentDuration).
+    // The narrator is saying the title text itself during this window
+    // (that's how parentDuration was measured — see line 365 above).
+    const titleSpokenText = spokenTextInWindow(
+      wordsNN,
+      group.parentT,
+      group.parentT + group.parentDuration,
+    );
+    voCursor = group.parentT + group.parentDuration;
     const titleCardRow: TimelineItemDraft = {
       project_id: projectId,
       clip_id: null,
       type: "title_card",
       position: 0, // re-numbered below
       duration: group.parentDuration,
-      script_text: null,
+      script_text: titleSpokenText,
       overlay_text: group.parent.text,
       metadata: {
         placeholder: false,
@@ -450,50 +395,13 @@ export function applyScriptMarkers(
       rows.push(forcedFootageFromMarker(extra));
     }
 
-    // Consume-and-trim: the narrator's voiceover plays continuously under
-    // the title card + forced footage. The script items in the window
-    // [parentT, parentT + overlayDuration) are being spoken under the
-    // overlay; rendering them as separate scenes would duplicate the
-    // narration's visible position and grow the timeline past the
-    // voiceover. So we REMOVE those items and splice the overlay in their
-    // place, preserving total timeline length.
-    //
-    // Last consumed item may overshoot — keep only the residual seconds
-    // after the overlay window so the narration AFTER the overlay still
-    // has a scene tied to it.
-    const overlayDuration = rows.reduce((s, r) => s + r.duration, 0);
-    const overlayStart = currentStarts[k];
-    const overlayEnd = overlayStart + overlayDuration;
-    let consumedCount = 0;
-    let trimmedResidualDuration: number | null = null;
-    for (let c = k; c < items.length; c++) {
-      const itemStart = currentStarts[c];
-      const itemEnd = itemStart + items[c].duration;
-      if (itemEnd <= overlayEnd + 0.01) {
-        // Item fully inside overlay window — consume entirely.
-        consumedCount++;
-        continue;
-      }
-      // Item straddles the overlay end — trim its head, keep the residual.
-      // The narration after the overlay reads the tail of this item's
-      // script_text, so we keep script_text intact and just shrink duration.
-      trimmedResidualDuration = Math.round((itemEnd - overlayEnd) * 10) / 10;
-      consumedCount++;
-      break;
-    }
-    if (trimmedResidualDuration != null && trimmedResidualDuration > 0.05) {
-      // Mutate the straddling item to its residual length BEFORE splicing
-      // so the splice indices are stable.
-      items[k + consumedCount - 1].duration = trimmedResidualDuration;
-      // Splice in overlay rows BEFORE the residual, removing (consumedCount - 1)
-      // fully-consumed items in the same call.
-      items.splice(k, consumedCount - 1, ...rows);
-      result.itemsConsumed += consumedCount - 1;
-    } else {
-      // No residual — every overlapping item is fully inside the overlay.
-      items.splice(k, consumedCount, ...rows);
-      result.itemsConsumed += consumedCount;
-    }
+    // Insert the title card + forced footage BEFORE the script item playing
+    // at the title's spoken moment. The narrator reaches the title text at
+    // voiceover time `parentT`; the item at index k is whatever scene the
+    // editor is showing at that moment. Splicing before k makes the title
+    // appear at exactly the right narration beat, with the surrounding
+    // script items unchanged on either side of it.
+    items.splice(k, 0, ...rows);
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
   }

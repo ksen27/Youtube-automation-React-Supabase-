@@ -3229,20 +3229,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .order("ordinal");
   if (allMarkerRows && allMarkerRows.length > 0) {
     const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
-    // Doc paragraphs in saved-transcript order. parse.ts now writes the
-    // marker's paragraph_index as the index into this array, so we can
-    // map "title belongs at paragraph N" → first-word-of-paragraph-N
-    // spoken time directly.
-    const transcriptParagraphs: string[] = transcript
-      .split(/\n\n+/)
-      .map((p: string) => p.trim())
-      .filter((p: string) => p.length > 0);
     const stats = applyScriptMarkers(
       items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
       allMarkerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
       transcriptWords,
       projectId,
-      transcriptParagraphs,
     );
     await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
   }
