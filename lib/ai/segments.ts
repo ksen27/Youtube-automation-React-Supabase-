@@ -35,23 +35,7 @@ function countWords(s: string): number {
   return s.trim().split(/\s+/).filter(Boolean).length;
 }
 
-export interface SplitOptions {
-  // Topic boundary phrases — typically the text of each blue-bold title
-  // card in the user's Google Doc. When provided, the splitter searches
-  // for each boundary's text in the transcript and starts a new segment
-  // at every match it finds. Boundaries that don't appear in the
-  // transcript (because Deepgram heard them slightly differently than the
-  // doc reads them, or the title is purely an editorial label not spoken
-  // aloud) are silently ignored — the splitter still cuts at the matches
-  // it DID find, and falls back to the word-count split only when no
-  // boundaries matched at all.
-  topicBoundaries?: string[];
-}
-
-export function splitTranscriptIntoSegments(
-  transcript: string,
-  options: SplitOptions = {},
-): RawSegment[] {
+export function splitTranscriptIntoSegments(transcript: string): RawSegment[] {
   const cleaned = transcript.trim();
   if (!cleaned) return [];
   const totalWords = countWords(cleaned);
@@ -63,23 +47,6 @@ export function splitTranscriptIntoSegments(
       startSeconds: 0,
       endSeconds: Math.round((totalWords / WORDS_PER_MINUTE) * 60),
     }];
-  }
-
-  // Topic-driven split. We try this first when boundaries are provided —
-  // the doc's chapter structure usually gives Gemini much tighter context
-  // than an arbitrary 5-minute split (queries get the chapter's actual
-  // subject instead of mixing two unrelated topics). If we find at least
-  // one boundary in the transcript, we use the topic-split result; if
-  // none match we fall through to the word-count split below.
-  const boundaries = (options.topicBoundaries ?? [])
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (boundaries.length > 0) {
-    const topicSegments = splitByTopicBoundaries(cleaned, boundaries);
-    if (topicSegments.length >= 2) return topicSegments;
-    // If only one boundary matched, the result is effectively a single
-    // segment — that's worse than the word-count split for long scripts,
-    // so fall through.
   }
 
   const targetWords = TARGET_SEGMENT_MINUTES * WORDS_PER_MINUTE;     // ~750
@@ -110,165 +77,6 @@ export function splitTranscriptIntoSegments(
   }
   if (buffer.length) {
     out.push(buildSegment(out.length, buffer.join(" "), cursorWords, bufferWords));
-  }
-  return out;
-}
-
-// Locate each topic boundary phrase in the transcript and cut a new
-// segment at every match. Matching is fuzzy-ish: punctuation and case are
-// ignored on both sides, and we look at the first 6–10 normalized words of
-// the boundary so a slightly longer doc title still anchors against the
-// spoken opening. Returns segments in order, including the leading
-// portion (before the first boundary) as segment 0.
-function splitByTopicBoundaries(
-  transcript: string,
-  boundaries: string[],
-): RawSegment[] {
-  // Normalize: lowercase + collapse whitespace + strip non-letter chars.
-  // We keep apostrophes so "didn't" stays "didnt" not "didn t".
-  function normalize(s: string): string {
-    return s
-      .toLowerCase()
-      .replace(/[''`]/g, "")
-      .replace(/[^a-z0-9\s]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  const normTranscript = normalize(transcript);
-  // Build a parallel index that maps each character in normTranscript
-  // back to its position in the original transcript. We walk the original
-  // once, applying the same normalization rules and recording for each
-  // emitted character which original-index it came from.
-  const indexMap: number[] = [];
-  let normBuf = "";
-  let prevWasSpace = true;
-  for (let i = 0; i < transcript.length; i++) {
-    const ch = transcript[i];
-    const code = ch.charCodeAt(0);
-    // Same character class logic as normalize() — keep this in sync.
-    const isApostrophe = ch === "'" || ch === "‘" || ch === "’" || ch === "`";
-    const isLetterOrDigit =
-      (code >= 97 && code <= 122) || // a-z
-      (code >= 65 && code <= 90)  || // A-Z (we lowercase below)
-      (code >= 48 && code <= 57);   // 0-9
-    const isWs = /\s/.test(ch);
-    if (isApostrophe) continue; // dropped by normalize
-    if (isLetterOrDigit) {
-      normBuf += ch.toLowerCase();
-      indexMap.push(i);
-      prevWasSpace = false;
-    } else if (isWs || !isLetterOrDigit) {
-      // Coalesce runs of separators to a single space.
-      if (!prevWasSpace) {
-        normBuf += " ";
-        indexMap.push(i);
-        prevWasSpace = true;
-      }
-    }
-  }
-  // Trim trailing whitespace from the normalized form.
-  while (normBuf.endsWith(" ")) {
-    normBuf = normBuf.slice(0, -1);
-    indexMap.pop();
-  }
-  // Sanity check: indexMap should align with normBuf 1:1.
-  if (normBuf.length !== indexMap.length) {
-    // Defensive — should never happen. Bail to word-count split.
-    return [];
-  }
-  if (normBuf !== normTranscript) {
-    // Our two normalization paths disagreed somewhere; the simplest fix
-    // is to fall back, which the caller treats as "no topic split".
-    return [];
-  }
-
-  // For each boundary, find its first occurrence in normTranscript at or
-  // after the previous match's end. We use the first ~8 normalized words
-  // of the boundary so a slightly longer doc title still anchors.
-  function boundaryNeedle(b: string): string {
-    const n = normalize(b);
-    const words = n.split(" ").slice(0, 8);
-    return words.join(" ");
-  }
-
-  const cuts: number[] = []; // original-transcript character positions
-  let searchFrom = 0;
-  for (const b of boundaries) {
-    const needle = boundaryNeedle(b);
-    if (!needle) continue;
-    const found = normTranscript.indexOf(needle, searchFrom);
-    if (found < 0) continue;
-    const origPos = indexMap[found];
-    cuts.push(origPos);
-    searchFrom = found + needle.length;
-  }
-  if (cuts.length === 0) return [];
-
-  // Build segments from [0..cuts[0]], [cuts[0]..cuts[1]], etc. We snap the
-  // cut position back to the nearest preceding paragraph or sentence
-  // boundary so the resulting segment ends cleanly mid-prose isn't split.
-  function snapToSentenceStart(pos: number): number {
-    // Scan backward for the nearest sentence end (.!?) followed by ws, or
-    // a paragraph break. Limit lookback to ~200 chars so we don't pull a
-    // cut multiple paragraphs back from where the title actually appears.
-    const minPos = Math.max(0, pos - 200);
-    for (let k = pos - 1; k >= minPos; k--) {
-      const ch = transcript[k];
-      if (ch === "\n") return k + 1;
-      if ((ch === "." || ch === "!" || ch === "?") && /\s/.test(transcript[k + 1] ?? "")) {
-        // Move forward past the whitespace so the next segment starts
-        // with the next sentence's first letter, not its leading space.
-        let j = k + 1;
-        while (j < transcript.length && /\s/.test(transcript[j])) j++;
-        return j;
-      }
-    }
-    return pos;
-  }
-  const snappedCuts = cuts.map(snapToSentenceStart);
-
-  // De-duplicate cuts (a tiny boundary might snap to the same position
-  // as the previous one).
-  const uniq: number[] = [];
-  for (const c of snappedCuts) {
-    if (uniq.length === 0 || c > uniq[uniq.length - 1]) uniq.push(c);
-  }
-
-  // Build raw slices first.
-  const rawSlices: string[] = [];
-  let prev = 0;
-  for (const c of uniq) {
-    rawSlices.push(transcript.slice(prev, c).trim());
-    prev = c;
-  }
-  rawSlices.push(transcript.slice(prev).trim());
-
-  // Fold the LEADING slice (everything before the first title card) into
-  // slice[1]. That leading slice is "hook" narration with no chapter
-  // heading — the user wrote chapters as title-card-marked sections, so
-  // anything before the first card is preamble to chapter 1, not its own
-  // chapter. Merging the hook forward gives chapter 1's Gemini call the
-  // hook's entity context (names, places mentioned in the opening) without
-  // burning a separate analysis pass on a chapterless preamble.
-  //
-  // Slices 1..N (post-first-title) stay separate even when short — each
-  // one has its own title card defining its identity, so a 30-second
-  // chapter is still a real chapter.
-  const slices = rawSlices.filter((s) => s.length > 0);
-  if (slices.length >= 2) {
-    const leading = slices.shift() as string;
-    slices[0] = `${leading} ${slices[0]}`.trim();
-  }
-  if (slices.length < 2) return []; // caller falls back to word-count split
-
-  const out: RawSegment[] = [];
-  let priorWords = 0;
-  for (let i = 0; i < slices.length; i++) {
-    const text = slices[i];
-    const words = countWords(text);
-    out.push(buildSegment(out.length, text, priorWords, words));
-    priorWords += words;
   }
   return out;
 }
