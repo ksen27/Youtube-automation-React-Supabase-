@@ -520,7 +520,7 @@ export async function analyzeSegment(
 ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
 {
   "mainTopic": "short phrase, e.g. 'Margot Robbie's early career'",
-  "segment_subject": "the ONE person or entity this section is visually about. If the narration uses pronouns or only mentions topics (a lawsuit, a place, a year) without naming a person, leave this EMPTY — do NOT guess. The code will inherit the project subject for empty values.",
+  "segment_subject": "the ONE person or entity this section is visually about. Fill this when ANY of the following ground the section to one named person: (a) the person is named at least once anywhere in this section's text, (b) the section uses last-name references (e.g. 'Walliams said', 'Robbie was cast'), (c) the section uses pronouns that clearly continue from a person named earlier in the section. Use the PROJECT SUBJECT (above) by default when the section is anchored to them this way — do not leave empty just because most sentences use pronouns. Leave EMPTY ONLY when the section genuinely names no one and references no prior person.",
   "segment_topic": "short focus topic, 2-5 words, e.g. 'lawsuit / Creative Controls', 'early career', 'wedding 2019'. This is the story beat, not the subject.",
   "people": ["EVERY named person in this section, INCLUDING the main subject when their name appears. Do not omit the subject just because the whole video is about them."],
   "places": ["cities, countries, venues"],

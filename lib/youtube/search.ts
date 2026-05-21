@@ -210,9 +210,18 @@ export interface RankInput {
   // True when the segment inherited its subject from the global project
   // (i.e. the segment never re-stated the celebrity's name). For inherited
   // segments we hard-reject any candidate that doesn't mention the subject,
-  // an alias, or a context term — generic "Creative Controls company profile"
-  // is exactly the failure mode that triggered this work.
+  // an alias, a context term, or one of segmentEntities below — generic
+  // "Creative Controls company profile" is exactly the failure mode that
+  // triggered this work.
   inheritedSegment?: boolean;
+  // Per-segment named anchors — the people / places / events the section
+  // actually mentions. Used as an additional anchor on inherited segments
+  // so an event-driven section ("the BGT scandal at the London Palladium")
+  // can still match results that say "Britain's Got Talent" or "London
+  // Palladium" without the celebrity's name in the title. Gemini fills
+  // these via analyzeSegment's people/places/events arrays; the analyze
+  // route flattens and forwards them here.
+  segmentEntities?: string[];
   keywords: string[];
   approvedChannelIds: Set<string>;
   blockedChannelIds: Set<string>;
@@ -348,12 +357,23 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   }
 
   // Context-term hit (+35 once). Context terms are recurring proper nouns tied
-  // to the subject — "Kindig It Design", "Bitchin Rides". They're the
-  // secondary anchor when a result doesn't restate the celebrity by name.
+  // to the subject — "Kindig It Design", "Bitchin Rides", "Britain's Got
+  // Talent". They're the secondary anchor when a result doesn't restate the
+  // celebrity by name.
+  //
+  // Normalize curly vs straight apostrophes on BOTH sides — YouTube titles
+  // often use the typographic apostrophe ('Britain's Got Talent') while our
+  // context terms come from Gemini as plain ASCII. Without normalization a
+  // valid match like "Britain's Got Talent" silently misses.
+  function normApostrophes(s: string): string {
+    return s.replace(/[''`]/g, "'");
+  }
+  const titleNorm = normApostrophes(titleLower);
+  const descNorm = normApostrophes(descLower);
   const contextLowers = (input.contextTerms ?? [])
-    .map((t) => t.toLowerCase().trim())
+    .map((t) => normApostrophes(t.toLowerCase().trim()))
     .filter((t) => t && !subjectVariants.includes(t));
-  const contextHit = contextLowers.find((t) => titleLower.includes(t) || descLower.includes(t));
+  const contextHit = contextLowers.find((t) => titleNorm.includes(t) || descNorm.includes(t));
   if (contextHit) {
     score += 35;
     reasons.push(`context:${contextHit}`);
@@ -433,13 +453,27 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   }
 
   // Hard reject for INHERITED segments that come back with zero subject /
-  // alias / context anchor in the result. Inherited segments are the ones
-  // where the section never re-stated the subject's name; the only way to
-  // keep them on-topic is to demand the result mentions the subject (or a
-  // tied entity) somewhere. Without this rule, a section about Dave Kindig's
-  // lawsuit pulls "iPhone Creative Controls tutorial" — the matched query
-  // tokens align but nothing in the result is about Dave Kindig.
-  if (input.inheritedSegment && !subjectHit && !contextHit) {
+  // alias / context / segment-entity anchor in the result. Inherited
+  // segments are the ones where the section never re-stated the subject's
+  // name; the only way to keep them on-topic is to demand the result
+  // mentions the subject (or one of the section's named entities)
+  // somewhere. Without this rule, a section about a lawsuit pulls
+  // "iPhone Creative Controls tutorial" — the matched query tokens align
+  // but nothing in the result is about the subject.
+  const segmentEntityLowers = (input.segmentEntities ?? [])
+    .map((t) => normApostrophes(t.toLowerCase().trim()))
+    .filter((t) => t.length >= 3 && !subjectVariants.includes(t));
+  const segmentEntityHit = segmentEntityLowers.find(
+    (t) => titleNorm.includes(t) || descNorm.includes(t),
+  );
+  if (segmentEntityHit && !contextHit && !subjectHit) {
+    // Treat a segment-entity hit as a secondary anchor (slightly weaker
+    // than a context-term hit because segment entities are scoped to one
+    // section, not the whole project).
+    score += 20;
+    reasons.push(`segment_entity:${segmentEntityHit}`);
+  }
+  if (input.inheritedSegment && !subjectHit && !contextHit && !segmentEntityHit) {
     return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "inherited segment without subject/context anchor" };
   }
 
@@ -447,7 +481,7 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   // wave through tourist clips and unrelated paparazzi videos because the
   // ranker had nothing else to weigh — they passed the duration window and
   // rendered as "100" in the UI. Approved channel counts as a signal too.
-  const hasContentSignal = !!subjectHit || !!contextHit || !!topicHit || titleHits > 0 || descHits > 0 || approvedChannelHit;
+  const hasContentSignal = !!subjectHit || !!contextHit || !!segmentEntityHit || !!topicHit || titleHits > 0 || descHits > 0 || approvedChannelHit;
   if (!hasContentSignal) {
     return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "no keyword or subject match" };
   }

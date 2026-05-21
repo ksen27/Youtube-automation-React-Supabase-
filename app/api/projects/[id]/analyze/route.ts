@@ -304,11 +304,23 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         let dupes = 0;
         for (const c of cands) {
           if (seenVideo.has(c.videoId)) { dupes++; continue; }
+          // Flatten the segment's named-entity arrays into a single list
+          // the ranker can use as a fallback anchor on inherited segments.
+          // Without this, an event-driven section like "the Walliams
+          // recording at the London Palladium" hard-rejects any BGT-scandal
+          // news result whose title doesn't restate "David Walliams" —
+          // exactly the failure mode the user flagged.
+          const segmentEntities = Array.from(new Set([
+            ...(u.people ?? []),
+            ...(u.places ?? []),
+            ...(u.events ?? []),
+          ].filter(Boolean)));
           const ranked = rankCandidate({
             candidate: c,
             mainCelebrity,
             aliases: subjectAliases,
             contextTerms,
+            segmentEntities,
             segmentTopic: u.segmentTopic || u.mainTopic,
             matchedQuery: intent.query,
             inheritedSegment: u.inheritedSubject,
