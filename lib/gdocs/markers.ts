@@ -92,6 +92,16 @@ function tokenize(s: string): string[] {
 // and small ASR slips (homophones, contractions split differently) fail
 // gracefully by returning -1 so the caller can skip the marker rather than
 // snapping it to the wrong moment.
+// Return the first word index whose start time is >= t. Used by the
+// section-window resolver to convert a section-start audio time into a
+// word-stream cursor that findPhraseIndex can search from.
+function findWordIndexAtOrAfter(words: WordTiming[], t: number): number {
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].start >= t) return i;
+  }
+  return words.length;
+}
+
 function findPhraseIndex(
   words: WordTiming[],
   phraseTokens: string[],
@@ -239,58 +249,147 @@ export function applyScriptMarkers(
   const wordsNN: WordTiming[] = words;
 
   // Resolve each marker's spoken-time window by finding its text in the
-  // Deepgram word stream. We walk markers in doc order (by ordinal) and
-  // maintain a SINGLE global cursor that advances past each marker's
-  // anchor. The next marker's phrase search starts from that cursor —
-  // so a phrase like "London Palladium" that appears in BOTH the intro
-  // and a later paragraph anchors to the later occurrence when the
-  // marker was authored after an earlier marker that already consumed
-  // the earlier mention.
+  // Deepgram word stream.
   //
-  // Why not a per-phrase cursor: the doc author's red-text lower-third
-  // for "London Palladium" in paragraph 3 was always meant to fire at
-  // that paragraph's spoken moment. With a per-phrase cursor starting
-  // at 0, it would lock onto the intro's incidental "London Palladium"
-  // mention (~t=10s) instead — landing the overlay at the wrong moment
-  // and on the wrong clip. The global cursor enforces doc-order
-  // monotonicity: a paragraph-3 marker can only anchor AFTER all
-  // earlier-ordinal markers have been placed.
+  // Two-pass design driven by a real bug: the doc author's red-marked
+  // lower-third "London Palladium" sits in paragraph 3 of a section. But
+  // the same phrase also appears in the doc's intro paragraph (NOT
+  // red-marked). A single-pass forward scan would lock the marker onto
+  // the intro's earlier spoken mention (~t=10s) instead of the
+  // paragraph-3 mention (~t=40s), placing the overlay on the wrong clip.
   //
-  // Title cards' phrases (e.g. "The Moment That Changed Everything")
-  // are doc headings, not narration — usually never said aloud. When
-  // their search fails (idx < 0), we DON'T advance the cursor (we have
-  // nothing to advance past). Later lower-thirds still get correct
-  // anchoring because the cursor sits where the previous SUCCESSFUL
-  // anchor left it.
-  let globalCursor = 0;
+  // Pass 1: anchor all title-card markers in doc order. Title cards are
+  // doc headings; the narrator reads each section's body right after.
+  // A title's spoken anchor (or fallback to the previous title's anchor
+  // when this one's text isn't in the narration) marks where the next
+  // section's audio starts.
+  //
+  // Pass 2: for each lower-third, the search start = the audio anchor
+  // of the most recent title-card marker that precedes it in ordinal
+  // order. That way, a lower-third in section N can only anchor inside
+  // section N's audio — never the intro, never an earlier section.
+  // Within one section, identical phrases still use a per-phrase forward
+  // cursor so multiple occurrences pick distinct instances.
   const resolved: Array<{ marker: ScriptMarkerRow; t: number | null; tEnd: number | null }> = [];
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
+
+  // Pass 1: title-card audio anchors, keyed by ordinal.
+  const titleAnchorByOrdinal = new Map<number, number>();
+  {
+    let lastTitleEnd = 0;
+    for (const m of ordered) {
+      if (m.kind !== "title_card") continue;
+      const tokens = tokenize(m.text);
+      if (tokens.length === 0) continue;
+      const idx = findPhraseIndex(words, tokens, lastTitleEnd);
+      if (idx < 0) continue;
+      titleAnchorByOrdinal.set(m.ordinal, words[idx].start);
+      lastTitleEnd = idx + tokens.length;
+    }
+  }
+  // For each ordinal, the search-start audio time for a lower-third with
+  // that ordinal: the most recent title-card anchor at-or-before its
+  // ordinal, falling back to 0 when no title card has anchored yet (i.e.
+  // the lower-third sits in the intro paragraph or before any title).
+  function sectionStartForOrdinal(ord: number): number {
+    let bestT = 0;
+    for (const [titleOrd, titleT] of titleAnchorByOrdinal) {
+      if (titleOrd <= ord && titleT > bestT) bestT = titleT;
+    }
+    return bestT;
+  }
+
+  // Pass 2: resolve all markers.
+  // Per-phrase cursor still used WITHIN a section for distinct
+  // occurrences of the same phrase (e.g. a name said multiple times
+  // within one section). Reset per section to avoid the cursor leaking
+  // forward across sections.
+  const phraseSearchCursor = new Map<string, number>();
+  let cursorSectionOrdinal = -1;
+  const debugRows: Array<Record<string, unknown>> = [];
   for (const m of ordered) {
-    // title_card_clip rows are doc-stacked extra timestamps under a title
-    // — they share the parent title's spoken anchor and have no own text
-    // to search for. Resolution is deferred to the grouping pass below.
     if (m.kind === "title_card_clip") {
       resolved.push({ marker: m, t: null, tEnd: null });
+      debugRows.push({
+        ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
+        text: m.text.slice(0, 40), skipped: "title_card_clip",
+      });
       continue;
     }
     const tokens = tokenize(m.text);
     if (tokens.length === 0) {
       resolved.push({ marker: m, t: null, tEnd: null });
+      debugRows.push({
+        ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
+        text: m.text.slice(0, 40), skipped: "empty_tokens",
+      });
       continue;
     }
-    const idx = findPhraseIndex(words, tokens, globalCursor);
+    // For title cards, reuse the pass-1 anchor if we have one; the
+    // search start is the previous section. For lower-thirds, search
+    // start is the section anchor.
+    let searchStart: number;
+    if (m.kind === "title_card") {
+      // Find the previous successfully-anchored title's audio time and
+      // use it as the lower bound. If none, start at 0.
+      searchStart = 0;
+      for (const [titleOrd, titleT] of titleAnchorByOrdinal) {
+        if (titleOrd < m.ordinal && titleT > searchStart) searchStart = titleT;
+      }
+    } else {
+      // lower_third: locked to its section's audio window.
+      const sectionStartT = sectionStartForOrdinal(m.ordinal);
+      // Find the word index for sectionStartT.
+      const sectionStartIdx = findWordIndexAtOrAfter(words, sectionStartT);
+      // Reset per-phrase cursor when crossing into a new section so
+      // counting starts fresh inside the section.
+      const sectionKey = sectionStartT;
+      if (sectionKey !== cursorSectionOrdinal) {
+        phraseSearchCursor.clear();
+        cursorSectionOrdinal = sectionKey;
+      }
+      const key = tokens.join(" ");
+      const cursorFromMap = phraseSearchCursor.get(key);
+      searchStart = cursorFromMap != null && cursorFromMap > sectionStartIdx
+        ? cursorFromMap
+        : sectionStartIdx;
+    }
+    const idx = findPhraseIndex(words, tokens, Math.floor(searchStart));
     if (idx < 0) {
       resolved.push({ marker: m, t: null, tEnd: null });
+      debugRows.push({
+        ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
+        text: m.text.slice(0, 40), searchedFrom: searchStart, found: -1,
+      });
       continue;
     }
-    globalCursor = idx + tokens.length;
+    if (m.kind === "lower_third") {
+      const key = tokens.join(" ");
+      phraseSearchCursor.set(key, idx + tokens.length);
+    }
     const lastIdx = idx + tokens.length - 1;
     resolved.push({
       marker: m,
       t: words[idx].start,
       tEnd: words[lastIdx].end,
     });
+    debugRows.push({
+      ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
+      text: m.text.slice(0, 40),
+      searchedFrom: searchStart, foundAtWord: idx,
+      tStart: Math.round(words[idx].start * 100) / 100,
+      tEnd: Math.round(words[lastIdx].end * 100) / 100,
+    });
   }
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    msg: "markers.resolve.debug",
+    projectId,
+    totalMarkers: ordered.length,
+    totalWords: words.length,
+    titleAnchors: Array.from(titleAnchorByOrdinal.entries()).map(([o, t]) => ({ ord: o, t: Math.round(t * 100) / 100 })),
+    rows: debugRows,
+  }));
 
   // Apply lower-thirds first because they only mutate existing items'
   // metadata — order independent. Title-card insertions shift positions
