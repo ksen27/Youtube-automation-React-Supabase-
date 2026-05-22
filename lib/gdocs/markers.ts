@@ -331,17 +331,52 @@ export function applyScriptMarkers(
       ? Math.max(TITLE_CARD_MIN_DURATION, spokenDuration)
       : TITLE_CARD_FALLBACK_DURATION;
     const extras: ScriptMarkerRow[] = [];
-    // Walk forward collecting title_card_clip siblings. Stop at the next
-    // non-clip marker (another title_card, lower_third with intervening
-    // text, etc) or end of stream.
+    // Walk forward collecting sibling clips. Two cases count as a sibling:
+    //   1. title_card_clip — the parser's clean case (a bare timestamp
+    //      stacked under the title with no label text).
+    //   2. title_card whose text could NOT be aligned in the spoken audio
+    //      (r.t == null) but DOES carry a youtube_url. The author labeled
+    //      the stacked clip in the doc (e.g. "I, extra clip 2 — 0:00-0:08")
+    //      so the parser classified it as its own title_card; since the
+    //      label isn't spoken by the narrator, the matcher would otherwise
+    //      drop the clip silently. We absorb it as an extra here so both
+    //      clips play under the previous title's card.
     let h = g + 1;
-    while (h < orderedResolutions.length
-        && orderedResolutions[h].marker.kind === "title_card_clip") {
-      const sib = orderedResolutions[h].marker;
-      if (sib.youtube_url) extras.push(sib);
-      h++;
+    while (h < orderedResolutions.length) {
+      const sibRes = orderedResolutions[h];
+      // lower_third markers use an independent ordinal counter from the
+      // title_* markers, so a lower_third can land BETWEEN a title_card
+      // and its title_card_clip in the ordinal-sorted stream. Skip past
+      // it without breaking the sibling walk — it's not a sibling and not
+      // a barrier; the next title_card_clip after it still belongs to
+      // this group.
+      if (sibRes.marker.kind === "lower_third") {
+        h++;
+        continue;
+      }
+      if (sibRes.marker.kind === "title_card_clip") {
+        if (sibRes.marker.youtube_url) extras.push(sibRes.marker);
+        h++;
+        continue;
+      }
+      if (
+        sibRes.marker.kind === "title_card"
+        && sibRes.t == null
+        && sibRes.marker.youtube_url
+      ) {
+        extras.push(sibRes.marker);
+        h++;
+        continue;
+      }
+      break;
     }
     groups.push({ parent: r.marker, parentT: r.t, parentDuration, extras });
+    // Skip the absorbed siblings so the outer loop doesn't re-process them
+    // (the inner `if (r.marker.kind !== "title_card") continue;` would
+    // skip title_card_clip extras anyway, but unaligned title_card extras
+    // would otherwise come back through as their own groups and get
+    // counted under titleCardsSkipped).
+    g = h - 1;
   }
 
   // Insert groups in reverse spoken-time order so an earlier insertion
@@ -499,9 +534,14 @@ export function applyScriptMarkers(
   // video" case cleanly.
   const orphanedClipCount = orderedResolutions.filter((r, idx) => {
     if (r.marker.kind !== "title_card_clip") return false;
-    // An extra is "orphaned" if the preceding ordinal isn't a title_card
-    // OR that title_card was skipped (no t, no youtube_url).
-    const prev = orderedResolutions[idx - 1];
+    // Walk back past lower_third markers (independent ordinal counter,
+    // can interleave) to find the real preceding marker — the one the
+    // sibling walk uses as the parent.
+    let prevIdx = idx - 1;
+    while (prevIdx >= 0 && orderedResolutions[prevIdx].marker.kind === "lower_third") {
+      prevIdx--;
+    }
+    const prev = prevIdx >= 0 ? orderedResolutions[prevIdx] : null;
     if (!prev) return true;
     if (prev.marker.kind === "title_card") {
       return prev.t == null || !prev.marker.youtube_url;
