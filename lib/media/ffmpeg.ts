@@ -450,11 +450,25 @@ export async function buildTitleCardVideo(opts: {
       if (totalChars > 0) {
         const dt = typingWindow / totalChars;
         const filters: string[] = [];
-        for (let k = 1; k <= totalChars; k++) {
-          // Compute the prefix of `totalText` of length k, then re-split it
-          // back onto the line widths from `lines`. The simplest robust
-          // splitter: walk the original lines consuming `k` characters in
-          // order, plus 1 character per inter-line separator (the space).
+        // Intermediate typing snapshots — one per prefix length, each
+        // active only during its own (k-1)*dt .. k*dt window. We DON'T
+        // include k = totalChars here; that final state is rendered by
+        // a separate, static drawtext below covering the typing tail
+        // through card end. Splitting it this way avoids two problems
+        // with the previous N=totalChars + last-extended-window design:
+        //   (1) The filter chain grew to lines.length * totalChars
+        //       drawtexts (~180 for a 3-line 60-char title). On longer
+        //       titles this hit drawtext-chain limits silently — the
+        //       last snapshot's third line dropped out mid-render,
+        //       leaving only the first two lines visible during the
+        //       hold tail.
+        //   (2) Edge-case overlap at the k*dt boundary fired both the
+        //       last intermediate and the final snapshot for a frame,
+        //       causing a momentary flicker.
+        // Total snapshot count is now (totalChars - 1) + 1 final = same,
+        // but the final state is one drawtext-per-line with a single
+        // long enable window — far less filter graph pressure.
+        for (let k = 1; k < totalChars; k++) {
           const partialLines: string[] = [];
           let remaining = k;
           for (let li = 0; li < lines.length && remaining > 0; li++) {
@@ -462,7 +476,6 @@ export async function buildTitleCardVideo(opts: {
             if (remaining >= lineText.length) {
               partialLines.push(lineText);
               remaining -= lineText.length;
-              // Consume the inter-line space if there's another line.
               if (li + 1 < lines.length) {
                 if (remaining > 0) remaining -= 1;
               }
@@ -471,19 +484,25 @@ export async function buildTitleCardVideo(opts: {
               remaining = 0;
             }
           }
-          // enable window: from (k-1)*dt to either k*dt (intermediate) or
-          // the very end (last frame, so the finished text holds through
-          // the tail without a 1/30s gap before card-end).
           const tStart = ((k - 1) * dt).toFixed(3);
-          const tEnd = k === totalChars
-            ? opts.durationSeconds.toFixed(3)
-            : (k * dt).toFixed(3);
+          const tEnd = (k * dt).toFixed(3);
           const enableExpr = `between(t,${tStart},${tEnd})`;
           for (let li = 0; li < partialLines.length; li++) {
             const t = partialLines[li];
             if (!t) continue;
             filters.push(buildLineDrawtext(t, li, enableExpr));
           }
+        }
+        // Final state: full text, held from the end of the typing window
+        // through to card end. One drawtext per line, single long enable
+        // window — no per-character snapshot pile-up.
+        const tailStart = (((totalChars - 1) * dt)).toFixed(3);
+        const tailEnd = opts.durationSeconds.toFixed(3);
+        const tailEnable = `between(t,${tailStart},${tailEnd})`;
+        for (let li = 0; li < lines.length; li++) {
+          const t = lines[li];
+          if (!t) continue;
+          filters.push(buildLineDrawtext(t, li, tailEnable));
         }
         drawtext = filters.join(",") + ",";
       }

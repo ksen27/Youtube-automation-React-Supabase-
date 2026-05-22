@@ -239,16 +239,31 @@ export function applyScriptMarkers(
   const wordsNN: WordTiming[] = words;
 
   // Resolve each marker's spoken-time window by finding its text in the
-  // Deepgram word stream. The narrator speaks the title text aloud in the
-  // audio (e.g. "the moment that changed everything the walliams recording"
-  // is spoken between the end of one paragraph and the start of the next);
-  // we anchor the card at that exact spoken moment. Walking a cursor
-  // forward through `words` keeps duplicate phrases (a name appearing many
-  // times) aligned to distinct spoken instances rather than all snapping
-  // to the first hit.
-  const phraseSearchCursor = new Map<string, number>();
+  // Deepgram word stream. We walk markers in doc order (by ordinal) and
+  // maintain a SINGLE global cursor that advances past each marker's
+  // anchor. The next marker's phrase search starts from that cursor —
+  // so a phrase like "London Palladium" that appears in BOTH the intro
+  // and a later paragraph anchors to the later occurrence when the
+  // marker was authored after an earlier marker that already consumed
+  // the earlier mention.
+  //
+  // Why not a per-phrase cursor: the doc author's red-text lower-third
+  // for "London Palladium" in paragraph 3 was always meant to fire at
+  // that paragraph's spoken moment. With a per-phrase cursor starting
+  // at 0, it would lock onto the intro's incidental "London Palladium"
+  // mention (~t=10s) instead — landing the overlay at the wrong moment
+  // and on the wrong clip. The global cursor enforces doc-order
+  // monotonicity: a paragraph-3 marker can only anchor AFTER all
+  // earlier-ordinal markers have been placed.
+  //
+  // Title cards' phrases (e.g. "The Moment That Changed Everything")
+  // are doc headings, not narration — usually never said aloud. When
+  // their search fails (idx < 0), we DON'T advance the cursor (we have
+  // nothing to advance past). Later lower-thirds still get correct
+  // anchoring because the cursor sits where the previous SUCCESSFUL
+  // anchor left it.
+  let globalCursor = 0;
   const resolved: Array<{ marker: ScriptMarkerRow; t: number | null; tEnd: number | null }> = [];
-  // Sort by ordinal so the cursor walk respects doc order across kinds.
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
   for (const m of ordered) {
     // title_card_clip rows are doc-stacked extra timestamps under a title
@@ -263,14 +278,12 @@ export function applyScriptMarkers(
       resolved.push({ marker: m, t: null, tEnd: null });
       continue;
     }
-    const key = tokens.join(" ");
-    const from = phraseSearchCursor.get(key) ?? 0;
-    const idx = findPhraseIndex(words, tokens, from);
+    const idx = findPhraseIndex(words, tokens, globalCursor);
     if (idx < 0) {
       resolved.push({ marker: m, t: null, tEnd: null });
       continue;
     }
-    phraseSearchCursor.set(key, idx + tokens.length);
+    globalCursor = idx + tokens.length;
     const lastIdx = idx + tokens.length - 1;
     resolved.push({
       marker: m,
