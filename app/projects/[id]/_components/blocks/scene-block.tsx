@@ -15,6 +15,12 @@ import { cn } from "@/lib/utils";
 export interface SceneBlockProps {
   index: number;
   thumbnail?: string | null;
+  /**
+   * Ordered list of previously-used image URLs from elsewhere on the timeline.
+   * When `thumbnail` 404s/fails to load, the tile walks this list until one
+   * resolves so a scene is never rendered blank.
+   */
+  fallbackThumbnails?: string[];
   scriptText?: string | null;
   overlayText?: string | null;
   durationSec: number;
@@ -32,6 +38,28 @@ export interface SceneBlockProps {
 }
 
 export function SceneBlock(p: SceneBlockProps) {
+  // Walk the fallback list when the primary thumbnail fails. -1 = show
+  // primary, 0..n-1 = show fallbacks[idx], n = exhausted (show placeholder).
+  // Reset whenever the primary changes (user replaces media) so the new URL
+  // gets a fresh try before falling back again.
+  const [fallbackIdx, setFallbackIdx] = React.useState(-1);
+  React.useEffect(() => {
+    setFallbackIdx(-1);
+  }, [p.thumbnail]);
+  const fallbacks = React.useMemo(
+    () =>
+      (p.fallbackThumbnails ?? []).filter(
+        (u): u is string => !!u && u !== p.thumbnail,
+      ),
+    [p.fallbackThumbnails, p.thumbnail],
+  );
+  const exhausted = fallbackIdx >= fallbacks.length;
+  const displayedThumb = exhausted
+    ? null
+    : fallbackIdx < 0
+      ? p.thumbnail
+      : fallbacks[fallbackIdx];
+
   return (
     <div
       onClick={p.onSelect}
@@ -62,10 +90,17 @@ export function SceneBlock(p: SceneBlockProps) {
       <div className="relative w-40 aspect-video shrink-0 overflow-hidden rounded-md bg-bg-elevated border border-border">
         {p.isLoading ? (
           <div className="skeleton h-full w-full" />
-        ) : p.thumbnail ? (
+        ) : displayedThumb ? (
           <>
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={p.thumbnail} alt="" className="h-full w-full object-cover" loading="lazy" />
+            <img
+              key={displayedThumb}
+              src={displayedThumb}
+              alt=""
+              className="h-full w-full object-cover"
+              loading="lazy"
+              onError={() => setFallbackIdx((i) => i + 1)}
+            />
             {p.onPlay && (
               <button
                 type="button"

@@ -69,6 +69,28 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     throw new Error("no renderable timeline items");
   }
 
+  // Diagnostic: count how many renderable items carry a lower_third overlay
+  // and from which source. Helps verify the matcher's lower_third stamping
+  // survived the round-trip from match step to render step. If this number
+  // is 0 but the matcher reported lowerThirdsApplied > 0, the metadata was
+  // dropped during DB write/read. If non-zero but no overlay appears in the
+  // final video, the failure is downstream in the drawtext filter.
+  {
+    const ltSummary = { count: 0, samples: [] as Array<{ idx: number; type: string; text: string; source: string }> };
+    for (let i = 0; i < renderable.length; i++) {
+      const it = renderable[i];
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const lt = meta.lower_third as { text?: string; type?: string } | undefined;
+      if (lt?.text) {
+        ltSummary.count++;
+        if (ltSummary.samples.length < 5) {
+          ltSummary.samples.push({ idx: i, type: String(it.type), text: lt.text, source: String(lt.type ?? "?") });
+        }
+      }
+    }
+    await logJob({ projectId, jobId: mediaJobId }, "render.lower_thirds.preflight", ltSummary);
+  }
+
   // Defense-in-depth: enforce unique clip ids among footage items. Image
   // blocks have clip_id=null, so they don't participate in this check.
   const footageClipIds = renderable.map((it) => it.clip_id as string | null).filter(Boolean) as string[];

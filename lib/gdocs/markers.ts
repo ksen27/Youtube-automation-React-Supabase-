@@ -501,6 +501,37 @@ export function applyScriptMarkers(
     const overlayWindowStart = group.parentT;
     const overlayWindowEnd = group.parentT + rows.reduce((s, r) => s + r.duration, 0);
 
+    // Close the inter-sentence gap between the previous item and the
+    // narrator's title-start moment. computeStarts returns each item's
+    // voiceover-relative start; the previous item's visual end is
+    // start[k-1] + duration[k-1]. When the narrator pauses between
+    // sentences, that end can land 0.5-1.5s BEFORE parentT — and since
+    // the renderer concatenates segments back-to-back, the title card
+    // would otherwise appear at the previous item's end (i.e. EARLY,
+    // during the inter-sentence silence) rather than at parentT.
+    //
+    // Pad the preceding non-intro item by the gap so its visible end
+    // lines up with parentT. The duration_reclaim pass downstream
+    // absorbs the extra length; if the prior row is clamped (a forced
+    // clip or a row whose source is shorter than planned), we leave it
+    // alone — stretching past a clip's real length re-introduces black
+    // tail frames. In that case the card still drifts slightly early,
+    // but never past the prior row's source-clip end.
+    let prevIdx = k - 1;
+    while (prevIdx >= 0 && items[prevIdx].type === "intro") prevIdx--;
+    if (prevIdx >= 0) {
+      const prevItem = items[prevIdx];
+      const prevStart = currentStarts[prevIdx];
+      const prevEnd = prevStart + Number(prevItem.duration ?? 0);
+      const gap = group.parentT - prevEnd;
+      if (gap > 0.05) {
+        const prevMeta = (prevItem.metadata ?? {}) as Record<string, unknown>;
+        if (prevMeta.duration_clamped !== true) {
+          prevItem.duration = Number(prevItem.duration ?? 0) + gap;
+        }
+      }
+    }
+
     // Insert the title card + forced footage BEFORE the script item playing
     // at the title's spoken moment. The narrator reaches the title text at
     // voiceover time `parentT`; the item at index k is whatever scene the
@@ -533,6 +564,34 @@ export function applyScriptMarkers(
     const insertedDuration = rows.reduce((s, r) => s + r.duration, 0);
     let absorbedDuration = 0;
     const afterOverlayIdx = k + rows.length;
+    // Track lower-thirds rescued from items the dedup pass is about to
+    // remove. The doc-marker lower-third loop above stamped them onto
+    // whichever script item was playing at the spoken moment — but the
+    // very items that overlap the title's overlay window are exactly the
+    // ones we're about to delete. Without rescue, a lower-third whose
+    // spoken word falls inside the first title's window vanishes from the
+    // final video (this was the "first 3 lower-thirds invisible" bug).
+    // After the removal loop we re-stamp these onto the forced-footage
+    // rows (which now play during that narration window) in spoken-time
+    // order, so the overlay still appears with the correct word.
+    const rescuedLowerThirds: Array<{
+      text: string;
+      type: string;
+      marker_id?: string;
+      voStart: number;
+    }> = [];
+    function rescueIfPresent(it: TimelineItemDraft, voStart: number): void {
+      const m = (it.metadata ?? {}) as Record<string, unknown>;
+      const lt = m.lower_third as { text?: string; type?: string; marker_id?: string } | undefined;
+      if (lt?.text) {
+        rescuedLowerThirds.push({
+          text: lt.text,
+          type: String(lt.type ?? "doc_marker"),
+          marker_id: lt.marker_id,
+          voStart,
+        });
+      }
+    }
     // Stage 1: window-based removal.
     for (let r = afterOverlayIdx; r < items.length; ) {
       const it = items[r];
@@ -542,6 +601,7 @@ export function applyScriptMarkers(
       if (typeof itStart !== "number") { r++; continue; }
       if (itStart >= overlayWindowEnd - 0.05) break;
       if (itStart >= overlayWindowStart - 0.05) {
+        rescueIfPresent(it, Number(itStart));
         absorbedDuration += Number(it.duration ?? 0);
         items.splice(r, 1);
         continue;
@@ -561,8 +621,56 @@ export function applyScriptMarkers(
       const meta = (it.metadata ?? {}) as Record<string, unknown>;
       const pickSource = meta.pick_source;
       if (pickSource === "doc_marker" || pickSource === "doc_marker_forced") break;
+      const itStart = typeof meta.vo_start_seconds === "number"
+        ? Number(meta.vo_start_seconds)
+        : overlayWindowStart;
+      rescueIfPresent(it, itStart);
       absorbedDuration += Number(it.duration ?? 0);
       items.splice(afterOverlayIdx, 1);
+    }
+
+    // Re-stamp rescued lower-thirds onto the forced-footage rows that now
+    // play during the overlay window. We walk both lists in spoken-time
+    // order and place each rescued overlay onto the forced-footage row
+    // whose voiceover window contains its original spoken moment, falling
+    // back to the closest forced row when the boundaries don't line up
+    // exactly. Title-card rows are intentionally skipped — burning a
+    // chyron on top of a typewriter card looks awful, and the overlay
+    // belongs on the footage clip the narrator is actually talking over.
+    if (rescuedLowerThirds.length > 0) {
+      rescuedLowerThirds.sort((a, b) => a.voStart - b.voStart);
+      const forcedRows: Array<{ row: TimelineItemDraft; voStart: number; voEnd: number }> = [];
+      let cursor = group.parentT + group.parentDuration; // forced footage begins right after the title card
+      for (let r = 1; r < rows.length; r++) {
+        const fr = rows[r];
+        if (fr.type !== "footage") continue;
+        const dur = Number(fr.duration ?? 0);
+        forcedRows.push({ row: fr, voStart: cursor, voEnd: cursor + dur });
+        cursor += dur;
+      }
+      for (const lt of rescuedLowerThirds) {
+        if (forcedRows.length === 0) break;
+        let target = forcedRows.find((f) => lt.voStart >= f.voStart && lt.voStart < f.voEnd);
+        if (!target) {
+          // Marker's original spoken moment sits outside any forced-row
+          // window (rare — happens when stage 2 absorbed an item past the
+          // title's spoken end). Pin to the closest forced row by start.
+          target = forcedRows.reduce((best, f) =>
+            Math.abs(f.voStart - lt.voStart) < Math.abs(best.voStart - lt.voStart) ? f : best,
+          forcedRows[0]);
+        }
+        const targetMeta = (target.row.metadata ?? {}) as Record<string, unknown>;
+        // Don't overwrite a forced row that already carries a lower_third
+        // (would only happen with overlapping markers, which is rare and
+        // operator-authored).
+        if (targetMeta.lower_third && typeof targetMeta.lower_third === "object") continue;
+        targetMeta.lower_third = {
+          text: lt.text,
+          type: lt.type,
+          ...(lt.marker_id ? { marker_id: lt.marker_id } : {}),
+        };
+        target.row.metadata = targetMeta;
+      }
     }
   }
 

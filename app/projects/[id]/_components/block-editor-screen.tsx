@@ -46,6 +46,17 @@ export function BlockEditorScreen({
   const clips = useMemo(() => clipsQ.data?.clips ?? [], [clipsQ.data?.clips]);
   const clipById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
 
+  // Pool of every image_url already used somewhere on the timeline. Scene
+  // blocks fall back to this list when their own image_url 404s, so an
+  // approved row never renders as an empty grey tile.
+  const timelineImagePool = useMemo(
+    () =>
+      Array.from(
+        new Set(items.map((it) => it.image_url).filter((v): v is string => !!v)),
+      ),
+    [items],
+  );
+
   // The block whose media is being replaced. When non-null, the replace
   // modal opens. We track the whole row so the modal can decide what tab
   // to default to (footage → Clips, image → Images).
@@ -252,6 +263,7 @@ export function BlockEditorScreen({
               <SceneBlock
                 index={i}
                 thumbnail={thumbnail}
+                fallbackThumbnails={timelineImagePool}
                 scriptText={it.script_text}
                 overlayText={it.overlay_text}
                 durationSec={it.duration}

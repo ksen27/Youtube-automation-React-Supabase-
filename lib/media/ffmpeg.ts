@@ -734,14 +734,31 @@ async function buildLowerThirdFilter(text: string, height: number): Promise<stri
 
   // Blue (#1E5BC9) matches the reference screenshot; white bold text inside.
   // boxcolor's alpha applies the same fade as the text via the chain's alpha.
-  return (
+  const filter = (
     `drawtext=fontfile='${fontPath}':text='${escaped}':` +
     `fontcolor=white:fontsize=${fontsize}:` +
     `box=1:boxcolor=0x1E5BC9:boxborderw=${boxPad}:` +
     `x=${leftMargin}:y=${yExpr}:` +
     `alpha=${alphaExpr}`
   );
+  // One-shot diagnostic: log the first filter string we build per process
+  // so we can verify the exact drawtext arguments going to ffmpeg. After
+  // we've confirmed the syntax works on the worker's ffmpeg 4.4, this can
+  // be deleted.
+  if (!ltFilterDebugLogged) {
+    ltFilterDebugLogged = true;
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({
+      msg: "lower_third.filter.debug",
+      text,
+      fontPath,
+      filter,
+    }));
+  }
+  return filter;
 }
+
+let ltFilterDebugLogged = false;
 
 export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   const env = getEnv();
