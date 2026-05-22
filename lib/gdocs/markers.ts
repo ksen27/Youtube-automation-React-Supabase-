@@ -273,28 +273,51 @@ export function applyScriptMarkers(
   const resolved: Array<{ marker: ScriptMarkerRow; t: number | null; tEnd: number | null }> = [];
   const ordered = [...markers].sort((a, b) => a.ordinal - b.ordinal);
 
-  // Pass 1: title-card audio anchors, keyed by ordinal.
-  const titleAnchorByOrdinal = new Map<number, number>();
+  // Pass 1: title-card audio anchors, keyed by paragraph_index. Title
+  // cards use one ordinal counter and lower-thirds use another (they're
+  // independent sequences), so we use paragraph_index — which IS shared
+  // across all kinds — to bracket lower-thirds into sections.
+  //
+  // Sort title cards by their paragraph_index so the forward search
+  // through the audio respects doc order. Title cards without a paragraph
+  // index are dropped from the bracketing logic (rare; would only happen
+  // for malformed parser output).
+  const titleAnchors: Array<{ pIdx: number; t: number }> = [];
   {
+    const titleCards = ordered
+      .filter((m) => m.kind === "title_card" && m.paragraph_index != null)
+      .sort((a, b) => (a.paragraph_index as number) - (b.paragraph_index as number));
     let lastTitleEnd = 0;
-    for (const m of ordered) {
-      if (m.kind !== "title_card") continue;
+    for (const m of titleCards) {
       const tokens = tokenize(m.text);
       if (tokens.length === 0) continue;
       const idx = findPhraseIndex(words, tokens, lastTitleEnd);
       if (idx < 0) continue;
-      titleAnchorByOrdinal.set(m.ordinal, words[idx].start);
+      titleAnchors.push({ pIdx: m.paragraph_index as number, t: words[idx].start });
       lastTitleEnd = idx + tokens.length;
     }
   }
-  // For each ordinal, the search-start audio time for a lower-third with
-  // that ordinal: the most recent title-card anchor at-or-before its
-  // ordinal, falling back to 0 when no title card has anchored yet (i.e.
-  // the lower-third sits in the intro paragraph or before any title).
-  function sectionStartForOrdinal(ord: number): number {
+  // For a lower-third at paragraph_index P: the section it belongs to
+  // starts at the most recent title-card anchor whose paragraph_index <= P.
+  // Returns 0 when no title card precedes the marker (e.g. markers
+  // sitting in the intro paragraph).
+  function sectionStartForParagraph(pIdx: number | null): number {
+    if (pIdx == null) return 0;
     let bestT = 0;
-    for (const [titleOrd, titleT] of titleAnchorByOrdinal) {
-      if (titleOrd <= ord && titleT > bestT) bestT = titleT;
+    for (const a of titleAnchors) {
+      if (a.pIdx <= pIdx && a.t > bestT) bestT = a.t;
+    }
+    return bestT;
+  }
+  // Section END is the NEXT title card's anchor — used to bound the
+  // search so a lower-third can't accidentally drift into the next
+  // section's audio when its own phrase isn't present. Returns +Infinity
+  // when no later title card exists.
+  function sectionEndForParagraph(pIdx: number | null): number {
+    if (pIdx == null) return Number.POSITIVE_INFINITY;
+    let bestT = Number.POSITIVE_INFINITY;
+    for (const a of titleAnchors) {
+      if (a.pIdx > pIdx && a.t < bestT) bestT = a.t;
     }
     return bestT;
   }
@@ -325,21 +348,23 @@ export function applyScriptMarkers(
       });
       continue;
     }
-    // For title cards, reuse the pass-1 anchor if we have one; the
-    // search start is the previous section. For lower-thirds, search
-    // start is the section anchor.
+    // For title cards: search starts after the PREVIOUS title-card anchor
+    // (by paragraph_index). For lower-thirds: search is constrained to
+    // the section the marker sits in — bracketed by the most recent
+    // title at-or-before its paragraph_index and the next title after.
     let searchStart: number;
     if (m.kind === "title_card") {
-      // Find the previous successfully-anchored title's audio time and
-      // use it as the lower bound. If none, start at 0.
+      // Lower bound: the latest title anchor whose pIdx is strictly less.
       searchStart = 0;
-      for (const [titleOrd, titleT] of titleAnchorByOrdinal) {
-        if (titleOrd < m.ordinal && titleT > searchStart) searchStart = titleT;
+      if (m.paragraph_index != null) {
+        for (const a of titleAnchors) {
+          if (a.pIdx < m.paragraph_index && a.t > searchStart) searchStart = a.t;
+        }
       }
+      searchStart = findWordIndexAtOrAfter(words, searchStart);
     } else {
       // lower_third: locked to its section's audio window.
-      const sectionStartT = sectionStartForOrdinal(m.ordinal);
-      // Find the word index for sectionStartT.
+      const sectionStartT = sectionStartForParagraph(m.paragraph_index);
       const sectionStartIdx = findWordIndexAtOrAfter(words, sectionStartT);
       // Reset per-phrase cursor when crossing into a new section so
       // counting starts fresh inside the section.
@@ -355,11 +380,24 @@ export function applyScriptMarkers(
         : sectionStartIdx;
     }
     const idx = findPhraseIndex(words, tokens, Math.floor(searchStart));
-    if (idx < 0) {
+    // For lower-thirds, also enforce the upper bound — don't accept a
+    // hit that sits past the next title-card's audio anchor (that would
+    // be a different section).
+    let outOfBounds = false;
+    if (idx >= 0 && m.kind === "lower_third") {
+      const sectionEndT = sectionEndForParagraph(m.paragraph_index);
+      if (Number.isFinite(sectionEndT) && words[idx].start >= sectionEndT) {
+        outOfBounds = true;
+      }
+    }
+    if (idx < 0 || outOfBounds) {
       resolved.push({ marker: m, t: null, tEnd: null });
       debugRows.push({
         ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
-        text: m.text.slice(0, 40), searchedFrom: searchStart, found: -1,
+        text: m.text.slice(0, 40),
+        searchedFrom: searchStart,
+        found: idx < 0 ? -1 : idx,
+        skipped: outOfBounds ? "out_of_section" : undefined,
       });
       continue;
     }
@@ -387,7 +425,7 @@ export function applyScriptMarkers(
     projectId,
     totalMarkers: ordered.length,
     totalWords: words.length,
-    titleAnchors: Array.from(titleAnchorByOrdinal.entries()).map(([o, t]) => ({ ord: o, t: Math.round(t * 100) / 100 })),
+    titleAnchors: titleAnchors.map((a) => ({ pIdx: a.pIdx, t: Math.round(a.t * 100) / 100 })),
     rows: debugRows,
   }));
 

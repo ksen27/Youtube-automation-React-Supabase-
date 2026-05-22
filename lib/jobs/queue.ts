@@ -36,6 +36,16 @@ const REDIS_BASE_OPTIONS = {
   maxRetriesPerRequest: null, // BullMQ requirement on shared connections.
   enableReadyCheck: true,
   keepAlive: 30_000,
+  // Cap reconnect backoff at 2s. Default ramps to 2s after ~10 tries anyway;
+  // setting it explicitly means a Fly deploy / machine restart gets workers
+  // back on Redis within seconds of it being reachable, rather than waiting
+  // out the default cold-start ramp.
+  retryStrategy: (times: number) => Math.min(times * 100, 2000),
+  // Force a fresh connection when Redis answers but rejects commands —
+  // happens during the AOF-replay window on boot (LOADING) and during a
+  // failover (READONLY). ioredis would otherwise hold the broken socket
+  // until the next command attempt, surfacing as a stuck worker.
+  reconnectOnError: (err: Error) => /READONLY|LOADING/.test(err.message),
 } as const;
 
 let connection: Redis | null = null;

@@ -8,7 +8,7 @@ loadDotenv({ path: ".env.local" });
 loadDotenv();
 
 import { Worker } from "bullmq";
-import { QUEUE_NAMES, getRedisConnection } from "@/lib/jobs/queue";
+import { QUEUE_NAMES, getRedisConnection, closeAllQueues } from "@/lib/jobs/queue";
 import { getEnv } from "@/lib/env";
 
 import { processSearchJob }     from "./processors/searchProcessor";
@@ -110,7 +110,14 @@ workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadC
 
 async function shutdown(signal: string) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.shutdown", signal }));
+  // Order matters: close workers first so they finish their current job and
+  // stop polling, then close the Queue/QueueEvents objects, then quit the
+  // shared Redis connection. Quitting Redis first would race in-flight
+  // BullMQ commands and leave the AOF without a clean shutdown marker —
+  // which is exactly what makes the next boot's replay window long.
   await Promise.all(workers.map((w) => w.close()));
+  await closeAllQueues();
+  await getRedisConnection().quit();
   process.exit(0);
 }
 process.on("SIGINT",  () => void shutdown("SIGINT"));
