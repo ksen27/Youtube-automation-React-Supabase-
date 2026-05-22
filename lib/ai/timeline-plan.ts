@@ -564,37 +564,43 @@ export function buildBlockSequenceFromHints(
   // reported: when Gemini complies, you get one block; when it
   // hallucinates, you get two.
   //
-  // We detect duplicates by voiceover-window overlap. Two adjacent
-  // hints are duplicates when one's [voStart, voEnd] window overlaps
-  // ≥60% of the SHORTER hint's duration. We drop the later one and
-  // keep the earlier one (it set the wordCursor first, so subsequent
-  // hints are anchored against it).
+  // We detect duplicates by TEXT SIMILARITY, not vo-window overlap. The
+  // window-overlap approach doesn't work because sentenceDurationFromWords
+  // uses a forward-walking cursor: if hint B's text is the same as hint A's,
+  // hint B's word search starts AFTER hint A's words, so it either fails
+  // (no match → null window) or aligns to the next occurrence in audio
+  // (different window). Either way the windows don't overlap, but the
+  // hints are still duplicates.
   //
-  // The 60% threshold is conservative: legitimately adjacent sentences
-  // share at most a tiny boundary overlap (the straddle word), well
-  // below 60%. Hallucinated duplicates share 80-100% of their window.
-  // Only applies when both hints have real word-timing alignment —
-  // cadence-estimated windows are too noisy to compare reliably.
+  // Token-similarity check: if hint B's normalized tokens are ≥80% a
+  // prefix of hint A's tokens, B is a paraphrase of A's narration. We
+  // drop the later one and keep the earlier one (it set the wordCursor
+  // first, so subsequent hints are anchored against it).
+  function normalizeTokens(s: string): string[] {
+    return s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s']/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 0);
+  }
+  function tokenOverlapFraction(a: string[], b: string[]): number {
+    if (a.length === 0 || b.length === 0) return 0;
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+    let matched = 0;
+    for (let i = 0; i < shorter.length; i++) {
+      if (i < longer.length && shorter[i] === longer[i]) matched++;
+    }
+    return matched / shorter.length;
+  }
+  const hintTokens = hints.map((h) => normalizeTokens(h.text));
   const droppedIndices = new Set<number>();
   for (let i = 1; i < hints.length; i++) {
     if (droppedIndices.has(i)) continue;
-    // Find the previous non-dropped hint.
     let prev = i - 1;
     while (prev >= 0 && droppedIndices.has(prev)) prev--;
     if (prev < 0) continue;
-    const aStart = rawVoStart[prev];
-    const aEnd = rawVoEnd[prev];
-    const bStart = rawVoStart[i];
-    const bEnd = rawVoEnd[i];
-    if (aStart == null || aEnd == null || bStart == null || bEnd == null) continue;
-    const aDur = aEnd - aStart;
-    const bDur = bEnd - bStart;
-    if (aDur <= 0 || bDur <= 0) continue;
-    const overlapStart = Math.max(aStart, bStart);
-    const overlapEnd = Math.min(aEnd, bEnd);
-    const overlap = Math.max(0, overlapEnd - overlapStart);
-    const shorter = Math.min(aDur, bDur);
-    if (overlap / shorter >= 0.6) {
+    if (tokenOverlapFraction(hintTokens[prev], hintTokens[i]) >= 0.8) {
       droppedIndices.add(i);
     }
   }

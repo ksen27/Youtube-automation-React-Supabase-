@@ -3283,6 +3283,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
   }
 
+  // Recompute the reclaim target AFTER applyScriptMarkers ran. The marker
+  // pass can both add (title card + forced footage rows) AND remove (the
+  // dedup pass strips script items overlapping the inserted overlay), so
+  // the original durationReclaimSeconds calculated from planner blocks
+  // alone no longer reflects reality. We use the live items[] sum vs
+  // voiceoverSeconds to set the actual gap that needs closing. Without
+  // this, a doc-driven project can land 3-5s short of voiceover after
+  // dedup over-removes, and the render-time tolerance check (±3s) rejects
+  // the render with the "Timeline duration must match voiceover" error.
+  const liveTimelineSum = items
+    .filter((it) => it.type !== "intro")
+    .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+  const liveGap = voiceoverSeconds - liveTimelineSum;
+  if (liveGap > 0.1) {
+    // Replace the planner-derived reclaim target with the live gap.
+    // Only widen, never narrow — if the planner's reclaim was bigger,
+    // the items added/removed by markers cancelled out some of it
+    // already and we should trust the live number.
+    durationReclaimSeconds = liveGap;
+  }
+
   // Reclaim time lost to clip-shorter-than-planned clamping by stretching
   // the unclamped footage rows. Without this, the inserted timeline would
   // total voiceoverSeconds - durationReclaimSeconds and the duration check
