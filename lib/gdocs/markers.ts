@@ -235,6 +235,7 @@ export function applyScriptMarkers(
   markers: ScriptMarkerRow[],
   words: WordTiming[] | null | undefined,
   projectId: string,
+  transcript: string,
 ): ApplyMarkersResult {
   const result: ApplyMarkersResult = {
     titleCardsInserted: 0,
@@ -247,6 +248,113 @@ export function applyScriptMarkers(
   // Local non-null alias so TS narrows inside nested closures (the
   // `words` parameter is typed as nullable for the public API).
   const wordsNN: WordTiming[] = words;
+
+  // Build a word-index → transcript-char-offset map. The transcript is
+  // the SAME text the narrator reads, so Deepgram's word stream and the
+  // transcript text are the same words in the same order (modulo whitespace
+  // differences). Walk both in parallel: for each Deepgram word, scan
+  // forward in the transcript until we find a normalized-token match,
+  // then record that transcript position. This lets us anchor markers by
+  // their AUTHORED character offset in the doc — bypassing the "first
+  // textual occurrence wins" problem entirely.
+  //
+  // The marker for the red-marked "London Palladium" in paragraph 6
+  // has char_offset pointing at that exact red run. A plain-text
+  // "London Palladium" earlier in paragraph 3 has a different char
+  // offset. Each is mapped to a distinct word index → distinct timestamp.
+  const wordToTranscriptOffset: number[] = new Array(wordsNN.length).fill(-1);
+  {
+    let tCursor = 0;
+    const normalizedTranscript = transcript;
+    for (let wi = 0; wi < wordsNN.length; wi++) {
+      const tok = normalizeToken(wordsNN[wi].word);
+      if (!tok) continue;
+      // Skip past whitespace / punctuation in the transcript.
+      while (tCursor < normalizedTranscript.length) {
+        const ch = normalizedTranscript[tCursor];
+        if (/[\p{L}\p{N}']/u.test(ch)) break;
+        tCursor++;
+      }
+      if (tCursor >= normalizedTranscript.length) break;
+      // Read the next word-token from the transcript at this position.
+      let end = tCursor;
+      while (end < normalizedTranscript.length && /[\p{L}\p{N}']/u.test(normalizedTranscript[end])) {
+        end++;
+      }
+      const transWord = normalizeToken(normalizedTranscript.slice(tCursor, end));
+      // If the transcript word matches this Deepgram word, record the
+      // offset and advance. If they don't match (Deepgram heard something
+      // different from the transcript), skip the Deepgram word and try
+      // again next iteration — the transcript cursor stays put so the
+      // next Deepgram word can match it.
+      if (transWord === tok) {
+        wordToTranscriptOffset[wi] = tCursor;
+        tCursor = end;
+      } else {
+        // Soft retry: scan forward up to 5 transcript words for a match
+        // (handles small transcription drift like a missed filler word).
+        let probe = end;
+        let hops = 0;
+        let matched = false;
+        while (probe < normalizedTranscript.length && hops < 5) {
+          while (probe < normalizedTranscript.length && !/[\p{L}\p{N}']/u.test(normalizedTranscript[probe])) probe++;
+          let probeEnd = probe;
+          while (probeEnd < normalizedTranscript.length && /[\p{L}\p{N}']/u.test(normalizedTranscript[probeEnd])) probeEnd++;
+          const probeWord = normalizeToken(normalizedTranscript.slice(probe, probeEnd));
+          if (probeWord === tok) {
+            wordToTranscriptOffset[wi] = probe;
+            tCursor = probeEnd;
+            matched = true;
+            break;
+          }
+          probe = probeEnd;
+          hops++;
+        }
+        if (!matched) {
+          // Leave wordToTranscriptOffset[wi] = -1; this Deepgram word has
+          // no clean transcript anchor (rare — heavy filler/noise word).
+          // The next Deepgram word will try from the same tCursor.
+        }
+      }
+    }
+  }
+
+  // Compute each content paragraph's starting offset in the transcript.
+  // The transcript is paragraphs joined with newlines; the parser uses
+  // contentParagraphCount which skips blank paragraphs. We mirror that
+  // here by counting only non-blank paragraphs.
+  const paragraphStart: number[] = [];
+  {
+    const paragraphs = transcript.split(/\n+/);
+    let cursor = 0;
+    for (const p of paragraphs) {
+      if (p.trim().length === 0) {
+        cursor += p.length + 1; // +1 for the newline separator
+        continue;
+      }
+      paragraphStart.push(cursor);
+      cursor += p.length + 1;
+    }
+  }
+
+  // Convert a marker's (paragraph_index, char_offset) into the audio
+  // word whose transcript position is closest to (but not past) the
+  // marker's absolute transcript offset. Returns -1 when no anchor can
+  // be derived (paragraph out of range, word map empty, etc.).
+  function wordIndexForMarkerOffset(pIdx: number | null, charOffset: number | null): number {
+    if (pIdx == null || pIdx < 0 || pIdx >= paragraphStart.length) return -1;
+    const absOffset = paragraphStart[pIdx] + (charOffset ?? 0);
+    // Walk wordToTranscriptOffset to find the last word whose mapped
+    // offset is <= absOffset. Linear scan is fine — markers are sparse.
+    let bestWi = -1;
+    for (let wi = 0; wi < wordToTranscriptOffset.length; wi++) {
+      const off = wordToTranscriptOffset[wi];
+      if (off < 0) continue;
+      if (off <= absOffset) bestWi = wi;
+      else break;
+    }
+    return bestWi;
+  }
 
   // Resolve each marker's spoken-time window by finding its text in the
   // Deepgram word stream.
@@ -348,11 +456,31 @@ export function applyScriptMarkers(
       });
       continue;
     }
-    // For title cards: search starts after the PREVIOUS title-card anchor
-    // (by paragraph_index). For lower-thirds: search is constrained to
-    // the section the marker sits in — bracketed by the most recent
-    // title at-or-before its paragraph_index and the next title after.
+    // For lower-thirds: anchor by the marker's authored (paragraph_index,
+    // char_offset) in the doc. The transcript is the same text the
+    // narrator reads, so a marker at transcript char offset O maps to
+    // the audio word spoken at that position. This picks the EXACT
+    // red-marked occurrence even when the phrase repeats earlier or
+    // later in the same paragraph.
+    //
+    // Phrase-text fallback (findPhraseIndex from a section-bracketed
+    // start) only kicks in when the offset map can't anchor — e.g. the
+    // transcript-to-Deepgram word alignment failed at that position.
     let searchStart: number;
+    let offsetAnchoredIdx = -1;
+    if (m.kind === "lower_third") {
+      const anchorWi = wordIndexForMarkerOffset(m.paragraph_index, m.char_offset);
+      if (anchorWi >= 0) {
+        // Verify the phrase actually starts at this anchor (within a
+        // small forward tolerance to absorb minor alignment drift).
+        // findPhraseIndex with from=anchorWi will find the next match —
+        // if it matches at-or-very-near anchorWi, we accept it.
+        const probe = findPhraseIndex(words, tokens, anchorWi);
+        if (probe >= 0 && probe - anchorWi <= 5) {
+          offsetAnchoredIdx = probe;
+        }
+      }
+    }
     if (m.kind === "title_card") {
       // Lower bound: the latest title anchor whose pIdx is strictly less.
       searchStart = 0;
@@ -363,11 +491,9 @@ export function applyScriptMarkers(
       }
       searchStart = findWordIndexAtOrAfter(words, searchStart);
     } else {
-      // lower_third: locked to its section's audio window.
+      // lower_third fallback path: locked to its section's audio window.
       const sectionStartT = sectionStartForParagraph(m.paragraph_index);
       const sectionStartIdx = findWordIndexAtOrAfter(words, sectionStartT);
-      // Reset per-phrase cursor when crossing into a new section so
-      // counting starts fresh inside the section.
       const sectionKey = sectionStartT;
       if (sectionKey !== cursorSectionOrdinal) {
         phraseSearchCursor.clear();
@@ -379,7 +505,9 @@ export function applyScriptMarkers(
         ? cursorFromMap
         : sectionStartIdx;
     }
-    const idx = findPhraseIndex(words, tokens, Math.floor(searchStart));
+    const idx = offsetAnchoredIdx >= 0
+      ? offsetAnchoredIdx
+      : findPhraseIndex(words, tokens, Math.floor(searchStart));
     // For lower-thirds, also enforce the upper bound — don't accept a
     // hit that sits past the next title-card's audio anchor (that would
     // be a different section).
@@ -413,7 +541,9 @@ export function applyScriptMarkers(
     });
     debugRows.push({
       ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
+      cOff: m.char_offset,
       text: m.text.slice(0, 40),
+      anchorSrc: offsetAnchoredIdx >= 0 ? "char_offset" : "phrase_search",
       searchedFrom: searchStart, foundAtWord: idx,
       tStart: Math.round(words[idx].start * 100) / 100,
       tEnd: Math.round(words[lastIdx].end * 100) / 100,

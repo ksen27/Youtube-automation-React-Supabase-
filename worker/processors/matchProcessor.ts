@@ -3135,6 +3135,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       allMarkerRows as unknown as import("@/lib/gdocs/markers").ScriptMarkerRow[],
       transcriptWords,
       projectId,
+      transcript,
     );
     await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
   }

@@ -424,22 +424,23 @@ export async function buildTitleCardVideo(opts: {
   let drawtext = "";
   if (fontPath && lines.length > 0) {
     if (animation === "typewriter") {
-      // Typewriter mode: build N "snapshot" frames where snapshot k shows
-      // the first k characters of the full text (re-wrapped onto the same
-      // lines as the final text — the wrap targets fixed columns, so a
-      // partial text wraps onto a subset of the final lines and never
-      // breaks differently).
+      // Typewriter mode: character-by-character reveal, with snapshots
+      // taken every CHAR_STEP characters instead of every single one.
       //
-      // Total characters drives the per-character time slice. We treat the
-      // total as the visible length of the wrapped lines joined by single
-      // spaces — this includes the inter-word spaces that drawtext renders
-      // as a moving cursor between words.
+      // Why chunked snapshots instead of per-character: each snapshot
+      // emits up to `lines.length` drawtext filters. With per-character
+      // snapshots, a 60-character 3-line title produces ~180 drawtext
+      // invocations — ffmpeg 4.4 on the worker silently drops filters
+      // past a chain-length limit, manifesting as the third line briefly
+      // appearing then disappearing for the hold tail.
       //
-      // Typing window: defaults to the full segment, but the caller can pass
-      // typewriterDurationSeconds to finish earlier and hold the fully-typed
-      // text for the remainder. The final-character snapshot's `enable`
-      // window always extends to segment end so the held title doesn't
-      // flicker off before the card ends.
+      // CHAR_STEP=2 cuts the chain in half (~90 filters) while keeping
+      // a clear typing animation: at 30fps with typingWindow≈3.5s and
+      // totalChars≈60, each character lasts ~58ms. Stepping by 2 means
+      // each visible "tick" is ~116ms apart — still under 8 ticks/second,
+      // still reads as typing rather than word-snapping. Below the chain
+      // limit on every title we'd realistically produce.
+      const CHAR_STEP = 2;
       const totalText = lines.join(" ");
       const totalChars = totalText.length;
       const typingWindow = opts.typewriterDurationSeconds != null
@@ -450,25 +451,9 @@ export async function buildTitleCardVideo(opts: {
       if (totalChars > 0) {
         const dt = typingWindow / totalChars;
         const filters: string[] = [];
-        // Intermediate typing snapshots — one per prefix length, each
-        // active only during its own (k-1)*dt .. k*dt window. We DON'T
-        // include k = totalChars here; that final state is rendered by
-        // a separate, static drawtext below covering the typing tail
-        // through card end. Splitting it this way avoids two problems
-        // with the previous N=totalChars + last-extended-window design:
-        //   (1) The filter chain grew to lines.length * totalChars
-        //       drawtexts (~180 for a 3-line 60-char title). On longer
-        //       titles this hit drawtext-chain limits silently — the
-        //       last snapshot's third line dropped out mid-render,
-        //       leaving only the first two lines visible during the
-        //       hold tail.
-        //   (2) Edge-case overlap at the k*dt boundary fired both the
-        //       last intermediate and the final snapshot for a frame,
-        //       causing a momentary flicker.
-        // Total snapshot count is now (totalChars - 1) + 1 final = same,
-        // but the final state is one drawtext-per-line with a single
-        // long enable window — far less filter graph pressure.
-        for (let k = 1; k < totalChars; k++) {
+        // Build the prefix split for an arbitrary character count k —
+        // same logic as before, just called from chunked-step loop.
+        function partialLinesForChars(k: number): string[] {
           const partialLines: string[] = [];
           let remaining = k;
           for (let li = 0; li < lines.length && remaining > 0; li++) {
@@ -476,15 +461,21 @@ export async function buildTitleCardVideo(opts: {
             if (remaining >= lineText.length) {
               partialLines.push(lineText);
               remaining -= lineText.length;
-              if (li + 1 < lines.length) {
-                if (remaining > 0) remaining -= 1;
-              }
+              if (li + 1 < lines.length && remaining > 0) remaining -= 1;
             } else {
               partialLines.push(lineText.slice(0, remaining));
               remaining = 0;
             }
           }
-          const tStart = ((k - 1) * dt).toFixed(3);
+          return partialLines;
+        }
+        // Intermediate snapshots — k stepping by CHAR_STEP from CHAR_STEP
+        // up to but not including totalChars. The final (full-text) state
+        // is emitted separately below with a long enable window so it
+        // covers the hold tail reliably.
+        for (let k = CHAR_STEP; k < totalChars; k += CHAR_STEP) {
+          const partialLines = partialLinesForChars(k);
+          const tStart = ((k - CHAR_STEP) * dt).toFixed(3);
           const tEnd = (k * dt).toFixed(3);
           const enableExpr = `between(t,${tStart},${tEnd})`;
           for (let li = 0; li < partialLines.length; li++) {
@@ -493,10 +484,11 @@ export async function buildTitleCardVideo(opts: {
             filters.push(buildLineDrawtext(t, li, enableExpr));
           }
         }
-        // Final state: full text, held from the end of the typing window
-        // through to card end. One drawtext per line, single long enable
-        // window — no per-character snapshot pile-up.
-        const tailStart = (((totalChars - 1) * dt)).toFixed(3);
+        // Final state: full text held from the last intermediate snapshot
+        // through to card end. Use a single long enable window — no
+        // per-character pile-up to push past the chain limit.
+        const lastIntermediateK = Math.floor((totalChars - 1) / CHAR_STEP) * CHAR_STEP;
+        const tailStart = (lastIntermediateK * dt).toFixed(3);
         const tailEnd = opts.durationSeconds.toFixed(3);
         const tailEnable = `between(t,${tailStart},${tailEnd})`;
         for (let li = 0; li < lines.length; li++) {
