@@ -554,6 +554,75 @@ export function buildBlockSequenceFromHints(
     rawVoEnd.push(null);
   }
 
+  // Gemini hallucination filter. Gemini sometimes violates the
+  // "ONE BLOCK = ONE COMPLETE SENTENCE" prompt rule and emits TWO
+  // adjacent hints whose text covers the same narration — one tagged
+  // "image", one tagged "footage", both paraphrasing the same sentence.
+  // This shows up in the editor as two consecutive scenes with nearly
+  // identical script_text and is the root cause of the "same project
+  // re-matched gives different results" non-determinism the user
+  // reported: when Gemini complies, you get one block; when it
+  // hallucinates, you get two.
+  //
+  // We detect duplicates by voiceover-window overlap. Two adjacent
+  // hints are duplicates when one's [voStart, voEnd] window overlaps
+  // ≥60% of the SHORTER hint's duration. We drop the later one and
+  // keep the earlier one (it set the wordCursor first, so subsequent
+  // hints are anchored against it).
+  //
+  // The 60% threshold is conservative: legitimately adjacent sentences
+  // share at most a tiny boundary overlap (the straddle word), well
+  // below 60%. Hallucinated duplicates share 80-100% of their window.
+  // Only applies when both hints have real word-timing alignment —
+  // cadence-estimated windows are too noisy to compare reliably.
+  const droppedIndices = new Set<number>();
+  for (let i = 1; i < hints.length; i++) {
+    if (droppedIndices.has(i)) continue;
+    // Find the previous non-dropped hint.
+    let prev = i - 1;
+    while (prev >= 0 && droppedIndices.has(prev)) prev--;
+    if (prev < 0) continue;
+    const aStart = rawVoStart[prev];
+    const aEnd = rawVoEnd[prev];
+    const bStart = rawVoStart[i];
+    const bEnd = rawVoEnd[i];
+    if (aStart == null || aEnd == null || bStart == null || bEnd == null) continue;
+    const aDur = aEnd - aStart;
+    const bDur = bEnd - bStart;
+    if (aDur <= 0 || bDur <= 0) continue;
+    const overlapStart = Math.max(aStart, bStart);
+    const overlapEnd = Math.min(aEnd, bEnd);
+    const overlap = Math.max(0, overlapEnd - overlapStart);
+    const shorter = Math.min(aDur, bDur);
+    if (overlap / shorter >= 0.6) {
+      droppedIndices.add(i);
+    }
+  }
+  if (droppedIndices.size > 0) {
+    const filteredHints: BlockPlanHint[] = [];
+    const filteredTypes: BlockType[] = [];
+    const filteredDurations: number[] = [];
+    const filteredVoStart: Array<number | null> = [];
+    const filteredVoEnd: Array<number | null> = [];
+    for (let i = 0; i < hints.length; i++) {
+      if (droppedIndices.has(i)) continue;
+      filteredHints.push(hints[i]);
+      filteredTypes.push(effectiveTypes[i]);
+      filteredDurations.push(rawDurations[i]);
+      filteredVoStart.push(rawVoStart[i]);
+      filteredVoEnd.push(rawVoEnd[i]);
+    }
+    hints = filteredHints;
+    effectiveTypes.length = 0;
+    effectiveTypes.push(...filteredTypes);
+    rawDurations.length = 0;
+    rawDurations.push(...filteredDurations);
+    rawVoStart.length = 0;
+    rawVoStart.push(...filteredVoStart);
+    rawVoEnd.length = 0;
+    rawVoEnd.push(...filteredVoEnd);
+  }
+
   // Group consecutive same-type sentence hints into blocks whose combined
   // spoken duration lands in the footage target window. The previous
   // one-sentence-per-block design accumulated drift two ways:

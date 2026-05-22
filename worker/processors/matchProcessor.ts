@@ -3433,6 +3433,20 @@ async function loadBlockHintsFromAnalyze(
   const segments = payload?.segments ?? [];
   if (segments.length === 0) return [];
 
+  // When the project has doc-driven title markers (blue-bold titles in the
+  // pasted Google Doc), those are the authoritative title cards. We must
+  // NOT also auto-promote segment openings to title cards from Gemini's
+  // sectionTitle field — that produces extra cards the user never wrote.
+  // The doc is the source of truth; the auto-promotion path is a fallback
+  // for projects that didn't paste a doc.
+  const { data: docTitleRows } = await sb
+    .from("project_script_markers")
+    .select("id")
+    .eq("project_id", projectId)
+    .eq("kind", "title_card")
+    .limit(1);
+  const hasDocTitleCards = (docTitleRows?.length ?? 0) > 0;
+
   // Pre-compute per-paragraph normalized text so each hint can be tagged
   // with the doc paragraph its narration came from. The planner uses this
   // to refuse to merge hints from different paragraphs. We split on \n
@@ -3498,8 +3512,12 @@ async function loadBlockHintsFromAnalyze(
     const hasExplicitSectionTitle = !!(u.sectionTitle && u.sectionTitle.trim());
     for (let i = 0; i < segBlocks.length; i++) {
       const b = segBlocks[i];
+      // Doc-driven title cards (from blue-bold paragraphs in the Google
+      // Doc) are authoritative. When the project has any, suppress the
+      // Gemini-sectionTitle auto-promotion path entirely so only the
+      // user's intended cards appear in the final video.
       const promoteToTitleCard =
-        i === 0 && segIdx > 0 && hasExplicitSectionTitle;
+        i === 0 && segIdx > 0 && hasExplicitSectionTitle && !hasDocTitleCards;
       hints.push({
         text: b.text,
         resolved_subject: b.resolved_subject || undefined,
