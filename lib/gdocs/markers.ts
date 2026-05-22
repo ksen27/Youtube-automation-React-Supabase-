@@ -426,6 +426,12 @@ export function applyScriptMarkers(
           pick_source: "doc_marker_forced",
           doc_marker_id: m.id,
           thumbnail_url: thumbnailUrl,
+          // Pin the row's duration so the post-processor's duration_reclaim
+          // pass leaves it alone. Forced clips are cut to a fixed YouTube
+          // window (start_seconds..end_seconds); stretching the row past
+          // that window would either repeat the last frame or run black
+          // tail frames, neither of which the user wants.
+          duration_clamped: true,
           forced_clip: {
             youtube_url: m.youtube_url,
             start_seconds: start,
@@ -491,25 +497,29 @@ export function applyScriptMarkers(
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
 
-    // De-dup pass: any script item whose narration falls inside the
-    // overlay window is redundant — the overlay rows we just inserted
-    // already display that narration in their own script_text fields
-    // (spokenTextInWindow extracts the narrator's words during each
-    // overlay row's duration). Leaving the original script items in
-    // place shows the same line of narration twice in the editor.
+    // De-dup pass: forced footage clips play OVER the voiceover (the
+    // narrator keeps talking under the visual), so they REPLACE script
+    // items rather than adding length on top. We must remove enough
+    // subsequent script items to cover the inserted overlay rows'
+    // duration — otherwise the timeline grows past voiceover length.
     //
-    // We use itStart as the test: an item whose vo START is inside the
-    // overlay window has its narration playing under the overlay (even
-    // if its stored vo_end overshoots slightly past the overlay end —
-    // a 0.3s overshoot still represents the same spoken sentence the
-    // forced-footage row already captured).
+    // Two-stage strategy:
+    //   1. Window-based: remove items whose vo_start_seconds falls in
+    //      [overlayWindowStart, overlayWindowEnd). This is precise when
+    //      the metadata is present.
+    //   2. Duration-matched: if we haven't yet absorbed enough duration
+    //      to cover the overlay rows, keep removing the next script
+    //      items until the total removed duration ≈ the overlay rows'
+    //      total. This catches script items with missing vo_start_seconds
+    //      OR items whose vo_start falls just past the window but whose
+    //      narration the forced clips were meant to cover.
     //
-    // Walk forward from just after the inserted rows. Stop as soon as
-    // we hit an item whose start is past the overlay end — items in
-    // narration order beyond that point can't be inside the overlay.
-    // Items without stored vo_start are left alone (they predate the
-    // vo_start metadata and can't be reliably classified).
+    // Intro rows are never removed — they live on a different time axis
+    // (pre-roll, not voiceover).
+    const insertedDuration = rows.reduce((s, r) => s + r.duration, 0);
+    let absorbedDuration = 0;
     const afterOverlayIdx = k + rows.length;
+    // Stage 1: window-based removal.
     for (let r = afterOverlayIdx; r < items.length; ) {
       const it = items[r];
       if (it.type === "intro") { r++; continue; }
@@ -518,10 +528,27 @@ export function applyScriptMarkers(
       if (typeof itStart !== "number") { r++; continue; }
       if (itStart >= overlayWindowEnd - 0.05) break;
       if (itStart >= overlayWindowStart - 0.05) {
+        absorbedDuration += Number(it.duration ?? 0);
         items.splice(r, 1);
         continue;
       }
       r++;
+    }
+    // Stage 2: keep removing subsequent script items until the absorbed
+    // duration covers the inserted rows. Tolerance of 0.5s keeps us from
+    // removing one item too many over rounding. We only remove
+    // footage/image/split rows (the kinds the planner emits); never
+    // intro rows (different time axis) and never title_card / overlay
+    // rows the markers pass inserted earlier in this same loop (those
+    // have pick_source set by markers.ts).
+    while (absorbedDuration + 0.5 < insertedDuration && afterOverlayIdx < items.length) {
+      const it = items[afterOverlayIdx];
+      if (it.type === "intro") break;
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const pickSource = meta.pick_source;
+      if (pickSource === "doc_marker" || pickSource === "doc_marker_forced") break;
+      absorbedDuration += Number(it.duration ?? 0);
+      items.splice(afterOverlayIdx, 1);
     }
   }
 
