@@ -501,34 +501,49 @@ export function applyScriptMarkers(
     const overlayWindowStart = group.parentT;
     const overlayWindowEnd = group.parentT + rows.reduce((s, r) => s + r.duration, 0);
 
-    // Close the inter-sentence gap between the previous item and the
-    // narrator's title-start moment. computeStarts returns each item's
-    // voiceover-relative start; the previous item's visual end is
-    // start[k-1] + duration[k-1]. When the narrator pauses between
-    // sentences, that end can land 0.5-1.5s BEFORE parentT — and since
-    // the renderer concatenates segments back-to-back, the title card
-    // would otherwise appear at the previous item's end (i.e. EARLY,
-    // during the inter-sentence silence) rather than at parentT.
+    // Align the title card's video-time position with the narrator's
+    // title-start moment.
     //
-    // Pad the preceding non-intro item by the gap so its visible end
-    // lines up with parentT. The duration_reclaim pass downstream
-    // absorbs the extra length; if the prior row is clamped (a forced
-    // clip or a row whose source is shorter than planned), we leave it
-    // alone — stretching past a clip's real length re-introduces black
-    // tail frames. In that case the card still drifts slightly early,
-    // but never past the prior row's source-clip end.
+    // The renderer concatenates segments back-to-back, so a title card
+    // inserted at index k will appear in the final video at video-time
+    // = sum(items[0..k-1].duration). The narrator reaches the title
+    // text at voiceover-time `parentT`. For audio and video to line up,
+    // those two must be equal.
+    //
+    // They aren't, for two reasons:
+    //   (1) Each item's duration = spoken duration of its sentence,
+    //       which excludes the silence after the sentence. The audio
+    //       file does include that silence. So cumulative video-time
+    //       runs ahead of voiceover-time by the accumulated silence.
+    //   (2) Inter-sentence gaps near the title-card location add up
+    //       to several seconds — exactly the "4-5s early" symptom.
+    //
+    // Pad the immediately-preceding non-intro item so that the
+    // cumulative video sum just before the inserted title card equals
+    // parentT exactly. Mark the row as duration_clamped so the
+    // duration_reclaim pass downstream doesn't stretch it further
+    // (which would push the card past parentT in the other direction).
     let prevIdx = k - 1;
     while (prevIdx >= 0 && items[prevIdx].type === "intro") prevIdx--;
     if (prevIdx >= 0) {
       const prevItem = items[prevIdx];
-      const prevStart = currentStarts[prevIdx];
-      const prevEnd = prevStart + Number(prevItem.duration ?? 0);
-      const gap = group.parentT - prevEnd;
-      if (gap > 0.05) {
+      // Cumulative video-time at the start of items[k] = sum of
+      // durations of items[0..k-1] (skipping intro rows, which live
+      // on a different time axis). The card will appear here unless
+      // we pad prevItem.
+      let cumulativeVideoSec = 0;
+      for (let q = 0; q < k; q++) {
+        if (items[q].type === "intro") continue;
+        cumulativeVideoSec += Number(items[q].duration ?? 0);
+      }
+      const drift = group.parentT - cumulativeVideoSec;
+      if (drift > 0.05) {
+        prevItem.duration = Number(prevItem.duration ?? 0) + drift;
         const prevMeta = (prevItem.metadata ?? {}) as Record<string, unknown>;
-        if (prevMeta.duration_clamped !== true) {
-          prevItem.duration = Number(prevItem.duration ?? 0) + gap;
-        }
+        // Lock the padded row so reclaim doesn't stretch it further and
+        // shift the card off its spoken moment again.
+        prevMeta.duration_clamped = true;
+        prevItem.metadata = prevMeta;
       }
     }
 
@@ -629,12 +644,18 @@ export function applyScriptMarkers(
       items.splice(afterOverlayIdx, 1);
     }
 
-    // Re-stamp rescued lower-thirds onto the forced-footage rows that now
-    // play during the overlay window. We walk both lists in spoken-time
-    // order and place each rescued overlay onto the forced-footage row
-    // whose voiceover window contains its original spoken moment, falling
-    // back to the closest forced row when the boundaries don't line up
-    // exactly. Title-card rows are intentionally skipped — burning a
+    // Re-stamp rescued lower-thirds. Two cases:
+    //   (a) The rescued marker's spoken moment falls INSIDE the forced-
+    //       footage window — the narrator says it while the doc-author's
+    //       YouTube clip is on screen. Stamp onto that forced footage row.
+    //   (b) The marker's spoken moment falls OUTSIDE the forced-footage
+    //       window — the narrator says it AFTER the forced clips end, but
+    //       stage 2's duration-matching swept the host item up anyway.
+    //       Stamp onto the nearest surviving script item by voStart so the
+    //       overlay appears at roughly the right narration beat, not
+    //       crammed onto the forced footage at the start of the section.
+    //
+    // Title-card rows are intentionally skipped as targets — burning a
     // chyron on top of a typewriter card looks awful, and the overlay
     // belongs on the footage clip the narrator is actually talking over.
     if (rescuedLowerThirds.length > 0) {
@@ -648,28 +669,61 @@ export function applyScriptMarkers(
         forcedRows.push({ row: fr, voStart: cursor, voEnd: cursor + dur });
         cursor += dur;
       }
-      for (const lt of rescuedLowerThirds) {
-        if (forcedRows.length === 0) break;
-        let target = forcedRows.find((f) => lt.voStart >= f.voStart && lt.voStart < f.voEnd);
-        if (!target) {
-          // Marker's original spoken moment sits outside any forced-row
-          // window (rare — happens when stage 2 absorbed an item past the
-          // title's spoken end). Pin to the closest forced row by start.
-          target = forcedRows.reduce((best, f) =>
-            Math.abs(f.voStart - lt.voStart) < Math.abs(best.voStart - lt.voStart) ? f : best,
-          forcedRows[0]);
+      const forcedWindowEnd = forcedRows.length > 0
+        ? forcedRows[forcedRows.length - 1].voEnd
+        : group.parentT + group.parentDuration;
+      // Cache surviving script items by voStart for case (b) — built lazily
+      // so we don't walk items[] when no rescues need it.
+      let scriptItemsByVo: Array<{ item: TimelineItemDraft; voStart: number }> | null = null;
+      function buildScriptIndex(): Array<{ item: TimelineItemDraft; voStart: number }> {
+        const idx: Array<{ item: TimelineItemDraft; voStart: number }> = [];
+        for (const it of items) {
+          if (it.type === "intro" || it.type === "title_card") continue;
+          const m = (it.metadata ?? {}) as Record<string, unknown>;
+          // Skip the forced-footage rows we just inserted — they're for case (a).
+          const ps = m.pick_source;
+          if (ps === "doc_marker_forced") continue;
+          const vs = m.vo_start_seconds;
+          if (typeof vs !== "number") continue;
+          idx.push({ item: it, voStart: Number(vs) });
         }
-        const targetMeta = (target.row.metadata ?? {}) as Record<string, unknown>;
-        // Don't overwrite a forced row that already carries a lower_third
-        // (would only happen with overlapping markers, which is rare and
-        // operator-authored).
-        if (targetMeta.lower_third && typeof targetMeta.lower_third === "object") continue;
-        targetMeta.lower_third = {
+        idx.sort((a, b) => a.voStart - b.voStart);
+        return idx;
+      }
+      for (const lt of rescuedLowerThirds) {
+        // Case (a): inside the forced-footage window.
+        if (forcedRows.length > 0 && lt.voStart >= forcedRows[0].voStart && lt.voStart < forcedWindowEnd) {
+          const target = forcedRows.find((f) => lt.voStart >= f.voStart && lt.voStart < f.voEnd)
+            ?? forcedRows[forcedRows.length - 1];
+          const targetMeta = (target.row.metadata ?? {}) as Record<string, unknown>;
+          if (targetMeta.lower_third && typeof targetMeta.lower_third === "object") continue;
+          targetMeta.lower_third = {
+            text: lt.text,
+            type: lt.type,
+            ...(lt.marker_id ? { marker_id: lt.marker_id } : {}),
+          };
+          target.row.metadata = targetMeta;
+          continue;
+        }
+        // Case (b): outside the forced-footage window. Find the surviving
+        // script item whose voStart is closest to lt.voStart and stamp there.
+        if (!scriptItemsByVo) scriptItemsByVo = buildScriptIndex();
+        if (scriptItemsByVo.length === 0) continue;
+        let best = scriptItemsByVo[0];
+        let bestGap = Math.abs(best.voStart - lt.voStart);
+        for (let i = 1; i < scriptItemsByVo.length; i++) {
+          const cand = scriptItemsByVo[i];
+          const gap = Math.abs(cand.voStart - lt.voStart);
+          if (gap < bestGap) { best = cand; bestGap = gap; }
+        }
+        const bestMeta = (best.item.metadata ?? {}) as Record<string, unknown>;
+        if (bestMeta.lower_third && typeof bestMeta.lower_third === "object") continue;
+        bestMeta.lower_third = {
           text: lt.text,
           type: lt.type,
           ...(lt.marker_id ? { marker_id: lt.marker_id } : {}),
         };
-        target.row.metadata = targetMeta;
+        best.item.metadata = bestMeta;
       }
     }
   }
