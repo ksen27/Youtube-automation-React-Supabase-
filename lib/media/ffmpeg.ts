@@ -339,12 +339,17 @@ export async function buildTitleCardVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
-  // When "typewriter", the text is typed in character-by-character across
-  // the full segment duration so the last character lands as the card ends.
+  // When "typewriter", the text is typed in character-by-character. By
+  // default the typing spans the full segment duration so the last
+  // character lands as the card ends. Pass typewriterDurationSeconds to
+  // finish typing earlier — the remainder of the segment holds the
+  // fully-typed text on screen (used for the script-doc title cards so the
+  // viewer has a beat to read the title after the narrator finishes saying it).
   // When omitted (default "static"), the entire text shows for the full
   // duration — the original chapter-card behavior used by the analyze
   // pipeline. Script-doc title cards pass "typewriter".
   animation?: "static" | "typewriter";
+  typewriterDurationSeconds?: number;
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -377,11 +382,21 @@ export async function buildTitleCardVideo(opts: {
   // sidesteps the older `textfile=` + `\n` lexer bug that mangled words on
   // some builds.
   const lines = wrapTitleCardText(opts.text, 22);
-  // Each line's text needs the drawtext quoting treatment: backslashes
-  // first, then single quotes, then colons. drawtext's filter-arg parser
-  // treats : and ' as separators inside the option value.
+  // Each line's text has to survive two lexers stacked on top of each
+  // other: ffmpeg's filter-graph parser (which sees `text='...'` as a
+  // single-quoted value) and drawtext's own arg parser (which uses `:`
+  // as the option separator). The filter-graph layer treats backslashes
+  // inside a single-quoted value as literal — the ONLY way to embed a
+  // literal apostrophe is the close-escape-reopen trick: `'\''`. Without
+  // this, a title like "He Didn't" terminates the outer value early and
+  // everything after gets parsed as new filter options (which is exactly
+  // how `enable=between(t,...)` got chopped at its first comma before).
+  // Drawtext itself only cares about `\`, `%`, and `:` inside the text.
   const escapeDrawtext = (s: string): string =>
-    s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/:/g, "\\:");
+    s
+      .replace(/\\/g, "\\\\")
+      .replace(/:/g, "\\:")
+      .replace(/'/g, "'\\''");
   // Stack lines vertically around the frame center. Each line is
   // (fontsize + line_spacing) tall in flowed text; we approximate by
   // measuring with text_h at draw time per line, but the simplest stable
@@ -419,10 +434,21 @@ export async function buildTitleCardVideo(opts: {
       // total as the visible length of the wrapped lines joined by single
       // spaces — this includes the inter-word spaces that drawtext renders
       // as a moving cursor between words.
+      //
+      // Typing window: defaults to the full segment, but the caller can pass
+      // typewriterDurationSeconds to finish earlier and hold the fully-typed
+      // text for the remainder. The final-character snapshot's `enable`
+      // window always extends to segment end so the held title doesn't
+      // flicker off before the card ends.
       const totalText = lines.join(" ");
       const totalChars = totalText.length;
+      const typingWindow = opts.typewriterDurationSeconds != null
+        && opts.typewriterDurationSeconds > 0
+        && opts.typewriterDurationSeconds <= opts.durationSeconds
+          ? opts.typewriterDurationSeconds
+          : opts.durationSeconds;
       if (totalChars > 0) {
-        const dt = opts.durationSeconds / totalChars;
+        const dt = typingWindow / totalChars;
         const filters: string[] = [];
         for (let k = 1; k <= totalChars; k++) {
           // Compute the prefix of `totalText` of length k, then re-split it
@@ -663,10 +689,12 @@ async function resolveLowerThirdFont(): Promise<string | null> {
   return null;
 }
 
-// Build the drawtext filter chain for a 3-second lower-third with fade in/out
-// and a translucent bar. Pinned to the lower-third zone (≈ 78% of frame
-// height), 36px bold text with a black drop-shadow for legibility against
-// busy footage. Returns null if no font is available on the host.
+// Build the drawtext filter chain for a 3-second lower-third with fade in/out.
+// Broadcast-chyron style: solid blue rectangle, white bold all-caps text
+// inside, anchored to the lower-third zone (≈ 80% of frame height). Padding
+// around the glyphs comes from drawtext's `boxborderw`. Pinned bottom-left
+// with a small left margin so the box reads like a TV news caption.
+// Returns null if no font is available on the host.
 async function buildLowerThirdFilter(text: string, height: number): Promise<string | null> {
   const font = await resolveLowerThirdFont();
   if (!font) return null;
@@ -684,26 +712,33 @@ async function buildLowerThirdFilter(text: string, height: number): Promise<stri
     `if(lt(t,${start + fadeIn + hold}),1,` +
     `if(lt(t,${end}),(${end}-t)/${fadeOut},0))))'`;
   const fontPath = font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:");
-  const escaped = escapeDrawtextValue(text);
+  // Upper-case the text to match the broadcast chyron convention
+  // ("PANG BOURNE IN BERKSHIRE"). Doing it here rather than in drawtext's
+  // `text` expression keeps the filter graph simple and compatible with
+  // ffmpeg 4.4 on the worker image.
+  const escaped = escapeDrawtextValue(text.toUpperCase());
 
-  // Text sits in the lower-third zone (~80% of frame height). No background
-  // bar: per client direction, the overlay is text-only. Legibility on busy
-  // footage comes from a thick black border around each glyph plus a small
-  // dark drop-shadow — drawtext's `shadowcolor` + `shadowx`/`shadowy` paints
-  // an offset shadow so the red doesn't disappear over bright frames.
-  const textY = Math.round(height * 0.80);
-  const fontsize = Math.round(height / 20);  // 36 at 720p
+  // Layout. Box sits in the lower-third zone with a 60px left margin and a
+  // ~12% bottom inset from frame height, matching the chyron-style mock the
+  // client supplied. Padding (boxborderw) around the glyphs is generous so
+  // the box reads as a label rather than a tight rectangle around the text.
+  const fontsize = Math.round(height / 18);   // 40 at 720p — slightly larger
+  const boxPad = Math.round(height / 30);     // 24 at 720p — chunky padding
+  const leftMargin = 60;
+  const bottomInset = Math.round(height * 0.12);
+  // Y is the text baseline; the box extends boxborderw above and below.
+  // Place the text so the box bottom edge sits `bottomInset` from frame
+  // bottom: textY + textHeight + boxborderw ≈ h - bottomInset.
+  // Drawtext exposes `text_h` at draw time, so anchor via expression.
+  const yExpr = `h-${bottomInset}-text_h-${boxPad}`;
 
-  // Text color: red (#FF3030) to match the client's "highlighted in red"
-  // script convention. Border is thicker now that there's no bar behind it,
-  // and a shadow gives a bit of depth so the text still reads on a bright
-  // background (sky, light car body, etc.).
+  // Blue (#1E5BC9) matches the reference screenshot; white bold text inside.
+  // boxcolor's alpha applies the same fade as the text via the chain's alpha.
   return (
     `drawtext=fontfile='${fontPath}':text='${escaped}':` +
-    `fontcolor=0xFF3030:fontsize=${fontsize}:` +
-    `borderw=4:bordercolor=black@0.9:` +
-    `shadowcolor=black@0.8:shadowx=2:shadowy=2:` +
-    `x=60:y=${textY}:` +
+    `fontcolor=white:fontsize=${fontsize}:` +
+    `box=1:boxcolor=0x1E5BC9:boxborderw=${boxPad}:` +
+    `x=${leftMargin}:y=${yExpr}:` +
     `alpha=${alphaExpr}`
   );
 }

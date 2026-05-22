@@ -63,6 +63,11 @@ const TITLE_CARD_FALLBACK_DURATION = 3;
 // over the card's full duration, so the floor is also the minimum total
 // animation time the viewer sees.
 const TITLE_CARD_MIN_DURATION = 1.5;
+// Extra hold added after the typewriter finishes typing — gives the viewer
+// a beat to read the fully-typed title before the next clip cuts in. Without
+// it, the animation ends exactly when the narrator stops saying the phrase
+// and the last character lands on the last frame, which reads as abrupt.
+const TITLE_CARD_HOLD_TAIL = 0.8;
 
 // Token-strip: lowercased word with surrounding punctuation removed. Both
 // sides (Deepgram words and marker phrases) go through this so "Walliams,"
@@ -310,12 +315,15 @@ export function applyScriptMarkers(
   interface TitleCardGroup {
     parent: ScriptMarkerRow;
     parentT: number;
-    // Card duration in seconds — measured from Deepgram word timings as
-    // (last word end - first word start) so the typewriter animation
-    // finishes when the narrator finishes saying the phrase. Floored at
-    // TITLE_CARD_MIN_DURATION for very short titles. Null only when the
-    // resolution lacked a tEnd (shouldn't happen when t is set, but defensive).
+    // Total card duration in seconds = typewriter window + TITLE_CARD_HOLD_TAIL.
+    // The typing animation finishes at `typewriterDuration` (matching the
+    // narrator), then the fully-typed title holds on screen for the tail so
+    // the viewer has a beat to read it before the next clip cuts in.
     parentDuration: number;
+    // Sub-window inside parentDuration during which the typewriter types.
+    // Equals max(MIN, spokenDuration). After this point, the renderer holds
+    // the fully-typed text on screen until parentDuration elapses.
+    typewriterDuration: number;
     extras: ScriptMarkerRow[];
   }
   const groups: TitleCardGroup[] = [];
@@ -327,8 +335,11 @@ export function applyScriptMarkers(
       continue;
     }
     const spokenDuration = r.tEnd != null && r.tEnd > r.t ? r.tEnd - r.t : null;
-    const parentDuration = spokenDuration != null
+    const typewriterDuration = spokenDuration != null
       ? Math.max(TITLE_CARD_MIN_DURATION, spokenDuration)
+      : TITLE_CARD_FALLBACK_DURATION;
+    const parentDuration = spokenDuration != null
+      ? typewriterDuration + TITLE_CARD_HOLD_TAIL
       : TITLE_CARD_FALLBACK_DURATION;
     const extras: ScriptMarkerRow[] = [];
     // Walk forward collecting sibling clips. Two cases count as a sibling:
@@ -370,7 +381,7 @@ export function applyScriptMarkers(
       }
       break;
     }
-    groups.push({ parent: r.marker, parentT: r.t, parentDuration, extras });
+    groups.push({ parent: r.marker, parentT: r.t, parentDuration, typewriterDuration, extras });
     // Skip the absorbed siblings so the outer loop doesn't re-process them
     // (the inner `if (r.marker.kind !== "title_card") continue;` would
     // skip title_card_clip extras anyway, but unaligned title_card extras
@@ -465,10 +476,13 @@ export function applyScriptMarkers(
         pick_source: "doc_marker",
         doc_marker_id: group.parent.id,
         doc_marker_kind: "title_card",
-        // Signal to the renderer that this card should be typed in,
-        // animating across the full segment duration. The renderer reads
-        // this in buildTitleCardVideo to switch from static to typewriter.
+        // Signal to the renderer that this card should be typed in. The
+        // typewriter animation runs for `typewriter_seconds` (the spoken
+        // duration of the title phrase); the remaining segment time holds
+        // the fully-typed text on screen so the viewer has a beat to read
+        // it before the next clip cuts in.
         animation: "typewriter",
+        typewriter_seconds: group.typewriterDuration,
       },
       approved: false,
     };

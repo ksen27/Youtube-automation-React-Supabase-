@@ -246,6 +246,16 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const tcMeta = (it.metadata ?? {}) as Record<string, unknown>;
         const tcAnimation: "static" | "typewriter" =
           tcMeta.animation === "typewriter" ? "typewriter" : "static";
+        // Typewriter sub-window: the spoken duration of the title phrase.
+        // The typing animation runs for this long; the remainder of the
+        // segment holds the fully-typed text so the viewer can read it.
+        // When missing (legacy rows), fall back to full segment so the
+        // old behavior — type-across-the-whole-card — still works.
+        const tcTypewriterRaw = tcMeta.typewriter_seconds;
+        const tcTypewriterSeconds =
+          typeof tcTypewriterRaw === "number" && tcTypewriterRaw > 0
+            ? Math.min(tcTypewriterRaw, renderDur)
+            : undefined;
         try {
           await buildTitleCardVideo({
             text,
@@ -253,6 +263,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
             animation: tcAnimation,
+            typewriterDurationSeconds: tcTypewriterSeconds,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
