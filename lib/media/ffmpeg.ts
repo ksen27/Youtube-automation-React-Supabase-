@@ -434,13 +434,15 @@ export async function buildTitleCardVideo(opts: {
       // past a chain-length limit, manifesting as the third line briefly
       // appearing then disappearing for the hold tail.
       //
-      // CHAR_STEP=2 cuts the chain in half (~90 filters) while keeping
-      // a clear typing animation: at 30fps with typingWindow≈3.5s and
-      // totalChars≈60, each character lasts ~58ms. Stepping by 2 means
-      // each visible "tick" is ~116ms apart — still under 8 ticks/second,
-      // still reads as typing rather than word-snapping. Below the chain
-      // limit on every title we'd realistically produce.
-      const CHAR_STEP = 2;
+      // CHAR_STEP cuts the chain: with 60 chars and 3 lines, step 4
+      // gives ~15 snapshots × 3 = ~45 drawtext filters + 3 final = ~48.
+      // Well under ffmpeg 4.4's silent chain-truncation threshold (the
+      // 90-filter chain from step 2 was STILL hitting it on the longer
+      // of the two title cards, dropping the third line during the hold
+      // tail). With typingWindow ≈ 4.7s for a 60-char title, each
+      // visible "tick" is ~313ms apart — still 3 visible ticks/second,
+      // still reads as typing rather than word-snapping.
+      const CHAR_STEP = 4;
       const totalText = lines.join(" ");
       const totalChars = totalText.length;
       const typingWindow = opts.typewriterDurationSeconds != null
