@@ -79,9 +79,14 @@ function normalizeToken(s: string): string {
     .replace(/['']/g, "'");
 }
 
+// Split on whitespace AND internal punctuation, so a doc-authored title like
+// "Back,The" (comma with no following space) tokenizes to ["back","the"]
+// instead of the single garbage token "backthe" that never matches any
+// Deepgram word. Apostrophes stay attached so "Walliams'" / "don't" survive
+// — normalizeToken handles the trailing apostrophe.
 function tokenize(s: string): string[] {
   return s
-    .split(/\s+/)
+    .split(/[\s,;:.!?()\[\]"–—…]+/u)
     .map(normalizeToken)
     .filter(Boolean);
 }
@@ -390,7 +395,16 @@ export function applyScriptMarkers(
   // through the audio respects doc order. Title cards without a paragraph
   // index are dropped from the bracketing logic (rare; would only happen
   // for malformed parser output).
-  const titleAnchors: Array<{ pIdx: number; t: number }> = [];
+  // `anchored: true` means the title's own text was found in the audio.
+  // `anchored: false` means it's an interpolated fallback — its `t` came
+  // from neighboring titles' positions, not its own phrase match. We track
+  // both so section bracketing (sectionStartForParagraph / End) still
+  // covers titles whose text isn't spoken (editorial headings the narrator
+  // skips) or doesn't tokenize cleanly. Without this, every lower-third
+  // in an unanchored title's section inherits the PREVIOUS section's
+  // anchor and searches a huge wrong window — usually returning -1.
+  const titleAnchors: Array<{ pIdx: number; t: number; anchored: boolean }> = [];
+  const unanchoredTitlePIdx: number[] = [];
   {
     const titleCards = ordered
       .filter((m) => m.kind === "title_card" && m.paragraph_index != null)
@@ -398,11 +412,52 @@ export function applyScriptMarkers(
     let lastTitleEnd = 0;
     for (const m of titleCards) {
       const tokens = tokenize(m.text);
-      if (tokens.length === 0) continue;
+      const pIdx = m.paragraph_index as number;
+      if (tokens.length === 0) {
+        unanchoredTitlePIdx.push(pIdx);
+        continue;
+      }
       const idx = findPhraseIndex(words, tokens, lastTitleEnd);
-      if (idx < 0) continue;
-      titleAnchors.push({ pIdx: m.paragraph_index as number, t: words[idx].start });
+      if (idx < 0) {
+        unanchoredTitlePIdx.push(pIdx);
+        continue;
+      }
+      titleAnchors.push({ pIdx, t: words[idx].start, anchored: true });
       lastTitleEnd = idx + tokens.length;
+    }
+    // Fill in unanchored titles by linear interpolation against the
+    // surrounding successful anchors. Paragraph index is a rough proxy
+    // for narration time — close enough to keep section brackets correct
+    // for lower-thirds, which is all we need this for. (The unanchored
+    // title still gets t=null in Pass 2 if its own text doesn't match —
+    // it just won't be inserted as a timeline card. But its forced clips
+    // and the section's lower-thirds are now rescued.)
+    if (unanchoredTitlePIdx.length > 0 && titleAnchors.length >= 1) {
+      for (const pIdx of unanchoredTitlePIdx) {
+        let prev: { pIdx: number; t: number } | null = null;
+        let next: { pIdx: number; t: number } | null = null;
+        for (const a of titleAnchors) {
+          if (!a.anchored) continue;
+          if (a.pIdx < pIdx && (!prev || a.pIdx > prev.pIdx)) prev = a;
+          if (a.pIdx > pIdx && (!next || a.pIdx < next.pIdx)) next = a;
+        }
+        let interpolated: number;
+        if (prev && next) {
+          const frac = (pIdx - prev.pIdx) / (next.pIdx - prev.pIdx);
+          interpolated = prev.t + frac * (next.t - prev.t);
+        } else if (prev) {
+          // Last section: assume the unanchored title sits roughly at the
+          // same paragraph-per-second pace as the preceding stretch.
+          interpolated = prev.t + 1;
+        } else if (next) {
+          // First section is unanchored: bracket it at the very start.
+          interpolated = 0;
+        } else {
+          continue; // shouldn't happen — guarded by length check above
+        }
+        titleAnchors.push({ pIdx, t: interpolated, anchored: false });
+      }
+      titleAnchors.sort((a, b) => a.pIdx - b.pIdx);
     }
   }
   // For a lower-third at paragraph_index P: the section it belongs to
@@ -555,7 +610,11 @@ export function applyScriptMarkers(
     projectId,
     totalMarkers: ordered.length,
     totalWords: words.length,
-    titleAnchors: titleAnchors.map((a) => ({ pIdx: a.pIdx, t: Math.round(a.t * 100) / 100 })),
+    titleAnchors: titleAnchors.map((a) => ({
+      pIdx: a.pIdx,
+      t: Math.round(a.t * 100) / 100,
+      anchored: a.anchored,
+    })),
     rows: debugRows,
   }));
 

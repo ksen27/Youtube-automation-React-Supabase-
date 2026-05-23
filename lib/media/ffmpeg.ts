@@ -392,11 +392,22 @@ export async function buildTitleCardVideo(opts: {
   // everything after gets parsed as new filter options (which is exactly
   // how `enable=between(t,...)` got chopped at its first comma before).
   // Drawtext itself only cares about `\`, `%`, and `:` inside the text.
+  //
+  // Apostrophes get replaced with the typographic right-single-quote
+  // (U+2019) instead of the close-escape-reopen quoting trick. Reason: on
+  // ffmpeg 4.4 the trick has flaky parser behavior — the title card
+  // "Simon Cowell Finally Speaks, What He Said and What He Didn't"
+  // rendered with the third line missing during the hold tail, while the
+  // apostrophe-free "The Moment That Changed Everything, The Walliams
+  // Recording" worked fine. The two titles have identical filter chain
+  // structure otherwise; the only difference is the apostrophe in
+  // "Didn't". The typographic quote is visually indistinguishable in
+  // body text and a literal character (no parser interaction).
   const escapeDrawtext = (s: string): string =>
     s
+      .replace(/'/g, "’")
       .replace(/\\/g, "\\\\")
-      .replace(/:/g, "\\:")
-      .replace(/'/g, "'\\''");
+      .replace(/:/g, "\\:");
   // Stack lines vertically around the frame center. Each line is
   // (fontsize + line_spacing) tall in flowed text; we approximate by
   // measuring with text_h at draw time per line, but the simplest stable
@@ -508,6 +519,27 @@ export async function buildTitleCardVideo(opts: {
     }
   }
   const vfChain = `${drawtext}setsar=1,format=yuv420p`;
+  // Diagnostic: log title-card filter chain so we can see exactly what
+  // ffmpeg gets when a card has the "third line drops" bug. Per-text
+  // gate (not one-shot) so BOTH title cards in a render get logged —
+  // we need to compare the apostrophe-containing card against the
+  // apostrophe-free one. Strip after the cause is confirmed.
+  const tcKey = opts.text;
+  if (animation === "typewriter" && !tcFilterDebugSeen.has(tcKey)) {
+    tcFilterDebugSeen.add(tcKey);
+    const filterCount = (drawtext.match(/drawtext=/g) ?? []).length;
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({
+      msg: "title_card.filter.debug",
+      text: opts.text,
+      lines,
+      durationSeconds: opts.durationSeconds,
+      typewriterDurationSeconds: opts.typewriterDurationSeconds,
+      filterCount,
+      vfChainLength: vfChain.length,
+      vfChain,
+    }));
+  }
 
   const args = [
     "-y",
@@ -772,6 +804,7 @@ async function buildLowerThirdFilter(text: string, height: number): Promise<stri
 }
 
 let ltFilterDebugLogged = false;
+const tcFilterDebugSeen = new Set<string>();
 
 export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   const env = getEnv();
