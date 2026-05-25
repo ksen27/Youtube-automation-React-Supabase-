@@ -17,8 +17,40 @@ import {
   type PlannedBlock,
   type PlannedBlockWithHint,
 } from "@/lib/ai/timeline-plan";
-import { estimateDurationSeconds, type BlockPlan, type SegmentUnderstanding } from "@/lib/ai/segments";
+import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages } from "@/lib/images/fetch";
+import { verifyPoolAsset } from "@/lib/ai/pool-verification";
+
+// Legacy entity type → closed-world BlockEntityType mapping for the image
+// pool's verification gate (Slice 5 of the matching refactor). The pool
+// builder pulls entities from project_entities whose `type` column uses
+// the original extractor vocabulary; verifyPoolAsset speaks the new closed-
+// world vocabulary. Returns null when the type cannot be mapped (e.g.
+// "topic", "year"), in which case the gate is skipped — those entities
+// produce stock graphics anyway and the relaxed-pass fallback handles them.
+function legacyEntityToBlockEntityType(legacy: string): BlockEntityType | null {
+  switch (legacy) {
+    case "celebrity":
+      // Project celebrity → fallback pool, gate skipped. The pool builder
+      // already isolates celebrity queries; verifyPoolAsset returns
+      // accept=true for celebrity_default to keep this consistent.
+      return "celebrity_default";
+    case "related_person":
+      return "person";
+    case "company":
+      return "company";
+    case "tv_show":
+      return "tv_show";
+    case "movie":
+      return "movie";
+    case "song":
+      return "song";
+    case "place":
+      return "place";
+    default:
+      return null;
+  }
+}
 
 // Below this score (0–100), Gemini judged the clip a poor visual fit for the
 // block's spoken words. We'd rather downgrade the block to an image
@@ -2189,16 +2221,49 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           imgType: q.imgType,
           requireContextTokens: ctxTokens.length > 0 ? ctxTokens : undefined,
         });
-        // Take the first non-duplicate image. We use a per-pass set to
-        // avoid two image blocks landing on the same URL when the script
-        // mentions the same reference twice. Also honor the image cooldown
-        // so the same picture doesn't repeat within ~2 minutes.
-        const pick = fetched.find((f) => {
-          if (refUrlSet.has(f.url)) return false;
+        // Slice 5: per-block verification gate. Map the block's subject_type
+        // to a closed-world BlockEntityType and ask Gemini whether each
+        // fetched image actually depicts the entity Gemini named. This
+        // catches the "UK map for 'United Kingdom'", "PRIVATE—KEEP OUT
+        // sign for 'private'", "What is LOGO graphic for 'Guardian logo'"
+        // failure mode at the source: bad images never reach item.image_url.
+        // Routes only the matchable types; subject_type "general" / unknown
+        // skips the gate (those queries don't have a clean entity binding).
+        const verifyType: BlockEntityType | null =
+          subjectType === "person" ? "person" :
+          subjectType === "company" ? "company" :
+          subjectType === "show" ? "tv_show" :
+          subjectType === "movie" ? "movie" :
+          subjectType === "place" ? "place" :
+          null;
+        const verifyName = (refs[0] ?? ents[0] ?? "").trim();
+        // Take the first non-duplicate, verification-passing image. The
+        // verification call runs inside the find predicate so we stop at
+        // the first acceptable URL instead of paying for every candidate
+        // in fetched[] — matters because each verify call hits Gemini.
+        let pick: (typeof fetched)[number] | undefined;
+        for (const f of fetched) {
+          if (refUrlSet.has(f.url)) continue;
           const last = imageUrlLastUsedAt.get(f.url);
-          if (last === undefined) return true;
-          return nowSec - last >= IMAGE_REUSE_COOLDOWN_SEC;
-        });
+          if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
+          if (verifyType && verifyName) {
+            const verdict = await verifyPoolAsset({
+              projectId,
+              entityType: verifyType,
+              entityName: verifyName,
+              candidateUrl: f.url,
+            });
+            if (!verdict.accept) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.image_block_verify.rejected", {
+                blockIndex: blockIdx, entity_type: verifyType, entity_name: verifyName,
+                url: f.url, verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+              });
+              continue;
+            }
+          }
+          pick = f;
+          break;
+        }
         if (!pick) continue;
         refUrlSet.add(pick.url);
         imageUrlLastUsedAt.set(pick.url, nowSec);
@@ -2209,10 +2274,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         meta.image_query_used = q.query;
         meta.image_source_url = pick.url;
         meta.image_source_provider = pick.source;
-        meta.image_entity = refs[0] ?? ents[0] ?? null;
+        meta.image_entity = verifyName || refs[0] || ents[0] || null;
         meta.image_reason = q.reason;
         meta.image_pick_source = q.reason.startsWith("script_phrase:") ? "script_phrase" : "reference_driven";
         item.metadata = meta;
+        // Slice 4b: stamp the verification metadata onto the timeline_item
+        // so the Replace Media UI (Slice 7) can show which entity this
+        // image was bound to and which verdict the gate returned.
+        if (verifyType) {
+          item.image_entity_type = verifyType;
+          item.image_entity_name = verifyName;
+          item.image_verified = "yes";
+        } else {
+          item.image_entity_type = "celebrity_default";
+          item.image_entity_name = mainCelebrity ?? null;
+          item.image_verified = "skipped";
+        }
         refImagesAssigned++;
         filled = true;
         break;
@@ -2658,8 +2735,31 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         poolFetchStats.entitiesFailed++;
         continue;
       }
+      // Slice 5: closed-world verification gate. For each fetched image we
+      // ask Gemini "is this actually a {logo|poster|cover|place photo} of
+      // {entityName}?" via verifyPoolAsset. Rejected images never enter the
+      // pool. Mapping to BlockEntityType is lossy (topic/year/event don't
+      // map) — those legacy types fall through with mapped=null and the gate
+      // is skipped, preserving prior behavior for entity classes we can't
+      // verify.
+      const mapped = legacyEntityToBlockEntityType(ent.type);
       for (const f of fetched) {
         if (poolUrlSet.has(f.url)) continue;          // dedupe across entities
+        if (mapped && mapped !== "celebrity_default") {
+          const verdict = await verifyPoolAsset({
+            projectId,
+            entityType: mapped,
+            entityName: ent.value,
+            candidateUrl: f.url,
+          });
+          if (!verdict.accept) {
+            void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+              entity_type: mapped, entity_name: ent.value, url: f.url,
+              verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+            });
+            continue;
+          }
+        }
         pool.push({ url: f.url, source: f.source, query: spec.query, entityType: ent.type });
         poolUrlSet.add(f.url);
         if (pool.length >= imageBlockCount) break;
@@ -2724,8 +2824,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           poolFetchStats.entitiesFailed++;
           continue;
         }
+        // Slice 5: same verification gate as the strict pass. The relaxed
+        // pass widens the query (drops modifiers/quotes) so it's MORE likely
+        // to surface off-topic stock results — gating here is what stops
+        // "Republican states" / "What is LOGO" graphics from ever entering
+        // the pool.
+        const mappedRelaxed = legacyEntityToBlockEntityType(ent.type);
         for (const f of fetched) {
           if (poolUrlSet.has(f.url)) continue;
+          if (mappedRelaxed && mappedRelaxed !== "celebrity_default") {
+            const verdict = await verifyPoolAsset({
+              projectId,
+              entityType: mappedRelaxed,
+              entityName: ent.value,
+              candidateUrl: f.url,
+            });
+            if (!verdict.accept) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+                entity_type: mappedRelaxed, entity_name: ent.value, url: f.url,
+                verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+                relaxed: true,
+              });
+              continue;
+            }
+          }
           pool.push({ url: f.url, source: f.source, query: relaxedQuery, entityType: ent.type });
           poolUrlSet.add(f.url);
           if (pool.length >= imageBlockCount) break;
@@ -2915,6 +3037,24 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     meta.image_reason = `entity_pool:${next.entityType}`;
     meta.image_pick_source = "entity_pool";
     item.metadata = meta;
+    // Slice 4b: stamp closed-world verification metadata. Pool entries from
+    // the celebrity floor / final fallback get celebrity_default; everything
+    // else inherits its mapped BlockEntityType (verified at insert time in
+    // the pool builder above). Skipped entries fall through with "skipped".
+    const mappedPoolType = legacyEntityToBlockEntityType(next.entityType);
+    if (mappedPoolType === "celebrity_default" || next.entityType === "celebrity") {
+      item.image_entity_type = "celebrity_default";
+      item.image_entity_name = mainCelebrity ?? null;
+      item.image_verified = "skipped";
+    } else if (mappedPoolType) {
+      item.image_entity_type = mappedPoolType;
+      item.image_entity_name = next.query;
+      item.image_verified = "yes";
+    } else {
+      item.image_entity_type = null;
+      item.image_entity_name = null;
+      item.image_verified = "skipped";
+    }
     lastUsedAt[idx] = useCounter++;
     imageUrlLastUsedAt.set(next.url, nowSec);
   }

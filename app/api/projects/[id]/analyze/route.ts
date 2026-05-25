@@ -11,6 +11,12 @@ import {
 import { planTimeline } from "@/lib/ai/timeline-plan";
 import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
 import { extractEntities, extractProjectContext } from "@/lib/ai/gemini";
+import {
+  buildReferenceRoster,
+  type ReferenceEntity,
+  type ReferenceEntityType,
+} from "@/lib/ai/face-references";
+import { verifyPoolAsset } from "@/lib/ai/pool-verification";
 
 // Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
 // a YouTube preview search. No FFmpeg, no yt-dlp, no downloads. The user
@@ -250,6 +256,62 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       if (error) await logJob({ projectId: id, jobId: mediaJobId }, "analyze.entities.save_failed", { err: error.message });
     }
 
+    // 1c) Build the face/entity reference roster (Slice 2-3 of the matching
+    //     refactor). For every named entity Gemini emitted across the script —
+    //     the project celebrity, every other person, every company / TV show /
+    //     movie / song / place — fetch a canonical reference image from
+    //     Wikipedia and persist it to face_references. The matcher (Slices
+    //     5-6) consults this table at fetch time to gate candidates: a
+    //     candidate image of "Bruno Tonioli" only enters a David Walliams
+    //     block's pool if Gemini's verification gate confirms it's actually
+    //     Walliams. We collect entities from THREE sources:
+    //       (a) the project celebrity (always needed)
+    //       (b) project-level extractEntities output (companies, related
+    //           people, tv_shows, movies, songs)
+    //       (c) the block_entity field on each block of each segment (the
+    //           closed-world entities the matcher will actually try to fill)
+    //     Source (c) is the most important — it's the exact set of entities
+    //     the matcher will ask about. (a) and (b) are belt-and-suspenders so
+    //     the celebrity reference is ready even on segments where Gemini
+    //     never emitted block_entity = celebrity_default explicitly.
+    const rosterEntities: ReferenceEntity[] = [];
+    if (mainCelebrity) {
+      rosterEntities.push({ type: "person", name: mainCelebrity });
+    }
+    for (const e of projectEntities) {
+      const mapped: ReferenceEntityType | null =
+        e.type === "celebrity" || e.type === "related_person" ? "person" :
+        e.type === "company" ? "company" :
+        e.type === "tv_show" ? "tv_show" :
+        e.type === "movie" ? "movie" :
+        e.type === "song" ? "song" :
+        e.type === "place" ? "place" :
+        null;
+      if (mapped) rosterEntities.push({ type: mapped, name: e.value });
+    }
+    for (const u of understandings) {
+      for (const b of u.blocks) {
+        const be = b.block_entity;
+        if (!be || be.type === "celebrity_default") continue;
+        if (!be.name?.trim()) continue;
+        rosterEntities.push({ type: be.type, name: be.name });
+      }
+    }
+    const rosterRows = await buildReferenceRoster(id, rosterEntities).catch(async (e) => {
+      // Roster failures must NOT block analysis — the matcher tolerates
+      // missing references (it just skips the verification gate for those
+      // entities). Log and continue.
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.roster.failed", {
+        err: (e as Error).message?.slice(0, 200),
+      });
+      return [];
+    });
+    await logJob({ projectId: id, jobId: mediaJobId }, "analyze.roster.built", {
+      entities_in: rosterEntities.length,
+      rows_persisted: rosterRows.length,
+      with_reference: rosterRows.filter((r) => !!r.reference_url).length,
+    });
+
     // 2) YouTube search per intent. We'll dedupe across the whole project but
     // still attribute the best score to a single segment for the preview UI.
     await setProjectStatus(id, "searching");
@@ -351,6 +413,44 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
             segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
             segmentRejectedTotal++;
             continue;
+          }
+          // Slice 6: face-verify the candidate's thumbnail against the
+          // project celebrity's Wikipedia reference before accepting. This
+          // catches the "Bruno Tonioli Golden Buzzer" / "Heartbreaking
+          // Tragic Life Of Bruno Tonioli" failure mode at the source — the
+          // ranker says the clip is on-topic (BGT context + Bruno in
+          // people[]) but face verification can tell that the celebrity
+          // isn't actually in the thumbnail.
+          //
+          // Gating policy:
+          //   - Only gate "person" intents — these are the queries asking
+          //     for the celebrity directly. Broll / archival / generic
+          //     intents intentionally look at non-person footage.
+          //   - Skip when no mainCelebrity (no reference to verify against).
+          //   - verifyPoolAsset returns accept=true for "skipped" verdicts
+          //     (no Wikipedia reference, fetch failure) — those candidates
+          //     keep flowing.
+          //   - Cache hits are per-process so re-running analysis on the
+          //     same project pays for verification only once per thumbnail.
+          if (sourceIntent === "person" && mainCelebrity) {
+            const thumb = `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`;
+            const verdict = await verifyPoolAsset({
+              projectId: id,
+              entityType: "person",
+              entityName: mainCelebrity,
+              candidateUrl: thumb,
+            });
+            if (!verdict.accept) {
+              const k = `verify_${verdict.verdict}`;
+              rejectTally[k] = (rejectTally[k] ?? 0) + 1;
+              segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
+              segmentRejectedTotal++;
+              await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand_verify.rejected", {
+                segment: i, videoId: c.videoId, title: c.title.slice(0, 100),
+                verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+              });
+              continue;
+            }
           }
           accepted++;
           seenVideo.add(c.videoId);

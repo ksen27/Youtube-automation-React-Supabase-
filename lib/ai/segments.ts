@@ -299,6 +299,49 @@ export const VisualPriority = z.enum([
 ]);
 export type VisualPriority = z.infer<typeof VisualPriority>;
 
+// Closed-world block-entity type per the client's matching rule. The matcher
+// is only allowed to fetch a visual for these six entity types. Anything that
+// doesn't cleanly map to one of them falls through to "celebrity_default",
+// which renders the project's main subject (footage or Wikipedia image). This
+// is the architectural fix for the "random images and off-topic clips"
+// problem — it makes "wrong visual for the block" impossible by construction
+// rather than relying on downstream filters to catch it.
+//
+//   person          → a real, named person other than the project celebrity.
+//                     Visual: that person's footage or face image.
+//   company         → a named company / organisation. Visual: their logo.
+//   tv_show         → a named TV programme. Visual: show artwork / poster.
+//   movie           → a named feature film. Visual: movie poster.
+//   song            → a named song / single. Visual: cover art.
+//   place           → a named building / venue / landmark / city.
+//                     Visual: photo of the place.
+//   celebrity_default → no clean match — show the project celebrity.
+//                     This is the FALLBACK for everything: abstract narration,
+//                     transitions, recaps, dates without a named event, etc.
+//                     The matcher must never invent a search for these blocks.
+export const BlockEntityType = z.enum([
+  "person", "company", "tv_show", "movie", "song", "place",
+  "celebrity_default",
+]);
+export type BlockEntityType = z.infer<typeof BlockEntityType>;
+
+// The matchable entity bound to a block. Drives clip/image selection at
+// assignment time — the matcher looks for an asset tagged with this exact
+// (type, name) pair, and falls back to the celebrity pool if none is found.
+//
+// For "celebrity_default" the name field is the project celebrity's name —
+// set by the deterministic post-processor after Gemini returns, so Gemini
+// only has to pick the type.
+export const BlockEntitySchema = z.object({
+  type: BlockEntityType.default("celebrity_default"),
+  // The literal name to match against. For person/company/tv_show/movie/
+  // song/place this is the exact proper noun from the script (verbatim, no
+  // editorial framing). For celebrity_default this is the project celebrity's
+  // name (filled in by post-processor; Gemini may leave it empty).
+  name: z.string().default(""),
+});
+export type BlockEntity = z.infer<typeof BlockEntitySchema>;
+
 export const BlockPlanSchema = z.object({
   text: z.string().min(1),
   // The person/thing the block is "about". For pronoun-only blocks Gemini
@@ -331,6 +374,16 @@ export const BlockPlanSchema = z.object({
   // person on a failed specific match (per the client's "NEVER random"
   // rule).
   visual_priority: VisualPriority.default("person_default"),
+  // Closed-world entity binding (Slice 1 of the matching-quality refactor).
+  // Gemini picks ONE of the seven entity types per block. Everything that
+  // doesn't cleanly map to person/company/tv_show/movie/song/place falls
+  // through to "celebrity_default", which renders the project celebrity.
+  // The closed-world matcher (Slice 6) selects assets by this field's
+  // (type, name) pair instead of by the loose mentioned_entities /
+  // specific_visual_references / topics / related_keywords surface. Those
+  // old fields stay populated for backward compatibility with the existing
+  // matcher until Slice 6 ships, then become metadata-only.
+  block_entity: BlockEntitySchema.default({ type: "celebrity_default", name: "" }),
 });
 export type BlockPlan = z.infer<typeof BlockPlanSchema>;
 
@@ -514,7 +567,11 @@ ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
       "pronouns_detected": true,
       "visual_intent": "one short phrase describing what the screen should show here",
       "recommended_visual_type": "footage | image | title_card | split_2",
-      "visual_priority": "person_default | specific_event | specific_object | title_card | split_2"
+      "visual_priority": "person_default | specific_event | specific_object | title_card | split_2",
+      "block_entity": {
+        "type": "person | company | tv_show | movie | song | place | celebrity_default",
+        "name": "the exact proper noun from the script, or \"\" for celebrity_default"
+      }
     }
   ]
 }
@@ -539,6 +596,68 @@ person. So:
 - FALLBACK — if no exact image exists, the matcher falls back to the person's
   image. NEVER random unrelated visuals. You don't need to handle the fallback
   — just mark the block correctly and the matcher does the rest.
+
+CLOSED-WORLD BLOCK ENTITY (HARD REQUIREMENT — every block must have one).
+The matcher is only allowed to fetch a visual for six entity types. Pick ONE
+type per block via "block_entity". If the block doesn't cleanly map to one
+of the six, pick "celebrity_default" — that tells the matcher to show the
+project celebrity. This rule is non-negotiable; off-topic visuals come from
+blocks trying to invent entities outside this list.
+
+The six matchable types and what each one means:
+- "person"     — the block is ABOUT a real, named person OTHER than the
+                 project celebrity (a co-host, a relative, a rival, a public
+                 figure mentioned by name). "name" = that person's exact name.
+- "company"    — the block names a real company / organisation / publication
+                 (e.g. "The Guardian", "Apple", "Manchester United"). "name"
+                 = the company's exact name. Visual will be their logo.
+- "tv_show"    — the block names a TV programme (e.g. "Britain's Got Talent",
+                 "Strictly Come Dancing"). "name" = the show's exact title.
+- "movie"      — the block names a feature film. "name" = the film's exact
+                 title. Year in parentheses if disambiguating.
+- "song"       — the block names a song / single. "name" = song title (add
+                 "— Artist" if the artist is also named in the block).
+- "place"      — the block names a specific building / venue / landmark
+                 ("London Palladium", "Buckingham Palace", "Wembley Stadium").
+                 NOT countries, regions, or vague locations.
+- "celebrity_default" — EVERYTHING ELSE. Use this when the block is about
+                 the project celebrity, abstract narration, transitions,
+                 recaps, dates without a named event, generic concepts, or
+                 anything that doesn't have a clean proper-noun match for
+                 one of the six types above. "name" = "" (the code fills in
+                 the project celebrity's name automatically).
+
+Decision procedure (apply IN ORDER, stop at the first match):
+1. Does the block PROMINENTLY name a non-celebrity person? → "person"
+2. Does the block PROMINENTLY name a company/publication? → "company"
+3. Does the block PROMINENTLY name a TV show? → "tv_show"
+4. Does the block PROMINENTLY name a movie? → "movie"
+5. Does the block PROMINENTLY name a song? → "song"
+6. Does the block PROMINENTLY name a specific building/venue? → "place"
+7. Otherwise → "celebrity_default"
+
+"PROMINENTLY" means the entity is what the sentence is actually about, not
+just mentioned in passing. "He spoke at the London Palladium" → "place"
+(the venue is the visual hook). "He spoke about his time in London" →
+"celebrity_default" (the visual is him, not a generic London shot). If you
+can't decide, pick "celebrity_default" — it is the safe default.
+
+When multiple entities fit, pick the ONE that most carries the block's
+visual meaning. A block that says "David Walliams left BGT after The
+Guardian published the transcript" should be "celebrity_default" (it's
+about Walliams), NOT "company" (Guardian is just where it was published).
+A block that says "The Guardian published the transcript in December 2022"
+should be "company" (the publication IS the subject of the sentence).
+
+Examples:
+- "Bruno Tonioli was brought in as his replacement" → person, "Bruno Tonioli"
+- "The Guardian published the transcript"           → company, "The Guardian"
+- "He had been a BGT judge since 2012"              → tv_show, "Britain's Got Talent"
+- "The recordings were captured at the London Palladium" → place, "London Palladium"
+- "Private conversations between friends"            → celebrity_default
+- "What he didn't say was louder"                    → celebrity_default
+- "Three years on the show"                          → celebrity_default
+- "He called an elderly contestant an expletive"     → celebrity_default
 
 visual_priority axis (REQUIRED — drives matcher fallback chain):
 - "person_default"  → person footage / person image. Always the safe default.
@@ -692,7 +811,11 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     applySubjectContinuity(safe.data.blocks, resolved.segmentSubject || context.mainSubject),
     resolved.segmentSubject || context.mainSubject || "",
   );
-  const blocks = applySubjectContinuity(reconciledBlocks, resolved.segmentSubject || context.mainSubject);
+  const continuityBlocks = applySubjectContinuity(reconciledBlocks, resolved.segmentSubject || context.mainSubject);
+  const blocks = normalizeBlockEntities(
+    continuityBlocks,
+    context.mainSubject || resolved.segmentSubject || "",
+  );
   return {
     ...safe.data,
     segmentSubject: resolved.segmentSubject,
@@ -701,6 +824,43 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     searchIntents: rewrittenIntents,
     blocks,
   };
+}
+
+// Closed-world block-entity post-processor.
+//
+// Gemini fills in block_entity.type per block; we normalise the result so
+// downstream code (Slice 4-6) can rely on three invariants:
+//
+//   1. block_entity.type is always one of the seven enum values (the schema
+//      enforces this — but a missing field defaults to celebrity_default, so
+//      legacy blocks emitted before this prompt change still parse cleanly).
+//   2. block_entity.name is non-empty whenever type !== celebrity_default.
+//      If Gemini emits e.g. type="person" with empty name, we demote the
+//      block to celebrity_default rather than ship an unmatchable entity to
+//      the matcher.
+//   3. For celebrity_default blocks, name is the project celebrity's name
+//      (so the matcher can look up the celebrity pool with a single field
+//      lookup instead of resolving "celebrity_default → project subject"
+//      everywhere).
+//
+// The function is pure — it does not consult Gemini or any external state.
+// It only mutates block_entity; the rest of the block is passed through.
+export function normalizeBlockEntities(blocks: BlockPlan[], projectCelebrity: string): BlockPlan[] {
+  const celebrity = projectCelebrity.trim();
+  return blocks.map((b) => {
+    const raw = b.block_entity ?? { type: "celebrity_default" as const, name: "" };
+    const type = raw.type;
+    const name = (raw.name ?? "").trim();
+    if (type === "celebrity_default") {
+      return { ...b, block_entity: { type: "celebrity_default", name: celebrity } };
+    }
+    // Matchable type with no name → demote to celebrity_default. The matcher
+    // can't search for "" so this block would render nothing otherwise.
+    if (!name) {
+      return { ...b, block_entity: { type: "celebrity_default", name: celebrity } };
+    }
+    return { ...b, block_entity: { type, name } };
+  });
 }
 
 // Split a section's text into sentences using the same regex as the
@@ -736,6 +896,10 @@ function makeDefaultBlock(text: string, subject: string): BlockPlan {
     visual_intent: "",
     recommended_visual_type: "footage",
     visual_priority: "person_default",
+    // Synthesized blocks (uncovered sentences) always fall to the celebrity
+    // — they have no Gemini-typed entity to bind to. normalizeBlockEntities
+    // will fill in name=projectCelebrity downstream.
+    block_entity: { type: "celebrity_default", name: subject },
   };
 }
 
@@ -916,6 +1080,7 @@ function fallbackUnderstanding(segment: RawSegment, context: SegmentContext = {}
       visual_intent: "",
       recommended_visual_type: "footage",
       visual_priority: "person_default",
+      block_entity: { type: "celebrity_default", name: subject },
     }],
   };
 }
