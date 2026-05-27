@@ -126,12 +126,14 @@ export async function processScriptClipJob(
       outputPath: trimmedTmp,
       startSeconds: start,
       durationSeconds: duration,
+      keepAudio: true,
     });
     normalizedTmp = path.join(tmp, "norm.mp4");
     await normalizeClip({
       inputPath: trimmedTmp,
       outputPath: normalizedTmp,
       width: 1280, height: 720, fps: 30,
+      keepAudio: true,
     });
     await setMediaJob(mediaJobId, { progress: 75 });
 

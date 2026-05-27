@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -321,14 +321,24 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           await downloadHttp(it.image_url as string, localImg);
           const imgMeta = (it.metadata ?? {}) as Record<string, unknown>;
           const imgLt = imgMeta.lower_third as { text?: string } | undefined;
+          // Cycle through four motion modes per consecutive image so the
+          // viewer never sees the same motion twice in a row:
+          //   0 → zoom-in
+          //   1 → pan-right
+          //   2 → zoom-out
+          //   3 → pan-left
+          // The four-step cycle (rather than a simple in/out toggle)
+          // matches the client direction: "Either Zoom, moving to the left
+          // or moving to the right". Keeps a still image from reading as
+          // a static frame even on slow narration.
+          const MOTION_CYCLE = ["in", "pan_right", "out", "pan_left"] as const;
+          const motion = MOTION_CYCLE[i % MOTION_CYCLE.length];
           await buildStillVideo({
             inputImagePath: localImg,
             outputPath: out,
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
-            // Alternate zoom direction by timeline index so consecutive
-            // image blocks don't all push the viewer the same way.
-            motionDirection: i % 2 === 0 ? "in" : "out",
+            motionDirection: motion,
             lowerThird: imgLt?.text ? { text: imgLt.text } : undefined,
           });
           slots[i] = out;
@@ -378,6 +388,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // Pre-downloaded path. The asset on R2 is already cut + normalized
           // so we only re-encode when we need to bake a lower-third overlay
           // or when the renderer's mixed-boundary headroom adds duration.
+          //
+          // Forced doc clips need their audio track retained on every
+          // intermediate file — the audio-splice pass after rendering
+          // extracts the audio and inserts it into the voiceover chain.
+          // If we drop the audio at any stage (cutClip / normalizeClip
+          // default -an), there's nothing to splice and the clip plays
+          // silent.
           const localPre = path.join(tmp, `forced_pre_${idx}.mp4`);
           try {
             await downloadHttp(preClipUrl, localPre);
@@ -386,11 +403,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               await cutClip({
                 inputPath: localPre, outputPath: trimmedPre,
                 startSeconds: 0, durationSeconds: renderDur,
+                keepAudio: true,
               });
               await normalizeClip({
                 inputPath: trimmedPre, outputPath: out,
                 width: 1280, height: 720, fps: 30,
                 lowerThird: lt?.text ? { text: lt.text } : undefined,
+                keepAudio: true,
               });
               await safeUnlink(trimmedPre);
             } else {
@@ -435,11 +454,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await cutClip({
               inputPath: dl.outputPath, outputPath: trimmed,
               startSeconds, durationSeconds: renderDur,
+              keepAudio: true,
             });
             await normalizeClip({
               inputPath: trimmed, outputPath: out,
               width: 1280, height: 720, fps: 30,
               lowerThird: lt?.text ? { text: lt.text } : undefined,
+              keepAudio: true,
             });
             slots[i] = out;
             let actualDur = renderDur;
@@ -770,6 +791,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     //     [start_time, end_time] window
     //   - concatNormalizedClips uses introAudioPath + crossfade to mix in
     //     the source audio for the intro window, voiceover for the rest.
+    //
+    // Per user direction (2026-05-27): mid-timeline forced clips (doc
+    // markers placed inside the script body) play VIDEO ONLY — the
+    // narrator voiceover keeps playing continuously over them, no pause.
+    // The intro pre-roll is UNAFFECTED — it still plays its source audio
+    // before the voiceover, as before. The flag below gates only the
+    // mid-timeline splice; introAudioPath is wired in as usual.
+    const MID_TIMELINE_FORCED_CLIP_AUDIO_ENABLED = false;
     let introAudioPath: string | undefined;
     let introDurationActual = 0;
 
@@ -1185,10 +1214,152 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }
     }
 
+    // Forced-clip audio splice.
+    //
+    // Per client direction: when a forced doc clip plays, the narrator
+    // (voiceover) pauses; the clip plays with its OWN audio; then the
+    // narrator resumes from where it stopped. Implementation:
+    //
+    //   1. Walk renderable[] computing each item's video-timeline position.
+    //   2. For every forced-clip-with-audio row, the voiceover should pause
+    //      at the position where the clip starts (in the voiceover, that's
+    //      the sum of NON-forced item durations preceding the clip).
+    //   3. Cut the voiceover into chunks at every forced-clip boundary,
+    //      extract each forced clip's audio, then concat:
+    //         [vo[0..pos1]] + [clip1_audio] + [vo[pos1..pos2]] + [clip2_audio] + ...
+    //
+    // When no forced clips carry their own audio, this whole pass is a
+    // no-op and the original voiceover path goes through unchanged.
+    let voiceoverForConcat = voiceoverLocal;
+    if (voiceoverLocal && MID_TIMELINE_FORCED_CLIP_AUDIO_ENABLED) {
+      type ForcedAudio = {
+        timelinePos: number;     // start time within the video timeline
+        videoDuration: number;   // forced clip's actual rendered duration
+        voPos: number;           // start time within the voiceover (excludes prior forced clips)
+        slotPath: string;        // rendered MP4 slot containing audio
+      };
+      const forcedAudioItems: ForcedAudio[] = [];
+      let tlPos = 0;
+      let voPos = 0;
+      for (let i = 0; i < renderable.length; i++) {
+        const it = renderable[i];
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const fc = meta.forced_clip as { youtube_url?: string } | undefined;
+        const slotDur = slotDurations[i] ?? Number(it.duration ?? 0);
+        const slotPath = slots[i];
+        if (it.type === "footage" && fc?.youtube_url && slotPath) {
+          forcedAudioItems.push({
+            timelinePos: tlPos,
+            videoDuration: slotDur,
+            voPos,
+            slotPath,
+          });
+          // Forced clip consumes timeline time but NOT voiceover time —
+          // voPos doesn't advance, so the next vo chunk picks up where
+          // the narrator was when the clip started.
+        } else {
+          voPos += slotDur;
+        }
+        tlPos += slotDur;
+      }
+      if (forcedAudioItems.length > 0) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.forced_audio_splice.start", {
+            clips: forcedAudioItems.length,
+            originalVoiceoverPath: voiceoverLocal,
+          });
+        try {
+          // Probe the voiceover for its real duration — we may need to
+          // clamp the final vo-cut at its end.
+          let voiceoverTotal = 0;
+          try {
+            const probed = await probeFile(voiceoverLocal);
+            voiceoverTotal = probed.durationSeconds;
+          } catch { voiceoverTotal = voPos; /* approximate fallback */ }
+
+          // Build the splice plan: [vo_chunk_0, clip0_audio, vo_chunk_1, clip1_audio, ...].
+          const chunkPaths: string[] = [];
+          let voCursor = 0;
+          for (let n = 0; n < forcedAudioItems.length; n++) {
+            const fa = forcedAudioItems[n];
+            const chunkDur = Math.max(0, fa.voPos - voCursor);
+            if (chunkDur > 0.02) {
+              const voChunkPath = path.join(tmp, `vo_chunk_${n}.m4a`);
+              await cutAudio({
+                inputPath: voiceoverLocal,
+                outputPath: voChunkPath,
+                startSeconds: voCursor,
+                durationSeconds: chunkDur,
+              });
+              chunkPaths.push(voChunkPath);
+            }
+            voCursor = fa.voPos;
+            // Extract this clip's audio. If extraction fails (clip had no
+            // audio track or yt-dlp grabbed a video-only stream), fall
+            // back to silence of the same length so the timeline stays
+            // aligned. We never abort the render on splice failure —
+            // worst case the viewer hears silence under the clip.
+            const clipAudioPath = path.join(tmp, `forced_audio_${n}.m4a`);
+            try {
+              await extractAudio({
+                inputPath: fa.slotPath,
+                outputPath: clipAudioPath,
+              });
+            } catch (e) {
+              await logJob({ projectId, jobId: mediaJobId },
+                "render.forced_audio_splice.extract_failed", {
+                  index: n, err: (e as Error).message?.slice(0, 200),
+                });
+              await buildSilentAudio({
+                outputPath: clipAudioPath,
+                durationSeconds: fa.videoDuration,
+              });
+            }
+            chunkPaths.push(clipAudioPath);
+          }
+          // Tail chunk — voiceover from the last splice point to its end.
+          const tailDur = Math.max(0, voiceoverTotal - voCursor);
+          if (tailDur > 0.02) {
+            const tailPath = path.join(tmp, `vo_chunk_tail.m4a`);
+            await cutAudio({
+              inputPath: voiceoverLocal,
+              outputPath: tailPath,
+              startSeconds: voCursor,
+              durationSeconds: tailDur,
+            });
+            chunkPaths.push(tailPath);
+          }
+          if (chunkPaths.length > 0) {
+            const splicedPath = path.join(tmp, "voiceover_spliced.m4a");
+            await concatAudioFiles({
+              inputPaths: chunkPaths,
+              outputPath: splicedPath,
+            });
+            voiceoverForConcat = splicedPath;
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.forced_audio_splice.done", {
+                clips: forcedAudioItems.length,
+                chunks: chunkPaths.length,
+                splicedPath,
+              });
+          }
+        } catch (e) {
+          // Splice failure shouldn't kill the render — fall back to the
+          // unspliced voiceover. The forced clips will then play silent
+          // and the narrator will overlap them, which is wrong but
+          // shippable.
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.forced_audio_splice.failed", {
+              err: (e as Error).message?.slice(0, 200),
+            });
+        }
+      }
+    }
+
     await concatNormalizedClips({
       inputPaths: normalized,
       outputPath: finalLocal,
-      voiceoverPath: voiceoverLocal,
+      voiceoverPath: voiceoverForConcat,
       voiceoverGain: 1.0,
       bgMusicPath: bgMusicLocal,
       bgMusicGain,

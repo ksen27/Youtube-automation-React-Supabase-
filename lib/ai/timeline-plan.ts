@@ -20,17 +20,16 @@ export interface DurationRange {
 
 export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   intro:   { min: 5,  max: 6  },
-  // Footage holds match the spoken length of their sentence: short
-  // sentences → short holds, long sentences → long holds. The max
-  // mirrors CLIP_DURATION_MAX_SECONDS (12s) so the planner never asks
-  // for a hold longer than what the clip generator can actually produce
-  // — that mismatch was the source of the previous "timeline falls short
-  // of voiceover" bug, because the matcher would clamp long footage
-  // blocks down to whatever the assigned clip's real length was. The
-  // min prevents degenerate 0.4s flashes from 1-word sentences. Used
-  // only on the cadence-fallback path now; word-timing-driven planning
-  // sizes blocks directly from the audio's word timestamps.
-  footage: { min: 3,  max: 12 },
+  // Footage holds are now capped at ~7s. Per client direction, every
+  // clip should land in the 5-6s window so the viewer's eye gets a new
+  // visual every few seconds instead of holding on a 12s talking-head
+  // shot. Long sentences are split into multiple sub-blocks of
+  // FOOTAGE_HOLD_SECONDS at the planner stage (see footage-split logic
+  // below — mirrors the existing image-split). The 1s headroom over the
+  // hold target lets a sentence land at 6.5s (just under the split
+  // threshold) without being forced into a split it doesn't need.
+  // The min prevents degenerate 0.4s flashes from 1-word sentences.
+  footage: { min: 3,  max: 7  },
   // Per-image hold is still 5s per user spec. The sentence-aligned planner
   // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
   // blocks rather than stretching one image, so the contract holds.
@@ -62,6 +61,17 @@ export const IMAGE_HOLD_SECONDS = 5;
 // for image blocks. A 6.5s sentence on a tattoo reference produces TWO
 // 5s image blocks (cloned hint metadata), not ONE 6.5s image hold.
 export const IMAGE_SPLIT_THRESHOLD = IMAGE_HOLD_SECONDS + 1.5;
+
+// Per-footage hold target (seconds). Mirrors the image-split logic — long
+// sentences exceeding FOOTAGE_SPLIT_THRESHOLD are broken into multiple
+// back-to-back footage blocks of this length so the viewer never sees a
+// single talking-head clip held for 10-12 seconds. Each sub-block gets
+// its own clip slot, and the matcher's no-adjacent-same-source rule then
+// forces the sub-blocks to come from different sources where possible.
+//
+// Set to 6 to match the client direction "keep the clip duration 5-6s".
+export const FOOTAGE_HOLD_SECONDS = 6;
+export const FOOTAGE_SPLIT_THRESHOLD = FOOTAGE_HOLD_SECONDS + 1.5;
 
 export interface TimelinePlan {
   voiceoverSeconds: number;
@@ -269,6 +279,15 @@ export interface BlockPlanHint {
   // "specific_*" blocks fall back to the person image when the exact match
   // can't be found (never random visuals).
   visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
+  // Closed-world block-entity binding. The analyze pass picks ONE entity
+  // type per block (person | company | tv_show | movie | song | place |
+  // celebrity_default) and pairs it with the literal name. The matcher
+  // uses (type, name) as the verify target — never refs[0]/ents[0] which
+  // often contain common nouns ("transcript", "announcement"). When
+  // type === "celebrity_default" the matcher skips the reference-driven
+  // image search and routes directly to the celebrity pool / person
+  // fallback — the spec's "NEVER random visuals" rule.
+  block_entity?: { type: "person" | "company" | "tv_show" | "movie" | "song" | "place" | "celebrity_default"; name: string };
   // Doc-paragraph the hint's narration came from (0-based, counted across
   // the project transcript split on "\n"). When set, the planner's grouping
   // pass refuses to merge hints from different paragraphs so a single block
@@ -288,6 +307,10 @@ export interface PlannedBlockWithHint extends PlannedBlock {
   mentioned_entities?: string[];
   subject_type?: "person" | "place" | "movie" | "show" | "company" | "event" | "object" | "general";
   visual_priority?: "person_default" | "specific_event" | "specific_object" | "title_card" | "split_2";
+  // Closed-world entity binding (mirrored from BlockPlanHint). The matcher
+  // uses (type, name) as the verify target and as the routing signal for
+  // celebrity_default blocks (which skip the reference-driven image search).
+  block_entity?: { type: "person" | "company" | "tv_show" | "movie" | "song" | "place" | "celebrity_default"; name: string };
   // Doc paragraph this block's narration came from. Forwarded from the
   // source hint so post-build passes (mergeShortFootage, etc.) can keep
   // the no-merge-across-paragraph invariant intact.
@@ -705,8 +728,8 @@ export function buildBlockSequenceFromHints(
     // residual gap.
     let accDur = baseDur;
     let accText = baseHint.text;
-    let mergedRefs = [...(baseHint.specific_visual_references ?? [])];
-    let mergedEntities = [...(baseHint.mentioned_entities ?? [])];
+    const mergedRefs = [...(baseHint.specific_visual_references ?? [])];
+    const mergedEntities = [...(baseHint.mentioned_entities ?? [])];
     let accVoStart: number | null = rawVoStart[cursor] ?? null;
     let accVoEnd: number | null = rawVoEnd[cursor] ?? null;
     let lookahead = cursor + 1;
@@ -763,6 +786,67 @@ export function buildBlockSequenceFromHints(
     cursor = lookahead;
   }
 
+  // Tiny-tail absorption. Some sentences are too short to deserve their own
+  // scene — "This is the full story." (3 words, ~1.5s) is the canonical case.
+  // The forward grouper above can't absorb them because it only merges
+  // adjacent same-type footage hints; a tiny footage tail sitting next to an
+  // image group (or next to a paragraph/type boundary) is stranded.
+  //
+  // The symptom is an audio/visual desync: the renderer holds the tiny
+  // sentence's visual for its full rendered duration (often inflated by the
+  // residue stretcher to ~3s), but the narrator finishes it in ~1.5s, so the
+  // following scene's audio begins while the prior visual is still on
+  // screen. Cascading across many such tails accumulates into multi-second
+  // drift.
+  //
+  // Fix: walk the grouped list and absorb any block whose own spoken time is
+  // below TINY_TAIL_SECONDS into its previous neighbor when both are in the
+  // same doc paragraph. The previous block's vo window extends to include
+  // the tail's audio, and its rendered duration grows by the tail's spoken
+  // time — so the scene stays on screen for exactly the combined narration,
+  // and the next scene starts exactly when the next paragraph/segment
+  // begins. We keep the previous block's TYPE and metadata (image stays
+  // image, footage stays footage) since the absorbed tail is, by definition,
+  // a trailing thought of the same beat.
+  const TINY_TAIL_SECONDS = 2;
+  // Hard ceiling on the prev block's post-merge duration. Without this,
+  // a chain of short sentences ("What he said was careful." +
+  // "What he didn't say was louder." + "This is the full story.") all
+  // collapse into the prev block one after another, producing a 12-14s
+  // mega-block that the matcher then can't size sensibly. Capping at 8s
+  // keeps the merged block in a normal footage range while still folding
+  // single stranded tails.
+  const PREV_BLOCK_MERGE_CEILING = 8;
+  for (let i = groupedHints.length - 1; i >= 1; i--) {
+    const tail = groupedHints[i];
+    const prev = groupedHints[i - 1];
+    if (tail.duration >= TINY_TAIL_SECONDS) continue;
+    if (prev.duration + tail.duration > PREV_BLOCK_MERGE_CEILING) continue;
+    const tailPara = tail.hint.paragraph_index;
+    const prevPara = prev.hint.paragraph_index;
+    if (tailPara != null && prevPara != null && tailPara !== prevPara) continue;
+    prev.duration = Math.round((prev.duration + tail.duration) * 10) / 10;
+    prev.text = `${prev.text} ${tail.text}`.trim();
+    if (prev.voEnd == null || (tail.voEnd != null && tail.voEnd > prev.voEnd)) {
+      prev.voEnd = tail.voEnd ?? prev.voEnd;
+    }
+    if (prev.voStart == null && tail.voStart != null) prev.voStart = tail.voStart;
+    const dedup = (xs: string[]) => Array.from(new Set(xs));
+    prev.hint = {
+      ...prev.hint,
+      specific_visual_references: dedup([
+        ...(prev.hint.specific_visual_references ?? []),
+        ...(tail.hint.specific_visual_references ?? []),
+      ]),
+      mentioned_entities: dedup([
+        ...(prev.hint.mentioned_entities ?? []),
+        ...(tail.hint.mentioned_entities ?? []),
+      ]),
+    };
+    prev.merged = true;
+    groupedHints.splice(i, 1);
+  }
+
   // Rebuild the parallel arrays so the rest of this function sees the
   // post-merge view. After this point, `mergedHints` / `rawDurations` /
   // `effectiveTypes` indices refer to MERGED groups, not individual
@@ -805,15 +889,32 @@ export function buildBlockSequenceFromHints(
   // old way so the timeline still lands near voiceoverSeconds.
   const haveRealTimings = wordTimings != null && wordTimings.length > 0;
 
-  // Slot counts for image hints. Round to nearest whole 5s multiple so
-  // a 7s sentence gets one slot (5s) and a 12s sentence gets two (10s).
-  // Math.round used to gain over Math.floor: a 7.5s sentence becomes
+  // Slot counts for image AND footage hints. Round to nearest whole
+  // hold-size multiple so a 7s sentence gets one slot (5s for image)
+  // and a 12s sentence gets two (10s).
+  //
+  // Footage uses FOOTAGE_HOLD_SECONDS (6s) so a 12s talking-head
+  // sentence becomes TWO 6s footage blocks instead of one 12s hold.
+  // Each sub-block gets its own clip slot, and the matcher's
+  // no-adjacent-same-source rule picks two visually distinct clips.
+  //
+  // Math.round used over Math.floor: a 7.5s sentence becomes
   // two slots, which is closer to the truth than one.
   const slotCounts = new Array<number>(mergedHints.length).fill(1);
   for (let i = 0; i < mergedHints.length; i++) {
+    const rawSec = rawDurations[i];
     if (effectiveTypes[i] === "image") {
-      const rawSec = rawDurations[i];
       slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
+    } else if (effectiveTypes[i] === "footage") {
+      // Only split when the sentence is meaningfully longer than the
+      // target hold — short sentences stay as a single block (a 4s
+      // sentence at FOOTAGE_HOLD_SECONDS=6 would otherwise become a
+      // 4s slot, which is fine, but rounding to one slot avoids
+      // degenerate sub-1-slot math). The FOOTAGE_SPLIT_THRESHOLD is
+      // hold + 1.5s so 7.5s sentences split, 7.0s sentences don't.
+      slotCounts[i] = rawSec >= FOOTAGE_SPLIT_THRESHOLD
+        ? Math.max(1, Math.round(rawSec / FOOTAGE_HOLD_SECONDS))
+        : 1;
     }
   }
 
@@ -884,13 +985,65 @@ export function buildBlockSequenceFromHints(
       return;
     }
 
+    // Footage may need to be split into multiple sub-blocks the same way
+    // images already do. When slotCounts[i] > 1, the sentence's spoken
+    // window is divided evenly across N sub-blocks, each at the
+    // FOOTAGE_HOLD_SECONDS target — so a 12s talking-head sentence
+    // produces two 6s footage rows instead of one 12s hold, and the
+    // matcher can fill each from a different source.
+    if (type === "footage") {
+      const slots = slotCounts[i];
+      if (slots > 1) {
+        const hintVoStart = mergedVoStart[i];
+        const hintVoEnd = mergedVoEnd[i];
+        const hintSpan =
+          hintVoStart != null && hintVoEnd != null && hintVoEnd > hintVoStart
+            ? hintVoEnd - hintVoStart
+            : null;
+        // Slot duration: prefer the spoken-window slice (so two 6.4s
+        // halves of a 12.8s sentence land at 6.4s each, not 6s + leftover
+        // gap), but fall back to FOOTAGE_HOLD_SECONDS when the hint had
+        // no aligned audio window. Round to 0.1s precision to match the
+        // existing block-duration convention.
+        const slotDur = hintSpan != null
+          ? Math.round((hintSpan / slots) * 10) / 10
+          : FOOTAGE_HOLD_SECONDS;
+        for (let k = 0; k < slots; k++) {
+          const slotStart = hintVoStart != null && hintSpan != null
+            ? hintVoStart + (k * hintSpan) / slots
+            : null;
+          const slotEnd = hintVoStart != null && hintSpan != null
+            ? hintVoStart + ((k + 1) * hintSpan) / slots
+            : null;
+          blocks.push({
+            type,
+            duration: slotDur,
+            text: h.text,
+            resolved_subject: h.resolved_subject,
+            // Section titles only ride the FIRST sub-block of a split
+            // sentence — putting the section title on every sub-block
+            // would render the chapter heading repeatedly.
+            section_title: k === 0 ? h.section_title : undefined,
+            specific_visual_references: h.specific_visual_references,
+            mentioned_entities: h.mentioned_entities,
+            subject_type: h.subject_type,
+            visual_priority: h.visual_priority,
+            block_entity: h.block_entity,
+            paragraph_index: h.paragraph_index,
+            vo_start_seconds: slotStart,
+            vo_end_seconds: slotEnd,
+          });
+        }
+        return;
+      }
+    }
+
     let duration: number;
     if (type === "footage") {
-      // With real timings: use the spoken duration directly so the visual
-      // is on screen for as long as the narrator speaks the sentence.
-      // Without timings: scale to fit voiceover length as before. Either
-      // way we round to 0.1s precision — finer precision adds no value
-      // because the matcher's clip-clamp is the dominant rounding step.
+      // Single-slot footage. With real timings: use the spoken duration
+      // directly so the visual is on screen for as long as the narrator
+      // speaks the sentence. Without timings: scale to fit voiceover
+      // length as before. Either way we round to 0.1s precision.
       const raw = haveRealTimings
         ? rawDurations[i]
         : rawDurations[i] * footageScale;
@@ -909,6 +1062,7 @@ export function buildBlockSequenceFromHints(
       mentioned_entities: h.mentioned_entities,
       subject_type: h.subject_type,
       visual_priority: h.visual_priority,
+      block_entity: h.block_entity,
       paragraph_index: h.paragraph_index,
       vo_start_seconds: mergedVoStart[i],
       vo_end_seconds: mergedVoEnd[i],
@@ -945,6 +1099,14 @@ export function buildBlockSequenceFromHints(
 // at the floor reads as a visual flash rather than a beat.
 const MERGE_SHORT_FOOTAGE_THRESHOLD = 3.5;
 
+function sameBlockEntity(a: PlannedBlockWithHint, b: PlannedBlockWithHint): boolean {
+  const ae = a.block_entity;
+  const be = b.block_entity;
+  if (!ae || !be) return false;
+  if (ae.type !== be.type) return false;
+  return (ae.name ?? "").trim().toLowerCase() === (be.name ?? "").trim().toLowerCase();
+}
+
 function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
   const footageMax = DURATION_RANGES.footage.max;
   let i = 0;
@@ -964,6 +1126,65 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
       a.paragraph_index == null
       || b.paragraph_index == null
       || a.paragraph_index === b.paragraph_index;
+    // Cross-type merge for staccato short blocks. The "one sentence =
+    // one block" rule produces uncomfortably fast cuts when 3-4 short
+    // sentences land back-to-back with alternating types
+    // (footage→image→footage). We fuse adjacent image/footage blocks
+    // when BOTH share the same closed-world block_entity AND at least
+    // one side is short. The merged block takes the FOOTAGE type
+    // whenever either side was footage — narrative motion reads better
+    // than a static image on a long hold — and the matcher's clip-
+    // duration clamp (max ~12s) bounds the result.
+    //
+    // Restricted to celebrity_default OR same matchable entity so we
+    // don't merge two different image-entity blocks (Guardian logo +
+    // BGT poster shouldn't collapse into one). Paragraph boundary is
+    // still respected — that's the script author's "context shift"
+    // signal and remains hard.
+    const aIsImageOrFootage = a.type === "image" || a.type === "footage";
+    const bIsImageOrFootage = b.type === "image" || b.type === "footage";
+    const aShort = a.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD + 1;
+    const bShort = b.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD + 1;
+    if (
+      aIsImageOrFootage &&
+      bIsImageOrFootage &&
+      sameParagraph &&
+      sameBlockEntity(a, b) &&
+      (aShort || bShort) &&
+      // Combined cap: footage max (12s) so the matcher never has to
+      // hold a still image longer than image_block_split would allow.
+      a.duration + b.duration <= footageMax
+    ) {
+      // Footage wins on mixed types — clips give the merged block
+      // motion, which is what the viewer wants for a 6-8s hold.
+      const mergedType: "footage" | "image" =
+        a.type === "footage" || b.type === "footage" ? "footage" : "image";
+      const mergedTextMix = [a.text, b.text].filter(Boolean).join(" ");
+      blocks.splice(i, 2, {
+        type: mergedType,
+        duration: Math.round((a.duration + b.duration) * 10) / 10,
+        text: mergedTextMix,
+        resolved_subject: b.resolved_subject ?? a.resolved_subject,
+        section_title: a.section_title ?? b.section_title,
+        specific_visual_references: [
+          ...(a.specific_visual_references ?? []),
+          ...(b.specific_visual_references ?? []),
+        ].filter((v, k, arr) => arr.indexOf(v) === k),
+        mentioned_entities: [
+          ...(a.mentioned_entities ?? []),
+          ...(b.mentioned_entities ?? []),
+        ].filter((v, k, arr) => arr.indexOf(v) === k),
+        subject_type: b.subject_type ?? a.subject_type,
+        visual_priority: b.visual_priority ?? a.visual_priority,
+        block_entity: a.block_entity,
+        paragraph_index: a.paragraph_index ?? b.paragraph_index,
+        vo_start_seconds: a.vo_start_seconds ?? b.vo_start_seconds,
+        vo_end_seconds: b.vo_end_seconds ?? a.vo_end_seconds,
+      });
+      // Don't advance i — the merged block might now be a merge candidate
+      // with the next block (chains of 3+ short sentences collapse cleanly).
+      continue;
+    }
     if (
       a.type === "footage" &&
       b.type === "footage" &&
@@ -993,6 +1214,9 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
         ].filter((v, k, arr) => arr.indexOf(v) === k),
         subject_type: b.subject_type ?? a.subject_type,
         visual_priority: b.visual_priority ?? a.visual_priority,
+        // Keep b's block_entity when both share one (the meatier follow-up
+        // sentence's binding); fall back to a's when only one is present.
+        block_entity: b.block_entity ?? a.block_entity,
         // Both a and b are in the same paragraph (enforced above), so the
         // merged block inherits that paragraph index.
         paragraph_index: a.paragraph_index ?? b.paragraph_index,
@@ -1011,27 +1235,16 @@ function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
 // Real-timing residue path. Footage blocks already hold their real spoken
 // duration so we must not shrink them — that would desync the visual from
 // the narration. We only stretch when the timeline is short, and only by
-// a tiny per-block amount (max +1s) to keep alignment intact. Any residue
+// a tiny per-block amount (max +2s) to keep alignment intact. Any residue
 // we can't absorb this way is left for the render-tolerance check (±3s).
 //
 // We split the gap across all footage blocks, not just one tail block,
-// so any single block stretches at most 1s — a hold that's 1s longer than
+// so any single block stretches at most 2s — a hold that's 2s longer than
 // the narration on screen is visually imperceptible, but stretching one
 // block by 10s would be a desync.
 function redistributeResidueWithRealTimings(blocks: PlannedBlockWithHint[], target: number): void {
   const EPSILON = 0.1;
-  // Hard ceiling per footage block. Real spoken durations are the truth,
-  // so a 2-second stretch is the most we should ever add — beyond that the
-  // visual would noticeably linger past the narrated sentence. The loop
-  // below absorbs the gap across many blocks, so each block typically gets
-  // a fraction of a second; this limit only matters when the gap is very
-  // large relative to the footage count.
   const PER_BLOCK_STRETCH_LIMIT = 2.0;
-  // Loop until the gap is closed or no further progress can be made. Each
-  // pass distributes whatever's left across footage blocks that still have
-  // headroom (haven't hit the per-block stretch limit). Without this loop,
-  // a single-pass with `gap / footage.length` clamped to the limit leaves
-  // a small residue whenever per-block fractional rounding loses pennies.
   const MAX_PASSES = 8;
   const footage = blocks.filter((b) => b.type === "footage");
   if (footage.length === 0) return;
@@ -1042,9 +1255,6 @@ function redistributeResidueWithRealTimings(blocks: PlannedBlockWithHint[], targ
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     const total = sumDurations(blocks);
     const gap = target - total;
-    // Negative gap (timeline > voiceover) is rare with real timings — the
-    // narration can't be longer than itself. Skip negative-gap handling to
-    // avoid shortening real-timing blocks.
     if (gap < EPSILON) return;
     const stretchable = footage.filter((b) => b.duration < (ceilings.get(b) ?? b.duration));
     if (stretchable.length === 0) return;
@@ -1058,8 +1268,6 @@ function redistributeResidueWithRealTimings(blocks: PlannedBlockWithHint[], targ
       absorbed += next - b.duration;
       b.duration = next;
     }
-    // If a pass produces no measurable change (everything rounded to 0),
-    // bail out instead of looping forever.
     if (absorbed < 0.01) return;
   }
 }

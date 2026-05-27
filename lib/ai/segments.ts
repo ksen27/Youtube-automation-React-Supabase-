@@ -582,6 +582,34 @@ Rules:
 - For searchIntents ONLY: skip the section's narration tone and writing style and focus on what should appear on screen. This rule does NOT apply to blocks — blocks must cover every sentence (see COMPLETENESS below).
 - Skip duplicates. Skip empty arrays — return [] if you have nothing.
 
+QUERY MINING — HARD REQUIREMENT FOR BUILDING searchIntents.
+The chapter title / sectionTitle is often editorial ("Three words", "The
+Cancellation", "Marriage", "Aftermath") and NOT searchable on YouTube. DO
+NOT use the editorial title as the query basis. Instead, walk THIS
+section's actual narration sentence by sentence and harvest every
+searchable specific that already appears in the text:
+  - named people (the project subject + any other person named)
+  - named TV shows / movies / songs / podcasts
+  - named companies / publications (e.g. "The Guardian", "HarperCollins")
+  - named venues / buildings (e.g. "London Palladium")
+  - 4-digit years
+  - named events / lawsuits / awards / incidents
+Then BUILD each searchIntent's query by combining the project subject
+with ONE OR TWO of those harvested specifics. Every searchIntent must be
+grounded in something that LITERALLY appears in this section's narration.
+If the section uses pronouns and you can't find any harvested specific,
+build queries from secondary anchors (the show, the year, the publication,
+the venue) — never default to a bare subject query.
+
+Example — for a section titled "Three words" whose narration says
+"In December 2022 The Guardian published a transcript of David Walliams's
+Britain's Got Talent comments…", the queries are:
+  - "David Walliams Guardian transcript 2022"
+  - "David Walliams Britain's Got Talent comments"
+  - "David Walliams BGT scandal Guardian"
+NOT "David Walliams three words" (chapter title is editorial).
+NOT "David Walliams interview" (no story specifics).
+
 PERSON-FIRST DOCUMENTARY PRINCIPLE — read this BEFORE choosing block types.
 This video is edited like a celebrity documentary. The viewer is here to see the
 person. So:
@@ -603,6 +631,18 @@ type per block via "block_entity". If the block doesn't cleanly map to one
 of the six, pick "celebrity_default" — that tells the matcher to show the
 project celebrity. This rule is non-negotiable; off-topic visuals come from
 blocks trying to invent entities outside this list.
+
+IMPORTANT — DO NOT confuse "block_entity.type" with "subject_type". They are
+two different fields with two different value sets:
+  - "subject_type" uses: person | place | movie | show | company | event |
+                          object | general  (NOTE: "show", NOT "tv_show")
+  - "block_entity.type" uses: person | company | tv_show | movie | song |
+                              place | celebrity_default  (NOTE: "tv_show",
+                              NOT "show")
+For a block about a TV programme, write subject_type="show" AND
+block_entity.type="tv_show". Mixing them — e.g. subject_type="tv_show" —
+will be rejected by validation and the whole segment will fall back to a
+generic plan. Get both right.
 
 The six matchable types and what each one means:
 - "person"     — the block is ABOUT a real, named person OTHER than the
@@ -765,11 +805,31 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
   // contract but our zod schema uses camelCase. Normalise before parsing so a
   // present-but-empty subject still lands in the schema's default and the
   // inheritance pass below has a value to act on.
+  //
+  // Also coerce subject_type "tv_show" → "show". The legacy SubjectType
+  // enum uses "show" but the new closed-world BlockEntityType uses "tv_show";
+  // Gemini occasionally bleeds the latter into the former and would
+  // otherwise blow up the whole segment via schema validation. The mapping
+  // is unambiguous (both mean "TV programme") so we fix it silently. Same
+  // logic for block_entity.type values that mis-flow into subject_type.
   const normalised = (() => {
     if (!parsed || typeof parsed !== "object") return parsed;
     const p = parsed as Record<string, unknown>;
     if ("segment_subject" in p && !("segmentSubject" in p)) p.segmentSubject = p.segment_subject;
     if ("segment_topic" in p && !("segmentTopic" in p)) p.segmentTopic = p.segment_topic;
+    if (Array.isArray(p.blocks)) {
+      for (const b of p.blocks as Array<Record<string, unknown>>) {
+        if (b && typeof b === "object" && b.subject_type === "tv_show") {
+          b.subject_type = "show";
+        }
+        // Inverse defensive: if block_entity.type came back as "show",
+        // remap to the closed-world "tv_show" so BlockEntitySchema parses.
+        const be = b?.block_entity as Record<string, unknown> | undefined;
+        if (be && typeof be === "object" && be.type === "show") {
+          be.type = "tv_show";
+        }
+      }
+    }
     return p;
   })();
   const safe = SegmentUnderstandingSchema.safeParse(normalised);
@@ -799,6 +859,25 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     query: buildSegmentQuery(it.query, context, resolved.segmentSubject),
   }));
 
+  // 2b) Deterministic story-anchor backstop. The new prompt asks Gemini to
+  //     mine the section text for searchable specifics, but when the
+  //     chapter title is purely editorial ("Three words", "The Cancellation")
+  //     Gemini sometimes still collapses to a single bare-subject query.
+  //     We synthesize additional queries by combining the segment subject
+  //     with concrete anchors LITERALLY present in the section text:
+  //     named people other than the subject, places, events, and 4-digit
+  //     years. The result is appended (deduped) so Gemini's own intents
+  //     stay primary but the segment never ends up with a single generic
+  //     query when the narration has real specifics to anchor on.
+  const storyAnchoredIntents = synthesizeStoryAnchoredIntents({
+    sectionText: segment.text,
+    subject: resolved.segmentSubject || context.mainSubject || "",
+    parsed: safe.data,
+    existingQueries: rewrittenIntents.map((it) => it.query.toLowerCase()),
+    context,
+  });
+  const mergedIntents = [...rewrittenIntents, ...storyAnchoredIntents].slice(0, 6);
+
   // Reconcile Gemini's blocks against the section's actual sentences.
   // Gemini occasionally drops "recap" or "transition" sentences from blocks[]
   // even when the prompt forbids it (LLMs are bad at count-and-verify
@@ -821,9 +900,114 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
     segmentSubject: resolved.segmentSubject,
     inheritedSubject: resolved.inheritedSubject,
     segmentTopic: safe.data.segmentTopic?.trim() || safe.data.mainTopic.slice(0, 80),
-    searchIntents: rewrittenIntents,
+    searchIntents: mergedIntents,
     blocks,
   };
+}
+
+// Harvest 4-digit years (1900-2099) literally present in the section text.
+// Used by the deterministic story-anchor backstop to ground at least one
+// query in a specific year when the narration mentions one. We dedupe and
+// cap to keep the output bounded — five distinct years per section is far
+// more than the matcher can use anyway.
+function harvestYearsFromText(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /\b(19|20)\d{2}\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const y = m[0];
+    if (!seen.has(y)) {
+      seen.add(y);
+      out.push(y);
+      if (out.length >= 5) break;
+    }
+  }
+  return out;
+}
+
+// Build extra story-anchored queries from the parsed segment understanding
+// PLUS years harvested directly from the section text. Each synthesized
+// query is "<subject> <anchor>" where anchor is a literal proper noun
+// (person, place, event) or a year that appears in the section. Skips
+// anchors that are restatements of the subject and queries that duplicate
+// an existing intent. Returns up to 3 extra intents so the merged list
+// stays manageable.
+//
+// Output shape mirrors SegmentUnderstanding["searchIntents"][number] so
+// the caller can splice directly into the searchIntents array.
+function synthesizeStoryAnchoredIntents(args: {
+  sectionText: string;
+  subject: string;
+  parsed: SegmentUnderstanding;
+  existingQueries: string[]; // already-lowercased
+  context: SegmentContext;
+}): SegmentUnderstanding["searchIntents"] {
+  const { sectionText, subject, parsed, existingQueries, context } = args;
+  if (!subject) return [];
+  const subjectLower = subject.toLowerCase();
+  const aliasSet = new Set(
+    [subject, ...(context.subjectAliases ?? [])].map((s) => s.toLowerCase()),
+  );
+
+  // Anchor pool — concrete specifics from the parsed understanding. Order
+  // matters: events / places / non-subject people tend to be the strongest
+  // YouTube anchors, then topics, then years (years alone are too generic).
+  const anchors: string[] = [];
+  for (const e of parsed.events ?? []) if (e.trim()) anchors.push(e.trim());
+  for (const p of parsed.places ?? []) if (p.trim()) anchors.push(p.trim());
+  for (const person of parsed.people ?? []) {
+    const t = person.trim();
+    if (!t) continue;
+    if (aliasSet.has(t.toLowerCase())) continue; // skip subject restatements
+    anchors.push(t);
+  }
+  for (const topic of parsed.topics ?? []) {
+    const t = topic.trim();
+    if (!t) continue;
+    // Topics are sometimes editorial labels — skip ones that consist only
+    // of generic words. isGenericPhrase covers "creative controls" /
+    // "court ruling" / "interview" etc.
+    if (isGenericPhrase(t)) continue;
+    anchors.push(t);
+  }
+  for (const y of harvestYearsFromText(sectionText)) anchors.push(y);
+
+  // Dedupe anchors case-insensitively while preserving order.
+  const seenAnchor = new Set<string>();
+  const uniqueAnchors = anchors.filter((a) => {
+    const k = a.toLowerCase();
+    if (seenAnchor.has(k)) return false;
+    seenAnchor.add(k);
+    return true;
+  });
+
+  const out: SegmentUnderstanding["searchIntents"] = [];
+  for (const anchor of uniqueAnchors) {
+    if (out.length >= 3) break;
+    // Construct "<subject> <anchor>" — buildSegmentQuery would re-prepend
+    // the subject if missing anyway, but doing it explicitly here keeps
+    // the query human-readable and avoids subtle word-order surprises.
+    const rawQuery = anchor.toLowerCase().includes(subjectLower)
+      ? anchor
+      : `${subject} ${anchor}`;
+    const finalQuery = buildSegmentQuery(rawQuery, context, subject).trim();
+    if (!finalQuery) continue;
+    const lower = finalQuery.toLowerCase();
+    if (existingQueries.includes(lower)) continue;
+    existingQueries.push(lower);
+    out.push({
+      label: `Looking for ${subject} + ${anchor}`,
+      query: finalQuery,
+      // Default to talking_head — the ranker is loose enough on intentType
+      // that this rarely matters for synthesized queries. Years skew
+      // toward archival but we'd need to inspect the anchor's shape to
+      // pick; keeping it talking_head matches the safest default the
+      // schema uses.
+      intentType: /^(19|20)\d{2}$/.test(anchor) ? "archival" : "talking_head",
+    });
+  }
+  return out;
 }
 
 // Closed-world block-entity post-processor.
@@ -845,22 +1029,276 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
 //
 // The function is pure — it does not consult Gemini or any external state.
 // It only mutates block_entity; the rest of the block is passed through.
+// Tokenize a string into lowercase word tokens for substring matching.
+// We strip non-letter/digit chars so "BGT," and "BGT" both yield ["bgt"].
+function tokenizeForGrounding(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .filter((t) => t.length > 0);
+}
+
+// Words too generic to count as proper-noun evidence even when Gemini puts
+// them in block_entity.name. "the" / "of" / "a" appear capitalized at the
+// start of every sentence; using them as the sole grounding signal lets
+// "The transcript" pass when only "The" matched. We exclude these from the
+// "primary token" calculation but still accept names whose OTHER tokens
+// ground in the text.
+const GROUNDING_STOPWORDS = new Set([
+  "the", "a", "an", "of", "and", "or", "but", "to", "for", "in", "on", "at",
+  "by", "with", "from", "as", "is", "was", "were", "be", "been", "it", "its",
+]);
+
+// Decide whether block_entity.name is grounded in the block's own text.
+// The rule:
+//   1. Strip stopwords from the entity name. Pick the longest remaining
+//      token as the "primary token" (e.g. "The Guardian" → "guardian",
+//      "London Palladium" → "palladium" or "london" — whichever is longer).
+//   2. The primary token must appear in the block text (tokenwise).
+//   3. The primary token must appear CAPITALIZED in the original-casing
+//      block text — that's the proper-noun signal. Lowercase appearance
+//      ("transcript" in "...published the transcript") fails because the
+//      sentence treated it as a common noun.
+//
+// This catches both classes of Gemini misfire:
+//   - Pure common nouns ("transcript", "announcement") — fail rule (3).
+//   - Plausible-but-absent names ("BGT Series 16" in a sentence that
+//     only says "the show") — fail rule (2).
+//
+// We do NOT consult any external denylist. The block's own text is the
+// ground truth — if the proper noun isn't there, the binding is wrong.
+function isEntityNameGroundedInText(name: string, blockText: string): boolean {
+  const nameTokensAll = tokenizeForGrounding(name);
+  if (nameTokensAll.length === 0) return false;
+  const meaningfulTokens = nameTokensAll.filter((t) => !GROUNDING_STOPWORDS.has(t));
+  if (meaningfulTokens.length === 0) return false;
+  // Primary token = the longest non-stopword token. Longer = more
+  // specific, so "Palladium" beats "London" for grounding precision.
+  const primary = meaningfulTokens.reduce(
+    (best, cur) => (cur.length > best.length ? cur : best),
+    meaningfulTokens[0],
+  );
+  // Rule 2: primary token must appear in the block text.
+  const textTokensLower = tokenizeForGrounding(blockText);
+  if (!textTokensLower.includes(primary)) return false;
+  // Rule 3: primary token must appear with a capital first letter in
+  // the original-casing text. We scan the raw text for the token,
+  // case-insensitively, then check the character at the match start.
+  const re = new RegExp(`\\b${primary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+  const m = blockText.match(re);
+  if (!m || m.index == null) return false;
+  const firstChar = blockText[m.index];
+  return firstChar >= "A" && firstChar <= "Z";
+}
+
+// Closed-world block-entity post-processor.
+//
+// Gemini fills in block_entity.{type,name} per block; we normalise the
+// result so the matcher can rely on three invariants:
+//
+//   1. block_entity.type is always one of the seven enum values.
+//   2. block_entity.name is non-empty whenever type !== celebrity_default.
+//   3. For celebrity_default blocks, name is the project celebrity's name.
+//
+// We ALSO verify that the name is grounded in the block's own text —
+// see isEntityNameGroundedInText above. Gemini occasionally hallucinates
+// names that aren't in the script (sentence-keyword common nouns like
+// "transcript", or plausible-but-absent show names like "BGT Series 16").
+// Rather than maintain a denylist of bad words (which is endless), we
+// require the name to physically appear as a capitalized token in the
+// block. If it doesn't, the binding is wrong — demote to celebrity_default
+// so the block renders the project celebrity instead of chasing a
+// fictional entity through image search.
+//
+// Continuity exception: a block whose narration uses pronouns to refer
+// back to the previous block's named entity ("It was published two years
+// later") should keep that binding. We allow inheritance from the prior
+// block when the current block has no proper noun of its own but the
+// previous block's entity type+name was already accepted.
+//
+// The function is pure (no external state). Input is the block plan as
+// emitted by Gemini; output is the same blocks with normalized
+// block_entity bindings.
 export function normalizeBlockEntities(blocks: BlockPlan[], projectCelebrity: string): BlockPlan[] {
   const celebrity = projectCelebrity.trim();
-  return blocks.map((b) => {
+  // Walk in order so continuity inheritance can look at the previous
+  // block's FINAL binding (post-normalization), not Gemini's raw one.
+  const out: BlockPlan[] = [];
+  let prevBinding: { type: BlockEntityType; name: string } | null = null;
+  // Diagnostic trace — captures every decision the normaliser makes so
+  // an analyze run can be audited from logs. Each entry says what
+  // Gemini emitted vs. what we kept/demoted and why. Logged once per
+  // segment at the call site (analyzeSegment) so noise stays bounded.
+  const trace: Array<{
+    blockIdx: number;
+    text: string;
+    geminiType: string;
+    geminiName: string;
+    decision: "kept_celebrity_default" | "demoted_empty_name" | "kept_grounded" | "kept_continuity" | "demoted_not_grounded";
+    primaryToken?: string;
+    firstCharOfMatch?: string;
+  }> = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
     const raw = b.block_entity ?? { type: "celebrity_default" as const, name: "" };
     const type = raw.type;
     const name = (raw.name ?? "").trim();
+
+    // Branch 1 — celebrity_default: always fill in the project celebrity.
     if (type === "celebrity_default") {
-      return { ...b, block_entity: { type: "celebrity_default", name: celebrity } };
+      const binding = { type: "celebrity_default" as const, name: celebrity };
+      out.push({ ...b, block_entity: binding });
+      prevBinding = binding;
+      trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "kept_celebrity_default" });
+      continue;
     }
-    // Matchable type with no name → demote to celebrity_default. The matcher
-    // can't search for "" so this block would render nothing otherwise.
+
+    // Branch 2 — matchable type with empty name: demote.
     if (!name) {
-      return { ...b, block_entity: { type: "celebrity_default", name: celebrity } };
+      const binding = { type: "celebrity_default" as const, name: celebrity };
+      out.push({ ...b, block_entity: binding });
+      prevBinding = binding;
+      trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "demoted_empty_name" });
+      continue;
     }
-    return { ...b, block_entity: { type, name } };
-  });
+
+    // Branch 3 — matchable type with a name. Check grounding.
+    const grounded = isEntityNameGroundedInText(name, b.text ?? "");
+    // Capture grounding details for trace.
+    const meaningfulTokens = tokenizeForGrounding(name).filter((t) => !GROUNDING_STOPWORDS.has(t));
+    const primary = meaningfulTokens.length > 0
+      ? meaningfulTokens.reduce((best, cur) => (cur.length > best.length ? cur : best), meaningfulTokens[0])
+      : "";
+    let firstCharOfMatch = "";
+    if (primary && b.text) {
+      const re = new RegExp(`\\b${primary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+      const m = b.text.match(re);
+      if (m && m.index != null) firstCharOfMatch = b.text[m.index] ?? "";
+    }
+    if (grounded) {
+      const groundedBinding: { type: BlockEntityType; name: string } = { type, name };
+      out.push({ ...b, block_entity: groundedBinding });
+      prevBinding = groundedBinding;
+      trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "kept_grounded", primaryToken: primary, firstCharOfMatch });
+      continue;
+    }
+
+    // Branch 4 — name not grounded in THIS block's text. Try continuity:
+    // if Gemini's claimed binding matches the previous block's accepted
+    // binding (same type AND same name), the current block is a pronoun-
+    // continuation of the previous one. Keep the binding.
+    if (
+      prevBinding &&
+      prevBinding.type === type &&
+      prevBinding.name.toLowerCase() === name.toLowerCase()
+    ) {
+      const continuityBinding: { type: BlockEntityType; name: string } = { type, name };
+      out.push({ ...b, block_entity: continuityBinding });
+      prevBinding = continuityBinding;
+      trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "kept_continuity", primaryToken: primary, firstCharOfMatch });
+      continue;
+    }
+
+    // Branch 5 — neither grounded nor a continuation. Demote.
+    const demoteBinding: { type: BlockEntityType; name: string } = { type: "celebrity_default", name: celebrity };
+    out.push({ ...b, block_entity: demoteBinding });
+    prevBinding = demoteBinding;
+    trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "demoted_not_grounded", primaryToken: primary, firstCharOfMatch });
+  }
+  // Emit the full trace as one console.log entry — analyzeSegment will
+  // pick this up via stdout. Only emit if at least one decision was
+  // made on a matchable type (avoid noise on celebrity-only segments).
+  const matchableTraces = trace.filter((t) =>
+    t.decision === "kept_grounded" ||
+    t.decision === "kept_continuity" ||
+    t.decision === "demoted_not_grounded" ||
+    t.decision === "demoted_empty_name"
+  );
+  if (matchableTraces.length > 0) {
+    console.log(JSON.stringify({
+      msg: "analyzeSegment.block_entity_normalize",
+      celebrity,
+      decisions: trace,
+    }));
+  }
+  return out;
+}
+
+// Walk every block across every segment in narration order and count the
+// MAX CONSECUTIVE RUN of blocks bound to each secondary person (anyone
+// who is NOT the project celebrity). The result drives the hybrid
+// secondary-character policy:
+//
+//   - run < SECONDARY_PERSON_CLIP_THRESHOLD (default 4 blocks ≈ 28s):
+//       show a Wikipedia photo for that person, no YouTube fetch.
+//       Cheap and reliable for brief mentions.
+//   - run >= threshold:
+//       fall back to clip search + face verification, same as the
+//       project celebrity. Longer paragraphs deserve motion.
+//
+// We report MAX consecutive (not total) because two isolated 1-block
+// mentions feel like two separate photos, not a 2-block run. The viewer
+// experiences runs locally, not cumulatively.
+//
+// The map key is the person's name, lower-cased so analyze/match callers
+// can do case-insensitive lookups without re-implementing the matching
+// each time.
+export const SECONDARY_PERSON_CLIP_THRESHOLD = 4;
+
+export function findPersonRunsAcrossSegments(
+  understandings: Array<{ blocks: BlockPlan[] }>,
+  projectCelebrity: string,
+): Map<string, { displayName: string; maxRun: number }> {
+  const celebrityLower = projectCelebrity.trim().toLowerCase();
+  const result = new Map<string, { displayName: string; maxRun: number }>();
+
+  // Flatten all blocks across segments in narration order. Runs cross
+  // segment boundaries when consecutive segments happen to both name the
+  // same person (rare, but it can happen with a continuation paragraph
+  // split by the topic-boundary splitter).
+  type Marker = { name: string; lower: string };
+  const flat: Marker[] = [];
+  for (const u of understandings) {
+    for (const b of u.blocks) {
+      const be = b.block_entity;
+      if (!be) { flat.push({ name: "", lower: "" }); continue; }
+      if (be.type !== "person") { flat.push({ name: "", lower: "" }); continue; }
+      const nm = (be.name ?? "").trim();
+      const lo = nm.toLowerCase();
+      if (!nm || lo === celebrityLower) { flat.push({ name: "", lower: "" }); continue; }
+      flat.push({ name: nm, lower: lo });
+    }
+  }
+
+  // Sweep flat list counting runs.
+  let i = 0;
+  while (i < flat.length) {
+    const cur = flat[i];
+    if (!cur.lower) { i++; continue; }
+    let j = i;
+    while (j < flat.length && flat[j].lower === cur.lower) j++;
+    const run = j - i;
+    const prev = result.get(cur.lower);
+    if (!prev || run > prev.maxRun) {
+      result.set(cur.lower, { displayName: cur.name, maxRun: run });
+    }
+    i = j;
+  }
+  return result;
+}
+
+// Convenience predicate for callers. Returns true when the named
+// secondary person's max run is BELOW the threshold (Wikipedia-photo
+// path); false when at-or-above (clip-fetch path). Unknown people
+// (no run recorded) default to BELOW — they were never mentioned, so
+// the matcher should never reach this code path for them; if it does,
+// the photo path is the safe default.
+export function shouldUsePhotoForSecondaryPerson(
+  runs: Map<string, { maxRun: number }>,
+  personName: string,
+): boolean {
+  const run = runs.get(personName.trim().toLowerCase())?.maxRun ?? 0;
+  return run < SECONDARY_PERSON_CLIP_THRESHOLD;
 }
 
 // Split a section's text into sentences using the same regex as the
@@ -1058,19 +1496,38 @@ function fallbackUnderstanding(segment: RawSegment, context: SegmentContext = {}
   const subject = (context.mainSubject ?? "").trim();
   const rawQuery = firstSentence || `Part ${segment.index + 1}`;
   const query = buildSegmentQuery(rawQuery, context, subject);
-  return {
-    mainTopic: firstSentence || `Part ${segment.index + 1}`,
-    people: subject ? [subject] : [],
-    places: [], events: [], topics: [],
-    relatedKeywords: [],
-    segmentSubject: subject,
-    inheritedSubject: !!subject,
-    segmentTopic: firstSentence.slice(0, 60),
-    sectionTitle: "",
-    searchIntents: [{ label: "Looking for relevant background footage", query, intentType: "talking_head" }],
-    // No Gemini analysis available — emit a single footage-typed block from
-    // the whole segment so the planner has something to align against.
-    blocks: [{
+
+  // Split the segment into sentences so each one becomes its own block —
+  // matches what Gemini's prompt rule "ONE BLOCK = ONE COMPLETE SENTENCE"
+  // would have produced. The earlier single-mega-block fallback put the
+  // entire segment text on every planner-derived block, which surfaced in
+  // the editor as 30+ consecutive scenes all showing the same transcript
+  // and made the audio/visual sync impossible to reason about. Sentence-
+  // level blocks let the planner size each block to one sentence's spoken
+  // duration so the visual changes every few seconds with the narration.
+  const sentences = segment.text.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g)
+    ?? [segment.text];
+  const blocks: BlockPlan[] = sentences
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map((sentenceText) => ({
+      text: sentenceText,
+      resolved_subject: subject,
+      subject_type: (subject ? "person" : "general") as BlockPlan["subject_type"],
+      mentioned_entities: [],
+      specific_visual_references: [],
+      pronouns_detected: false,
+      visual_intent: "",
+      recommended_visual_type: "footage" as BlockPlan["recommended_visual_type"],
+      visual_priority: "person_default" as BlockPlan["visual_priority"],
+      block_entity: { type: "celebrity_default", name: subject } as BlockPlan["block_entity"],
+    }));
+
+  // Safety net: if sentence-splitting produced nothing (segment had no
+  // terminal punctuation, e.g. a stream-of-consciousness chunk), fall back
+  // to one block per the whole segment so the planner still has something.
+  if (blocks.length === 0) {
+    blocks.push({
       text: segment.text,
       resolved_subject: subject,
       subject_type: subject ? "person" : "general",
@@ -1081,6 +1538,19 @@ function fallbackUnderstanding(segment: RawSegment, context: SegmentContext = {}
       recommended_visual_type: "footage",
       visual_priority: "person_default",
       block_entity: { type: "celebrity_default", name: subject },
-    }],
+    });
+  }
+
+  return {
+    mainTopic: firstSentence || `Part ${segment.index + 1}`,
+    people: subject ? [subject] : [],
+    places: [], events: [], topics: [],
+    relatedKeywords: [],
+    segmentSubject: subject,
+    inheritedSubject: !!subject,
+    segmentTopic: firstSentence.slice(0, 60),
+    sectionTitle: "",
+    searchIntents: [{ label: "Looking for relevant background footage", query, intentType: "talking_head" }],
+    blocks,
   };
 }

@@ -20,6 +20,7 @@ import {
 import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages } from "@/lib/images/fetch";
 import { verifyPoolAsset } from "@/lib/ai/pool-verification";
+import { lookupReference } from "@/lib/ai/face-references";
 
 // Legacy entity type → closed-world BlockEntityType mapping for the image
 // pool's verification gate (Slice 5 of the matching refactor). The pool
@@ -683,6 +684,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // image when their reference search fails, NEVER to random pool entries.
   // null when the legacy planner is in use.
   let blockVisualPriorities: Array<string | null>;
+  // Closed-world block-entity bindings forwarded from analyze. Replaces
+  // the noisy refs[0]/ents[0] heuristic for picking the image-verify
+  // target — when block_entity is celebrity_default we skip the
+  // reference-driven image search entirely and go straight to the
+  // person fallback so abstract narration never picks up a random image.
+  // Named with a "ClosedWorld" suffix because an unrelated local
+  // `blockEntities` (mentioned-entity hits per block) lives in the same
+  // outer scope further down for clip scoring — different concept, same
+  // word, can't rename without churn so we differentiate the new one.
+  type BlockEntityBinding = { type: BlockEntityType; name: string };
+  let blockClosedWorldEntities: Array<BlockEntityBinding | null>;
   // Real voiceover-time window for each block, from Deepgram word timings
   // via the planner. The matcher writes these onto each timeline item's
   // metadata so script-marker positioning and per-block text slicing can
@@ -705,6 +717,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
     blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
     blockVisualPriorities = planned.map((p) => p.visual_priority ?? null);
+    blockClosedWorldEntities = planned.map((p) =>
+      p.block_entity
+        ? { type: p.block_entity.type as BlockEntityType, name: (p.block_entity.name ?? "").trim() }
+        : null,
+    );
     blockVoStart = planned.map((p) => p.vo_start_seconds ?? null);
     blockVoEnd = planned.map((p) => p.vo_end_seconds ?? null);
   } else {
@@ -716,6 +733,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = blocks.map(() => []);
     blockSubjectTypes = blocks.map(() => null);
     blockVisualPriorities = blocks.map(() => null);
+    blockClosedWorldEntities = blocks.map(() => null);
     blockVoStart = blocks.map(() => null);
     blockVoEnd = blocks.map(() => null);
   }
@@ -981,6 +999,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const newSpecificRefs: typeof blockSpecificRefs = [];
     const newSubjectTypes: typeof blockSubjectTypes = [];
     const newVisualPriorities: typeof blockVisualPriorities = [];
+    const newClosedWorldEntities: typeof blockClosedWorldEntities = [];
     const newVoStart: typeof blockVoStart = [];
     const newVoEnd: typeof blockVoEnd = [];
     const newHints: typeof hints = [];
@@ -997,6 +1016,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         newSpecificRefs.push(blockSpecificRefs[i] ?? []);
         newSubjectTypes.push(blockSubjectTypes[i] ?? null);
         newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        newClosedWorldEntities.push(blockClosedWorldEntities[i] ?? null);
         newVoStart.push(blockVoStart[i] ?? null);
         newVoEnd.push(blockVoEnd[i] ?? null);
         if (i < hints.length) newHints.push(hints[i]);
@@ -1041,6 +1061,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         newSpecificRefs.push(blockSpecificRefs[i] ?? []);
         newSubjectTypes.push(blockSubjectTypes[i] ?? null);
         newVisualPriorities.push(blockVisualPriorities[i] ?? null);
+        newClosedWorldEntities.push(blockClosedWorldEntities[i] ?? null);
         if (srcVoStart != null && srcSpan != null) {
           newVoStart.push(srcVoStart + (k * srcSpan) / slots);
           newVoEnd.push(srcVoStart + ((k + 1) * srcSpan) / slots);
@@ -1061,6 +1082,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     blockSpecificRefs = newSpecificRefs;
     blockSubjectTypes = newSubjectTypes;
     blockVisualPriorities = newVisualPriorities;
+    blockClosedWorldEntities = newClosedWorldEntities;
     blockVoStart = newVoStart;
     blockVoEnd = newVoEnd;
     hints = newHints;
@@ -1480,9 +1502,59 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // clip that gets assigned (intro, scored, or filler) goes into this set
   // before any other block can claim it.
   if (introClipId) usedClipIds.add(introClipId);
+
+  // No-adjacent-same-source rule.
+  //
+  // Per client direction, two consecutive footage rows in the timeline
+  // must not come from the same source video. Even when the same source
+  // produces the highest-scoring clip for both rows, the second row
+  // falls to the next-best candidate from a different source. Eliminates
+  // the "two clips look like one continuous interview" pattern where the
+  // viewer perceives adjacent sub-blocks as a single long held shot.
+  //
+  // The rule is SOFT: if no candidate from a different source exists for
+  // a block, we still pick from the same source (better to repeat than
+  // to leave the row empty). We log the violation so we can audit how
+  // often the variety constraint runs out of options.
+  const clipSourceId = new Map<string, string>();
+  for (const c of clips) {
+    if (c.id && c.video_source_id) {
+      clipSourceId.set(c.id as string, c.video_source_id as string);
+    }
+  }
+  let adjacentSameSourceForced = 0;
+  // Find the source_id of whichever clip is assigned to blockIdx - 1.
+  // Returns null when the previous block has no assignment yet (e.g. its
+  // assignment comes later in the triples scan) or it's not a footage
+  // row at all.
+  function prevSourceFor(blockIdx: number): string | null {
+    if (blockIdx <= 0) return null;
+    const prev = blockAssignments.get(blockIdx - 1);
+    if (!prev) return null;
+    return clipSourceId.get(prev.clipId) ?? null;
+  }
+
+  // Tier 1 pass — TWO sweeps so the variety rule has all info available.
+  // The triples are sorted by score so a greedy single-sweep would let
+  // a high-scoring same-source pick claim a block before we know what
+  // the adjacent blocks will get. We do this in TWO passes:
+  //
+  //   Pass A: walk triples top-down; SKIP any candidate whose source
+  //           matches the previous block's already-assigned source.
+  //           This is where the variety rule fires.
+  //   Pass B: walk triples again; fill any block that's still empty,
+  //           ignoring the source-adjacency rule. This is the soft
+  //           fallback when no different-source candidate was available.
+  //
+  // The two-pass design preserves the original greedy "best score wins"
+  // intuition for blocks where the variety rule doesn't bite, but
+  // guarantees adjacent rows differ when there's any choice at all.
   for (const t of triples) {
     if (blockAssignments.has(t.blockIdx)) continue;
     if (usedClipIds.has(t.clipId)) continue;
+    const prevSrc = prevSourceFor(t.blockIdx);
+    const thisSrc = clipSourceId.get(t.clipId) ?? null;
+    if (prevSrc && thisSrc && prevSrc === thisSrc) continue; // pass A: skip same-source
     blockAssignments.set(t.blockIdx, {
       clipId: t.clipId,
       score: t.score,
@@ -1494,6 +1566,31 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
     usedClipIds.add(t.clipId);
   }
+  // Pass B: backstop. Blocks left empty after pass A get the next-best
+  // candidate even if it shares the previous block's source.
+  for (const t of triples) {
+    if (blockAssignments.has(t.blockIdx)) continue;
+    if (usedClipIds.has(t.clipId)) continue;
+    const prevSrc = prevSourceFor(t.blockIdx);
+    const thisSrc = clipSourceId.get(t.clipId) ?? null;
+    if (prevSrc && thisSrc && prevSrc === thisSrc) {
+      adjacentSameSourceForced++;
+    }
+    blockAssignments.set(t.blockIdx, {
+      clipId: t.clipId,
+      score: t.score,
+      baseScore: t.baseScore,
+      bonus: t.bonus,
+      bonusBreakdown: t.bonusBreakdown,
+      reason: t.reason,
+      tier: "scored",
+    });
+    usedClipIds.add(t.clipId);
+  }
+  await logJob({ projectId, jobId: mediaJobId }, "match.adjacent_source_rule", {
+    forced_same_source: adjacentSameSourceForced,
+    note: "blocks where no different-source candidate existed; the rule is soft",
+  });
 
   // ---- Tier 2: Label-overlap fill for unassigned footage blocks --------
   // Per the user spec: keep 60/40 video:image ratio by filling every
@@ -1529,9 +1626,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const blockText = blockTexts[blockIdx] ?? "";
     const visualPriority = blockVisualPriorities[blockIdx] ?? null;
     const requiresPerson = visualPriority === "person_default" || visualPriority === null;
+    // Same variety rule as Tier 1: prefer a clip whose source differs
+    // from the previous block's source. We do TWO passes — first try
+    // to find an overlap candidate from a different source, then if
+    // nothing qualifies, fall back to any candidate (the rule is soft).
+    const prevSrc = prevSourceFor(blockIdx);
     if (!blockText) {
-      // No words to compare against — fall back to first unused clip
-      // that satisfies the person-visible gate.
+      // No words to compare against — try a different-source clip first,
+      // then fall back to any unused clip that passes the person gate.
+      for (const c of clipsForMatch) {
+        if (usedClipIds.has(c.id)) continue;
+        if (requiresPerson && !clipShowsPerson(c)) continue;
+        const thisSrc = clipSourceId.get(c.id) ?? null;
+        if (prevSrc && thisSrc && prevSrc === thisSrc) continue;
+        return { clipId: c.id, overlap: 0 };
+      }
+      // Fallback pass — same-source allowed.
       for (const c of clipsForMatch) {
         if (usedClipIds.has(c.id)) continue;
         if (requiresPerson && !clipShowsPerson(c)) continue;
@@ -1540,18 +1650,21 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       return null;
     }
     const blockToks = tokenize(blockText);
-    let best: { clipId: string; overlap: number } | null = null;
+    // Pass A — best overlap among DIFFERENT-source candidates.
+    let bestDiff: { clipId: string; overlap: number } | null = null;
+    let bestAny: { clipId: string; overlap: number } | null = null;
     for (const c of clipsForMatch) {
       if (usedClipIds.has(c.id)) continue;
       if (requiresPerson && !clipShowsPerson(c)) continue;
       const labels = clipTokens.get(c.id) ?? new Set();
       let overlap = 0;
       for (const t of labels) if (blockToks.has(t)) overlap++;
-      if (!best || overlap > best.overlap) {
-        best = { clipId: c.id, overlap };
-      }
+      const thisSrc = clipSourceId.get(c.id) ?? null;
+      if (!bestAny || overlap > bestAny.overlap) bestAny = { clipId: c.id, overlap };
+      if (prevSrc && thisSrc && prevSrc === thisSrc) continue;
+      if (!bestDiff || overlap > bestDiff.overlap) bestDiff = { clipId: c.id, overlap };
     }
-    return best;
+    return bestDiff ?? bestAny;
   }
 
   // ---- Block timing (drives reuse cooldown distance) -------------------
@@ -2096,13 +2209,158 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return 0;
   }
 
+  // Per-person photo cache. tryPersonImageFallback builds this lazily on
+  // the first call for each person (block-resolved-subject or main
+  // celebrity), fetches multiple query facets to maximise variety, and
+  // face-verifies every image against the person's reference. Subsequent
+  // calls read from the cache so per-block fallback doesn't pay for
+  // redundant fetches.
+  //
+  // Sized analogously to the entity pool's personFloor: scales with
+  // voiceoverSeconds so a 10-min video gets ~60 unique celebrity images
+  // available to the fallback (vs. the old single-query fetch of 10).
+  // Without this, the celebrity_default short-circuit consumed only the
+  // top of one query's results, ignoring the bigger pool built later.
+  type PersonPhotoCacheEntry = {
+    url: string;
+    source: string;
+    query: string;
+  };
+  const personPhotoCache = new Map<string, PersonPhotoCacheEntry[]>();
+  // Per-person target size for the MAIN celebrity. Same formula as the
+  // entity-pool personFloor. Scales with voiceoverSeconds so a 10-min
+  // video gets ~60 unique celebrity images available to the fallback.
+  const personPhotoTarget = Math.max(20, Math.ceil(voiceoverSeconds / 10));
+
+  // Compute consecutive-run-length per secondary person from the block
+  // entity bindings. Used by Phase 2b to size each secondary's photo
+  // cache: a person mentioned in 8 consecutive blocks (e.g. Simon Cowell
+  // in this project) needs more variety than someone mentioned once.
+  //
+  // This mirrors analyze's findPersonRunsAcrossSegments but runs on the
+  // MATCHER's already-flattened block list, so we don't need to ship
+  // the personRuns map through the analyze payload. The match-time
+  // recompute is cheap (single linear scan) and stays in sync when
+  // block order changes (e.g. via image_block_split).
+  function computeSecondaryPersonRuns(): Map<string, number> {
+    const out = new Map<string, number>();
+    const celebLower = (mainCelebrity ?? "").trim().toLowerCase();
+    let i = 0;
+    while (i < blockClosedWorldEntities.length) {
+      const cur = blockClosedWorldEntities[i];
+      if (!cur || cur.type !== "person") { i++; continue; }
+      const name = cur.name.trim();
+      const lo = name.toLowerCase();
+      if (!name || lo === celebLower) { i++; continue; }
+      let j = i;
+      while (j < blockClosedWorldEntities.length) {
+        const next = blockClosedWorldEntities[j];
+        if (!next || next.type !== "person") break;
+        if (next.name.trim().toLowerCase() !== lo) break;
+        j++;
+      }
+      const run = j - i;
+      const prev = out.get(lo) ?? 0;
+      if (run > prev) out.set(lo, run);
+      i = j;
+    }
+    return out;
+  }
+  const secondaryPersonRuns = computeSecondaryPersonRuns();
+
+  // Map a secondary person's max-run length to a photo-cache target size.
+  // The thresholds mirror the docs-spec narrative weight tiers:
+  //   maxRun >= 6 → "co-main" treatment, larger pool
+  //   maxRun 3-5  → "significant secondary", moderate pool
+  //   maxRun 2    → "brief mention", small pool
+  //   maxRun 1    → 0 → caller skips the cache and uses Wikipedia portrait
+  function secondaryPhotoTargetForRun(maxRun: number): number {
+    if (maxRun >= 6) return Math.min(personPhotoTarget, 30);
+    if (maxRun >= 3) return 15;
+    if (maxRun >= 2) return 8;
+    return 0;
+  }
+
+  async function buildPersonPhotoCache(
+    personName: string,
+    sizeOverride?: number,
+  ): Promise<PersonPhotoCacheEntry[]> {
+    const cached = personPhotoCache.get(personName.toLowerCase());
+    if (cached) return cached;
+    // Caller-provided size override (used by secondary-person path to
+    // scale by maxRun); falls back to the main-celebrity target.
+    const target = sizeOverride ?? personPhotoTarget;
+    if (target <= 0) {
+      // Caller asked for an empty pool (maxRun 1 secondary). Return [] —
+      // they'll fall back to the Wikipedia portrait.
+      personPhotoCache.set(personName.toLowerCase(), []);
+      return [];
+    }
+    const result: PersonPhotoCacheEntry[] = [];
+    const seen = new Set<string>();
+    // Query facets — same set as the entity pool's celebrity floor, kept
+    // in sync deliberately. Each query returns ~10-15 unique URLs after
+    // dedup; with ~85% face-verify pass rate, 10 facets yield ~50-70.
+    // For smaller targets (secondary people with low maxRun) we exit the
+    // outer loop early once the target is reached, so cost scales with
+    // the cache size we actually need.
+    const queries = [
+      `"${personName}"`,
+      `${personName} interview`,
+      `${personName} portrait`,
+      `${personName} red carpet`,
+      `${personName} premiere`,
+      `${personName} press conference`,
+      `${personName} photoshoot`,
+      `${personName} BAFTA`,
+      `${personName} headshot`,
+      `${personName} talk show`,
+    ];
+    for (const q of queries) {
+      if (result.length >= target) break;
+      try {
+        const fetched = await fetchImages(q, 12, { entityType: "celebrity" });
+        for (const f of fetched) {
+          if (seen.has(f.url)) continue;
+          // Face-verify before caching — same gate as the entity pool's
+          // person floor. Stops wrong-person red-carpet co-attendees from
+          // entering the cache. Fail-open on Gemini outage.
+          try {
+            const verdict = await verifyPoolAsset({
+              projectId,
+              entityType: "person",
+              entityName: personName,
+              candidateUrl: f.url,
+            });
+            if (!verdict.accept) continue;
+          } catch {
+            // verify failed (Gemini outage etc.) — keep the candidate
+            // rather than gut the cache.
+          }
+          result.push({ url: f.url, source: f.source, query: q });
+          seen.add(f.url);
+          if (result.length >= target) break;
+        }
+      } catch {
+        // Image search failed for one query — continue with the rest.
+      }
+    }
+    personPhotoCache.set(personName.toLowerCase(), result);
+    void logJob({ projectId, jobId: mediaJobId }, "match.person_photo_cache.built", {
+      person: personName,
+      target,
+      cached: result.length,
+    });
+    return result;
+  }
+
   // Per-block PERSON-image fallback. When a "specific_*" block can't find
   // an image of its exact reference (a tattoo, a wedding, a courthouse),
   // the client spec says: fall back to the PERSON image — never to a
-  // random pool entry. This helper builds the bare-name search for the
-  // block's resolved_subject (or the project celebrity when the subject is
-  // unknown). Returns the first non-duplicate image URL respecting the
-  // image cooldown.
+  // random pool entry. This helper now consults a per-person photo cache
+  // (built lazily on first call) instead of issuing a fresh single-query
+  // fetch every time — giving the celebrity_default short-circuit access
+  // to the same wide pool the entity-pool builder uses.
   async function tryPersonImageFallback(blockIdx: number): Promise<{
     url: string;
     source: string;
@@ -2111,64 +2369,60 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const subj = (blockResolvedSubjects[blockIdx] || mainCelebrity || "").trim();
     if (!subj) return null;
     const nowSec = blockStartSec[blockIdx];
-    try {
-      const fetched = await fetchImages(subj, 10, { entityType: "celebrity" });
-      if (fetched.length === 0) return null;
-      // Three-tier pick. Per client spec: "If an exact image/visual cannot
-      // be found → fallback to the person image. NEVER use random unrelated
-      // visuals." So we MUST return a person image when any exist — even
-      // when they're already used elsewhere in the timeline. Re-showing the
-      // same celebrity photo twice is strictly better than dropping through
-      // to the entity pool and rendering a random brand logo.
-      //
-      //   Tier A — fresh URL outside the reuse cooldown (or never used).
-      //   Tier B — fresh URL ignoring the cooldown but unused by reference
-      //            pass (refUrlSet) — i.e. seen earlier in the timeline as
-      //            another person-fallback, fine to repeat.
-      //   Tier C — any fetched URL, including ones reference-claimed. This
-      //            is the "we'd rather repeat than ship junk" tier.
-      let bestA: typeof fetched[number] | null = null;
-      let bestB: typeof fetched[number] | null = null;
-      let bestBDistance = -Infinity;
-      for (const f of fetched) {
-        if (refUrlSet.has(f.url)) continue;
-        const last = imageUrlLastUsedAt.get(f.url);
-        if (last === undefined) {
-          bestA = f;
-          break;
-        }
-        const dist = nowSec - last;
-        if (dist >= IMAGE_REUSE_COOLDOWN_SEC) {
-          bestA = f;
-          break;
-        }
-        if (dist > bestBDistance) {
-          bestB = f;
-          bestBDistance = dist;
-        }
+    const fetched = await buildPersonPhotoCache(subj);
+    if (fetched.length === 0) return null;
+    // Three-tier pick. Per client spec: "If an exact image/visual cannot
+    // be found → fallback to the person image. NEVER use random unrelated
+    // visuals." So we MUST return a person image when any exist — even
+    // when they're already used elsewhere in the timeline. Re-showing the
+    // same celebrity photo twice is strictly better than dropping through
+    // to the entity pool and rendering a random brand logo.
+    //
+    //   Tier A — fresh URL outside the reuse cooldown (or never used).
+    //   Tier B — fresh URL ignoring the cooldown but unused by reference
+    //            pass (refUrlSet) — i.e. seen earlier in the timeline as
+    //            another person-fallback, fine to repeat.
+    //   Tier C — any fetched URL, including ones reference-claimed. This
+    //            is the "we'd rather repeat than ship junk" tier.
+    let bestA: PersonPhotoCacheEntry | null = null;
+    let bestB: PersonPhotoCacheEntry | null = null;
+    let bestBDistance = -Infinity;
+    for (const f of fetched) {
+      if (refUrlSet.has(f.url)) continue;
+      const last = imageUrlLastUsedAt.get(f.url);
+      if (last === undefined) {
+        bestA = f;
+        break;
       }
-      let pick = bestA ?? bestB;
-      if (!pick) {
-        // Tier C — every fetched image was already in refUrlSet. Pick the
-        // one used longest ago, ignoring refUrlSet. Better to re-show a
-        // person photo than to leave the block for the entity pool.
-        let bestC: typeof fetched[number] | null = null;
-        let bestCDistance = -Infinity;
-        for (const f of fetched) {
-          const last = imageUrlLastUsedAt.get(f.url);
-          const dist = last === undefined ? Infinity : nowSec - last;
-          if (dist > bestCDistance) {
-            bestCDistance = dist;
-            bestC = f;
-          }
-        }
-        pick = bestC;
+      const dist = nowSec - last;
+      if (dist >= IMAGE_REUSE_COOLDOWN_SEC) {
+        bestA = f;
+        break;
       }
-      if (!pick) return null;
-      return { url: pick.url, source: pick.source, query: subj };
-    } catch {
-      return null;
+      if (dist > bestBDistance) {
+        bestB = f;
+        bestBDistance = dist;
+      }
     }
+    let pick = bestA ?? bestB;
+    if (!pick) {
+      // Tier C — every fetched image was already in refUrlSet. Pick the
+      // one used longest ago, ignoring refUrlSet. Better to re-show a
+      // person photo than to leave the block for the entity pool.
+      let bestC: PersonPhotoCacheEntry | null = null;
+      let bestCDistance = -Infinity;
+      for (const f of fetched) {
+        const last = imageUrlLastUsedAt.get(f.url);
+        const dist = last === undefined ? Infinity : nowSec - last;
+        if (dist > bestCDistance) {
+          bestCDistance = dist;
+          bestC = f;
+        }
+      }
+      pick = bestC;
+    }
+    if (!pick) return null;
+    return { url: pick.url, source: pick.source, query: pick.query };
   }
 
   // First pass: walk image blocks in order, try to fill from references.
@@ -2181,6 +2435,203 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const ents = (hints[blockIdx]?.mentioned_entities) ?? [];
     const subjectType = blockSubjectTypes[blockIdx] ?? null;
     const resolvedSubject = blockResolvedSubjects[blockIdx] ?? null;
+    const rawBlockEntity = blockClosedWorldEntities[blockIdx] ?? null;
+    // Defensive null-coalescing. The diagnostic logs showed some image
+    // blocks arrive with blockEntity=null — Gemini occasionally omits
+    // the block_entity field entirely, or it gets lost between the
+    // analyze payload and the matcher's hint forwarding. When that
+    // happens, the legacy reference-driven path uses refs[0]/ents[0]
+    // (common nouns like "transcript", "recordings") and produces
+    // pages of nonsense Gemini rejects. Treat a null binding as
+    // celebrity_default so the same protective short-circuit applies.
+    const blockEntity: BlockEntityBinding =
+      rawBlockEntity ?? { type: "celebrity_default", name: mainCelebrity ?? "" };
+    void logJob({ projectId, jobId: mediaJobId }, "match.image_block_entity_state", {
+      blockIndex: blockIdx,
+      blockEntity: { type: blockEntity.type, name: blockEntity.name },
+      rawWasNull: rawBlockEntity === null,
+      subjectType,
+      refs0: refs[0] ?? null,
+      ents0: ents[0] ?? null,
+    });
+    // Note: text-grounding for block_entity is enforced upstream in
+    // analyze's normalizeBlockEntities — by the time hints reach the
+    // matcher, any non-grounded entity has already been demoted to
+    // celebrity_default. No matcher-side denylist needed.
+
+    // Closed-world short-circuit. When analyze tagged this block as
+    // celebrity_default, the block is abstract narration ("Private
+    // conversations, he would later say. Among friends."). The spec is
+    // explicit: never random visuals — show the project celebrity. Skip
+    // the reference-driven image search (whose refs/ents for these blocks
+    // are common nouns like "private" / "friends" that pull noise like
+    // the "I AM PAKISTANI" graphic) and route directly to the person
+    // fallback. Without this, Gemini's mistyped image blocks slip through
+    // the reference search and produce the random-image failure mode the
+    // user reported.
+    if (blockEntity && blockEntity.type === "celebrity_default") {
+      void logJob({ projectId, jobId: mediaJobId }, "match.image_block_celebrity_default", {
+        blockIndex: blockIdx, name: blockEntity.name || mainCelebrity || null,
+      });
+      refImagesFailed++;
+      const personPick = await tryPersonImageFallback(blockIdx);
+      if (personPick) {
+        refUrlSet.add(personPick.url);
+        imageUrlLastUsedAt.set(personPick.url, blockStartSec[blockIdx]);
+        item.image_url = personPick.url;
+        item.image_query = personPick.query;
+        item.image_source = personPick.source;
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.image_query_used = personPick.query;
+        meta.image_source_url = personPick.url;
+        meta.image_source_provider = personPick.source;
+        meta.image_entity = personPick.query;
+        meta.image_reason = "celebrity_default_short_circuit";
+        meta.image_pick_source = "person_fallback";
+        item.metadata = meta;
+        item.image_entity_type = "celebrity_default";
+        item.image_entity_name = mainCelebrity ?? null;
+        item.image_verified = "yes";
+      }
+      continue;
+    }
+
+    // Hybrid secondary-person policy. When the block's resolved subject is
+    // a NAMED PERSON who is NOT the project celebrity, and we have a
+    // Wikipedia reference image for them in face_references, fill the
+    // block with that reference image and skip the entire fetch path.
+    // This is the matcher half of the analyze-route policy that already
+    // suppressed YouTube searches for short-mention secondary characters
+    // (analyze.intent.skipped_for_photo_path). For runs >= 4 the analyze
+    // route did fetch clips; this code path still runs because:
+    //   (a) the picker UI shows the Wikipedia photo as a fallback option,
+    //   (b) on a 1-block run we never search and the photo is the only
+    //       way to render the block.
+    // The check is intentionally narrow: subject_type must be "person",
+    // resolved_subject must be a non-celebrity name, and the reference
+    // lookup must succeed. Anything else falls through to the existing
+    // reference-driven fetch (which already handles celebrity blocks via
+    // the entity pool / person-floor pre-fetch).
+    if (
+      subjectType === "person" &&
+      resolvedSubject &&
+      mainCelebrity &&
+      resolvedSubject.trim().toLowerCase() !== mainCelebrity.trim().toLowerCase()
+    ) {
+      // Phase 2b: per-secondary photo cache. Before falling back to the
+      // single Wikipedia portrait, try the secondary's own photo pool
+      // (sized by their narrative weight = max consecutive block run).
+      // For Cowell with maxRun=8 this yields ~30 verified Cowell photos
+      // instead of repeating his Wikipedia headshot. For brief mentions
+      // (maxRun=1, e.g. Bruno Tonioli) the target is 0 → cache returns
+      // [] → caller falls through to the Wikipedia portrait as before.
+      const personLower = resolvedSubject.trim().toLowerCase();
+      const maxRun = secondaryPersonRuns.get(personLower) ?? 1;
+      const target = secondaryPhotoTargetForRun(maxRun);
+      if (target > 0) {
+        try {
+          const cache = await buildPersonPhotoCache(resolvedSubject, target);
+          if (cache.length > 0) {
+            const nowSec = blockStartSec[blockIdx];
+            // Three-tier pick mirroring tryPersonImageFallback. We prefer
+            // fresh + uncooled, then fresh + ignoring cooldown, then
+            // longest-since-used.
+            let bestA: PersonPhotoCacheEntry | null = null;
+            let bestB: PersonPhotoCacheEntry | null = null;
+            let bestBDistance = -Infinity;
+            for (const f of cache) {
+              if (refUrlSet.has(f.url)) continue;
+              const last = imageUrlLastUsedAt.get(f.url);
+              if (last === undefined) { bestA = f; break; }
+              const dist = nowSec - last;
+              if (dist >= IMAGE_REUSE_COOLDOWN_SEC) { bestA = f; break; }
+              if (dist > bestBDistance) { bestB = f; bestBDistance = dist; }
+            }
+            let pick = bestA ?? bestB;
+            if (!pick) {
+              let bestC: PersonPhotoCacheEntry | null = null;
+              let bestCDistance = -Infinity;
+              for (const f of cache) {
+                const last = imageUrlLastUsedAt.get(f.url);
+                const dist = last === undefined ? Infinity : nowSec - last;
+                if (dist > bestCDistance) { bestCDistance = dist; bestC = f; }
+              }
+              pick = bestC;
+            }
+            if (pick) {
+              refUrlSet.add(pick.url);
+              imageUrlLastUsedAt.set(pick.url, nowSec);
+              item.image_url = pick.url;
+              item.image_source = pick.source;
+              item.image_query = pick.query;
+              const meta = (item.metadata ?? {}) as Record<string, unknown>;
+              meta.image_query_used = pick.query;
+              meta.image_source_url = pick.url;
+              meta.image_source_provider = pick.source;
+              meta.image_entity = resolvedSubject;
+              meta.image_reason = "secondary_person_pool";
+              meta.image_pick_source = "secondary_person_pool";
+              item.metadata = meta;
+              item.image_entity_type = "person";
+              item.image_entity_name = resolvedSubject;
+              item.image_verified = "yes";
+              void logJob({ projectId, jobId: mediaJobId }, "match.secondary_person_pool", {
+                blockIndex: blockIdx, person: resolvedSubject,
+                cacheSize: cache.length, maxRun,
+              });
+              continue;
+            }
+          }
+        } catch (e) {
+          // Cache build failure is non-fatal — fall through to the
+          // Wikipedia portrait path below so the block still gets a visual.
+          void logJob({ projectId, jobId: mediaJobId }, "match.secondary_person_pool.failed", {
+            blockIndex: blockIdx, person: resolvedSubject,
+            err: (e as Error).message?.slice(0, 120),
+          });
+        }
+      }
+
+      // Wikipedia portrait fallback. Used when:
+      //   - maxRun=1 (we don't build a cache for one-off mentions)
+      //   - cache build returned 0 verified photos
+      //   - all cache photos already consumed by refUrlSet (rare)
+      try {
+        const ref = await lookupReference(projectId, "person", resolvedSubject);
+        if (ref?.reference_url) {
+          item.image_url = ref.reference_url;
+          item.image_source = "wikipedia";
+          item.image_query = `face_reference:${resolvedSubject}`;
+          const meta = (item.metadata ?? {}) as Record<string, unknown>;
+          meta.image_query_used = `face_reference:${resolvedSubject}`;
+          meta.image_source_url = ref.reference_url;
+          meta.image_source_provider = "wikipedia";
+          meta.image_entity = resolvedSubject;
+          meta.image_reason = "secondary_person_photo";
+          meta.image_pick_source = "secondary_person_photo";
+          item.metadata = meta;
+          // Stamp closed-world verification metadata. The reference image
+          // IS the canonical — no Gemini gate needed.
+          item.image_entity_type = "person";
+          item.image_entity_name = resolvedSubject;
+          item.image_verified = "yes";
+          void logJob({ projectId, jobId: mediaJobId }, "match.secondary_person_photo", {
+            blockIndex: blockIdx, person: resolvedSubject,
+          });
+          // Block filled — skip the rest of the per-block fetch path.
+          continue;
+        }
+      } catch (e) {
+        // Lookup failure (DB hiccup, etc.) — fall through to the legacy
+        // fetch path. The matcher's existing fallback chain will still
+        // produce a visual.
+        void logJob({ projectId, jobId: mediaJobId }, "match.secondary_person_photo.lookup_failed", {
+          blockIndex: blockIdx, person: resolvedSubject,
+          err: (e as Error).message?.slice(0, 120),
+        });
+      }
+    }
+
     const refQueries = buildReferenceQueries(refs, resolvedSubject, ents, subjectType);
     // Tier 4 (script-derived): proper-noun phrases lifted straight from the
     // block's narration. This catches references Gemini's hint pipeline
@@ -2229,14 +2680,23 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // failure mode at the source: bad images never reach item.image_url.
         // Routes only the matchable types; subject_type "general" / unknown
         // skips the gate (those queries don't have a clean entity binding).
+        // Closed-world wins when present — block_entity.type is the
+        // analyze-side authoritative binding. Fall back to subject_type
+        // routing for legacy blocks that predate block_entity.
         const verifyType: BlockEntityType | null =
+          blockEntity && blockEntity.type !== "celebrity_default" ? blockEntity.type :
           subjectType === "person" ? "person" :
           subjectType === "company" ? "company" :
           subjectType === "show" ? "tv_show" :
           subjectType === "movie" ? "movie" :
           subjectType === "place" ? "place" :
           null;
-        const verifyName = (refs[0] ?? ents[0] ?? "").trim();
+        // Use the closed-world entity NAME (Gemini's verbatim proper
+        // noun) instead of the first ref/ent — refs[0] often contains
+        // common nouns like "transcript", "announcement", "private"
+        // which produce pages of nonsensical Gemini verify rejections
+        // (`entity_type: "company", entity_name: "transcript"`).
+        const verifyName = (blockEntity?.name || refs[0] || ents[0] || "").trim();
         // Take the first non-duplicate, verification-passing image. The
         // verification call runs inside the find predicate so we stop at
         // the first acceptable URL instead of paying for every candidate
@@ -2659,23 +3119,55 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // normalizeImageUrl). When the celebrity is unknown (rare — non-person-
   // centric video), the floor is skipped and the legacy entity loop runs
   // unchanged.
+  // Scale the celebrity-image floor by voiceover duration, not just by
+  // image-block count. A 10-min video has roughly 2× the image blocks of
+  // a 5-min one BUT the SAME pool size under the old formula because the
+  // cap was `min(imageBlockCount, ...)`. The cooldown (120s) means a tiny
+  // pool produces visible repetition on longer videos. Sized so a 5-min
+  // video gets ~30 unique celebrity images and a 10-min video gets ~60 —
+  // enough that no single image needs to appear more than 2× under the
+  // cooldown rule.
+  //
+  // Floor formula: max(imageBlockCount × 1.0, voiceoverSeconds / 10).
+  // The first term gives at least one unique image per block for short
+  // videos; the second scales with duration for long ones.
   const personFloor = mainCelebrity
-    ? Math.min(imageBlockCount, Math.ceil(imageBlockCount * 0.5))
+    ? Math.max(
+        imageBlockCount,
+        Math.ceil(voiceoverSeconds / 10),
+      )
     : 0;
   poolFetchStats.personFloorTarget = personFloor;
   if (mainCelebrity && personFloor > 0) {
     // Query variants in priority order. The bare quoted name runs first
     // because it returns the highest-precision results; diversified queries
-    // only run if dedup collapsed the bare query down to too few unique
-    // URLs. We keep the variant set small — three extras — because each
-    // call is an HTTP round-trip and the pool's downstream relaxed pass
-    // already provides a safety net.
+    // run after to add facet variety (interview, premiere, BAFTAs, etc.).
+    // Each query is one HTTP round-trip + N×Gemini-verify calls; we break
+    // out of the loop as soon as `pool.length >= personFloor` so we only
+    // pay for queries we actually need.
+    //
+    // Expanded from 4 → 10 facets so the 10-min target floor (~60) is
+    // reachable. Image-search APIs (Brave, CSE) return ~10-15 unique
+    // URLs per query after dedup, so 10 facets × ~6 unique × ~85% verify
+    // pass rate = ~50 images, close to the floor for a 10-min video.
     const celebrityQueries: string[] = [
       `"${mainCelebrity}"`,
       `${mainCelebrity} interview`,
       `${mainCelebrity} portrait`,
-      `${mainCelebrity} shop`,
+      `${mainCelebrity} red carpet`,
+      `${mainCelebrity} premiere`,
+      `${mainCelebrity} press conference`,
+      `${mainCelebrity} photoshoot`,
+      `${mainCelebrity} BAFTA`,
+      `${mainCelebrity} headshot`,
+      `${mainCelebrity} talk show`,
     ];
+    // Face-verify rejection counter so we can see how many fetched URLs
+    // didn't survive the gate. High rejection rate means CSE is returning
+    // press shots with the wrong primary subject (e.g. red-carpet photos
+    // where the celebrity is in the background and the foreground person
+    // dominates the frame — the "woman in yellow" failure mode).
+    let personPoolVerifyRejected = 0;
     for (const cq of celebrityQueries) {
       if (pool.length >= personFloor) break;
       poolFetchStats.entitiesQueried++;
@@ -2689,6 +3181,36 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         }
         for (const f of fetched) {
           if (poolUrlSet.has(f.url)) continue;
+          // Face-verify EVERY candidate image against the celebrity
+          // reference before adding to the pool. Catches the failure
+          // mode where image search returns a related photo (red-carpet
+          // crowd, event guest list page) whose visible subject is
+          // someone OTHER than the celebrity. verifyPoolAsset is the
+          // same helper used in analyze and clipProcessor; verdicts
+          // are cached per-URL so re-fetches of the same image don't
+          // re-charge Gemini.
+          try {
+            const verdict = await verifyPoolAsset({
+              projectId,
+              entityType: "person",
+              entityName: mainCelebrity,
+              candidateUrl: f.url,
+            });
+            if (!verdict.accept) {
+              personPoolVerifyRejected++;
+              void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_rejected", {
+                query: cq, url: f.url,
+                verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+              });
+              continue;
+            }
+          } catch (e) {
+            // Verify failure is fail-open — we keep the candidate so a
+            // Gemini outage doesn't gut the pool. Log it for visibility.
+            void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_failed", {
+              query: cq, url: f.url, err: (e as Error).message?.slice(0, 120),
+            });
+          }
           pool.push({ url: f.url, source: f.source, query: cq, entityType: "celebrity" });
           poolUrlSet.add(f.url);
           poolFetchStats.personImagesPrefetched++;
@@ -2699,6 +3221,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         void logJob({ projectId, jobId: mediaJobId },
           "match.image_fetch.failed", { query: cq, personFloor: true, err: (e as Error).message });
       }
+    }
+    if (personPoolVerifyRejected > 0) {
+      void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_summary", {
+        celebrity: mainCelebrity,
+        rejected: personPoolVerifyRejected,
+        kept: poolFetchStats.personImagesPrefetched,
+      });
     }
   }
 
@@ -3269,6 +3798,34 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .in("kind", ["title_card", "title_card_clip", "lower_third"])
     .order("ordinal");
   if (allMarkerRows && allMarkerRows.length > 0) {
+    // Lower-third → canonical visual override (per client spec).
+    //
+    // For each lower-third anchored to a named noun (Bruno Tonioli,
+    // Guardian, London Palladium, Dixon), we override the underlying
+    // item's visual with the canonical reference image we already fetched
+    // at analyze time and persisted to face_references. This stops the
+    // failure mode where a BRUNO TONIOLI chip sits over a Walliams+Carr
+    // split, or a GUARDIAN chip over BGT stage footage.
+    //
+    // We load every face_references row for the project ONCE and build
+    // an in-memory resolver, so the marker pass stays synchronous and
+    // doesn't fire one DB roundtrip per marker. Rows with no
+    // reference_url (Wikipedia miss at analyze time) are filtered inside
+    // buildResolverContext — they can't drive a visual, so they're
+    // treated as if the entity never existed for resolution purposes.
+    const { data: refRows } = await sb
+      .from("face_references")
+      .select("id, project_id, entity_type, entity_name, source, reference_url, source_page_url, metadata")
+      .eq("project_id", projectId);
+    const { buildResolverContext } = await import("@/lib/gdocs/lower-third-resolver");
+    const resolverCtx = buildResolverContext(
+      (refRows ?? []) as unknown as import("@/lib/ai/face-references").FaceReferenceRow[],
+    );
+    await logJob({ projectId, jobId: mediaJobId }, "match.lower_third_resolver.built", {
+      refRows: refRows?.length ?? 0,
+      withReferenceImage: (refRows ?? []).filter((r) => r.reference_url).length,
+    });
+
     const { applyScriptMarkers } = await import("@/lib/gdocs/markers");
     const stats = applyScriptMarkers(
       items as unknown as import("@/lib/gdocs/markers").TimelineItemDraft[],
@@ -3276,23 +3833,58 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       transcriptWords,
       projectId,
       transcript,
+      resolverCtx,
     );
     await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
+
+    // Audit log: which lower-third markers got a canonical override vs.
+    // were left to the celebrity fallback. Useful for the doc writer to
+    // see which red-marked nouns the system couldn't ground.
+    const overrideAudit = items
+      .map((it, idx) => {
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const ltOv = meta.lower_third_override as Record<string, unknown> | undefined;
+        const lt = meta.lower_third as { text?: string } | undefined;
+        if (!lt) return null;
+        return {
+          itemIdx: idx,
+          markerText: lt.text ?? null,
+          resolved: !!ltOv,
+          entity_type: ltOv?.entity_type ?? null,
+          entity_name: ltOv?.entity_name ?? null,
+          match: ltOv?.match ?? null,
+        };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null);
+    if (overrideAudit.length > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.lower_third_overrides", {
+        total: overrideAudit.length,
+        resolved: overrideAudit.filter((r) => r.resolved).length,
+        unresolved: overrideAudit.filter((r) => !r.resolved).length,
+        rows: overrideAudit,
+      });
+    }
   }
 
   // Recompute the reclaim target AFTER applyScriptMarkers ran. The marker
   // pass can both add (title card + forced footage rows) AND remove (the
-  // dedup pass strips script items overlapping the inserted overlay), so
+  // dedup pass strips script items overlapping the title-card overlay), so
   // the original durationReclaimSeconds calculated from planner blocks
-  // alone no longer reflects reality. We use the live items[] sum vs
-  // voiceoverSeconds to set the actual gap that needs closing. Without
-  // this, a doc-driven project can land 3-5s short of voiceover after
-  // dedup over-removes, and the render-time tolerance check (±3s) rejects
-  // the render with the "Timeline duration must match voiceover" error.
+  // alone no longer reflects reality. We use the live items[] sum vs the
+  // target sum to set the actual gap that needs closing.
+  //
+  // Target sum = voiceoverSeconds. Forced doc clips now play SILENT (per
+  // user direction 2026-05-27) under a continuing narrator voiceover, so
+  // they consume both video-timeline time AND voiceover time — just like
+  // any other footage row. The non-intro item sum should equal
+  // voiceoverSeconds (the previous "+forced clip durations" inflation
+  // only applied when the render-time audio splice paused the narrator,
+  // which is now disabled).
   const liveTimelineSum = items
     .filter((it) => it.type !== "intro")
     .reduce((s, it) => s + Number(it.duration ?? 0), 0);
-  const liveGap = voiceoverSeconds - liveTimelineSum;
+  const targetTimelineSum = voiceoverSeconds;
+  const liveGap = targetTimelineSum - liveTimelineSum;
   if (liveGap > 0.1) {
     // Replace the planner-derived reclaim target with the live gap.
     // Only widen, never narrow — if the planner's reclaim was bigger,
@@ -3566,6 +4158,16 @@ async function loadBlockHintsFromAnalyze(
         // "specific_*" block falls back to the person image, while a
         // "person_default" block routes a person clip directly.
         visual_priority: b.visual_priority,
+        // Closed-world entity binding from analyze. The matcher uses
+        // (type, name) as the verify target and as the routing signal
+        // for celebrity_default blocks (which skip the noisy reference
+        // search and go straight to the person fallback). Without this,
+        // verifyName falls back to refs[0]/ents[0] which often contain
+        // common nouns ("transcript", "announcement") that produce
+        // pages of useless Gemini verify rejections.
+        block_entity: b.block_entity
+          ? { type: b.block_entity.type, name: (b.block_entity.name ?? "").trim() }
+          : undefined,
         // Doc paragraph this hint's narration came from. Drives the
         // planner's no-merge-across-paragraph rule.
         paragraph_index: paragraphIndexForHintText(b.text),

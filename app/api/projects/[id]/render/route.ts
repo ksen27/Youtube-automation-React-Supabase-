@@ -77,15 +77,25 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const introSeconds = Math.max(0, Number(project.intro_duration_seconds) || 0);
   const voiceoverSeconds = Math.max(0, rawVoiceoverSeconds - introSeconds);
 
-  // Require approved timeline with at least some clips
+  // Require approved timeline with at least some clips. We also pull
+  // metadata so forced doc clips (metadata.forced_clip.youtube_url) are
+  // approve-able without clip_id and are excluded from the voiceover-
+  // duration comparison below.
   const { data: items, error: itemsErr } = await sb
     .from("timeline_items")
-    .select("id, type, duration, approved, clip_id")
+    .select("id, type, duration, approved, clip_id, metadata")
     .eq("project_id", id);
   if (itemsErr) return NextResponse.json({ error: itemsErr.message }, { status: 500 });
   if (!items?.length) return NextResponse.json({ error: "timeline is empty" }, { status: 400 });
 
-  const renderable = items.filter((it) => !!it.clip_id);
+  function isForcedClip(it: { type: string; metadata: unknown }): boolean {
+    if (it.type !== "footage") return false;
+    const meta = (it.metadata ?? {}) as Record<string, unknown>;
+    const fc = meta.forced_clip as { youtube_url?: unknown } | undefined;
+    return !!fc?.youtube_url;
+  }
+
+  const renderable = items.filter((it) => !!it.clip_id || isForcedClip(it as { type: string; metadata: unknown }));
   if (renderable.length === 0) {
     return NextResponse.json({ error: "no clips on timeline" }, { status: 400 });
   }
@@ -95,6 +105,13 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
 
   // ---- Dynamic-duration validation -------------------------------------
   // Sum of duration-bearing blocks must be within tolerance of voiceover.
+  // Per user direction (2026-05-27): forced doc clips now play SILENT under
+  // a continuing narrator voiceover (the mid-timeline audio splice is
+  // disabled in renderProcessor), so they consume voiceover time like any
+  // other footage row and MUST be included in this sum. Without this, the
+  // validator under-counts by the forced-clip total and reports a false
+  // "Timeline duration must match voiceover" error even when the actual
+  // timeline matches the voiceover exactly.
   // Duplicate clip_ids are permitted — the same source clip may legitimately
   // appear on the timeline more than once.
   const durationBearing = items.filter((it) =>

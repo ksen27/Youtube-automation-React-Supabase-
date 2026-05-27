@@ -85,6 +85,48 @@ const VideoItemSchema = z.object({
   }).optional(),
 });
 
+// Fetch full metadata for a single YouTube videoId. Used by the
+// "add source by URL" endpoint when the user pastes a YouTube link in
+// the analyze picker — we skip the search.list step (we already know
+// the id) and go straight to videos.list to hydrate snippet + duration
+// + privacy + thumbnails. Returns null when the id doesn't resolve to
+// a public video (deleted / private / blocked-in-country / Shorts).
+//
+// The shape matches what searchYoutube emits so callers can pass the
+// result through rankCandidate without reshaping.
+export async function fetchYoutubeVideoMeta(videoId: string): Promise<YoutubeCandidate | null> {
+  const env = getEnv();
+  if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");
+  const vparams = new URLSearchParams({
+    part: "snippet,contentDetails,status",
+    id: videoId,
+    key: env.YOUTUBE_API_KEY,
+  });
+  const vr = await fetch(`${VIDEOS_URL}?${vparams}`);
+  if (!vr.ok) {
+    const txt = await vr.text().catch(() => "");
+    throw new Error(`YouTube videos.list failed: ${vr.status} ${txt.slice(0, 300)}`);
+  }
+  const vjson = await vr.json();
+  const item = (vjson.items ?? [])[0];
+  if (!item) return null;
+  const safe = VideoItemSchema.safeParse(item);
+  if (!safe.success) return null;
+  return {
+    videoId: safe.data.id,
+    url: `https://www.youtube.com/watch?v=${safe.data.id}`,
+    title: safe.data.snippet.title,
+    description: safe.data.snippet.description ?? "",
+    channelId: safe.data.snippet.channelId,
+    channelTitle: safe.data.snippet.channelTitle,
+    durationSeconds: parseISO8601Duration(safe.data.contentDetails.duration),
+    isLive: safe.data.snippet.liveBroadcastContent === "live"
+          || safe.data.snippet.liveBroadcastContent === "upcoming",
+    privacyStatus: safe.data.status?.privacyStatus ?? "public",
+    aspectRatio: pickAspectRatio(safe.data.snippet.thumbnails),
+  };
+}
+
 export async function searchYoutube(input: SearchInput): Promise<YoutubeCandidate[]> {
   const env = getEnv();
   if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");

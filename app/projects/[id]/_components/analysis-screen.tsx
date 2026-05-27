@@ -9,6 +9,7 @@ import {
   Layers,
   Loader2,
   PlayCircle,
+  RefreshCw,
   Search,
   Sparkles,
 } from "lucide-react";
@@ -36,6 +37,10 @@ interface PreviewCandidate {
   reasons: string[];
   rejected: boolean;
   rejectReason?: string;
+  // Editorial type chip shown on the picker card. Optional because older
+  // saved payloads predate the classifier — those candidates render
+  // without a chip.
+  source_type?: "interview" | "news" | "archival" | "other";
 }
 
 interface SegmentUnderstanding {
@@ -119,8 +124,13 @@ export function AnalysisScreen({
 
   // Hydrate from the saved analyze job so re-visiting the screen doesn't
   // wipe and re-run Gemini + YouTube search. The POST handler persists the
-  // full AnalyzeResponse in media_jobs.metadata.payload.
-  const savedQ = useQuery<{ payload: AnalyzeResponse | null }>({
+  // full AnalyzeResponse in media_jobs.metadata.payload, and the PUT
+  // handler stores the user's last source-video selection in
+  // metadata.selectedVideoIds so picks survive navigation.
+  const savedQ = useQuery<{
+    payload: AnalyzeResponse | null;
+    selectedVideoIds: string[] | null;
+  }>({
     queryKey: ["analyze", projectId],
     queryFn: async () => {
       const r = await fetch(`/api/projects/${projectId}/analyze`);
@@ -171,12 +181,62 @@ export function AnalysisScreen({
       setOpenSegments(new Set([0]));
       setPhase("results");
       // Refresh the saved-payload cache so a future remount re-hydrates from
-      // the new run instead of the previous one.
-      qc.setQueryData(["analyze", projectId], { payload: d });
+      // the new run instead of the previous one. selectedVideoIds=null so
+      // the rehydration path uses the "top 5 per segment" default for this
+      // fresh run; subsequent user toggles will get persisted via the
+      // debounced PUT below.
+      qc.setQueryData(["analyze", projectId], { payload: d, selectedVideoIds: null });
     },
     onError: (e) => {
       setError(e.message);
       setPhase("error");
+    },
+  });
+
+  // Manually add a YouTube URL to a specific segment's candidate pool.
+  // The backend hydrates metadata, runs the same rank+verify filters as
+  // the AI search, and (on accept) returns a candidate row in the same
+  // shape the analyze step emits. We splice it into the segment's
+  // candidates state so the new card shows up immediately, and
+  // auto-select it (the user explicitly chose this URL — opt-in by
+  // default matches the existing "top 5 pre-selected" UX).
+  const addSource = useMutation<
+    { accepted: boolean; reason?: string; candidate?: PreviewCandidate },
+    Error,
+    { videoUrl: string; segmentIndex: number }
+  >({
+    mutationFn: async ({ videoUrl, segmentIndex }) => {
+      const r = await fetch(`/api/projects/${projectId}/analyze/add-source`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoUrl, segmentIndex }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? `Failed (${r.status})`);
+      return j;
+    },
+    onSuccess: (j, vars) => {
+      if (!j.accepted || !j.candidate) return;
+      // Mutate the in-memory analyze payload so the picker re-renders
+      // with the new card. We do this immutably so React detects the
+      // change.
+      setData((cur) => {
+        if (!cur) return cur;
+        const next = { ...cur, segments: cur.segments.map((s) => ({ ...s })) };
+        const seg = next.segments.find((s) => s.index === vars.segmentIndex);
+        if (!seg) return cur;
+        seg.candidates = [...seg.candidates, j.candidate!];
+        seg.plan = { ...seg.plan, generatedClips: seg.candidates.length };
+        return next;
+      });
+      // Auto-select the new candidate. Skip if the user happened to
+      // already select it via a duplicate paste somewhere.
+      setSelected((cur) => {
+        if (cur.has(j.candidate!.videoId)) return cur;
+        const next = new Set(cur);
+        next.add(j.candidate!.videoId);
+        return next;
+      });
     },
   });
 
@@ -208,12 +268,30 @@ export function AnalysisScreen({
     // Wait for the saved-payload fetch to settle before deciding what to do.
     if (savedQ.isLoading) return;
     const saved = savedQ.data?.payload ?? null;
+    const savedSelected = savedQ.data?.selectedVideoIds ?? null;
     if (saved) {
       // Rehydrate prior results — no Gemini/YouTube spend on re-visit.
       setData(saved);
       const initial = new Set<string>();
-      for (const seg of saved.segments) {
-        for (const c of seg.candidates.slice(0, 5)) initial.add(c.videoId);
+      if (savedSelected && savedSelected.length > 0) {
+        // User has a saved selection from a previous visit — restore exactly
+        // what they had checked. Filter to IDs that still exist in the
+        // current payload (stale IDs that were removed from candidates
+        // should not appear as ghost selections).
+        const validIds = new Set<string>();
+        for (const seg of saved.segments) {
+          for (const c of seg.candidates) validIds.add(c.videoId);
+        }
+        for (const v of savedSelected) {
+          if (validIds.has(v)) initial.add(v);
+        }
+      } else {
+        // No saved selection (first visit after analyze, or migrating from
+        // a payload that predates this feature) — fall back to the top 5
+        // candidates per segment as the AI-suggested default.
+        for (const seg of saved.segments) {
+          for (const c of seg.candidates.slice(0, 5)) initial.add(c.videoId);
+        }
       }
       setSelected(initial);
       setOpenSegments(new Set([0]));
@@ -227,6 +305,33 @@ export function AnalysisScreen({
     if (autoStart && !clipsStillDownloading) runAnalyze.mutate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoStart, savedQ.isLoading, savedQ.data, clipsStillDownloading]);
+
+  // Debounced persistence of the user's source-video selection.
+  //
+  // Toggling a card updates the local `selected` Set immediately for
+  // snappy UI. We then PUT the full set to the analyze endpoint after
+  // ~500ms of idle so a burst of rapid toggles only writes once at the
+  // end. Without this, navigating away and coming back used to silently
+  // re-run the top-5-per-segment default and wipe the user's actual
+  // picks.
+  //
+  // Skip the save while phase is still "idle" (rehydration just
+  // populated `selected` from the saved set — re-saving it immediately
+  // is a no-op write) or "confirming" / "done" (the confirm-sources
+  // endpoint takes over from here; no point recording further toggles).
+  useEffect(() => {
+    if (phase !== "results") return;
+    if (!data) return;
+    const ids = Array.from(selected);
+    const timer = setTimeout(() => {
+      void fetch(`/api/projects/${projectId}/analyze`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedVideoIds: ids }),
+      }).catch(() => { /* best-effort — failure leaves the in-memory state correct */ });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [selected, phase, data, projectId]);
 
   const totals = useMemo(() => {
     if (!data) return { selected: 0, segments: 0, durationSec: 0 };
@@ -304,6 +409,42 @@ export function AnalysisScreen({
         <SegmentSkeletons />
       ) : (
         <>
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-sm text-fg-muted">
+              Not happy with these results? Re-run analysis to regenerate segments and source candidates.
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={
+                runAnalyze.isPending ||
+                phase === "confirming" ||
+                phase === "done" ||
+                clipsStillDownloading
+              }
+              onClick={() => {
+                if (
+                  typeof window !== "undefined" &&
+                  !window.confirm(
+                    "Re-analyze this project? Existing source candidates and selections will be replaced.",
+                  )
+                ) {
+                  return;
+                }
+                setSelected(new Set());
+                setOpenSegments(new Set());
+                setData(null);
+                runAnalyze.mutate();
+              }}
+            >
+              {runAnalyze.isPending ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              Re-analyze
+            </Button>
+          </div>
           <SummaryStrip
             durationSec={totals.durationSec}
             segmentCount={totals.segments}
@@ -330,6 +471,10 @@ export function AnalysisScreen({
                   else next.add(videoId);
                   setSelected(next);
                 }}
+                onAddSource={(videoUrl) =>
+                  addSource.mutateAsync({ videoUrl, segmentIndex: seg.index })
+                }
+                addingSource={addSource.isPending}
               />
             ))}
           </div>
@@ -477,15 +622,25 @@ function SegmentPanel({
   onToggle,
   selectedIds,
   onToggleVideo,
+  onAddSource,
+  addingSource,
 }: {
   segment: SegmentAnalysis;
   open: boolean;
   onToggle: () => void;
   selectedIds: Set<string>;
   onToggleVideo: (videoId: string) => void;
+  onAddSource: (videoUrl: string) => Promise<{ accepted: boolean; reason?: string }>;
+  addingSource: boolean;
 }) {
   const u = segment.understanding;
   const segSelected = segment.candidates.filter((c) => selectedIds.has(c.videoId)).length;
+  // Manual-add-source state. Lives inside SegmentPanel because each
+  // segment has its own input — the user picks which segment a URL
+  // belongs to by where they paste it.
+  const [addUrl, setAddUrl] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addBusy, setAddBusy] = useState(false);
 
   return (
     <Card className="overflow-hidden">
@@ -577,6 +732,57 @@ function SegmentPanel({
             </TabsContent>
 
             <TabsContent value="sources" className="px-5 pb-5 mt-4">
+              {/* Manual add-source input. Lets the editor paste a known-good
+                YouTube URL and append it to this segment's candidate pool.
+                The backend runs the same rank + verify filters as the AI
+                search; a rejected URL surfaces the reason inline so the
+                user can pick a different one. Sits above the candidate
+                grid so it's always visible alongside the cards. */}
+              <form
+                className="mb-3 flex items-stretch gap-2"
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const url = addUrl.trim();
+                  if (!url) return;
+                  setAddBusy(true);
+                  setAddError(null);
+                  try {
+                    const res = await onAddSource(url);
+                    if (res.accepted) {
+                      setAddUrl("");
+                    } else {
+                      setAddError(res.reason ?? "Could not add this video.");
+                    }
+                  } catch (err) {
+                    setAddError((err as Error).message);
+                  } finally {
+                    setAddBusy(false);
+                  }
+                }}
+              >
+                <input
+                  type="url"
+                  value={addUrl}
+                  onChange={(e) => { setAddUrl(e.target.value); setAddError(null); }}
+                  placeholder="Paste YouTube URL to add as a source…"
+                  className="flex-1 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm placeholder:text-fg-subtle focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  disabled={addBusy || addingSource}
+                />
+                <Button
+                  type="submit"
+                  variant="outline"
+                  size="sm"
+                  disabled={!addUrl.trim() || addBusy || addingSource}
+                >
+                  {addBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add source"}
+                </Button>
+              </form>
+              {addError && (
+                <div className="mb-3 flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                  <span>{addError}</span>
+                </div>
+              )}
               {segSelected < 3 && segment.candidates.length >= 3 && (
                 <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
                   <AlertCircle className="h-3.5 w-3.5 shrink-0" />
@@ -594,6 +800,7 @@ function SegmentPanel({
                   {segment.candidates.map((c) => (
                     <VideoCard
                       key={c.videoId}
+                      videoId={c.videoId}
                       thumbnail={c.thumbnailUrl}
                       title={c.title}
                       channel={c.channelTitle}
@@ -601,6 +808,7 @@ function SegmentPanel({
                       score={c.displayScore}
                       rawScore={c.score}
                       reasons={c.reasons}
+                      sourceType={c.source_type}
                       selected={selectedIds.has(c.videoId)}
                       onToggle={() => onToggleVideo(c.videoId)}
                     />

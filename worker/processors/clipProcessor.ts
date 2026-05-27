@@ -14,6 +14,7 @@ import {
   getEnv,
 } from "@/lib/env";
 import { labelClipFromThumbnail, isJunkCategory } from "@/lib/ai/gemini";
+import { verifyPoolAsset } from "@/lib/ai/pool-verification";
 
 export async function processClipJob(data: ClipJobData): Promise<void> {
   const env = getEnv();
@@ -58,6 +59,25 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const { data: project } = await sb
     .from("projects").select("voiceover_duration_seconds, intro_source_youtube_url").eq("id", projectId).single();
   const projectCap = computeProjectClipCap(project?.voiceover_duration_seconds ?? null);
+
+  // Load the project's main celebrity once. Used by the per-clip face-
+  // verification pass below to check each cut's thumbnail against the
+  // Wikipedia reference photo. Without it, a 9-minute source whose video
+  // thumbnail shows the celebrity passes analyze but produces cuts that
+  // only contain the co-host — the failure the user reported on blocks
+  // 31/32/34 (Walliams apology blocks filled with Cowell footage).
+  let mainCelebrityForVerify: string | null = null;
+  if (env.CLIP_FACE_VERIFY_ENABLED) {
+    const { data: entRows } = await sb
+      .from("project_entities")
+      .select("value, confidence")
+      .eq("project_id", projectId)
+      .eq("type", "celebrity")
+      .order("confidence", { ascending: false })
+      .limit(1);
+    const top = (entRows ?? [])[0];
+    mainCelebrityForVerify = top?.value ? String(top.value).trim() : null;
+  }
   // When the user supplied an explicit intro URL + timestamp, the renderer
   // cuts the intro directly from that source and ignores anything tagged
   // intro_candidate in the matched pool. Skipping the t=0 candidate here
@@ -65,39 +85,75 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // having to score a candidate it will never use.
   const userIntroProvided = !!(project?.intro_source_youtube_url as string | null | undefined)?.trim();
 
-  // Divide the project cap evenly across all sources so every downloaded
-  // source contributes clips, instead of the first few hogging the budget.
-  // Floor the source count to MAX_VIDEOS_PER_PROJECT so the very first clip
-  // job (when only its own source row exists) doesn't grab the whole budget.
+  // Per-source clip quota.
+  //
+  // Two signals drive the quota:
+  //   1. Voiceover duration — `projectCap` is already computed from this
+  //      via computeProjectClipCap (footageBlocks × oversampling). Longer
+  //      narration → larger project budget.
+  //   2. Number of selected sources — divide the project budget by the
+  //      source count so every selected source gets a guaranteed share.
+  //
+  // The previous version used a project-wide ledger: whichever clip jobs
+  // ran first consumed the project cap, and the last source could land
+  // with zero clips because earlier jobs ate everything ("project clip
+  // budget already met" skip). That defeated the purpose of letting the
+  // user pick multiple sources for variety — a 7th selected source could
+  // contribute nothing.
+  //
+  // New rule: each source's quota is computed UP FRONT from the source
+  // count, and a source is only skipped when ITS OWN quota is already
+  // filled (e.g. on re-runs). The project may end up slightly over the
+  // soft cap when ceil-divided quotas don't add up exactly to projectCap,
+  // which is fine — projectCap is sized via oversampling so a few extra
+  // clips just give the matcher more candidates.
   const { count: sourceCountRaw } = await sb
     .from("video_sources").select("id", { count: "exact", head: true }).eq("project_id", projectId);
+  // Floor the source count to MAX_VIDEOS_PER_PROJECT so the very first
+  // clip job (when only its own source row exists) doesn't grab the
+  // whole budget — preserves the pre-existing safety guard.
   const sourceCount = Math.max(env.MAX_VIDEOS_PER_PROJECT, sourceCountRaw ?? 1);
-  const perSourceCap = Math.max(1, Math.ceil(projectCap / sourceCount));
+  const perSourceQuota = Math.max(1, Math.ceil(projectCap / sourceCount));
 
-  const { count: existingCount } = await sb
-    .from("video_clips").select("id", { count: "exact", head: true }).eq("project_id", projectId);
-  const projectRemaining = projectCap - (existingCount ?? 0);
-  if (projectRemaining <= 0) {
-    // Mark source as fully handled — otherwise it stays stuck at 'downloaded'
-    // and looks like in-flight work to anything checking pipeline state.
+  // Count clips THIS source has already produced FOR THIS PROJECT (not
+  // the whole project, not cross-project). A source is skipped ONLY
+  // when it has already met its own quota — that happens on retry /
+  // re-run, never on first pass.
+  //
+  // The video_sources row is upsert-by-youtube_video_id (see
+  // downloadProcessor), so the same row is reused across projects that
+  // pick the same YouTube URL. Without scoping by project_id, this
+  // count would include video_clips left over from prior projects that
+  // used the same source — sources that have never produced a single
+  // clip for THIS project would skip with "source quota already met".
+  const { count: existingForThisSource } = await sb
+    .from("video_clips").select("id", { count: "exact", head: true })
+    .eq("video_source_id", videoSourceId)
+    .eq("project_id", projectId);
+  const remainingForThisSource = perSourceQuota - (existingForThisSource ?? 0);
+  if (remainingForThisSource <= 0) {
+    // This source already produced its quota — typical on a retry. Mark
+    // it clipped and move on.
     await sb.from("video_sources").update({ status: "clipped" }).eq("id", videoSourceId);
     await setMediaJob(mediaJobId, {
       status: "completed", progress: 100,
       metadata: {
         videoSourceId,
-        skipped_reason: "project_clip_cap_reached",
-        skipped: "project clip cap reached",
-        projectCap,
-        existingCount,
+        skipped_reason: "source_quota_already_met",
+        skipped: "source quota already met",
+        perSourceQuota,
+        existingForThisSource,
       },
     });
     await maybeEnqueueMatch(projectId);
     return;
   }
 
-  // Per-source cap, bounded by what the project still has budget for and
-  // by the per-video ceiling.
-  const targetCount = Math.min(env.MAX_CLIPS_PER_VIDEO, perSourceCap, projectRemaining);
+  // Per-source target, bounded by what THIS source still owes us and by
+  // the per-video ceiling. We deliberately do NOT bound by remaining
+  // project budget here — that's what caused the "7th source skipped to
+  // zero" behaviour. Every source is guaranteed its quota slice.
+  const targetCount = Math.min(env.MAX_CLIPS_PER_VIDEO, remainingForThisSource);
 
   // Cap targetCount at what the source can physically yield as
   // non-overlapping windows. Without this, short sources (e.g. 20s)
@@ -191,9 +247,9 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       cappedCount,
       duration: vs.duration_seconds,
       projectCap,
-      perSourceCap,
+      perSourceQuota,
       sourceCount,
-      existingCount,
+      existingForThisSource,
       timestampSource,
       sceneCount,
       introHeadAdded: introTimestampIndex >= 0,
@@ -288,6 +344,179 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       if (isIntroHead) labelSet.add(INTRO_CANDIDATE_LABEL);
       // Phase B provenance — same for every clip from this source.
       for (const p of provenanceLabels) labelSet.add(p);
+
+      // Face-reference verification — MULTI-FRAME edition.
+      //
+      // The single-thumbnail check missed clips where the auto-sampled
+      // frame was a wide panel shot (4 judges, faces tiny, all uncertain)
+      // even when the rest of the clip had a clear close-up of the
+      // celebrity. We now sample THREE frames per clip — start, middle,
+      // end — and short-circuit as soon as ANY frame returns a confident
+      // "yes". This catches the BGT judges-table case the user flagged
+      // where the thumbnail was a wide shot but the clip itself was a
+      // Walliams close-up.
+      //
+      // Aggregation rules (in order, first hit wins):
+      //   any frame yes        → overall = yes  (keep, full bonus)
+      //   all frames no        → overall = no   (reject — person_gate drops it)
+      //   any uncertain/mixed  → overall = uncertain (keep, half bonus)
+      //   all frames skipped   → overall = skipped (no reference)
+      //
+      // Cost: up to 3× the single-frame cost (~$0.003 per clip). We
+      // short-circuit on the first "yes" so well-shot clips usually
+      // pay only 1 call.
+      //
+      // The intro candidate is exempt — it has its own dedicated
+      // verifier path in the matcher.
+      if (env.CLIP_FACE_VERIFY_ENABLED && mainCelebrityForVerify && !isIntroHead) {
+        // Generate two additional thumbnails (middle and end). The
+        // "start+1" thumbnail is already on disk and uploaded.
+        const midSec = start + Math.max(1, Math.floor(dur / 2));
+        // Clip is `dur` seconds long; sample at end-1 to avoid empty
+        // tail frames on clips that scene-detect snapped tightly.
+        const endSec = start + Math.max(1, Math.floor(dur) - 1);
+        const thumbMidLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}_mid.jpg`);
+        const thumbEndLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}_end.jpg`);
+        const thumbMidDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_mid.jpg`;
+        const thumbEndDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_end.jpg`;
+        const tempDeleteList: string[] = [];
+        const frameVerdicts: Array<"yes" | "no" | "uncertain" | "skipped"> = [];
+        const frameReasons: string[] = [];
+
+        async function verifyOne(url: string, label: string): Promise<"yes" | "no" | "uncertain" | "skipped"> {
+          try {
+            const v = await verifyPoolAsset({
+              projectId,
+              entityType: "person",
+              entityName: mainCelebrityForVerify!,
+              candidateUrl: url,
+            });
+            frameReasons.push(`${label}=${v.verdict}`);
+            return v.verdict;
+          } catch (e) {
+            void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+              "clip.face_verify.frame_failed", {
+                start, frame: label, err: (e as Error).message?.slice(0, 120),
+              });
+            return "skipped";
+          }
+        }
+
+        try {
+          // Start frame (the existing thumbnail, already uploaded).
+          const startVerdict = await verifyOne(thumbUp.publicUrl, "start");
+          frameVerdicts.push(startVerdict);
+
+          // Mid frame. Sample regardless of start verdict so the
+          // aggregation has enough signal to apply the majority rule
+          // (see "Aggregate" below). Earlier versions short-circuited on
+          // start=yes, but that let clips through where the celebrity
+          // appears for ~1s of a 6s clip and the rest shows contestants
+          // (failure mode the user flagged on blocks 102 / 107).
+          if (midSec > start + 1) {
+            try {
+              await generateThumbnail({
+                inputPath: sourceLocal, outputPath: thumbMidLocal, atSeconds: midSec,
+              });
+              const midUp = await uploadFile(thumbMidLocal, thumbMidDest, "image/jpeg");
+              tempDeleteList.push(thumbMidDest);
+              const midVerdict = await verifyOne(midUp.publicUrl, "mid");
+              frameVerdicts.push(midVerdict);
+            } catch (e) {
+              void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+                "clip.face_verify.mid_frame_failed", {
+                  start, err: (e as Error).message?.slice(0, 120),
+                });
+            } finally {
+              await safeUnlink(thumbMidLocal);
+            }
+          }
+
+          // End frame — always sample (was previously gated on
+          // !includes("yes"); now we collect all three so majority
+          // aggregation can apply consistently).
+          if (endSec > midSec + 1 && endSec < start + dur) {
+            try {
+              await generateThumbnail({
+                inputPath: sourceLocal, outputPath: thumbEndLocal, atSeconds: endSec,
+              });
+              const endUp = await uploadFile(thumbEndLocal, thumbEndDest, "image/jpeg");
+              tempDeleteList.push(thumbEndDest);
+              const endVerdict = await verifyOne(endUp.publicUrl, "end");
+              frameVerdicts.push(endVerdict);
+            } catch (e) {
+              void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+                "clip.face_verify.end_frame_failed", {
+                  start, err: (e as Error).message?.slice(0, 120),
+                });
+            } finally {
+              await safeUnlink(thumbEndLocal);
+            }
+          }
+
+          // Aggregate via MAJORITY rule. The previous "any yes wins"
+          // rule was too lenient — a 6s clip with the celebrity visible
+          // for only 1s would pass as "yes" because one of the three
+          // sampled frames happened to land on them, even though 5/6
+          // seconds show contestants / co-judges / wide shots. The
+          // viewer perceives the clip as "wrong character" because the
+          // celebrity isn't on screen most of the time.
+          //
+          // New rule:
+          //   yes  count >= ceil(N/2)  → overall yes
+          //   no   count >= ceil(N/2)  → overall no
+          //   all  skipped             → skipped
+          //   otherwise                → uncertain
+          //
+          // For N=3 frames, this means 2+ yes for "yes" and 2+ no for
+          // "no". Mixed verdicts (1 yes + 2 uncertain, or 1 yes + 1 no
+          // + 1 uncertain) fall through to uncertain — the matcher's
+          // person-first bonus halves for uncertain, making these clips
+          // less competitive against confirmed-yes clips.
+          const yesCount = frameVerdicts.filter((v) => v === "yes").length;
+          const noCount = frameVerdicts.filter((v) => v === "no").length;
+          const skippedCount = frameVerdicts.filter((v) => v === "skipped").length;
+          const total = frameVerdicts.length;
+          const majority = Math.ceil(total / 2);
+          const overallVerdict: "yes" | "no" | "uncertain" | "skipped" =
+            total === 0 ? "skipped" :
+            skippedCount === total ? "skipped" :
+            yesCount >= majority ? "yes" :
+            noCount >= majority ? "no" :
+            "uncertain";
+
+          labelSet.add(`face_verify: ${overallVerdict}`);
+          if (overallVerdict === "no") {
+            for (const l of Array.from(labelSet)) {
+              if (l.startsWith("subject_present:")) labelSet.delete(l);
+            }
+            labelSet.add("subject_present: no");
+            await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+              "clip.face_verify.rejected", {
+                start, person: mainCelebrityForVerify,
+                frames: frameReasons.join(","), framesChecked: frameVerdicts.length,
+              });
+          } else if (frameVerdicts.length > 1) {
+            // Successful multi-frame check — useful signal for tuning.
+            await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+              "clip.face_verify.multi_frame", {
+                start, overall: overallVerdict,
+                frames: frameReasons.join(","), framesChecked: frameVerdicts.length,
+              });
+          }
+        } catch (e) {
+          void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+            "clip.face_verify.failed", { start, err: (e as Error).message?.slice(0, 120) });
+        } finally {
+          // Best-effort cleanup of the extra thumbnails uploaded for
+          // verification. Failure to delete here doesn't affect the
+          // clip — just leaves orphaned files in R2.
+          if (tempDeleteList.length > 0) {
+            await removeFiles(tempDeleteList);
+          }
+        }
+      }
+
       const labels = Array.from(labelSet);
       await sb.from("video_clips").insert({
         project_id: projectId,

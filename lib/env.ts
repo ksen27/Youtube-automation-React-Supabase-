@@ -33,6 +33,46 @@ const ServerEnvSchema = z.object({
   // Toggle for the per-clip Gemini Vision labeler. Costs ~$0.001 per clip;
   // disable when running cost-sensitive tests.
   CLIP_LABELING_ENABLED: z.coerce.boolean().default(true),
+  // Toggle for per-clip face-reference verification. After each clip is cut,
+  // compare its thumbnail against the project celebrity's Wikipedia photo
+  // via verifyPoolAsset. Clips that fail get tagged subject_present:no so
+  // the matcher's existing person-gate drops them from person_default
+  // blocks. Costs one Gemini Vision call per clip (~$0.001) and stops the
+  // "wrong person in the clip" failure mode where the source thumbnail
+  // shows the celebrity but a cut mid-video shows only a co-host.
+  CLIP_FACE_VERIFY_ENABLED: z.coerce.boolean().default(true),
+  // Master toggle for analyze-time face verification. When false, both the
+  // thumbnail check AND the body-frame check are skipped — candidates are
+  // accepted based on rankCandidate score alone. The verify code path is
+  // kept (modules + DB table + per-call wiring) so this flag can be
+  // flipped back on without code changes. Default false: the new
+  // narration-aware query construction below targets the story beat
+  // specifically (e.g. "David Walliams Britain's Got Talent transcript
+  // 2022" instead of generic "David Walliams interview"), so on-topic
+  // candidates land first and the verify gate's value drops. Re-enable
+  // when face-recognition is needed to filter look-alike thumbnails.
+  ANALYZE_FACE_VERIFY_ENABLED: z.coerce.boolean().default(false),
+  // Toggle for analyze-time body-frame verification. In addition to the
+  // single mqdefault.jpg check, sample YouTube's auto-generated frames
+  // 1.jpg / 2.jpg / 3.jpg (taken at 25%/50%/75% of the video) and verify
+  // each against the celebrity reference. Rejects "thumbnail bait" sources
+  // where the custom thumbnail shows the celebrity but the body doesn't —
+  // reaction videos, "what really happened" explainers, BGT audition
+  // montages, etc. Costs ~3 extra Gemini Vision calls per candidate
+  // (~$0.003) but stops the user from selecting source videos that will
+  // produce zero useful clips. Only consulted when
+  // ANALYZE_FACE_VERIFY_ENABLED is true.
+  ANALYZE_BODY_VERIFY_ENABLED: z.coerce.boolean().default(true),
+  // Toggle for the character-anchored query lane at analyze time. In
+  // addition to script-aware queries (which target the story's specific
+  // events), run a fixed set of templated queries against the project
+  // celebrity: "{name} interview", "{name} talk show", "{name} red
+  // carpet", etc. These return videos where the celebrity is the
+  // on-screen subject (clean person footage) rather than the topic of
+  // discussion — exactly the content the matcher needs to fill abstract
+  // "celebrity_default" blocks. Results merge into every segment's pool
+  // and compete with story-aware candidates via the existing ranker.
+  ANALYZE_CHARACTER_LANE_ENABLED: z.coerce.boolean().default(true),
   MAX_VIDEOS_PER_PROJECT: z.coerce.number().int().positive().default(5),
   MIN_SUCCESSFUL_VIDEOS_PER_PROJECT: z.coerce.number().int().nonnegative().default(2),
   MAX_FALLBACK_PROMOTIONS_PER_PROJECT: z.coerce.number().int().nonnegative().default(5),
@@ -149,21 +189,21 @@ export function getEnv(): ServerEnv {
   return cached;
 }
 
-// Clip duration is now variable: when scene-detect provides both a start
+// Clip duration is variable: when scene-detect provides both a start
 // boundary and a next-boundary, we cut the clip to land exactly on that
 // next boundary so the user never sees a mid-clip scene change. The result
 // is clamped to [MIN, MAX]. Uniform-fallback clips (when scene-detect fails)
 // stay at DEFAULT.
 //
-// Sized so a single clip can cover the longest footage block the planner
-// emits (a 10-12s sentence). When clips were uniformly 5s, the matcher had
-// to clamp every long footage block down to 5s — which made the timeline
-// fall short of the voiceover by tens of seconds even though there was
-// plenty of clip material. The default lands in the middle so uniform
-// fallback gives a usable hold for typical-length sentences.
+// Per client direction, clips now target ~6s instead of the previous 9s.
+// The planner also splits long sentences into multiple sub-blocks (see
+// FOOTAGE_HOLD_SECONDS in timeline-plan.ts), so even a 12s narration
+// sentence produces two ~6s clips from different sources instead of one
+// long talking-head hold. MAX is 7s — gives the scene-detect snapping a
+// small margin of headroom without re-introducing 10-12s clips.
 export const CLIP_DURATION_MIN_SECONDS = 5;
-export const CLIP_DURATION_MAX_SECONDS = 12;
-export const CLIP_DURATION_DEFAULT_SECONDS = 9;
+export const CLIP_DURATION_MAX_SECONDS = 7;
+export const CLIP_DURATION_DEFAULT_SECONDS = 6;
 // Back-compat alias — anything that still imports this gets the default.
 export const CLIP_DURATION_SECONDS = CLIP_DURATION_DEFAULT_SECONDS;
 

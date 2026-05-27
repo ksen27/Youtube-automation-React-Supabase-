@@ -18,6 +18,10 @@
 // re-sorting, and re-writing the whole timeline. Same effect, more risk.
 
 import type { WordTiming } from "@/lib/ai/deepgram";
+import {
+  resolveLowerThird,
+  type LowerThirdResolverContext,
+} from "@/lib/gdocs/lower-third-resolver";
 
 export interface TimelineItemDraft {
   project_id: string;
@@ -30,6 +34,11 @@ export interface TimelineItemDraft {
   overlay_text: string | null;
   metadata: Record<string, unknown>;
   approved: boolean;
+  // image_url / right_image_url are written by matchProcessor on items that
+  // resolve to image / split_2 visuals. We touch image_url here when a
+  // lower-third's noun resolves to a canonical reference image (the noun
+  // overrides whatever visual the matcher previously assigned).
+  image_url?: string | null;
 }
 
 export interface ScriptMarkerRow {
@@ -235,12 +244,70 @@ export interface ApplyMarkersResult {
   lowerThirdsSkipped: number;
 }
 
+// Override a single timeline item's visual to the canonical reference
+// image for a lower-third's noun, when the noun resolves to a roster
+// entity.
+//
+// Per the client spec, a lower-third anchored to a named noun MUST
+// show that noun's canonical image on screen: a person photo for a
+// named person, a logo for a company, a poster for a movie/show, cover
+// art for a song, a building photo for a place. The matcher's earlier
+// visual assignment for this item is replaced.
+//
+// resolveLowerThird returns null for:
+//   - abstract concepts ("ten year run", "ceremony", "lawsuit")
+//   - bare dates / years
+//   - nouns that don't map to any roster entity (Wikipedia miss)
+//   - ambiguous last-name matches (two Cowells in the script)
+// In all these cases the item is left alone — the existing assignment
+// (usually the project celebrity) keeps showing, which matches the
+// spec's celebrity_default fallback. We stamp lower_third_unresolved on
+// the metadata so the audit log surfaces which doc nouns couldn't be
+// grounded.
+function applyLowerThirdVisualOverride(
+  item: TimelineItemDraft,
+  markerText: string,
+  resolverCtx?: LowerThirdResolverContext,
+): void {
+  if (!resolverCtx) return;
+  const meta = (item.metadata ?? {}) as Record<string, unknown>;
+  const resolution = resolveLowerThird(markerText, resolverCtx);
+  if (resolution) {
+    item.image_url = resolution.reference_url;
+    item.type = "image";
+    item.clip_id = null;
+    // Clear split_2 / footage metadata so the renderer takes the
+    // single-image path. Leave lower_third + block_index alone —
+    // downstream logs and renderer text overlays still need them.
+    delete meta.right_image_url;
+    delete meta.left_image_url;
+    delete meta.clip_duration;
+    delete meta.duration_clamped;
+    meta.lower_third_override = {
+      entity_type: resolution.entity_type,
+      entity_name: resolution.entity_name,
+      match: resolution.match,
+      reference_url: resolution.reference_url,
+    };
+  } else {
+    meta.lower_third_unresolved = true;
+  }
+  item.metadata = meta;
+}
+
 export function applyScriptMarkers(
   items: TimelineItemDraft[],
   markers: ScriptMarkerRow[],
   words: WordTiming[] | null | undefined,
   projectId: string,
   transcript: string,
+  // Optional resolver: when provided, every lower-third's noun is run
+  // through resolveLowerThird against the project's face_references roster.
+  // If the noun maps to a canonical entity with a reference image, the
+  // item carrying the lower-third has its visual overridden to that image
+  // (item.image_url + item.type="image"). Pass undefined to skip the
+  // override and keep the legacy text-stamp-only behaviour.
+  resolverCtx?: LowerThirdResolverContext,
 ): ApplyMarkersResult {
   const result: ApplyMarkersResult = {
     titleCardsInserted: 0,
@@ -638,6 +705,7 @@ export function applyScriptMarkers(
     }
     meta.lower_third = { text: marker.text, type: "doc_marker", marker_id: marker.id };
     items[k].metadata = meta;
+    applyLowerThirdVisualOverride(items[k], marker.text, resolverCtx);
     result.lowerThirdsApplied++;
   }
 
@@ -737,13 +805,7 @@ export function applyScriptMarkers(
     const k = findItemIndexAtTime(currentStarts, items, group.parentT);
     if (k < 0) { result.titleCardsSkipped++; continue; }
 
-    // Voiceover-time cursor: advanced as we build each row so every row's
-    // script_text reflects what the narrator is saying during its own
-    // window. Title card starts at `parentT` (the title's spoken moment),
-    // forced footage continues from where the title ends, and stacked
-    // extras chain after the first forced footage.
-    let voCursor = group.parentT;
-    function forcedFootageFromMarker(m: ScriptMarkerRow): TimelineItemDraft {
+    function forcedFootageFromMarker(m: ScriptMarkerRow, voStart: number): TimelineItemDraft {
       const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
       const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
       const dur = Math.max(1, end - start);
@@ -755,13 +817,15 @@ export function applyScriptMarkers(
       const ytIdMatch = m.youtube_url?.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|v\/)([A-Za-z0-9_-]{11})/);
       const ytId = ytIdMatch?.[1] ?? null;
       const thumbnailUrl = ytId ? `https://i.ytimg.com/vi/${ytId}/mqdefault.jpg` : null;
-      // Capture the narration spoken in this clip's voiceover window so
-      // the editor shows the script text the user will hear under this
-      // clip, instead of "No script text".
-      const voStart = voCursor;
-      const voEnd = voCursor + dur;
-      const scriptText = spokenTextInWindow(wordsNN, voStart, voEnd);
-      voCursor = voEnd;
+      // Forced clips now play SILENT (per user direction 2026-05-27) — the
+      // mid-timeline audio splice is disabled in renderProcessor, so the
+      // narrator voiceover keeps playing under the clip's video. That means
+      // the forced row occupies real narrator time and should show the
+      // spoken words for its window in script_text — same as any other
+      // footage row. Without this the editor shows "No script text" on the
+      // forced clip and the words that were spoken during its window
+      // appear on the NEXT row, making the timeline look desynced.
+      const scriptText = spokenTextInWindow(wordsNN, voStart, voStart + dur);
       return {
         project_id: projectId,
         clip_id: null,
@@ -776,6 +840,12 @@ export function applyScriptMarkers(
           pick_source: "doc_marker_forced",
           doc_marker_id: m.id,
           thumbnail_url: thumbnailUrl,
+          // Voiceover-time window for this forced clip, mirroring what the
+          // planner stamps on regular footage rows. Used by the lower-third
+          // rescue pass downstream and by any post-pass that maps timeline
+          // items back to audio position.
+          vo_start_seconds: voStart,
+          vo_end_seconds: voStart + dur,
           // Pin the row's duration so the post-processor's duration_reclaim
           // pass leaves it alone. Forced clips are cut to a fixed YouTube
           // window (start_seconds..end_seconds); stretching the row past
@@ -800,7 +870,6 @@ export function applyScriptMarkers(
       group.parentT,
       group.parentT + group.parentDuration,
     );
-    voCursor = group.parentT + group.parentDuration;
     const titleCardRow: TimelineItemDraft = {
       project_id: projectId,
       clip_id: null,
@@ -825,20 +894,33 @@ export function applyScriptMarkers(
       },
       approved: false,
     };
-    const rows: TimelineItemDraft[] = [titleCardRow, forcedFootageFromMarker(group.parent)];
+    // Forced clips play in sequence right after the title card. Their
+    // voiceover windows are back-to-back starting at parentT + parentDuration,
+    // and each row's script_text is sliced from the spoken words inside its
+    // own window so the editor shows the right narration on each clip.
+    let forcedVoCursor = group.parentT + group.parentDuration;
+    const parentForced = forcedFootageFromMarker(group.parent, forcedVoCursor);
+    forcedVoCursor += Number(parentForced.duration);
+    const rows: TimelineItemDraft[] = [titleCardRow, parentForced];
     for (const extra of group.extras) {
-      rows.push(forcedFootageFromMarker(extra));
+      const extraForced = forcedFootageFromMarker(extra, forcedVoCursor);
+      forcedVoCursor += Number(extraForced.duration);
+      rows.push(extraForced);
     }
 
     // Compute the overlay window in voiceover-time before we mutate
-    // items. We use this below to remove any subsequent script items
-    // whose narration falls entirely inside the overlay — their
-    // script_text already appears on the title card / forced footage
-    // rows (those rows pulled the spoken words via spokenTextInWindow
-    // above), so leaving them as separate scenes shows the same line
-    // of narration twice in the editor.
+    // items. With forced clips now playing SILENT (per user direction
+    // 2026-05-27) under a continuing narrator voiceover, BOTH the
+    // title_card AND its trailing forced-footage rows consume narrator
+    // time. The overlay window spans the entire inserted block —
+    // [parentT, parentT + parentDuration + sum(forced clip durations)) —
+    // so the dedup pass below removes every script item whose narration
+    // window falls under the title card OR its forced clips. Without
+    // this, a script item's narration would play twice (once on the
+    // forced footage row, once on the script item just past the
+    // overlay), creating the audio/visual desync the user reported.
     const overlayWindowStart = group.parentT;
-    const overlayWindowEnd = group.parentT + rows.reduce((s, r) => s + r.duration, 0);
+    const overlayWindowEnd = forcedVoCursor;
 
     // Align the title card's video-time position with the narrator's
     // title-start moment.
@@ -915,7 +997,14 @@ export function applyScriptMarkers(
     //
     // Intro rows are never removed — they live on a different time axis
     // (pre-roll, not voiceover).
-    const insertedDuration = rows.reduce((s, r) => s + r.duration, 0);
+    // Title_card AND its forced-footage rows all consume narrator time
+    // now (forced clips play silent under a continuing voiceover, per
+    // user direction 2026-05-27). The dedup pass must absorb script
+    // items totaling the full inserted block — otherwise script items
+    // covering the forced clips' narration window remain in the timeline,
+    // their voiceover plays under both the forced clip AND the script
+    // item, and the timeline runs long.
+    const insertedDuration = rows.reduce((s, r) => s + Number(r.duration ?? 0), 0);
     let absorbedDuration = 0;
     const afterOverlayIdx = k + rows.length;
     // Track lower-thirds rescued from items the dedup pass is about to
@@ -1042,6 +1131,7 @@ export function applyScriptMarkers(
             ...(lt.marker_id ? { marker_id: lt.marker_id } : {}),
           };
           target.row.metadata = targetMeta;
+          applyLowerThirdVisualOverride(target.row, lt.text, resolverCtx);
           continue;
         }
         // Case (b): outside the forced-footage window. Find the surviving
@@ -1063,6 +1153,7 @@ export function applyScriptMarkers(
           ...(lt.marker_id ? { marker_id: lt.marker_id } : {}),
         };
         best.item.metadata = bestMeta;
+        applyLowerThirdVisualOverride(best.item, lt.text, resolverCtx);
       }
     }
   }

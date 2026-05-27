@@ -11,6 +11,13 @@ export interface CutClipOptions {
   outputPath: string;
   startSeconds: number;
   durationSeconds: number;
+  // Retain the source's audio track on the cut. Default false — most clip
+  // cuts feed into a downstream concat that pairs silent video with the
+  // project voiceover. Forced doc clips that should play their own audio
+  // pass this true (and `normalizeClip` is called the same way) so the
+  // audio extraction step downstream sees the audio track on the trimmed
+  // file.
+  keepAudio?: boolean;
   signal?: AbortSignal;
 }
 
@@ -34,15 +41,20 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
   // -avoid_negative_ts make_zero resets PTS to start at 0; without it some
   // players show a brief black frame at the start because the first packet's
   // PTS reflects its keyframe-relative position in the source.
-  // -an because source downloads are video-only — final voiceover is mixed in
-  // during concat, not from clip audio.
+  // -an by default — final voiceover is mixed in during concat, not from
+  // clip audio. Forced doc clips that need their own audio surfaced pass
+  // keepAudio:true; we then stream-copy the source's audio packet stream
+  // alongside the video instead of dropping the track. AAC is the only
+  // codec we trust in MP4; if the source is something else (e.g. opus
+  // inside a WebM), the caller should have already remuxed via yt-dlp's
+  // post-processing.
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
     "-ss", String(opts.startSeconds),
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
-    "-an",
+    ...(opts.keepAudio ? ["-c:a", "aac"] : ["-an"]),
     "-c:v", "copy",
     "-avoid_negative_ts", "make_zero",
     "-movflags", "+faststart",
@@ -69,11 +81,14 @@ export async function buildStillVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
-  // Direction of the slow zoom applied to the still so it doesn't read as a
-  // frozen frame. "in" crops a shrinking window over time (zoom-in feel);
-  // "out" crops an expanding window (zoom-out feel). Caller alternates per
-  // image so consecutive stills don't move identically. Defaults to "in".
-  motionDirection?: "in" | "out";
+  // Motion applied to the still so it doesn't read as a frozen frame.
+  //   "in"        — crops a shrinking window over time (zoom-in feel).
+  //   "out"       — crops an expanding window (zoom-out feel).
+  //   "pan_left"  — constant zoom; window slides from right edge to left.
+  //   "pan_right" — constant zoom; window slides from left edge to right.
+  // Caller cycles through the four modes per consecutive image so adjacent
+  // stills never move identically. Defaults to "in".
+  motionDirection?: "in" | "out" | "pan_left" | "pan_right";
   // Optional lower-third overlay. Same semantics as normalizeClip — when the
   // matcher's minute-cadence picker lands on an image block, the renderer
   // burns the proper-noun text in via the shared drawtext recipe.
@@ -141,13 +156,34 @@ export async function buildStillVideo(opts: {
   const ZOOM_MAX = 1.12;
   const dur = Math.max(0.1, opts.durationSeconds);
   const totalFrames = Math.max(1, Math.round(dur * fps));
-  const zStart = direction === "in" ? 1.0 : ZOOM_MAX;
-  const zEnd = direction === "in" ? ZOOM_MAX : 1.0;
   // Linear time ramp on the on-frame counter `on` (0..totalFrames-1).
   // Clamped so the very last frame doesn't overshoot past zEnd due to
   // rounding of totalFrames.
   const tRamp = `min(on/${totalFrames - 1}\\,1)`;
+
+  // Build the per-frame zoom (z), x, and y expressions for the chosen
+  // motion mode. For zoom-in/out, x/y are fixed at center. For pan modes,
+  // zoom is fixed at ZOOM_MAX (so there's a crop window smaller than the
+  // input) and x animates from one edge to the other while y stays
+  // centered.
+  const isPan = direction === "pan_left" || direction === "pan_right";
+  const zStart = isPan ? ZOOM_MAX : (direction === "in" ? 1.0 : ZOOM_MAX);
+  const zEnd = isPan ? ZOOM_MAX : (direction === "in" ? ZOOM_MAX : 1.0);
   const zExpr = `${zStart}+(${zEnd}-${zStart})*${tRamp}`;
+  // x window position. At zoom=Z, the visible width inside the source is
+  // iw/Z, so x can range over [0, iw - iw/Z].
+  //   pan_right: x ramps 0 → iw - iw/Z   (window slides rightward)
+  //   pan_left : x ramps iw - iw/Z → 0   (window slides leftward)
+  //   zoom    : x = iw/2 - iw/(2*Z)      (centered)
+  const xExpr = direction === "pan_right"
+    ? `(iw-iw/zoom)*${tRamp}`
+    : direction === "pan_left"
+      ? `(iw-iw/zoom)*(1-${tRamp})`
+      : `iw/2-(iw/zoom/2)`;
+  // y stays centered for every mode — vertical pan was not in the client
+  // spec and most stills are landscape-ish so a vertical pan would tend
+  // to show the matte edge.
+  const yExpr = `ih/2-(ih/zoom/2)`;
 
   // Blurred-background composite: split the input into BG and FG streams.
   // BG covers the full frame (overshoot + center-crop), then heavy gblur so
@@ -185,7 +221,7 @@ export async function buildStillVideo(opts: {
     // default d=25 holds frames and ruins the motion.
     `[fgsrc]scale=${ssW}:${ssH}:force_original_aspect_ratio=decrease:flags=lanczos,` +
       `pad=${ssW}:${ssH}:-1:-1:color=#00000000,format=yuva420p,` +
-      `zoompan=z='${zExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'` +
+      `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}'` +
         `:d=1:s=${w}x${h}:fps=${fps},setsar=1[fg];` +
     `[bg][fg]overlay=0:0:format=auto,format=yuv420p${ltSuffix}`;
 
@@ -588,6 +624,62 @@ function wrapTitleCardText(text: string, maxCharsPerLine: number): string[] {
 // pipeline to extract the [start, end] segment of the source's audio that
 // matches the chosen intro video clip. AAC re-encode is fast and keeps the
 // container compatible with the renderer's filter graph.
+// Strip the audio out of a video file, re-encoding to AAC so the result
+// is concat-compatible with the other audio segments built by cutAudio /
+// concatAudioFiles. Used by the forced-clip audio-splice pass: each
+// forced doc clip's MP4 still carries its source audio (because cutClip /
+// normalizeClip were called with keepAudio:true); this function pulls
+// that audio into a standalone .m4a so it can be stitched into the
+// voiceover chain.
+//
+// If the input has no audio stream at all, the resulting file is a
+// silent track of the same duration — we don't error out, because a
+// rare "video-only forced clip" should still play silently rather than
+// failing the whole render.
+export async function extractAudio(opts: {
+  inputPath: string;
+  outputPath: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputPath,
+    "-vn",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// Generate a silent AAC audio segment of the given duration. Used as a
+// neutral filler when a forced clip's audio extraction fails or the
+// source clip has no audio track — the splice still produces a track
+// of the correct length so the spliced voiceover matches the video
+// timeline.
+export async function buildSilentAudio(opts: {
+  outputPath: string;
+  durationSeconds: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-f", "lavfi",
+    "-i", `anullsrc=channel_layout=stereo:sample_rate=44100`,
+    "-t", String(Math.max(0.05, opts.durationSeconds)),
+    "-c:a", "aac",
+    "-b:a", "192k",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 export async function cutAudio(opts: {
   inputPath: string;
   outputPath: string;
@@ -694,6 +786,12 @@ export interface NormalizeOptions {
   // burned in via ffmpeg's drawtext filter for the first ~3 seconds with a
   // fade in/out, sitting in the lower-third zone with a translucent bar.
   lowerThird?: { text: string };
+  // Retain the source's audio track on the normalized output. Default
+  // false — the downstream concat builds the final audio from the
+  // voiceover, so individual clips are silent. Forced doc clips that
+  // should play their own audio pass true; the renderer then extracts
+  // that audio for splicing into the voiceover chain.
+  keepAudio?: boolean;
   signal?: AbortSignal;
 }
 
@@ -734,28 +832,29 @@ async function resolveLowerThirdFont(): Promise<string | null> {
   return null;
 }
 
-// Build the drawtext filter chain for a 3-second lower-third with fade in/out.
-// Broadcast-chyron style: solid blue rectangle, white bold all-caps text
-// inside, anchored to the lower-third zone (≈ 80% of frame height). Padding
-// around the glyphs comes from drawtext's `boxborderw`. Pinned bottom-left
-// with a small left margin so the box reads like a TV news caption.
+// Build the drawtext filter chain for a 3-second lower-third with a
+// slide-in-from-left effect. Broadcast-chyron style: solid blue rectangle,
+// white bold all-caps text inside, anchored to the lower-third zone (≈ 80%
+// of frame height). Padding around the glyphs comes from drawtext's
+// `boxborderw`. The chip slides in horizontally from off-screen left to a
+// left-margin rest position, holds, then slides back out to the left.
+//
+// Per the client's "lower third should appear with effect on the screen"
+// note, replaced the previous fade in/out (which read as a static chip
+// that just got brighter) with a horizontal slide. The slide reads as a
+// real broadcast lower-third entrance — viewer's eye is drawn to it
+// instead of registering the chip as already-there.
+//
 // Returns null if no font is available on the host.
 async function buildLowerThirdFilter(text: string, height: number): Promise<string | null> {
   const font = await resolveLowerThirdFont();
   if (!font) return null;
-  // Show for the first 3 seconds of the clip with 0.4s fade in/out. The
-  // alpha expression evaluates per-frame: 0→1 over [0, 0.4], 1 through 2.6,
-  // 1→0 over [2.6, 3.0], 0 after.
+  // Timing: 0.4s slide in, 2.6s hold, 0.4s slide out. Total 3.4s.
   const start = 0;
-  const fadeIn = 0.4;
+  const slideIn = 0.4;
   const hold = 2.6;
-  const fadeOut = 0.4;
-  const end = start + fadeIn + hold + fadeOut;
-  const alphaExpr =
-    `'if(lt(t,${start}),0,` +
-    `if(lt(t,${start + fadeIn}),(t-${start})/${fadeIn},` +
-    `if(lt(t,${start + fadeIn + hold}),1,` +
-    `if(lt(t,${end}),(${end}-t)/${fadeOut},0))))'`;
+  const slideOut = 0.4;
+  const end = start + slideIn + hold + slideOut;
   const fontPath = font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:");
   // Upper-case the text to match the broadcast chyron convention
   // ("PANG BOURNE IN BERKSHIRE"). Doing it here rather than in drawtext's
@@ -777,14 +876,42 @@ async function buildLowerThirdFilter(text: string, height: number): Promise<stri
   // Drawtext exposes `text_h` at draw time, so anchor via expression.
   const yExpr = `h-${bottomInset}-text_h-${boxPad}`;
 
+  // Slide-in from the left.
+  //
+  // The chip's left edge moves between two x positions:
+  //   off-screen   = -(text_w + boxborderw*2)  — fully past the left edge
+  //   rest         = leftMargin               — final chyron position
+  //
+  // Timing (matches the start/slideIn/hold/slideOut constants above):
+  //   t <  start                    → fully off-screen
+  //   start..start+slideIn         → linear ramp off → rest
+  //   start+slideIn..+hold         → held at rest
+  //   start+slideIn+hold..end      → linear ramp rest → off
+  //   t >= end                      → fully off-screen
+  //
+  // We use ffmpeg's nested `if(lt(t,...), A, B)` so the expression is one
+  // line and compatible with the worker's ffmpeg 4.4 expression evaluator
+  // (no min/max chains, no `between()`).
+  const offX = `-(text_w+${boxPad * 2})`;
+  const restX = `${leftMargin}`;
+  // (rest - off) * progress  +  off  → linear interpolation from off → rest
+  const slideInExpr = `((${restX})-(${offX}))*((t-${start})/${slideIn})+(${offX})`;
+  // (off - rest) * progress + rest  → linear interpolation from rest → off
+  const slideOutExpr = `((${offX})-(${restX}))*((t-${start + slideIn + hold})/${slideOut})+(${restX})`;
+  const xExpr =
+    `'if(lt(t,${start}),${offX},` +
+    `if(lt(t,${start + slideIn}),${slideInExpr},` +
+    `if(lt(t,${start + slideIn + hold}),${restX},` +
+    `if(lt(t,${end}),${slideOutExpr},${offX}))))'`;
+
   // Blue (#1E5BC9) matches the reference screenshot; white bold text inside.
-  // boxcolor's alpha applies the same fade as the text via the chain's alpha.
+  // No alpha ramp — the chip is fully opaque whenever it's on-screen. The
+  // motion is what reads as the entrance/exit effect.
   const filter = (
     `drawtext=fontfile='${fontPath}':text='${escaped}':` +
     `fontcolor=white:fontsize=${fontsize}:` +
     `box=1:boxcolor=0x1E5BC9:boxborderw=${boxPad}:` +
-    `x=${leftMargin}:y=${yExpr}:` +
-    `alpha=${alphaExpr}`
+    `x=${xExpr}:y=${yExpr}`
   );
   // One-shot diagnostic: log the first filter string we build per process
   // so we can verify the exact drawtext arguments going to ffmpeg. After
@@ -833,7 +960,7 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
     "-i", opts.inputPath,
-    "-an",
+    ...(opts.keepAudio ? ["-c:a", "aac"] : ["-an"]),
     "-vf", vf,
     "-c:v", "libx264",
     "-preset", "ultrafast",
