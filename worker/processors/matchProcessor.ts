@@ -799,10 +799,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       const rebuiltHints: BlockPlanHint[] = built.blocks.map((b, i) => {
         const sIdx = built.blockSentenceIndex[i];
         const enr = enrichment.perSentence[sIdx];
+        // BlockPlanHint.recommended_visual_type is narrower than the
+        // builder's PlannedBlock type — it excludes "intro" and "split_4".
+        // The builder demotes split_4 internally and never emits intro
+        // (intros are a render-time prefix, not a block), but TS doesn't
+        // know that, so narrow explicitly.
+        const recommendedVisualType: BlockPlanHint["recommended_visual_type"] =
+          b.type === "intro" || b.type === "split_4" ? "footage" : b.type;
         return {
           text: b.text,
           resolved_subject: b.resolved_subject,
-          recommended_visual_type: b.type === "intro" ? "footage" : b.type,
+          recommended_visual_type: recommendedVisualType,
           section_title: b.section_title,
           specific_visual_references: enr?.specific_visual_references ?? [],
           mentioned_entities: enr?.mentioned_entities ?? [],
@@ -4385,7 +4392,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         const want = Math.max(1.0, scaled);
         const capped = Math.min(want, ceiling);
         it.duration = capped;
-        cumulative += it.duration;
+        // Use the local `capped` value (not it.duration) for the running
+        // sum — items[] is typed loosely so reading it.duration back
+        // returns `unknown`, breaking the addition.
+        cumulative += capped;
         if (want > capped) {
           leftover.push({ it, want, ceiling });
         }
@@ -4400,7 +4410,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         const want = Math.max(1.0, Math.round((adjustableTarget - cumulative) * 10) / 10);
         const capped = Math.min(want, tailCeiling);
         tail.duration = capped;
-        cumulative += tail.duration;
+        cumulative += capped;
       }
       // If we still undershoot the target (expand case where many footage
       // rows hit their clip ceilings), distribute the gap across IMAGE

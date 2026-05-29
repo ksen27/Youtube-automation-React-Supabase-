@@ -427,11 +427,14 @@ export function buildBlockSequenceFromTranscript(
     // Demote Gemini title_card recommendations to footage — title cards
     // come EXCLUSIVELY from blue-bold doc markers, never from Gemini.
     // Matches the policy already in matchProcessor.ts:4195-4198.
+    //
+    // Note: split_4 is NOT in the VisualType enum so it can never appear
+    // here. The matchProcessor.ts has a defensive split_4 → image downgrade
+    // for the legacy hint path which historically allowed split_4; the
+    // new builder consumes the strict VisualType set so the check would
+    // be dead code (and now a TS error).
     let effectiveType: PlannedBlockWithHint["type"] = enr.recommended_visual_type;
     if (effectiveType === "title_card") effectiveType = "footage";
-    // Split_4 isn't rendered today — downgrade to image (same policy as
-    // matchProcessor.ts:833-837).
-    if (effectiveType === "split_4") effectiveType = "image";
 
     const sentenceDuration = Math.max(0.1, s.vo_end - s.vo_start);
     const groupId = groupIds[i];
