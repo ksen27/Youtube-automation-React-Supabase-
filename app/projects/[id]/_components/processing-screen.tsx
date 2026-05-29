@@ -16,6 +16,7 @@ const PIPELINE_STEPS = [
 type MediaJob = JobsResp["media_jobs"][number];
 
 export function ProcessingScreen({
+  projectId,
   jobs,
   onRetry,
 }: {
@@ -30,6 +31,41 @@ export function ProcessingScreen({
   // that is the one whose status reflects what the user can act on.
   const mediaJobs = dedupeDownloadJobs(rawMediaJobs);
   const failedCount = mediaJobs.filter((j) => j.status === "failed").length;
+
+  // Re-run the match step on the existing clip pool. Used when the user
+  // wants to retry without re-running the whole pipeline (e.g. a previous
+  // match degraded silently from Gemini 503s, or the matcher's algorithm
+  // was updated and we want to re-apply it). The rematch endpoint wipes
+  // the current timeline_items first, so this is a clean restart of
+  // step 04 only.
+  const [rematching, setRematching] = useState(false);
+  const [rematchError, setRematchError] = useState<string | null>(null);
+  const matchState = aggregateState("match", mediaJobs);
+  const hasReadyClips = sources.some((s) => s.status === "clipped");
+  // Only show the rematch button when:
+  //   • A match has already finished (done OR failed) — no point clicking
+  //     it while a match is still running
+  //   • There are ready clips to match against (otherwise the endpoint
+  //     refuses with 400)
+  const canRematch = (matchState === "done" || matchState === "failed") && hasReadyClips;
+  async function handleRematch() {
+    setRematching(true);
+    setRematchError(null);
+    try {
+      const r = await fetch(`/api/projects/${projectId}/rematch`, { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error || `rematch failed: ${r.status}`);
+      }
+      // Kick the parent to refetch jobs so the UI flips back to "running"
+      // for step 04 immediately, without waiting for the next poll tick.
+      onRetry?.();
+    } catch (e) {
+      setRematchError((e as Error).message);
+    } finally {
+      setRematching(false);
+    }
+  }
 
   const downloadState = aggregateState("download", mediaJobs);
   const clipState = aggregateState("clip", mediaJobs);
@@ -131,6 +167,33 @@ export function ProcessingScreen({
               Retry failed
             </Button>
           )}
+        </div>
+      )}
+
+      {canRematch && (
+        <div className="rounded-[10px] border border-border bg-surface p-4 flex items-start gap-3">
+          <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-brand-500/15 text-brand-300">
+            ↻
+          </div>
+          <div className="flex-1">
+            <p className="text-sm font-medium text-fg">
+              Re-run matching
+            </p>
+            <p className="text-xs text-fg-muted mt-0.5">
+              Rebuild the timeline against the current clips. The previous draft is discarded.
+            </p>
+            {rematchError && (
+              <p className="text-xs text-danger mt-1">{rematchError}</p>
+            )}
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleRematch}
+            disabled={rematching}
+          >
+            {rematching ? "Starting…" : "Re-match"}
+          </Button>
         </div>
       )}
     </div>
