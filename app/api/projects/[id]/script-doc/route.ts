@@ -142,6 +142,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     ...parsedScript.introCards.map(markerToRow.bind(null, id)),
     ...parsedScript.titleCards.map(markerToRow.bind(null, id)),
     ...parsedScript.lowerThirds.map(markerToRow.bind(null, id)),
+    // Standalone overall-video opening title — at most ONE per project.
+    // The renderer prepends a 5s black title-card to the final video
+    // before the intro clips play. Skipped when the doc has no Pattern B
+    // intro (no title above the first timestamp).
+    ...(parsedScript.openingTitle ? [markerToRow(id, parsedScript.openingTitle)] : []),
   ];
   let insertedMarkers: Array<{
     id: string;
@@ -231,6 +236,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     introCards: parsedScript.introCards,
     titleCards: parsedScript.titleCards,
     lowerThirds: parsedScript.lowerThirds,
+    openingTitle: parsedScript.openingTitle,
     jobsEnqueued,
     clipsReused,
   });

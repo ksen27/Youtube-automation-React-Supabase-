@@ -37,7 +37,14 @@ export type ScriptMarkerKind =
   // adjacency: title_card_clip rows always immediately follow their
   // title_card row in the ordinal stream.
   | "title_card_clip"
-  | "lower_third";
+  | "lower_third"
+  // Standalone OVERALL-VIDEO title rendered as a 5s black title-card
+  // BEFORE the intro clips play. Set when the doc starts with a blue-bold
+  // title paragraph followed by an intro-style bare timestamp (Pattern B
+  // in the intro walk). Carries only `text` and `ordinal` — no
+  // youtube_url / paragraph_index / char_offset because it's a pure
+  // video-prefix card with no source clip.
+  | "opening_title";
 
 export interface ScriptMarker {
   kind: ScriptMarkerKind;
@@ -70,6 +77,12 @@ export interface ParsedScript {
   introCards: ScriptMarker[];
   titleCards: ScriptMarker[];
   lowerThirds: ScriptMarker[];
+  // Optional standalone overall-video title. Set when the doc starts with
+  // a blue-bold title paragraph followed by an intro timestamp (Pattern B).
+  // null when the doc starts with a bare timestamp (Pattern A) or has no
+  // intro at all. The renderer prepends a 5s black title-card to the
+  // final video when this is set.
+  openingTitle: ScriptMarker | null;
 }
 
 // Blue = web-link blue or any blue-ish foreground color. Docs API exposes
@@ -251,6 +264,11 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
   // Either pattern can repeat; the screenshot the user shared stacks two
   // Pattern-A lines (two bare timestamps back-to-back) before any prose.
   const introCards: ScriptMarker[] = [];
+  // The doc's overall title (Pattern B only — a blue-bold title paragraph
+  // sitting above the first intro timestamp). The renderer prepends this
+  // as a 5s black title-card before the intro clips. null when the doc
+  // uses Pattern A (bare timestamp at the top) or has no intro at all.
+  let openingTitle: ScriptMarker | null = null;
   // Indices of paragraphs consumed by the intro walk, so they're excluded
   // from the transcript pass below.
   const consumedAsIntro = new Set<number>();
@@ -286,9 +304,23 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
         if (j < rawParagraphs.length) {
           const nextBare = bareTimestampInfo(rawParagraphs[j]);
           if (nextBare) {
+            const titleText = titleParagraphText(p);
+            // The FIRST Pattern B occurrence at the very top of the doc
+            // becomes the overall-video opening title. Stash it so the
+            // renderer can prepend a 5s standalone title-card BEFORE the
+            // intro clips. Subsequent Pattern B blocks (rare — would be
+            // a second titled intro stacked below) don't re-set this;
+            // only the first one is "the video's title".
+            if (openingTitle === null && titleText.length > 0) {
+              openingTitle = {
+                kind: "opening_title",
+                text: titleText,
+                ordinal: 0,
+              };
+            }
             introCards.push({
               kind: "intro_card",
-              text: titleParagraphText(p),
+              text: titleText,
               youtubeUrl: nextBare.url,
               startSeconds: nextBare.range.start,
               endSeconds: nextBare.range.end,
@@ -442,5 +474,5 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
   // don't add extra separators.
   const transcript = transcriptParagraphTexts.join("").replace(/\n{3,}/g, "\n\n").trim();
 
-  return { transcript, introCards, titleCards, lowerThirds };
+  return { transcript, introCards, titleCards, lowerThirds, openingTitle };
 }

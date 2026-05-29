@@ -577,80 +577,26 @@ export function buildBlockSequenceFromHints(
     rawVoEnd.push(null);
   }
 
-  // Gemini hallucination filter. Gemini sometimes violates the
-  // "ONE BLOCK = ONE COMPLETE SENTENCE" prompt rule and emits TWO
-  // adjacent hints whose text covers the same narration — one tagged
-  // "image", one tagged "footage", both paraphrasing the same sentence.
-  // This shows up in the editor as two consecutive scenes with nearly
-  // identical script_text and is the root cause of the "same project
-  // re-matched gives different results" non-determinism the user
-  // reported: when Gemini complies, you get one block; when it
-  // hallucinates, you get two.
+  // Per-sentence audio-sync rule (replaces the old hallucination filter):
   //
-  // We detect duplicates by TEXT SIMILARITY, not vo-window overlap. The
-  // window-overlap approach doesn't work because sentenceDurationFromWords
-  // uses a forward-walking cursor: if hint B's text is the same as hint A's,
-  // hint B's word search starts AFTER hint A's words, so it either fails
-  // (no match → null window) or aligns to the next occurrence in audio
-  // (different window). Either way the windows don't overlap, but the
-  // hints are still duplicates.
+  // The old hallucination filter dropped any hint whose tokens overlapped
+  // ≥80% with the previous hint's prefix. It was meant to catch Gemini
+  // double-emitting a single narration, but it false-positived on real
+  // short follow-up sentences ("But somehow it just happened.") whose
+  // first few tokens happened to mirror the prior sentence — producing
+  // the "missing sentences" bug the user reported.
   //
-  // Token-similarity check: if hint B's normalized tokens are ≥80% a
-  // prefix of hint A's tokens, B is a paraphrase of A's narration. We
-  // drop the later one and keep the earlier one (it set the wordCursor
-  // first, so subsequent hints are anchored against it).
-  function normalizeTokens(s: string): string[] {
-    return s
-      .toLowerCase()
-      .replace(/[^a-z0-9\s']/g, " ")
-      .split(/\s+/)
-      .filter((w) => w.length > 0);
-  }
-  function tokenOverlapFraction(a: string[], b: string[]): number {
-    if (a.length === 0 || b.length === 0) return 0;
-    const shorter = a.length <= b.length ? a : b;
-    const longer = a.length <= b.length ? b : a;
-    let matched = 0;
-    for (let i = 0; i < shorter.length; i++) {
-      if (i < longer.length && shorter[i] === longer[i]) matched++;
-    }
-    return matched / shorter.length;
-  }
-  const hintTokens = hints.map((h) => normalizeTokens(h.text));
-  const droppedIndices = new Set<number>();
-  for (let i = 1; i < hints.length; i++) {
-    if (droppedIndices.has(i)) continue;
-    let prev = i - 1;
-    while (prev >= 0 && droppedIndices.has(prev)) prev--;
-    if (prev < 0) continue;
-    if (tokenOverlapFraction(hintTokens[prev], hintTokens[i]) >= 0.8) {
-      droppedIndices.add(i);
-    }
-  }
-  if (droppedIndices.size > 0) {
-    const filteredHints: BlockPlanHint[] = [];
-    const filteredTypes: BlockType[] = [];
-    const filteredDurations: number[] = [];
-    const filteredVoStart: Array<number | null> = [];
-    const filteredVoEnd: Array<number | null> = [];
-    for (let i = 0; i < hints.length; i++) {
-      if (droppedIndices.has(i)) continue;
-      filteredHints.push(hints[i]);
-      filteredTypes.push(effectiveTypes[i]);
-      filteredDurations.push(rawDurations[i]);
-      filteredVoStart.push(rawVoStart[i]);
-      filteredVoEnd.push(rawVoEnd[i]);
-    }
-    hints = filteredHints;
-    effectiveTypes.length = 0;
-    effectiveTypes.push(...filteredTypes);
-    rawDurations.length = 0;
-    rawDurations.push(...filteredDurations);
-    rawVoStart.length = 0;
-    rawVoStart.push(...filteredVoStart);
-    rawVoEnd.length = 0;
-    rawVoEnd.push(...filteredVoEnd);
-  }
+  // Every Gemini hint now stays in the stream. Duplicate hints are
+  // tolerated: each gets its own block in the editor. If the duplicate
+  // covered exactly the same vo window as a previous block, the matcher's
+  // existing block reconciliation downstream still produces sensible
+  // visuals (a duplicate hint just means a second editor row for the
+  // same audio moment — visible to the user, not dropped silently).
+  //
+  // The trade is intentional: silently dropping a real sentence is the
+  // worst failure mode because the editor stops mirroring the doc and
+  // the user can't tell anything went wrong. A duplicate hint, by
+  // contrast, is plainly visible and the user can delete the extra row.
 
   // Group consecutive same-type sentence hints into blocks whose combined
   // spoken duration lands in the footage target window. The previous
@@ -786,66 +732,22 @@ export function buildBlockSequenceFromHints(
     cursor = lookahead;
   }
 
-  // Tiny-tail absorption. Some sentences are too short to deserve their own
-  // scene — "This is the full story." (3 words, ~1.5s) is the canonical case.
-  // The forward grouper above can't absorb them because it only merges
-  // adjacent same-type footage hints; a tiny footage tail sitting next to an
-  // image group (or next to a paragraph/type boundary) is stranded.
+  // Tiny-tail absorption has been removed.
   //
-  // The symptom is an audio/visual desync: the renderer holds the tiny
-  // sentence's visual for its full rendered duration (often inflated by the
-  // residue stretcher to ~3s), but the narrator finishes it in ~1.5s, so the
-  // following scene's audio begins while the prior visual is still on
-  // screen. Cascading across many such tails accumulates into multi-second
-  // drift.
+  // The previous tiny-tail logic folded any sentence under 2s into its
+  // previous block, concatenating the texts. That hid the short sentence
+  // from the editor (it disappeared as its own row) — the same failure
+  // mode the user reported for "But somehow it just happened.", "That is
+  // not a detail that emerged in the scandal.", etc.
   //
-  // Fix: walk the grouped list and absorb any block whose own spoken time is
-  // below TINY_TAIL_SECONDS into its previous neighbor when both are in the
-  // same doc paragraph. The previous block's vo window extends to include
-  // the tail's audio, and its rendered duration grows by the tail's spoken
-  // time — so the scene stays on screen for exactly the combined narration,
-  // and the next scene starts exactly when the next paragraph/segment
-  // begins. We keep the previous block's TYPE and metadata (image stays
-  // image, footage stays footage) since the absorbed tail is, by definition,
-  // a trailing thought of the same beat.
-  const TINY_TAIL_SECONDS = 2;
-  // Hard ceiling on the prev block's post-merge duration. Without this,
-  // a chain of short sentences ("What he said was careful." +
-  // "What he didn't say was louder." + "This is the full story.") all
-  // collapse into the prev block one after another, producing a 12-14s
-  // mega-block that the matcher then can't size sensibly. Capping at 8s
-  // keeps the merged block in a normal footage range while still folding
-  // single stranded tails.
-  const PREV_BLOCK_MERGE_CEILING = 8;
-  for (let i = groupedHints.length - 1; i >= 1; i--) {
-    const tail = groupedHints[i];
-    const prev = groupedHints[i - 1];
-    if (tail.duration >= TINY_TAIL_SECONDS) continue;
-    if (prev.duration + tail.duration > PREV_BLOCK_MERGE_CEILING) continue;
-    const tailPara = tail.hint.paragraph_index;
-    const prevPara = prev.hint.paragraph_index;
-    if (tailPara != null && prevPara != null && tailPara !== prevPara) continue;
-    prev.duration = Math.round((prev.duration + tail.duration) * 10) / 10;
-    prev.text = `${prev.text} ${tail.text}`.trim();
-    if (prev.voEnd == null || (tail.voEnd != null && tail.voEnd > prev.voEnd)) {
-      prev.voEnd = tail.voEnd ?? prev.voEnd;
-    }
-    if (prev.voStart == null && tail.voStart != null) prev.voStart = tail.voStart;
-    const dedup = (xs: string[]) => Array.from(new Set(xs));
-    prev.hint = {
-      ...prev.hint,
-      specific_visual_references: dedup([
-        ...(prev.hint.specific_visual_references ?? []),
-        ...(tail.hint.specific_visual_references ?? []),
-      ]),
-      mentioned_entities: dedup([
-        ...(prev.hint.mentioned_entities ?? []),
-        ...(tail.hint.mentioned_entities ?? []),
-      ]),
-    };
-    prev.merged = true;
-    groupedHints.splice(i, 1);
-  }
+  // Short sentences now keep their own block. The matcher's existing
+  // clip-duration clamp + render-time fade tolerate 1-2s visual flashes
+  // gracefully, and the matchProcessor's downstream pickFillerForBlock
+  // chain handles the clip selection. If we later want SHARED-CLIP
+  // visual grouping for short sentences, that lives in transcript-driven-
+  // builder.ts (lib/ai/transcript-driven-builder.ts) which assigns
+  // group ids without merging editor rows. For now: every sentence =
+  // its own editor row, no exceptions.
 
   // Rebuild the parallel arrays so the rest of this function sees the
   // post-merge view. After this point, `mergedHints` / `rawDurations` /
@@ -900,11 +802,26 @@ export function buildBlockSequenceFromHints(
   //
   // Math.round used over Math.floor: a 7.5s sentence becomes
   // two slots, which is closer to the truth than one.
+  // Hard caps on slot expansion per hint. A single Gemini hint represents
+  // 1–3 sentences of narration; expanding it into more than a handful of
+  // blocks indicates rawSec overshot (typically because Gemini paraphrased
+  // the sentence and sentenceDurationFromWords couldn't find the tail
+  // bracket, falling back to a cadence estimate that landed on a slow
+  // narration patch). On long audios (~30 min) the overshoot compounds
+  // across hundreds of hints into a timeline 2× the audio length, with the
+  // same source sentence repeated across many editor rows. These caps stop
+  // a single hint from inflating the timeline regardless of how badly the
+  // raw duration was estimated.
+  const MAX_IMAGE_SLOTS_PER_HINT = 3;
+  const MAX_FOOTAGE_SLOTS_PER_HINT = 2;
   const slotCounts = new Array<number>(mergedHints.length).fill(1);
   for (let i = 0; i < mergedHints.length; i++) {
     const rawSec = rawDurations[i];
     if (effectiveTypes[i] === "image") {
-      slotCounts[i] = Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS));
+      slotCounts[i] = Math.min(
+        MAX_IMAGE_SLOTS_PER_HINT,
+        Math.max(1, Math.round(rawSec / IMAGE_HOLD_SECONDS)),
+      );
     } else if (effectiveTypes[i] === "footage") {
       // Only split when the sentence is meaningfully longer than the
       // target hold — short sentences stay as a single block (a 4s
@@ -913,7 +830,10 @@ export function buildBlockSequenceFromHints(
       // degenerate sub-1-slot math). The FOOTAGE_SPLIT_THRESHOLD is
       // hold + 1.5s so 7.5s sentences split, 7.0s sentences don't.
       slotCounts[i] = rawSec >= FOOTAGE_SPLIT_THRESHOLD
-        ? Math.max(1, Math.round(rawSec / FOOTAGE_HOLD_SECONDS))
+        ? Math.min(
+            MAX_FOOTAGE_SLOTS_PER_HINT,
+            Math.max(1, Math.round(rawSec / FOOTAGE_HOLD_SECONDS)),
+          )
         : 1;
     }
   }
@@ -1069,16 +989,9 @@ export function buildBlockSequenceFromHints(
     });
   });
 
-  // Step 3 — Merge very short adjacent footage blocks. A 3s footage block
-  // means a clip flashes by while the speaker is mid-thought; viewers
-  // perceive that as choppy. Fuse adjacent footage blocks when the first
-  // is short (≤MERGE_SHORT_FOOTAGE_THRESHOLD) and the combined duration
-  // still fits in footage's 3-10s range. We only merge footage — images
-  // need per-slot variety, title cards are deliberate beats, splits are
-  // fixed. The matcher uses the first hint's metadata, so the merged
-  // block searches by the leading sentence's subject (typical case: a
-  // short transition sentence followed by the meatier follow-up — the
-  // follow-up's hint subject is the right anchor for the combined block).
+  // Step 3 — formerly mergeShortFootage. Now a no-op (see function body).
+  // Every Gemini hint stays as its own block; we no longer fuse short
+  // adjacent blocks because that hid short sentences from the editor.
   mergeShortFootage(blocks);
 
   // Step 4 — Residual cleanup. With real word timings, footage durations
@@ -1094,142 +1007,21 @@ export function buildBlockSequenceFromHints(
   return blocks;
 }
 
-// Threshold below which a footage block is considered "too short" and
-// becomes a merge candidate. 3s is the footage minimum — a block sitting
-// at the floor reads as a visual flash rather than a beat.
-const MERGE_SHORT_FOOTAGE_THRESHOLD = 3.5;
-
-function sameBlockEntity(a: PlannedBlockWithHint, b: PlannedBlockWithHint): boolean {
-  const ae = a.block_entity;
-  const be = b.block_entity;
-  if (!ae || !be) return false;
-  if (ae.type !== be.type) return false;
-  return (ae.name ?? "").trim().toLowerCase() === (be.name ?? "").trim().toLowerCase();
-}
-
-function mergeShortFootage(blocks: PlannedBlockWithHint[]): void {
-  const footageMax = DURATION_RANGES.footage.max;
-  let i = 0;
-  while (i < blocks.length - 1) {
-    const a = blocks[i];
-    const b = blocks[i + 1];
-    // Only fuse adjacent footage→footage where the first is short and the
-    // combined duration still fits. Crossing block types breaks visual
-    // contracts (image cadence, section beats). Also refuse to fuse across
-    // doc paragraph boundaries — a paragraph break is the script author's
-    // signal that the visual context shifts, and merging hides it from the
-    // matcher and the editor UI. (e.g. "This is the full story." + the
-    // opening of the next paragraph "Private conversations between
-    // friends..." would otherwise collapse into one scene.) When either
-    // side lacks a known paragraph_index, fall through to the legacy rule.
-    const sameParagraph =
-      a.paragraph_index == null
-      || b.paragraph_index == null
-      || a.paragraph_index === b.paragraph_index;
-    // Cross-type merge for staccato short blocks. The "one sentence =
-    // one block" rule produces uncomfortably fast cuts when 3-4 short
-    // sentences land back-to-back with alternating types
-    // (footage→image→footage). We fuse adjacent image/footage blocks
-    // when BOTH share the same closed-world block_entity AND at least
-    // one side is short. The merged block takes the FOOTAGE type
-    // whenever either side was footage — narrative motion reads better
-    // than a static image on a long hold — and the matcher's clip-
-    // duration clamp (max ~12s) bounds the result.
-    //
-    // Restricted to celebrity_default OR same matchable entity so we
-    // don't merge two different image-entity blocks (Guardian logo +
-    // BGT poster shouldn't collapse into one). Paragraph boundary is
-    // still respected — that's the script author's "context shift"
-    // signal and remains hard.
-    const aIsImageOrFootage = a.type === "image" || a.type === "footage";
-    const bIsImageOrFootage = b.type === "image" || b.type === "footage";
-    const aShort = a.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD + 1;
-    const bShort = b.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD + 1;
-    if (
-      aIsImageOrFootage &&
-      bIsImageOrFootage &&
-      sameParagraph &&
-      sameBlockEntity(a, b) &&
-      (aShort || bShort) &&
-      // Combined cap: footage max (12s) so the matcher never has to
-      // hold a still image longer than image_block_split would allow.
-      a.duration + b.duration <= footageMax
-    ) {
-      // Footage wins on mixed types — clips give the merged block
-      // motion, which is what the viewer wants for a 6-8s hold.
-      const mergedType: "footage" | "image" =
-        a.type === "footage" || b.type === "footage" ? "footage" : "image";
-      const mergedTextMix = [a.text, b.text].filter(Boolean).join(" ");
-      blocks.splice(i, 2, {
-        type: mergedType,
-        duration: Math.round((a.duration + b.duration) * 10) / 10,
-        text: mergedTextMix,
-        resolved_subject: b.resolved_subject ?? a.resolved_subject,
-        section_title: a.section_title ?? b.section_title,
-        specific_visual_references: [
-          ...(a.specific_visual_references ?? []),
-          ...(b.specific_visual_references ?? []),
-        ].filter((v, k, arr) => arr.indexOf(v) === k),
-        mentioned_entities: [
-          ...(a.mentioned_entities ?? []),
-          ...(b.mentioned_entities ?? []),
-        ].filter((v, k, arr) => arr.indexOf(v) === k),
-        subject_type: b.subject_type ?? a.subject_type,
-        visual_priority: b.visual_priority ?? a.visual_priority,
-        block_entity: a.block_entity,
-        paragraph_index: a.paragraph_index ?? b.paragraph_index,
-        vo_start_seconds: a.vo_start_seconds ?? b.vo_start_seconds,
-        vo_end_seconds: b.vo_end_seconds ?? a.vo_end_seconds,
-      });
-      // Don't advance i — the merged block might now be a merge candidate
-      // with the next block (chains of 3+ short sentences collapse cleanly).
-      continue;
-    }
-    if (
-      a.type === "footage" &&
-      b.type === "footage" &&
-      sameParagraph &&
-      a.duration <= MERGE_SHORT_FOOTAGE_THRESHOLD &&
-      a.duration + b.duration <= footageMax
-    ) {
-      // Keep the second block's metadata (typically the meatier follow-up
-      // sentence) but concatenate text so anything downstream that reads
-      // the block's text still sees both sentences.
-      const mergedText = [a.text, b.text].filter(Boolean).join(" ");
-      blocks.splice(i, 2, {
-        type: "footage",
-        duration: Math.round((a.duration + b.duration) * 10) / 10,
-        text: mergedText,
-        resolved_subject: b.resolved_subject ?? a.resolved_subject,
-        // Section titles ride the first block of a segment — preserve a's
-        // if present, otherwise use b's.
-        section_title: a.section_title ?? b.section_title,
-        specific_visual_references: [
-          ...(a.specific_visual_references ?? []),
-          ...(b.specific_visual_references ?? []),
-        ].filter((v, k, arr) => arr.indexOf(v) === k),
-        mentioned_entities: [
-          ...(a.mentioned_entities ?? []),
-          ...(b.mentioned_entities ?? []),
-        ].filter((v, k, arr) => arr.indexOf(v) === k),
-        subject_type: b.subject_type ?? a.subject_type,
-        visual_priority: b.visual_priority ?? a.visual_priority,
-        // Keep b's block_entity when both share one (the meatier follow-up
-        // sentence's binding); fall back to a's when only one is present.
-        block_entity: b.block_entity ?? a.block_entity,
-        // Both a and b are in the same paragraph (enforced above), so the
-        // merged block inherits that paragraph index.
-        paragraph_index: a.paragraph_index ?? b.paragraph_index,
-        // Merged voiceover window spans a's start through b's end.
-        vo_start_seconds: a.vo_start_seconds ?? b.vo_start_seconds,
-        vo_end_seconds: b.vo_end_seconds ?? a.vo_end_seconds,
-      });
-      // Don't advance i — the merged block might now be a merge candidate
-      // with the *next* block (e.g. three 3s footage blocks in a row).
-      continue;
-    }
-    i++;
-  }
+// Disabled. Used to fuse adjacent short blocks (footage→footage,
+// image→footage with same block_entity, etc.) into one larger block,
+// concatenating their script text. Both merge paths hid short sentences
+// from the editor — the user can no longer see "But somehow it just
+// happened." as its own row because it was folded into the previous
+// block. Per the spec "every sentence must appear in the editor", we
+// keep every block separate. Visual choppiness from a 1-2s flash is the
+// acceptable trade for never silently dropping a sentence.
+//
+// Function kept (instead of deleted) so the call site stays stable.
+// If we later want shared-clip grouping that DOESN'T merge editor rows,
+// the right place is transcript-driven-builder.ts (which assigns group
+// ids without concatenating text or splicing the array).
+function mergeShortFootage(_blocks: PlannedBlockWithHint[]): void {
+  // intentionally empty
 }
 
 // Real-timing residue path. Footage blocks already hold their real spoken

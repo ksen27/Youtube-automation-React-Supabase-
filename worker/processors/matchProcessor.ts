@@ -21,6 +21,10 @@ import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type Seg
 import { fetchImages } from "@/lib/images/fetch";
 import { verifyPoolAsset } from "@/lib/ai/pool-verification";
 import { lookupReference } from "@/lib/ai/face-references";
+import { splitTranscriptIntoSentences } from "@/lib/ai/sentences";
+import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
+import { buildEnrichmentLookup } from "@/lib/ai/gemini-enrichment";
+import { buildBlockSequenceFromTranscript } from "@/lib/ai/transcript-driven-builder";
 
 // Legacy entity type → closed-world BlockEntityType mapping for the image
 // pool's verification gate (Slice 5 of the matching refactor). The pool
@@ -662,6 +666,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   const plan = planTimeline(voiceoverSeconds);
   let hints = await loadBlockHintsFromAnalyze(sb, projectId, voiceoverSeconds, transcript);
   const planSource: "gemini_hints" | "legacy_quota" = hints.length > 0 ? "gemini_hints" : "legacy_quota";
+  // True when the transcript-driven builder produced the block sequence
+  // for this project. Used much later by the duration-strategy logic to
+  // decide whether to skip duration_reclaim (proportional fit handles
+  // small adjustments cleanly on its own; reclaim distorts blocks).
+  let usedTranscriptDrivenBuilder = false;
 
   let blocks: PlannedBlock[];
   let blockHintTexts: Array<string | null>;
@@ -704,26 +713,139 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let blockVoStart: Array<number | null>;
   let blockVoEnd: Array<number | null>;
   if (planSource === "gemini_hints") {
-    // Pass the intro slot's reserved time so the planner targets
-    // (voiceoverSeconds - introClipDuration) for its block sum. Without
-    // this the prepended intro item pushed items.duration past voiceover,
-    // showing up in the editor header as a "X scenes · 9:47 / 10:00" gap.
-    const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript, transcriptWords, introClipDuration);
-    blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
-    blockHintTexts = planned.map((p) => p.text || null);
-    blockSectionTitles = planned.map((p) => p.section_title ?? null);
-    blockResolvedSubjects = planned.map((p) => p.resolved_subject ?? null);
-    blockRecommendedTypes = planned.map((p) => p.type);
-    blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
-    blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
-    blockVisualPriorities = planned.map((p) => p.visual_priority ?? null);
-    blockClosedWorldEntities = planned.map((p) =>
-      p.block_entity
-        ? { type: p.block_entity.type as BlockEntityType, name: (p.block_entity.name ?? "").trim() }
-        : null,
-    );
-    blockVoStart = planned.map((p) => p.vo_start_seconds ?? null);
-    blockVoEnd = planned.map((p) => p.vo_end_seconds ?? null);
+    // Transcript-driven path. The SENTENCE LIST is the source of truth —
+    // one editor row per sentence, never split mid-phrase, never merged
+    // across paragraph boundaries. Gemini's blocks become enrichment
+    // metadata (visual type, subject, references) looked up per sentence
+    // rather than the input to the block sequence itself.
+    //
+    // This replaces the hint-driven builder that silently dropped sentences
+    // and re-split single hints into many slots with duplicated text — the
+    // failure mode that surfaced in the editor as identical captions across
+    // many consecutive scenes on long audios.
+    //
+    // Requires both: (a) Deepgram word timings on the project, so each
+    // sentence gets a real spoken-audio window, and (b) at least one
+    // Gemini hint to enrich against. Falls through to the legacy
+    // hint-driven path when either is missing.
+    const haveWordTimings = transcriptWords != null && transcriptWords.length > 0;
+    if (haveWordTimings && hints.length > 0) {
+      // 1) Load blue-bold title-card markers and the paragraph indices
+      //    they belong to. The transcript splitter flags those paragraphs'
+      //    first sentence so the builder can prepend a title_card row.
+      const { data: titleMarkerRows } = await sb
+        .from("project_script_markers")
+        .select("paragraph_index, text")
+        .eq("project_id", projectId)
+        .eq("kind", "title_card");
+      const titleCardTextByParagraph = new Map<number, string>();
+      const titleCardParagraphIndices = new Set<number>();
+      for (const m of titleMarkerRows ?? []) {
+        const pIdx = m.paragraph_index as number | null;
+        if (pIdx == null) continue;
+        const text = (m.text as string | null) ?? "";
+        titleCardParagraphIndices.add(pIdx);
+        if (text.trim()) titleCardTextByParagraph.set(pIdx, text);
+      }
+
+      // 2) Split the doc into ordered sentences. Title cards bind to the
+      //    flagged paragraph's first sentence.
+      const sentences = splitTranscriptIntoSentences(transcript, titleCardParagraphIndices);
+
+      // 3) Stamp each sentence with its real spoken-audio window from
+      //    Deepgram. This is what gives every block a duration that
+      //    matches the narrator's actual pace — no cadence-fallback
+      //    overshoot, no sentence-drift across long audios.
+      const aligned = alignSentencesToWords(sentences, transcriptWords!);
+
+      // 4) Build the per-sentence enrichment lookup from Gemini's hints.
+      //    BlockPlanHint is structurally compatible with BlockPlan for
+      //    the fields enrichment reads — type-cast is safe.
+      const enrichment = buildEnrichmentLookup(sentences, hints as unknown as BlockPlan[]);
+
+      // 5) Build the block sequence. Image hold policy "fixed_5s" keeps
+      //    the existing 5s-per-image behavior so long sentences split
+      //    into multiple 5s holds of the same subject (matches the spec
+      //    the renderer already implements).
+      const built = buildBlockSequenceFromTranscript({
+        sentences: aligned,
+        enrichment,
+        titleCardTextByParagraph,
+        mainCelebrity: mainCelebrity ?? "",
+        imageHoldPolicy: "fixed_5s",
+      });
+
+      blocks = built.blocks.map((p) => ({ type: p.type, duration: p.duration }));
+      blockHintTexts = built.blocks.map((p) => p.text || null);
+      blockSectionTitles = built.blocks.map((p) => p.section_title ?? null);
+      blockResolvedSubjects = built.blocks.map((p) => p.resolved_subject ?? null);
+      blockRecommendedTypes = built.blocks.map((p) => p.type);
+      blockSpecificRefs = built.blocks.map((p) => p.specific_visual_references ?? []);
+      blockSubjectTypes = built.blocks.map((p) => p.subject_type ?? null);
+      blockVisualPriorities = built.blocks.map((p) => p.visual_priority ?? null);
+      blockClosedWorldEntities = built.blocks.map((p) =>
+        p.block_entity
+          ? { type: p.block_entity.type as BlockEntityType, name: (p.block_entity.name ?? "").trim() }
+          : null,
+      );
+      blockVoStart = built.blocks.map((p) => p.vo_start_seconds ?? null);
+      blockVoEnd = built.blocks.map((p) => p.vo_end_seconds ?? null);
+
+      // The downstream code reads from `hints` for fields that aren't on
+      // PlannedBlockWithHint (mentioned_entities for clip scoring, etc.).
+      // Rebuild a hints array aligned 1:1 with the new blocks so those
+      // lookups still work. Each block points back to its source sentence
+      // index; that sentence's enrichment carries the metadata we need.
+      const rebuiltHints: BlockPlanHint[] = built.blocks.map((b, i) => {
+        const sIdx = built.blockSentenceIndex[i];
+        const enr = enrichment.perSentence[sIdx];
+        return {
+          text: b.text,
+          resolved_subject: b.resolved_subject,
+          recommended_visual_type: b.type === "intro" ? "footage" : b.type,
+          section_title: b.section_title,
+          specific_visual_references: enr?.specific_visual_references ?? [],
+          mentioned_entities: enr?.mentioned_entities ?? [],
+          subject_type: enr?.subject_type ?? "general",
+          visual_priority: enr?.visual_priority ?? "person_default",
+          block_entity: enr?.block_entity,
+          paragraph_index: b.paragraph_index ?? null,
+        };
+      });
+      hints = rebuiltHints;
+
+      usedTranscriptDrivenBuilder = true;
+      await logJob({ projectId, jobId: mediaJobId }, "match.transcript_driven_builder", {
+        sentences: sentences.length,
+        alignedSentences: aligned.filter((s) => s.aligned).length,
+        enrichedSentences: enrichment.matchedSentences,
+        unmatchedSentences: enrichment.unmatched,
+        titleCardsInserted: built.titleCardsInserted,
+        shortSentencesGrouped: built.shortSentencesGrouped,
+        shortSentencesMerged: built.shortSentencesMerged,
+        imageSplitCount: built.imageSplitCount,
+        blocksProduced: built.blocks.length,
+      });
+    } else {
+      // Legacy hint-driven path. Used when word timings aren't available
+      // or Gemini emitted no hints.
+      const planned: PlannedBlockWithHint[] = buildBlockSequenceFromHints(hints, voiceoverSeconds, transcript, transcriptWords, introClipDuration);
+      blocks = planned.map((p) => ({ type: p.type, duration: p.duration }));
+      blockHintTexts = planned.map((p) => p.text || null);
+      blockSectionTitles = planned.map((p) => p.section_title ?? null);
+      blockResolvedSubjects = planned.map((p) => p.resolved_subject ?? null);
+      blockRecommendedTypes = planned.map((p) => p.type);
+      blockSpecificRefs = planned.map((p) => p.specific_visual_references ?? []);
+      blockSubjectTypes = planned.map((p) => p.subject_type ?? null);
+      blockVisualPriorities = planned.map((p) => p.visual_priority ?? null);
+      blockClosedWorldEntities = planned.map((p) =>
+        p.block_entity
+          ? { type: p.block_entity.type as BlockEntityType, name: (p.block_entity.name ?? "").trim() }
+          : null,
+      );
+      blockVoStart = planned.map((p) => p.vo_start_seconds ?? null);
+      blockVoEnd = planned.map((p) => p.vo_end_seconds ?? null);
+    }
   } else {
     blocks = buildBlockSequence(plan);
     blockHintTexts = blocks.map(() => null);
@@ -1025,7 +1147,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // Slot the duration into N fragments. Math.round biases toward an
       // even split (13s → 3 fragments of ~4.3s, 11s → 2 of 5.5s) so no
       // fragment lands too far from the IMAGE_HOLD_SECONDS target.
-      const slots = Math.max(2, Math.round(b.duration / IMAGE_HOLD_SECONDS));
+      // Hard cap at 4 fragments per source block. Without this, blocks that
+      // ended up with an inflated duration (footage→image rhythm swap that
+      // kept the footage's 10-15s window, or a planner overshoot from
+      // cadence-fallback estimation) explode into 6+ fragments all sharing
+      // the same source sentence. On long audios that compounded into a
+      // timeline 2× the audio length — see match.image_block_split log.
+      const MAX_IMAGE_FRAGMENTS = 4;
+      const slots = Math.min(
+        MAX_IMAGE_FRAGMENTS,
+        Math.max(2, Math.round(b.duration / IMAGE_HOLD_SECONDS)),
+      );
       const perSlot = Math.round((b.duration / slots) * 10) / 10;
       // Split the source block's voiceover window across the fragments
       // proportionally so each fragment knows the spoken-time slice it
@@ -1116,6 +1248,41 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const hintText = blockHintTexts[i];
     return hintText && hintText.trim().length > 0 ? hintText : (wordSlicedTexts[i] ?? "");
   });
+
+  // Roster-person promotion: when a block's text literally names a roster
+  // person (other than the main celebrity) but Gemini tagged the block as
+  // celebrity_default, promote the binding to that person. Catches the
+  // "Bruno Tonioli in the chair" failure mode where Gemini bound the
+  // block to the main celebrity even though Bruno is the literal subject
+  // of the sentence — without this, the block falls through to the
+  // Walliams pool and shows a generic Walliams photo (or worse, a noisy
+  // collage) instead of Bruno.
+  const rosterPersons = allEntities
+    .filter((e) => e.type === "person" || e.type === "celebrity")
+    .map((e) => e.value.trim())
+    .filter((v) => v.length > 0 && v.toLowerCase() !== (mainCelebrity ?? "").toLowerCase());
+  if (rosterPersons.length > 0) {
+    let promoted = 0;
+    for (let i = 0; i < blocks.length; i++) {
+      const cur = blockClosedWorldEntities[i];
+      if (cur && cur.type !== "celebrity_default") continue;
+      const text = (blockTexts[i] ?? "").toLowerCase();
+      if (!text) continue;
+      for (const person of rosterPersons) {
+        if (text.includes(person.toLowerCase())) {
+          blockClosedWorldEntities[i] = { type: "person", name: person };
+          promoted++;
+          break;
+        }
+      }
+    }
+    if (promoted > 0) {
+      void logJob({ projectId, jobId: mediaJobId }, "match.roster_person_promotion", {
+        promoted,
+        rosterSize: rosterPersons.length,
+      });
+    }
+  }
 
   // For each block, find which entities are mentioned in its spoken text.
   // We do a case-insensitive substring search on each entity value. This is
@@ -1904,6 +2071,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // duration-mismatch we already fixed in the planner.
   let durationReclaimSeconds = 0;
   let durationClampedCount = 0;
+  // Note: `usedTranscriptDrivenBuilder` is declared earlier (near the
+  // hints load) because it gets WRITTEN inside the planSource branch
+  // hundreds of lines above this point. The duration-strategy logic
+  // below reads it to decide whether to skip duration_reclaim.
 
   for (let i = 0; i < blocks.length; i++) {
     const block: PlannedBlock = blocks[i];
@@ -2230,7 +2401,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // Per-person target size for the MAIN celebrity. Same formula as the
   // entity-pool personFloor. Scales with voiceoverSeconds so a 10-min
   // video gets ~60 unique celebrity images available to the fallback.
-  const personPhotoTarget = Math.max(20, Math.ceil(voiceoverSeconds / 10));
+  //
+  // Hard cap at PERSON_PHOTO_HARD_CAP. Each cached image is a separate
+  // Gemini face-verify call; on a 30-min audio the uncapped target was
+  // ~192, multiplied across ~8 entities that's ~1500 Gemini calls just
+  // for the verify gate. With Gemini 503s retrying each call, the match
+  // step was burning 10+ minutes here. A cap of 40 still gives plenty
+  // of visual variety (the documentary-pacing reuse cooldown only needs
+  // ~20 unique photos to avoid back-to-back repeats) while cutting the
+  // verify workload by ~75% on long audios.
+  const PERSON_PHOTO_HARD_CAP = 40;
+  const personPhotoTarget = Math.min(
+    PERSON_PHOTO_HARD_CAP,
+    Math.max(20, Math.ceil(voiceoverSeconds / 10)),
+  );
 
   // Compute consecutive-run-length per secondary person from the block
   // entity bindings. Used by Phase 2b to size each secondary's photo
@@ -3146,10 +3330,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // out of the loop as soon as `pool.length >= personFloor` so we only
     // pay for queries we actually need.
     //
-    // Expanded from 4 → 10 facets so the 10-min target floor (~60) is
-    // reachable. Image-search APIs (Brave, CSE) return ~10-15 unique
-    // URLs per query after dedup, so 10 facets × ~6 unique × ~85% verify
-    // pass rate = ~50 images, close to the floor for a 10-min video.
+    // Expanded from 10 → 20 facets to compensate for the verify gate's
+    // strict mode (rejectUncertain). Strict mode drops ~30% more candidates
+    // than the lenient policy because side-angles, group shots, and small-
+    // face press photos return "uncertain" — those used to pass and now
+    // don't. Doubling the query count keeps the pool floor reachable for
+    // a 10-min video while every kept image is a clearly-identified
+    // headshot or portrait of the celebrity.
     const celebrityQueries: string[] = [
       `"${mainCelebrity}"`,
       `${mainCelebrity} interview`,
@@ -3161,6 +3348,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       `${mainCelebrity} BAFTA`,
       `${mainCelebrity} headshot`,
       `${mainCelebrity} talk show`,
+      `${mainCelebrity} smiling`,
+      `${mainCelebrity} suit`,
+      `${mainCelebrity} 2023`,
+      `${mainCelebrity} 2022`,
+      `${mainCelebrity} 2021`,
+      `${mainCelebrity} event`,
+      `${mainCelebrity} award`,
+      `${mainCelebrity} stage`,
+      `${mainCelebrity} close up`,
+      `${mainCelebrity} face`,
     ];
     // Face-verify rejection counter so we can see how many fetched URLs
     // didn't survive the gate. High rejection rate means CSE is returning
@@ -3190,6 +3387,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           // are cached per-URL so re-fetches of the same image don't
           // re-charge Gemini.
           try {
+            // Lenient mode: accept "uncertain" verdicts. We tried strict
+            // mode but it gutted the pool whenever the reference photo
+            // fetch failed (Wikipedia transient errors) — every candidate
+            // returned "uncertain reason: reference fetch failed" and the
+            // pool ended up empty. Collage filtering happens at a
+            // different layer (see filterMultiSubjectCollages below).
             const verdict = await verifyPoolAsset({
               projectId,
               entityType: "person",
@@ -3607,27 +3810,59 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     personImagesPrefetched: poolFetchStats.personImagesPrefetched,
   });
 
+  // ---- Empty-image → footage downgrade ---------------------------------
+  // After the entity pool + person fallback have run, any remaining image
+  // block whose image_url is still null would render as an empty tile in
+  // the editor and a black hole in the final MP4. Per the user's spec
+  // ("never empty visuals"), convert each such block to footage using
+  // the unused-clip pool. We honor the no-adjacent-same-source rule by
+  // routing through pickFillerForBlock (already enforces it). When the
+  // clip pool is empty too, the block stays as image — the renderer's
+  // black-background fallback then masks the missing url. This is the
+  // last-resort case the renderer was always able to handle; we just
+  // prefer footage when one exists.
+  let emptyImageDowngradedCount = 0;
+  for (const item of items) {
+    if (item.type !== "image") continue;
+    if (item.image_url && String(item.image_url).trim().length > 0) continue;
+    const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+    if (blockIdx == null) continue;
+    const filler = pickFillerForBlock(blockIdx);
+    if (!filler || usedClipIds.has(filler.clipId)) continue;
+    item.type = "footage";
+    item.clip_id = filler.clipId;
+    usedClipIds.add(filler.clipId);
+    clipLastUsedAt.set(filler.clipId, blockStartSec[blockIdx]);
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+    meta.downgraded_from = "image_no_url";
+    meta.downgrade_reason = "no image resolved (pool + person fallback failed)";
+    meta.pick_source = "image_downgrade_to_footage";
+    item.metadata = meta;
+    emptyImageDowngradedCount++;
+  }
+  await logJob({ projectId, jobId: mediaJobId }, "match.empty_image_downgrade", {
+    downgraded: emptyImageDowngradedCount,
+  });
+
   // ---- Split-screen image fill -----------------------------------------
   // Walk split_2 blocks (cap-survivors from earlier in this function) and
   // resolve a LEFT and RIGHT image for each. Strategy per side:
   //   1) Try the corresponding mentioned_entity via the same reference
-  //      query builder used for ordinary image blocks (Tier 1 / Tier 2).
-  //   2) On miss, draw from the project image pool — same pool feeding
-  //      regular image blocks. Per client direction, split-screen halves
-  //      do NOT have to relate to what the narrator is saying; any pool
-  //      image is acceptable.
-  // The LEFT image lives on item.image_url (so existing UI/tooling that
-  // reads image_url still gets a preview), and the RIGHT image is stored
-  // on item.metadata.right_image_url. The renderer consumes both.
-  const POOL_FALLBACK_REASON = "split_pool_fallback";
+  //      query builder used for ordinary image blocks.
+  //   2) On miss, fall back to the PERSON image (project celebrity).
+  //
+  // The old pool-fallback path was removed: it pasted ANY pool image onto
+  // a split half regardless of script relevance, which produced literal
+  // "Sun" photos for narration about The Sun newspaper, brand logos for
+  // unrelated narration, etc. Per spec "If an exact image/visual cannot
+  // be found → fallback to the person image. NEVER use random unrelated
+  // visuals." — split halves now follow the same rule.
   let splitsAssigned = 0;
   let splitsLeftFailed = 0;
   let splitsRightFailed = 0;
-  // Track which pool entries we've used for split halves so we don't pick
-  // the same URL for left and right of the same block, and so a later
-  // split doesn't repeat the same pair. We don't consume() from the main
-  // pool — splits get to reuse images already shown elsewhere, which is
-  // fine because they live in a half-width slot.
+  // Track which URLs we've used for split halves so we don't pick the
+  // same URL for left and right of the same block, and so a later split
+  // doesn't immediately repeat the same pair.
   const splitUsedUrls = new Set<string>();
   async function resolveSplitSide(
     entity: string | null,
@@ -3635,11 +3870,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     nowSec: number,
     forbiddenUrls: Set<string>,
   ): Promise<{ url: string; query: string; source: string; reason: string } | null> {
-    // Tier 1 — try the entity as a literal query (same shape as the
-    // mentioned_entity branch in buildReferenceQueries). Skip when Gemini
-    // didn't name a second entity for this block.
+    // Tier 1 — try the entity as a literal query. Skip when Gemini didn't
+    // name an entity for this side. Each candidate is Gemini-verified
+    // against the entity name BEFORE acceptance — without this, a query
+    // like "The Sun" (a newspaper) returned photos of our solar system's
+    // sun, which the gate now rejects so we fall through to the person
+    // image. Strict mode (rejectUncertain) is on because half-frame
+    // slots are visually obvious — an "uncertain" celebrity image is
+    // better than an "uncertain" off-topic image.
+    //
+    // Derive the entity type from the hint's subject_type so the verify
+    // gate prompts Gemini with the right framing ("is this a photo of
+    // the company X" vs "is this a photo of the person X"). Default to
+    // "company" when unknown — most non-person split entities in this
+    // pipeline are companies / publications (The Sun, Guardian, Fremantle).
     if (entity && entity.trim()) {
       const q = entity.trim();
+      const hintSubjectType = hints[blockIdx]?.subject_type;
+      const verifyEntityType: BlockEntityType =
+        hintSubjectType === "person" ? "person" :
+        hintSubjectType === "company" ? "company" :
+        hintSubjectType === "show" ? "tv_show" :
+        hintSubjectType === "movie" ? "movie" :
+        hintSubjectType === "place" ? "place" :
+        "company";
       try {
         const fetched = await fetchImages(q, 6, {});
         for (const f of fetched) {
@@ -3647,6 +3901,26 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           if (refUrlSet.has(f.url)) continue;
           const last = imageUrlLastUsedAt.get(f.url);
           if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
+          try {
+            const verdict = await verifyPoolAsset({
+              projectId,
+              entityType: verifyEntityType,
+              entityName: q,
+              candidateUrl: f.url,
+            }, { rejectUncertain: true });
+            if (!verdict.accept) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.split.entity_verify_rejected", {
+                blockIndex: blockIdx, query: q, url: f.url,
+                verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+              });
+              continue;
+            }
+          } catch {
+            // Verify failure (Gemini outage) — fail closed for split entities
+            // because the cost of a wrong image is high (literally "the sun"
+            // for "The Sun"). Skip this candidate; person fallback will run.
+            continue;
+          }
           return { url: f.url, query: q, source: f.source, reason: `split_entity:${q}` };
         }
       } catch (e) {
@@ -3654,19 +3928,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           "match.split.fetch_failed", { blockIndex: blockIdx, query: q, err: (e as Error).message });
       }
     }
-    // Tier 2 — pool fallback. Any pool entry that isn't forbidden by the
-    // caller (i.e. already used on the other side) and isn't cooling down.
-    for (const p of pool) {
-      if (forbiddenUrls.has(p.url)) continue;
-      const last = imageUrlLastUsedAt.get(p.url);
-      if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
-      return { url: p.url, query: p.query, source: p.source, reason: POOL_FALLBACK_REASON };
-    }
-    // Tier 3 — pool but ignore cooldown. Better to repeat a recent image
-    // in a half-frame slot than to leave the split half-empty.
-    for (const p of pool) {
-      if (forbiddenUrls.has(p.url)) continue;
-      return { url: p.url, query: p.query, source: p.source, reason: POOL_FALLBACK_REASON };
+    // Tier 2 — person-image fallback. Pulls from the project celebrity's
+    // photo cache (same path image blocks use when their reference search
+    // fails). Honours the forbidden-URL set so the two halves never end
+    // up with the same person photo. Skips the reuse cooldown because a
+    // half-frame slot can repeat a person photo seen elsewhere — that
+    // still beats a random pool image.
+    const personPick = await tryPersonImageFallback(blockIdx);
+    if (personPick && !forbiddenUrls.has(personPick.url)) {
+      return {
+        url: personPick.url,
+        query: personPick.query,
+        source: personPick.source,
+        reason: "split_person_fallback",
+      };
     }
     return null;
   }
@@ -3684,18 +3959,45 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     } else {
       splitsLeftFailed++;
     }
-    // RIGHT side: second mentioned entity (if any) or pool. Pass LEFT's
-    // URL as forbidden so the two halves are never the same image.
+    // RIGHT side: second mentioned entity (if any) or person fallback.
+    // Pass LEFT's URL as forbidden so the two halves are never the same
+    // image (especially important when both fall back to a person photo).
     const rightPick = await resolveSplitSide(ents[1] ?? null, blockIdx, nowSec, localForbidden);
     if (rightPick) {
       localForbidden.add(rightPick.url);
     } else {
       splitsRightFailed++;
     }
-    // If we couldn't resolve ANY image for either side, downgrade this
-    // block to a plain image and let the next render pick a pool entry.
-    // We can't render an empty split-screen.
-    if (!leftPick && !rightPick) continue;
+    // If we couldn't resolve ANY image for either side, the block was
+    // going to render as an empty split. Try a final downgrade to
+    // footage by pulling from the unused-clip pool the same way
+    // pickFillerForBlock did during the original Tier 2 fill. If a
+    // clip is available we convert to footage; if not we fall back to
+    // image (which still gets the eventual entity-pool fill below).
+    if (!leftPick && !rightPick) {
+      const filler = pickFillerForBlock(blockIdx);
+      if (filler && !usedClipIds.has(filler.clipId)) {
+        item.type = "footage";
+        item.clip_id = filler.clipId;
+        usedClipIds.add(filler.clipId);
+        clipLastUsedAt.set(filler.clipId, nowSec);
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.downgraded_from = "split_2_no_images";
+        meta.downgrade_reason = "neither split half resolved";
+        meta.pick_source = "split_downgrade_to_footage";
+        item.metadata = meta;
+      } else {
+        // No fresh clip either — leave the block as type=image with no
+        // url so the entity-pool fill / person-fallback pass below has
+        // a chance to attach something. Better than an empty split tile.
+        item.type = "image";
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.downgraded_from = "split_2_no_images";
+        meta.downgrade_reason = "neither split half resolved; no fresh clip in pool";
+        item.metadata = meta;
+      }
+      continue;
+    }
     // If only one side resolved, downgrade to a single full-frame image
     // using whichever URL we have. The renderer then treats this as a
     // normal image block.
@@ -3885,13 +4187,51 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .reduce((s, it) => s + Number(it.duration ?? 0), 0);
   const targetTimelineSum = voiceoverSeconds;
   const liveGap = targetTimelineSum - liveTimelineSum;
-  if (liveGap > 0.1) {
-    // Replace the planner-derived reclaim target with the live gap.
-    // Only widen, never narrow — if the planner's reclaim was bigger,
-    // the items added/removed by markers cancelled out some of it
-    // already and we should trust the live number.
+
+  // Predict the proportional fit multiplier for the new-builder path so we
+  // can decide whether to also run reclaim. Proportional fit is clean when
+  // the adjustment is small (≤ 5% per block); beyond that, every block
+  // distorts visibly. Reclaim absorbs the bulk shortfall onto specific
+  // footage rows BEFORE proportional fit runs, keeping the multiplier in
+  // the safe range.
+  //
+  // Math: proportional fit scales the "adjustable" sum (everything except
+  // intro + title_card) by adjustableTarget / adjustableSum. We compute
+  // what that ratio WOULD BE if reclaim didn't run, and check if it's
+  // outside [0.9, 1.1]. Outside that band → also run reclaim.
+  const PROP_FIT_SAFE_MIN = 0.9;
+  const PROP_FIT_SAFE_MAX = 1.1;
+  const adjustableSumPreview = items
+    .filter((it) => it.type !== "intro" && it.type !== "title_card")
+    .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+  const fixedSumPreview = items
+    .filter((it) => it.type === "title_card")
+    .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+  const adjustableTargetPreview = Math.max(0.1, voiceoverSeconds - fixedSumPreview);
+  const predictedMultiplier = adjustableSumPreview > 0.1
+    ? adjustableTargetPreview / adjustableSumPreview
+    : 1;
+  const propFitWouldBeExtreme =
+    predictedMultiplier < PROP_FIT_SAFE_MIN ||
+    predictedMultiplier > PROP_FIT_SAFE_MAX;
+
+  // Reclaim runs when:
+  //   • We're on the legacy hint-driven path (always), OR
+  //   • The transcript-driven path's proportional fit would be too
+  //     extreme (>10% per-block distortion). Reclaim absorbs the bulk
+  //     adjustment so proportional fit stays in the imperceptible range.
+  const shouldUseReclaim = !usedTranscriptDrivenBuilder || propFitWouldBeExtreme;
+  if (liveGap > 0.1 && shouldUseReclaim) {
     durationReclaimSeconds = liveGap;
   }
+  await logJob({ projectId, jobId: mediaJobId }, "match.duration_strategy", {
+    usedTranscriptDrivenBuilder,
+    liveGap: Math.round(liveGap * 10) / 10,
+    predictedMultiplier: Math.round(predictedMultiplier * 10000) / 10000,
+    propFitWouldBeExtreme,
+    shouldUseReclaim,
+    safeRange: [PROP_FIT_SAFE_MIN, PROP_FIT_SAFE_MAX],
+  });
 
   // Reclaim time lost to clip-shorter-than-planned clamping by stretching
   // the unclamped footage rows. Without this, the inserted timeline would
@@ -3973,6 +4313,126 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
+  // Proportional fit — force the body of the timeline to total exactly
+  // voiceoverSeconds so every word of narration aligns with a visual,
+  // start to end.
+  //
+  // Why proportional (not tail-trim): the renderer needs the visual
+  // timeline to match the voiceover EXACTLY so the narrator's voice ends
+  // at the same moment the last visual ends — no trailing silence under a
+  // frozen frame, no audio cut short. The old tail-trim only touched the
+  // last few rows, which either created 1-2s flash blocks at the end or
+  // dropped sentences entirely when the overshoot exceeded what trimming
+  // could absorb.
+  //
+  // Proportional fit distributes the adjustment across every body row
+  // (footage and image) by a fixed multiplier. A 32:10 timeline against
+  // 31:54 audio yields a 0.992 multiplier — a 5s sentence becomes 4.96s,
+  // a 6s footage becomes 5.95s, all rounded to 0.1s precision. Viewers
+  // cannot perceive 0.04s differences, but the total now matches exactly.
+  //
+  // Preserves:
+  //   • Title cards — their 5s hold is editorial spec, not adjustable
+  //   • Intro rows — they have their own audio track (separate timeline)
+  //
+  // When the timeline is SHORTER than audio (rare, but possible when many
+  // rows were clamped to clip lengths), we expand instead of compress
+  // using the same proportional rule, so the gap is absorbed evenly
+  // rather than appearing as silent visual at the end.
+  {
+    const target = voiceoverSeconds;
+    const adjustableType = (it: { type?: string | null }) =>
+      it.type !== "intro" && it.type !== "title_card";
+    const adjustableSum = () =>
+      items.filter(adjustableType).reduce((s, it) => s + Number(it.duration ?? 0), 0);
+    const fixedSum = () =>
+      items.filter((it) => !adjustableType(it) && it.type !== "intro")
+        .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+
+    const initialAdjustable = adjustableSum();
+    const fixed = fixedSum();
+    const adjustableTarget = Math.max(0.1, target - fixed);
+
+    if (initialAdjustable > 0.1) {
+      const multiplier = adjustableTarget / initialAdjustable;
+      // Per-row ceiling: a footage row can't exceed its clip's real length
+      // (we'd be asking ffmpeg to show frames that don't exist). Image
+      // rows have no source-media ceiling, so they can stretch freely.
+      // When compressing (multiplier <= 1) ceilings don't matter; only
+      // the expand path needs this guard.
+      function ceilingFor(it: typeof items[number]): number {
+        if (it.type === "footage") {
+          const meta = (it.metadata as Record<string, unknown> | undefined) ?? {};
+          const clipDur = Number(meta.clip_duration ?? 0);
+          if (clipDur > 0) return clipDur;
+        }
+        return Infinity;
+      }
+      // Apply the multiplier to every adjustable row. Round each to 0.1s
+      // precision; let the LAST adjustable row absorb any residue so the
+      // sum still equals adjustableTarget exactly.
+      const adjustableItems = items.filter(adjustableType);
+      let cumulative = 0;
+      const leftover: { it: typeof items[number]; want: number; ceiling: number }[] = [];
+      for (let k = 0; k < adjustableItems.length - 1; k++) {
+        const it = adjustableItems[k];
+        const cur = Number(it.duration ?? 0);
+        const ceiling = ceilingFor(it);
+        const scaled = Math.round(cur * multiplier * 10) / 10;
+        // Clamp to [1.0, ceiling]. Track any portion that couldn't be
+        // absorbed (when expand wanted to push past the clip's length)
+        // so we can redistribute it across other rows.
+        const want = Math.max(1.0, scaled);
+        const capped = Math.min(want, ceiling);
+        it.duration = capped;
+        cumulative += it.duration;
+        if (want > capped) {
+          leftover.push({ it, want, ceiling });
+        }
+      }
+      // Tail row absorbs the residue so the body sums to adjustableTarget
+      // exactly. Floor at 1s. When expanding and the tail's clip ceiling
+      // can't absorb the full residue, the leftover stretches across the
+      // image rows (which have no clip ceiling) on a second pass.
+      if (adjustableItems.length > 0) {
+        const tail = adjustableItems[adjustableItems.length - 1];
+        const tailCeiling = ceilingFor(tail);
+        const want = Math.max(1.0, Math.round((adjustableTarget - cumulative) * 10) / 10);
+        const capped = Math.min(want, tailCeiling);
+        tail.duration = capped;
+        cumulative += tail.duration;
+      }
+      // If we still undershoot the target (expand case where many footage
+      // rows hit their clip ceilings), distribute the gap across IMAGE
+      // rows only — they have no clip-source ceiling and can hold a
+      // single image for any length without source-media issues.
+      let gap = adjustableTarget - cumulative;
+      if (gap > 0.1) {
+        const imageRows = adjustableItems.filter((it) => it.type === "image");
+        if (imageRows.length > 0) {
+          const perImage = Math.round((gap / imageRows.length) * 10) / 10;
+          for (const it of imageRows) {
+            const cur = Number(it.duration ?? 0);
+            it.duration = Math.round((cur + perImage) * 10) / 10;
+          }
+        }
+      }
+    }
+
+    const finalSum = adjustableSum() + fixed;
+    await logJob({ projectId, jobId: mediaJobId }, "match.proportional_fit", {
+      targetSeconds: target,
+      voiceoverSeconds,
+      initialAdjustableSum: Math.round(initialAdjustable * 10) / 10,
+      fixedSum: Math.round(fixed * 10) / 10,
+      finalSum: Math.round(finalSum * 10) / 10,
+      residualGap: Math.round((target - finalSum) * 10) / 10,
+      multiplier: Math.round((adjustableTarget / Math.max(0.1, initialAdjustable)) * 10000) / 10000,
+      adjustableRows: items.filter(adjustableType).length,
+      fixedRows: items.filter((it) => !adjustableType(it) && it.type !== "intro").length,
+    });
+  }
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
@@ -4043,20 +4503,6 @@ async function loadBlockHintsFromAnalyze(
   const segments = payload?.segments ?? [];
   if (segments.length === 0) return [];
 
-  // When the project has doc-driven title markers (blue-bold titles in the
-  // pasted Google Doc), those are the authoritative title cards. We must
-  // NOT also auto-promote segment openings to title cards from Gemini's
-  // sectionTitle field — that produces extra cards the user never wrote.
-  // The doc is the source of truth; the auto-promotion path is a fallback
-  // for projects that didn't paste a doc.
-  const { data: docTitleRows } = await sb
-    .from("project_script_markers")
-    .select("id")
-    .eq("project_id", projectId)
-    .eq("kind", "title_card")
-    .limit(1);
-  const hasDocTitleCards = (docTitleRows?.length ?? 0) > 0;
-
   // Pre-compute per-paragraph normalized text so each hint can be tagged
   // with the doc paragraph its narration came from. The planner uses this
   // to refuse to merge hints from different paragraphs. We split on \n
@@ -4096,44 +4542,31 @@ async function loadBlockHintsFromAnalyze(
     if (!u) continue;
     const segBlocks: BlockPlan[] = Array.isArray(u.blocks) ? u.blocks : [];
     if (segBlocks.length === 0) continue;
-    // Resolve the section title for this segment's first block. Gemini's
-    // sectionTitle field is conservative — the prompt asks for it ONLY when
-    // the narration "clearly opens a new chapter", so scripts written as
-    // continuous prose (no labelled chapters) often leave it empty and the
-    // black title-card never gets rendered. Fall back to segmentTopic, which
-    // every segment has and which reads like a chapter heading ("lawsuit /
-    // Creative Controls", "early career", "wedding 2019"). Title-case the
-    // first letter so an all-lowercase topic reads as a heading.
+    // Resolve the section title for this segment's first block. Used only
+    // as section_title metadata on the first hint — title cards themselves
+    // come from the Google Doc, not from this field. Falls back to
+    // segmentTopic so the metadata is always populated.
     const rawTitle = (u.sectionTitle && u.sectionTitle.trim())
       || (u.segmentTopic && u.segmentTopic.trim())
       || "";
     const resolvedSectionTitle = rawTitle
       ? rawTitle.charAt(0).toUpperCase() + rawTitle.slice(1)
       : undefined;
-    // Force the first block of each segment (except segment 0, which is the
-    // hook/opening) to be a title_card ONLY when Gemini explicitly emitted a
-    // sectionTitle for the segment — that is its signal that the narration
-    // opens a real chapter. We deliberately do NOT promote on the
-    // segmentTopic fallback: every segment has a topic, and promoting on
-    // that would drop a black card every ~60-90s and bury the narration. The
-    // overlay_text still uses resolvedSectionTitle (which can fall back to
-    // segmentTopic), so the few promoted cards always render with readable
-    // heading text.
-    const hasExplicitSectionTitle = !!(u.sectionTitle && u.sectionTitle.trim());
     for (let i = 0; i < segBlocks.length; i++) {
       const b = segBlocks[i];
-      // Doc-driven title cards (from blue-bold paragraphs in the Google
-      // Doc) are authoritative. When the project has any, suppress the
-      // Gemini-sectionTitle auto-promotion path entirely so only the
-      // user's intended cards appear in the final video.
-      const promoteToTitleCard =
-        i === 0 && segIdx > 0 && hasExplicitSectionTitle && !hasDocTitleCards;
+      // Title cards come EXCLUSIVELY from blue-bold paragraphs in the
+      // Google Doc. Both AI-driven paths are permanently disabled:
+      //   1. segment-opening auto-promotion (was gated on hasDocTitleCards)
+      //   2. Gemini's per-block `recommended_visual_type: "title_card"`
+      //      — demoted to footage so the AI can't insert chapter cards.
+      const geminiSaidTitleCard = b.recommended_visual_type === "title_card";
+      const effectiveVisualType = geminiSaidTitleCard
+        ? "footage"
+        : b.recommended_visual_type;
       hints.push({
         text: b.text,
         resolved_subject: b.resolved_subject || undefined,
-        recommended_visual_type: promoteToTitleCard
-          ? "title_card"
-          : b.recommended_visual_type,
+        recommended_visual_type: effectiveVisualType,
         // Only attach section_title to the FIRST block of a segment — that's
         // the chapter boundary. Later blocks in the same segment continue
         // under the same section.

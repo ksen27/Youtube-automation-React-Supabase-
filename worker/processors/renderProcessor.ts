@@ -802,6 +802,76 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     let introAudioPath: string | undefined;
     let introDurationActual = 0;
 
+    // Opening title — the overall video title shown as a 5s black
+    // title-card BEFORE the intro clips play. Set when the doc starts
+    // with a blue-bold title paragraph above the first intro timestamp.
+    // Rendered with the same buildTitleCardVideo helper the chapter
+    // title cards use, with a silent audio track of matching duration
+    // so the intro audio crossfade lands at the right offset.
+    //
+    // The card is prepended to `normalized[]` AFTER the intro cards
+    // below (because the multi-intro block unshifts in reverse order).
+    // We build it first so the file exists when we unshift it.
+    const OPENING_TITLE_DURATION = 5;
+    let openingTitleVideoPath: string | undefined;
+    let openingTitleAudioPath: string | undefined;
+    let openingTitleDuration = 0;
+    {
+      const { data: openingTitleRow } = await sb
+        .from("project_script_markers")
+        .select("text")
+        .eq("project_id", projectId)
+        .eq("kind", "opening_title")
+        .maybeSingle();
+      const titleText = ((openingTitleRow?.text as string | null) ?? "").trim();
+      if (titleText) {
+        try {
+          const openingTmp = path.join(tmp, "opening_title");
+          await fs.mkdir(openingTmp, { recursive: true });
+          const cardPath = path.join(openingTmp, "card.mp4");
+          await buildTitleCardVideo({
+            text: titleText,
+            outputPath: cardPath,
+            durationSeconds: OPENING_TITLE_DURATION,
+            width: 1280,
+            height: 720,
+            fps: 30,
+            animation: "static",
+          });
+          const normalizedCard = path.join(openingTmp, "card_norm.mp4");
+          await normalizeClip({
+            inputPath: cardPath,
+            outputPath: normalizedCard,
+            width: 1280,
+            height: 720,
+            fps: 30,
+          });
+          // Silent audio track matching the card's duration so the intro
+          // audio path concat lands at the right offset.
+          const silentPath = path.join(openingTmp, "card_silent.m4a");
+          await buildSilentAudio({
+            outputPath: silentPath,
+            durationSeconds: OPENING_TITLE_DURATION,
+          });
+          openingTitleVideoPath = normalizedCard;
+          openingTitleAudioPath = silentPath;
+          openingTitleDuration = OPENING_TITLE_DURATION;
+          await safeUnlink(cardPath);
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.opening_title.ready", {
+              text: titleText.slice(0, 80),
+              durationSeconds: OPENING_TITLE_DURATION,
+            });
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.opening_title.failed", { err: (e as Error).message });
+          openingTitleVideoPath = undefined;
+          openingTitleAudioPath = undefined;
+          openingTitleDuration = 0;
+        }
+      }
+    }
+
     // Multi-clip intro from script-doc markers takes priority over
     // everything else. Each intro_card row in project_script_markers is a
     // blue-bold timestamp block at the top of the user's Google Doc; we
@@ -1152,6 +1222,39 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         await logJob({ projectId, jobId: mediaJobId },
           "render.intro.failed", { err: (e as Error).message });
       }
+    }
+
+    // Prepend the opening-title card (if built) so it lands at the very
+    // front of the final video — BEFORE any intro clips. Runs AFTER all
+    // intro paths so the unshift order is stable regardless of which
+    // intro variant ran. Audio: prepend the matching silent clip to
+    // introAudioPath so the voiceover crossfade still lands at the right
+    // offset (now: opening_title_duration + intro_duration).
+    if (openingTitleVideoPath && openingTitleAudioPath && openingTitleDuration > 0) {
+      normalized.unshift(openingTitleVideoPath);
+      if (introAudioPath) {
+        // Concat the silent opening title audio in FRONT of the existing
+        // intro audio so the merged track starts with silence then plays
+        // the intro source audio at offset openingTitleDuration.
+        const mergedIntroAudio = path.join(tmp, "intro_with_opening_title.m4a");
+        await concatAudioFiles({
+          inputPaths: [openingTitleAudioPath, introAudioPath],
+          outputPath: mergedIntroAudio,
+        });
+        await safeUnlink(introAudioPath);
+        introAudioPath = mergedIntroAudio;
+      } else {
+        // No intro audio at all — the opening title's silent track IS the
+        // entire intro audio. The voiceover crossfade in concatNormalizedClips
+        // will hand off to the voiceover at openingTitleDuration.
+        introAudioPath = openingTitleAudioPath;
+      }
+      introDurationActual += openingTitleDuration;
+      await logJob({ projectId, jobId: mediaJobId },
+        "render.opening_title.prepended", {
+          openingTitleDuration,
+          newIntroDurationActual: introDurationActual,
+        });
     }
 
     // 4) Concat

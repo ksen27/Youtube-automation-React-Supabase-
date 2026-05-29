@@ -12,6 +12,26 @@ import { safeFilename } from "@/lib/utils";
 import type { JobAttemptInfo } from "../index";
 import { maybeEnqueueMatch } from "./_shared";
 
+// Dedup guard for clip-job enqueue. Returns true when a queued or running
+// clip job already exists for the given video_source. Used by both enqueue
+// sites in this processor to prevent two concurrent clip jobs from sharing
+// /tmp/work/<videoId>/ paths and corrupting each other's frame stills /
+// source mp4 (the ENOENT-mid-clip-extraction symptom).
+async function hasOpenClipJob(videoSourceId: string): Promise<boolean> {
+  const sb = getServerSupabase();
+  const { data } = await sb
+    .from("media_jobs")
+    .select("id, metadata, status")
+    .eq("type", "clip")
+    .in("status", ["queued", "running"]);
+  if (!data || data.length === 0) return false;
+  for (const row of data) {
+    const meta = (row.metadata ?? {}) as Record<string, unknown>;
+    if (meta.videoSourceId === videoSourceId) return true;
+  }
+  return false;
+}
+
 export async function processDownloadJob(
   data: DownloadJobData,
   attempt?: JobAttemptInfo,
@@ -43,6 +63,19 @@ export async function processDownloadJob(
     // Make sure source is associated with this project (one source row per video).
     if (existing.project_id !== projectId) {
       await sb.from("video_sources").update({ project_id: projectId }).eq("id", existing.id);
+    }
+    // Dedup guard: refuse to enqueue a clip job if one is already in flight
+    // for this source. Without this, restarting a partially-processed project
+    // (user stopped + resumed) re-enqueues a clip job for sources that ALREADY
+    // had one running, which then races on /tmp/work/<videoId>/ paths and
+    // corrupts the in-flight job's tmp directory. Symptom: ENOENT errors mid-
+    // clip-extraction and duplicate source rows in the editor.
+    const alreadyInFlight = await hasOpenClipJob(existing.id);
+    if (alreadyInFlight) {
+      await logJob({ projectId, jobId: mediaJobId, sourceId: existing.id },
+        "download.clip.dedup_skip", { reason: "clip job already running" });
+      await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { cached: true, dedupSkipped: true } });
+      return;
     }
     const childId = await createMediaJob({ projectId, type: "clip", metadata: { videoSourceId: existing.id, cached: true } });
     await enqueueClip({ projectId, mediaJobId: childId, videoSourceId: existing.id });
@@ -168,7 +201,17 @@ export async function processDownloadJob(
 
     await setMediaJob(mediaJobId, { progress: 90 });
 
-    // 8) Enqueue clip job
+    // 8) Enqueue clip job — same dedup guard as the cache-hit path above.
+    // Protects against a download retry (BullMQ attempt 2/3) racing the
+    // clip job from attempt 1, which would otherwise share the same
+    // /tmp/work/<videoId>/ paths and corrupt each other.
+    const alreadyInFlight = await hasOpenClipJob(vs.id);
+    if (alreadyInFlight) {
+      await logJob({ projectId, jobId: mediaJobId, sourceId: vs.id },
+        "download.clip.dedup_skip", { reason: "clip job already running" });
+      await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { dedupSkipped: true } });
+      return;
+    }
     const clipJobId = await createMediaJob({
       projectId, type: "clip", metadata: { videoSourceId: vs.id },
     });

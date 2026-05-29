@@ -8,7 +8,15 @@ import { withGeminiRetry, isRetryableGeminiError } from "@/lib/ai/gemini";
 // human-readable understanding of each segment plus search intents.
 
 const WORDS_PER_MINUTE = 150;          // typical narration cadence
-const TARGET_SEGMENT_MINUTES = 5;
+// 3-minute target (~450 words / ~30-40 sentences per segment) keeps each
+// Gemini analyzeSegment call small enough that the model reliably emits
+// one block per sentence. At 5 minutes the model under-emitted blocks on
+// long-form audios, which surfaced in the editor as the same sentence
+// repeated across many scenes (one Gemini block being split into N slots
+// by the planner). Segments still run in parallel via Promise.all so the
+// 10-segment 31-min case isn't materially slower than the old 6-segment
+// split.
+const TARGET_SEGMENT_MINUTES = 3;
 const MIN_SEGMENT_WORDS = 250;          // don't split tiny scripts at all
 
 function getModel() {
@@ -773,7 +781,7 @@ ${subjectQueryRule}
   Good: "Princess Diana Charles wedding 1981"
 
 SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
-"""${segment.text.slice(0, 8000)}"""`;
+"""${segment.text}"""`;
 
   let txt: string;
   try {
