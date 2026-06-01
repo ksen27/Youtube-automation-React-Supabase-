@@ -18,12 +18,76 @@ export interface CutClipOptions {
   // audio extraction step downstream sees the audio track on the trimmed
   // file.
   keepAudio?: boolean;
+  // Slow-motion factor. When > 1.0, the source is read for
+  // `durationSeconds / slowmoFactor` seconds of input then stretched via
+  // `setpts=PTS*slowmoFactor` so the output is exactly `durationSeconds`
+  // long. Used by the renderer to fill a short clip's footage block when
+  // the sentence is up to 1.5× longer than the clip — keeps motion
+  // continuity without freeze frames or image substitution.
+  //
+  // Values ≤ 1.0 (or unset) take the original stream-copy fast path.
+  // Slow-mo requires a re-encode (libx264) because PTS rewriting can't
+  // be done with `-c:v copy`.
+  slowmoFactor?: number;
   signal?: AbortSignal;
 }
 
 export async function cutClip(opts: CutClipOptions): Promise<void> {
   const env = getEnv();
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  const slowmo = opts.slowmoFactor && opts.slowmoFactor > 1.0
+    ? opts.slowmoFactor
+    : null;
+
+  if (slowmo) {
+    // Slow-motion branch. Read `durationSeconds / slowmo` seconds of source
+    // (so the source content covered matches what a normal cutClip would
+    // have asked for at the original speed), then stretch via setpts to
+    // exactly `durationSeconds` output. Re-encode is mandatory — setpts
+    // rewrites timestamps which `-c:v copy` cannot do.
+    //
+    // Audio side: drop it entirely. The renderer mixes voiceover at concat
+    // time; the source clip's audio (if any) would have to be pitch-
+    // corrected to stay watchable at 1.0×–1.5× slow-mo and is never used
+    // in the final mix. Both regular footage AND forced doc clips (as of
+    // 2026-06-01) are silent in the final output — the narrator voiceover
+    // plays continuously. keepAudio is intentionally ignored in this
+    // branch.
+    // Read sourceDuration seconds of input, then stretch via setpts to
+    // exactly durationSeconds of output. Critical ordering:
+    //
+    //   -ss N -t M -i input        ← input-side -t (cuts the read)
+    //   -vf setpts=PTS*slowmo      ← stretches PTS
+    //   (NO output-side -t)        ← otherwise -t caps output duration
+    //                                AFTER setpts already stretched the
+    //                                timestamps, so the output only contains
+    //                                `output_t / slowmo` seconds of source
+    //                                stretched to `output_t` (silent crop).
+    //                                Result: probed output = output_t but
+    //                                content visibly cut short. This was the
+    //                                row-24 5.8s vs expected 8.23s bug
+    //                                on 2026-06-01.
+    const sourceDuration = opts.durationSeconds / slowmo;
+    const args = [
+      "-y",
+      "-threads", String(env.FFMPEG_THREADS),
+      "-ss", String(opts.startSeconds),
+      "-t", String(sourceDuration),
+      "-i", opts.inputPath,
+      "-vf", `setpts=PTS*${slowmo.toFixed(4)}`,
+      "-an",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "23",
+      "-pix_fmt", "yuv420p",
+      "-avoid_negative_ts", "make_zero",
+      "-movflags", "+faststart",
+      opts.outputPath,
+    ];
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+    return;
+  }
 
   // -ss before -i is input-side seek (fast: ffmpeg jumps in the file rather
   // than decoding from frame 0). With -c:v copy we stream-copy the H.264

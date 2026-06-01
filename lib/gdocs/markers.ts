@@ -242,6 +242,16 @@ export interface ApplyMarkersResult {
   titleCardExtraClipsInserted: number;
   lowerThirdsApplied: number;
   lowerThirdsSkipped: number;
+  // Forced YouTube clips that were trimmed because their requested duration
+  // overflowed the narration budget for their section. The doc author chose
+  // a clip longer than the sentences underneath; we shortened the playback
+  // to stop the visual from leaking into the next section's audio.
+  forcedClipTrimmings: Array<{
+    markerId: string;
+    requestedDur: number;
+    trimmedDur: number;
+    narrationBudget: number;
+  }>;
 }
 
 // Override a single timeline item's visual to the canonical reference
@@ -315,6 +325,7 @@ export function applyScriptMarkers(
     titleCardExtraClipsInserted: 0,
     lowerThirdsApplied: 0,
     lowerThirdsSkipped: 0,
+    forcedClipTrimmings: [],
   };
   if (!words || words.length === 0 || markers.length === 0) return result;
   // Local non-null alias so TS narrows inside nested closures (the
@@ -797,6 +808,22 @@ export function applyScriptMarkers(
     g = h - 1;
   }
 
+  // Section narration-end time for each group: the next title_card's
+  // parentT in spoken-audio time, or +Infinity when this is the last
+  // section. Used to clamp the forced YouTube clip's playback duration
+  // so it never overflows into the next section's narration ("the doc
+  // author picked a 30s clip but the section is only 18s of audio" case).
+  const orderedGroupsAsc = [...groups].sort((a, b) => a.parentT - b.parentT);
+  const sectionEndByGroupId = new Map<string, number>();
+  for (let gi = 0; gi < orderedGroupsAsc.length; gi++) {
+    const cur = orderedGroupsAsc[gi];
+    const nxt = orderedGroupsAsc[gi + 1];
+    sectionEndByGroupId.set(
+      cur.parent.id,
+      nxt ? nxt.parentT : Number.POSITIVE_INFINITY,
+    );
+  }
+
   // Insert groups in reverse spoken-time order so an earlier insertion
   // doesn't shift the index of a later one.
   const groupsByTimeDesc = [...groups].sort((a, b) => b.parentT - a.parentT);
@@ -805,10 +832,50 @@ export function applyScriptMarkers(
     const k = findItemIndexAtTime(currentStarts, items, group.parentT);
     if (k < 0) { result.titleCardsSkipped++; continue; }
 
+    // How much audio narration sits between this title's audio-end and the
+    // NEXT title's start. Forced YouTube clips must collectively play for
+    // at most this many seconds — otherwise the visual continues past the
+    // narrator entering the next section, producing the "wrong clip under
+    // the wrong narration" mismatch the user reported.
+    const sectionEndT = sectionEndByGroupId.get(group.parent.id) ?? Number.POSITIVE_INFINITY;
+    const forcedAudioBudget = Number.isFinite(sectionEndT)
+      ? Math.max(0, sectionEndT - (group.parentT + group.typewriterDuration))
+      : Number.POSITIVE_INFINITY;
+    // Running cursor: how much forced-clip duration we've already committed
+    // for this section. Each new forced clip can take at most
+    // (forcedAudioBudget - usedForcedAudio) before it overflows.
+    let usedForcedAudio = 0;
+    // Telemetry — surfaced via the result object so the matcher can log
+    // when a clip got trimmed and by how much.
+    const forcedClipTrimmings: Array<{
+      markerId: string;
+      requestedDur: number;
+      trimmedDur: number;
+      narrationBudget: number;
+    }> = [];
+
     function forcedFootageFromMarker(m: ScriptMarkerRow, voStart: number): TimelineItemDraft {
       const start = m.start_seconds != null ? Number(m.start_seconds) : 0;
       const end = m.end_seconds != null ? Number(m.end_seconds) : start + 6;
-      const dur = Math.max(1, end - start);
+      const requestedDur = Math.max(1, end - start);
+      // Trim to fit the remaining narration budget for this section.
+      // "Trim" = lower the playback duration only; the doc author's
+      // YouTube URL + start_seconds stay intact, the renderer just plays
+      // less of the clip than requested. Minimum playback = 1s so the
+      // viewer at least registers the visual switched.
+      const remainingBudget = Math.max(0, forcedAudioBudget - usedForcedAudio);
+      const dur = Number.isFinite(remainingBudget)
+        ? Math.max(1, Math.min(requestedDur, remainingBudget))
+        : requestedDur;
+      if (dur + 0.05 < requestedDur) {
+        forcedClipTrimmings.push({
+          markerId: m.id,
+          requestedDur: Math.round(requestedDur * 100) / 100,
+          trimmedDur: Math.round(dur * 100) / 100,
+          narrationBudget: Math.round(forcedAudioBudget * 100) / 100,
+        });
+      }
+      usedForcedAudio += dur;
       // Cheap YouTube thumbnail derived from the URL. The editor UI picks
       // this up from metadata.thumbnail_url and shows it on the block
       // instead of the empty grey-box-with-"footage" placeholder. It's
@@ -826,6 +893,12 @@ export function applyScriptMarkers(
       // forced clip and the words that were spoken during its window
       // appear on the NEXT row, making the timeline look desynced.
       const scriptText = spokenTextInWindow(wordsNN, voStart, voStart + dur);
+      // When trimmed, the renderer should play start..start+dur, not
+      // start..end (the doc author's original window). Adjusting
+      // forced_clip.end_seconds here keeps the doc author's chosen IN
+      // point intact while ensuring the cut is exactly the playback
+      // duration we settled on.
+      const trimmedEnd = start + dur;
       return {
         project_id: projectId,
         clip_id: null,
@@ -852,23 +925,34 @@ export function applyScriptMarkers(
           // that window would either repeat the last frame or run black
           // tail frames, neither of which the user wants.
           duration_clamped: true,
+          // Doc author's original requested duration before any trim. Lets
+          // the editor surface "trimmed from 30s" UI and lets analyze-time
+          // warnings cross-reference what the doc said vs. what the timeline
+          // committed to.
+          forced_clip_original_duration: Math.round(requestedDur * 100) / 100,
           forced_clip: {
             youtube_url: m.youtube_url,
             start_seconds: start,
-            end_seconds: end,
+            end_seconds: trimmedEnd,
           },
         },
         approved: false,
       };
     }
 
-    // Title card's spoken window: [parentT, parentT + parentDuration).
-    // The narrator is saying the title text itself during this window
-    // (that's how parentDuration was measured — see line 365 above).
+    // Title card's AUDIO window: [parentT, parentT + typewriterDuration).
+    // The narrator is saying the title text itself only during the
+    // typewriter window — the additional TITLE_CARD_HOLD_TAIL is a VISUAL
+    // hold (so the viewer has a beat to read the fully-typed card) and
+    // does not correspond to title narration. We previously used
+    // parentDuration here, which over-claimed audio time by the tail
+    // (~0.8s) and shifted every downstream row's vo_start metadata by
+    // that amount.
+    const audioWindowEnd = group.parentT + group.typewriterDuration;
     const titleSpokenText = spokenTextInWindow(
       wordsNN,
       group.parentT,
-      group.parentT + group.parentDuration,
+      audioWindowEnd,
     );
     const titleCardRow: TimelineItemDraft = {
       project_id: projectId,
@@ -891,14 +975,27 @@ export function applyScriptMarkers(
         // it before the next clip cuts in.
         animation: "typewriter",
         typewriter_seconds: group.typewriterDuration,
+        // Spoken-audio window the title card occupies. Without these the
+        // proportional-fit pass treats the title card as "no audio" and
+        // stretches surrounding image rows to absorb the narrator's title
+        // phrase time — making an image hold past its sentence's real
+        // spoken end. The window covers the typewriter (= narrated)
+        // portion; the trailing visual hold (TITLE_CARD_HOLD_TAIL) is a
+        // post-narration beat where the narrator has already moved on.
+        vo_start_seconds: group.parentT,
+        vo_end_seconds: audioWindowEnd,
       },
       approved: false,
     };
     // Forced clips play in sequence right after the title card. Their
-    // voiceover windows are back-to-back starting at parentT + parentDuration,
-    // and each row's script_text is sliced from the spoken words inside its
-    // own window so the editor shows the right narration on each clip.
-    let forcedVoCursor = group.parentT + group.parentDuration;
+    // voiceover windows are back-to-back starting at audioWindowEnd
+    // (parentT + typewriterDuration), NOT parentT + parentDuration. The
+    // 0.8s TITLE_CARD_HOLD_TAIL inside parentDuration is a VISUAL hold
+    // (so the viewer reads the typed card) — the narrator has already
+    // moved on to the next sentence during that tail. Anchoring forced
+    // clips to audioWindowEnd keeps each row's vo_start metadata aligned
+    // with what's actually being narrated under it.
+    let forcedVoCursor = audioWindowEnd;
     const parentForced = forcedFootageFromMarker(group.parent, forcedVoCursor);
     forcedVoCursor += Number(parentForced.duration);
     const rows: TimelineItemDraft[] = [titleCardRow, parentForced];
@@ -909,16 +1006,21 @@ export function applyScriptMarkers(
     }
 
     // Compute the overlay window in voiceover-time before we mutate
-    // items. With forced clips now playing SILENT (per user direction
-    // 2026-05-27) under a continuing narrator voiceover, BOTH the
-    // title_card AND its trailing forced-footage rows consume narrator
-    // time. The overlay window spans the entire inserted block —
-    // [parentT, parentT + parentDuration + sum(forced clip durations)) —
-    // so the dedup pass below removes every script item whose narration
-    // window falls under the title card OR its forced clips. Without
-    // this, a script item's narration would play twice (once on the
-    // forced footage row, once on the script item just past the
-    // overlay), creating the audio/visual desync the user reported.
+    // items. The dedup pass deletes script rows whose vo_start_seconds
+    // falls in [overlayWindowStart, overlayWindowEnd) — i.e. rows that
+    // would have covered the SAME narration window the inserted block
+    // now covers.
+    //
+    // overlayWindowStart = parentT (title narration begins)
+    // overlayWindowEnd   = forcedVoCursor (parentT + audio window +
+    //                      sum of forced clip durations)
+    //
+    // NOTE: forced clips ARE real rows that hold their own narration —
+    // they're not silent overlays needing separate absorption. So the
+    // overlay window ends where the forced clips end, but the dedup
+    // pass only needs to absorb the TITLE CARD's narration share (the
+    // forced clips already account for theirs by being rows). See the
+    // dedup target below.
     const overlayWindowStart = group.parentT;
     const overlayWindowEnd = forcedVoCursor;
 
@@ -977,34 +1079,46 @@ export function applyScriptMarkers(
     items.splice(k, 0, ...rows);
     result.titleCardsInserted++;
     result.titleCardExtraClipsInserted += group.extras.length;
+    if (forcedClipTrimmings.length > 0) {
+      result.forcedClipTrimmings.push(...forcedClipTrimmings);
+    }
 
-    // De-dup pass: forced footage clips play OVER the voiceover (the
-    // narrator keeps talking under the visual), so they REPLACE script
-    // items rather than adding length on top. We must remove enough
-    // subsequent script items to cover the inserted overlay rows'
-    // duration — otherwise the timeline grows past voiceover length.
+    // De-dup pass: when we insert the title card + forced clips at index k,
+    // some script-driven rows already in the timeline cover the SAME
+    // narration window. Without dedup, the same audio words would map to
+    // both the inserted rows AND the surviving script rows, and the
+    // timeline would grow past the voiceover length.
     //
-    // Two-stage strategy:
-    //   1. Window-based: remove items whose vo_start_seconds falls in
-    //      [overlayWindowStart, overlayWindowEnd). This is precise when
-    //      the metadata is present.
-    //   2. Duration-matched: if we haven't yet absorbed enough duration
-    //      to cover the overlay rows, keep removing the next script
-    //      items until the total removed duration ≈ the overlay rows'
-    //      total. This catches script items with missing vo_start_seconds
-    //      OR items whose vo_start falls just past the window but whose
-    //      narration the forced clips were meant to cover.
+    // CRITICAL DISTINCTION (this used to be wrong and caused missing
+    // sentences):
+    //   - The TITLE CARD is a true overlay row: the narrator is saying the
+    //     title words during this window, but no script-driven row was
+    //     going to cover those words (the planner doesn't know the title
+    //     exists). So the title card's narration share IS new — but it
+    //     also doesn't push other rows out, because typewriterDuration
+    //     equals the spoken title duration.
+    //   - FORCED CLIPS are also full rows that hold their own narration
+    //     window (script_text = spokenTextInWindow over their voStart). A
+    //     forced clip at vo_start=X with duration=D consumes exactly the
+    //     narration of [X, X+D]. That narration was previously covered by
+    //     whatever script row sat at vo_start=X; THAT script row is the one
+    //     we need to delete. The forced clip is the REPLACEMENT, not an
+    //     overlay on top of the replacement.
     //
-    // Intro rows are never removed — they live on a different time axis
-    // (pre-roll, not voiceover).
-    // Title_card AND its forced-footage rows all consume narrator time
-    // now (forced clips play silent under a continuing voiceover, per
-    // user direction 2026-05-27). The dedup pass must absorb script
-    // items totaling the full inserted block — otherwise script items
-    // covering the forced clips' narration window remain in the timeline,
-    // their voiceover plays under both the forced clip AND the script
-    // item, and the timeline runs long.
-    const insertedDuration = rows.reduce((s, r) => s + Number(r.duration ?? 0), 0);
+    // So the dedup target is the TITLE CARD's audio duration PLUS the sum
+    // of forced clip durations — but we only need to delete script rows
+    // that fall in [overlayWindowStart, overlayWindowEnd). The previous
+    // code summed ALL inserted rows (title card visual length + forced
+    // clip durations) which over-absorbed by TITLE_CARD_HOLD_TAIL when
+    // the title card's parentDuration included a visual hold tail. Now
+    // that we've stopped over-claiming on the title card's audio window
+    // (audioWindowEnd = parentT + typewriterDuration), the dedup target
+    // is the simple sum of (title card audio share) + (forced clip durs).
+    const titleCardAudioShare = audioWindowEnd - group.parentT; // == typewriterDuration
+    const forcedClipsDuration = rows
+      .slice(1)
+      .reduce((s, r) => s + Number(r.duration ?? 0), 0);
+    const insertedDuration = titleCardAudioShare + forcedClipsDuration;
     let absorbedDuration = 0;
     const afterOverlayIdx = k + rows.length;
     // Track lower-thirds rescued from items the dedup pass is about to
@@ -1051,26 +1165,29 @@ export function applyScriptMarkers(
       }
       r++;
     }
-    // Stage 2: keep removing subsequent script items until the absorbed
-    // duration covers the inserted rows. Tolerance of 0.5s keeps us from
-    // removing one item too many over rounding. We only remove
-    // footage/image/split rows (the kinds the planner emits); never
-    // intro rows (different time axis) and never title_card / overlay
-    // rows the markers pass inserted earlier in this same loop (those
-    // have pick_source set by markers.ts).
-    while (absorbedDuration + 0.5 < insertedDuration && afterOverlayIdx < items.length) {
-      const it = items[afterOverlayIdx];
-      if (it.type === "intro") break;
-      const meta = (it.metadata ?? {}) as Record<string, unknown>;
-      const pickSource = meta.pick_source;
-      if (pickSource === "doc_marker" || pickSource === "doc_marker_forced") break;
-      const itStart = typeof meta.vo_start_seconds === "number"
-        ? Number(meta.vo_start_seconds)
-        : overlayWindowStart;
-      rescueIfPresent(it, itStart);
-      absorbedDuration += Number(it.duration ?? 0);
-      items.splice(afterOverlayIdx, 1);
-    }
+    // Stage 2 (REMOVED): the old loop kept deleting subsequent script items
+    // until absorbedDuration matched insertedDuration. That over-deleted
+    // whenever insertedDuration > the actual spoken window — e.g. a 5s
+    // typewriter + 8s forced clip = 13s "inserted", but if Stage 1 only
+    // found 8s of overlapping script content (because some sentences sit
+    // AFTER the title+clip audio window), Stage 2 would keep deleting
+    // post-window sentences to "fill" the missing 5s. Those sentences are
+    // narrated in audio that plays AFTER the forced clip ends — they need
+    // their own visuals, not deletion.
+    //
+    // The fix: window-based deletion only. Stage 1 already deletes every
+    // script row whose vo_start falls inside [overlayWindowStart,
+    // overlayWindowEnd). That's the correct set — any sentence whose audio
+    // is being covered by the doc-author's title card or forced clip.
+    // Sentences past overlayWindowEnd narrate over their own clips and
+    // must stay in the editor.
+    //
+    // Any residual mismatch between insertedDuration and absorbedDuration
+    // is handled downstream by the proportional-fit pass, which sums the
+    // picture timeline against voiceoverSeconds and scales adjustable rows
+    // to close the gap. No row content needs to be deleted.
+    void insertedDuration;
+    void absorbedDuration;
 
     // Re-stamp rescued lower-thirds. Two cases:
     //   (a) The rescued marker's spoken moment falls INSIDE the forced-
@@ -1089,7 +1206,12 @@ export function applyScriptMarkers(
     if (rescuedLowerThirds.length > 0) {
       rescuedLowerThirds.sort((a, b) => a.voStart - b.voStart);
       const forcedRows: Array<{ row: TimelineItemDraft; voStart: number; voEnd: number }> = [];
-      let cursor = group.parentT + group.parentDuration; // forced footage begins right after the title card
+      // Forced footage begins at the AUDIO end of the title card, not the
+      // visual end — same anchor we used to set the forced clips'
+      // vo_start_seconds metadata above. Using parentDuration here used
+      // to shift the rescue window by TITLE_CARD_HOLD_TAIL (0.8s),
+      // dropping lower-thirds whose spoken word fell in that 0.8s gap.
+      let cursor = audioWindowEnd;
       for (let r = 1; r < rows.length; r++) {
         const fr = rows[r];
         if (fr.type !== "footage") continue;
@@ -1099,7 +1221,7 @@ export function applyScriptMarkers(
       }
       const forcedWindowEnd = forcedRows.length > 0
         ? forcedRows[forcedRows.length - 1].voEnd
-        : group.parentT + group.parentDuration;
+        : audioWindowEnd;
       // Cache surviving script items by voStart for case (b) — built lazily
       // so we don't walk items[] when no rescues need it.
       let scriptItemsByVo: Array<{ item: TimelineItemDraft; voStart: number }> | null = null;

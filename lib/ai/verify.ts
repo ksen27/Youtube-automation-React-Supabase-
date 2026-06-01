@@ -265,3 +265,61 @@ export async function verifyEntityImage(input: EntityVerifyInput): Promise<Verif
     [candidate],
   );
 }
+
+// =========================================================================
+// verifyImageMatchesScript — does the candidate match what the narrator is
+// saying right now?
+//
+// Used as a LAST-LINE gate that runs even when the per-entity verifier
+// (verifyPoolAsset) skips (block_entity is celebrity_default / general).
+// Catches the failure mode where a literal phrase lifted from the script
+// ("The Statement", "Case Closed") gets searched bare and returns an image
+// that matches the WORDS but not the TOPIC — e.g. a Nazi/swastika graphic
+// captioned "The Statement / Case Closed" attached to a Britain's Got
+// Talent narration.
+//
+// Inputs: the candidate URL plus a short "topic" line (main celebrity +
+// show/series if known) and the actual script text of this block. The
+// model decides whether a viewer of the topic would find the image on-topic.
+// =========================================================================
+
+export interface ScriptVerifyInput {
+  candidateUrl: string;
+  // One-liner project context — e.g. "David Walliams (Britain's Got Talent)".
+  // Helps Gemini reject same-word-different-world images.
+  topic: string;
+  // The actual narration text for the block this image will sit under.
+  scriptText: string;
+}
+
+const SCRIPT_VERIFY_PROMPT = (topic: string, scriptText: string) =>
+  `You are gating an image that a documentary editor wants to use under a specific narration line.
+
+PROJECT TOPIC: ${topic}
+NARRATION (what the viewer hears while the image is on screen):
+"${scriptText}"
+
+A "yes" answer means: a viewer who knows the project topic would find this image obviously on-topic for the narration. It does NOT need to literally depict every noun in the script — a related photo of the celebrity, the show, the venue, the supporting people, or any clear visual reference to the events being described is fine.
+
+A "no" answer is specifically for these failure modes:
+- The image matches a LITERAL PHRASE from the narration but in the wrong world entirely (e.g. a Nazi swastika graphic captioned "The Statement" for a narration about a TV-show controversy; a stock "case closed" rubber stamp for a narration about a legal review).
+- The image is hate symbolism, gore, or otherwise unsafe to place under entertainment-industry narration.
+- The image is clearly from a different celebrity/show/franchise than the topic.
+- The image is text-only / a meme / an infographic with no documentary value.
+
+A "uncertain" answer is for anything ambiguous — default here when in doubt, do NOT guess "yes". Uncertain images get a soft pass downstream; "yes" is for clearly on-topic.
+
+Return STRICT JSON ONLY in this shape:
+{ "verdict": "yes" | "no" | "uncertain", "reason": "short explanation", "confidence": 0.0 to 1.0 }`;
+
+export async function verifyImageMatchesScript(input: ScriptVerifyInput): Promise<VerifyResult> {
+  const candidate = await fetchImageAsBase64(input.candidateUrl);
+  if (!candidate) {
+    return { verdict: "uncertain", reason: "candidate fetch failed", confidence: 0 };
+  }
+  return askGemini(
+    `verifyImageMatchesScript[${input.topic.slice(0, 40)}]`,
+    SCRIPT_VERIFY_PROMPT(input.topic, input.scriptText.slice(0, 400)),
+    [candidate],
+  );
+}

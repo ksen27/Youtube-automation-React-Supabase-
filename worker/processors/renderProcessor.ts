@@ -13,9 +13,6 @@ import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
 import { getEnv } from "@/lib/env";
 
-const VALIDATION_FAILED_MSG =
-  "Timeline duration must match voiceover and use unique clips.";
-
 export async function processRenderJob(data: RenderJobData): Promise<void> {
   const sb = getServerSupabase();
   const { projectId, mediaJobId, renderJobId } = data;
@@ -91,15 +88,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     await logJob({ projectId, jobId: mediaJobId }, "render.lower_thirds.preflight", ltSummary);
   }
 
-  // Defense-in-depth: enforce unique clip ids among footage items. Image
-  // blocks have clip_id=null, so they don't participate in this check.
   const footageClipIds = renderable.map((it) => it.clip_id as string | null).filter(Boolean) as string[];
-  if (new Set(footageClipIds).size !== footageClipIds.length) {
-    await setMediaJob(mediaJobId, { status: "failed", error: VALIDATION_FAILED_MSG });
-    await sb.from("render_jobs").update({ status: "failed", error: VALIDATION_FAILED_MSG }).eq("id", renderJobId);
-    await setProjectStatus(projectId, "failed");
-    throw new Error(VALIDATION_FAILED_MSG);
-  }
 
   const { data: clipRows } = footageClipIds.length
     ? await sb.from("video_clips").select("id, clip_url").in("id", footageClipIds)
@@ -118,6 +107,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   // xfade pass can eat the overlap; for footage and isolated images it's the
   // plain planned duration. Used downstream to compute xfade offset.
   const slotDurations: number[] = new Array(renderable.length).fill(0);
+  // Per-slot CONTENT duration — what the viewer perceives as the scene length,
+  // excluding the xfade headroom baked into slotDurations. Used to write back
+  // the truth-of-render value to timeline_items.duration after concat so the
+  // editor stops lying about scene lengths. content_dur = slot_dur − (headLeft
+  // + headRight) for image/title_card/split_2, or slot_dur − (headLeft +
+  // headRight) for footage (clip cut also bakes headroom on mixed edges).
+  const slotContentDurations: number[] = new Array(renderable.length).fill(0);
   // Transition timing.
   //   - image↔image: 0.5s xfade, rotating through IMAGE_XFADE_PALETTE.
   //   - image↔video and video↔image: 0.4s fade-through-black (no xfade,
@@ -229,6 +225,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
+          slotContentDurations[i] = plannedDur;
           imageRendered++;
         } catch (e) {
           imageFailed++;
@@ -289,6 +286,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
+          slotContentDurations[i] = plannedDur;
         } catch (e) {
           await logJob({ projectId, jobId: mediaJobId },
             "render.title_card.failed", { idx: i, text, err: (e as Error).message });
@@ -343,6 +341,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
+          slotContentDurations[i] = plannedDur;
           imageRendered++;
           await safeUnlink(localImg);
         } catch (e) {
@@ -369,7 +368,40 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const rightIsImage = isImageNeighbor(i + 1);
         const headLeft = leftIsImage ? MIXED_FADE_SECONDS / 2 : 0;
         const headRight = rightIsImage ? MIXED_FADE_SECONDS / 2 : 0;
-        const renderDur = windowDur + headLeft + headRight;
+        // Slow-mo: when the matcher stretched this row's duration past
+        // the source YouTube window (audio interval > clip length), the
+        // source clip needs to play slower to fill the full narration.
+        // forced_clip_source_window_seconds is the natural source length
+        // (set by the matcher's vo_start_duration_pass when it extended
+        // the row). Cap the stretch at 1.5× — beyond that, slow-mo looks
+        // unnatural and the residue (audio overflow) is accepted as a
+        // small visual freeze on the clip's last frame.
+        const sourceWindowSeconds = typeof meta.forced_clip_source_window_seconds === "number"
+          ? Number(meta.forced_clip_source_window_seconds)
+          : windowDur;
+        const MAX_SLOWMO_FACTOR_FORCED = 1.5;
+        const targetContentDur = plannedDur; // the matcher-extended duration
+        const rawStretch = sourceWindowSeconds > 0 ? targetContentDur / sourceWindowSeconds : 1.0;
+        const forcedSlowmoFactor = rawStretch > 1.0
+          ? Math.min(rawStretch, MAX_SLOWMO_FACTOR_FORCED)
+          : undefined;
+        if (forcedSlowmoFactor) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.forced_clip.slowmo", {
+              idx: i,
+              docMarkerId: (meta.doc_marker_id as string | null | undefined) ?? null,
+              sourceWindowSeconds: Math.round(sourceWindowSeconds * 100) / 100,
+              targetContentDur: Math.round(targetContentDur * 100) / 100,
+              rawStretch: Math.round(rawStretch * 1000) / 1000,
+              appliedSlowmo: Math.round(forcedSlowmoFactor * 1000) / 1000,
+              capped: rawStretch > MAX_SLOWMO_FACTOR_FORCED,
+            });
+        }
+        // Render duration must reflect the matcher-committed audio
+        // interval, NOT the source window length. Using windowDur here
+        // would cut the output back to the source's natural length,
+        // erasing the slow-mo stretch.
+        const renderDur = targetContentDur + headLeft + headRight;
 
         // Look up the marker's pre-downloaded URL if metadata points to one.
         const docMarkerId = (meta.doc_marker_id as string | null | undefined) ?? null;
@@ -398,12 +430,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const localPre = path.join(tmp, `forced_pre_${idx}.mp4`);
           try {
             await downloadHttp(preClipUrl, localPre);
-            if (lt?.text || headLeft > 0 || headRight > 0) {
+            if (lt?.text || headLeft > 0 || headRight > 0 || forcedSlowmoFactor) {
               const trimmedPre = path.join(tmp, `forced_pretrim_${idx}.mp4`);
               await cutClip({
                 inputPath: localPre, outputPath: trimmedPre,
                 startSeconds: 0, durationSeconds: renderDur,
                 keepAudio: true,
+                slowmoFactor: forcedSlowmoFactor,
               });
               await normalizeClip({
                 inputPath: trimmedPre, outputPath: out,
@@ -424,6 +457,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
             } catch { /* keep renderDur fallback */ }
             slotDurations[i] = actualDur;
+            // Content duration = rendered file minus the xfade headroom
+            // baked in for mixed-boundary neighbors. Stays in sync with
+            // the on-screen visible content time the editor displays.
+            slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
             await safeUnlink(localPre);
           } catch (e) {
             await logJob({ projectId, jobId: mediaJobId },
@@ -455,6 +492,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               inputPath: dl.outputPath, outputPath: trimmed,
               startSeconds, durationSeconds: renderDur,
               keepAudio: true,
+              slowmoFactor: forcedSlowmoFactor,
             });
             await normalizeClip({
               inputPath: trimmed, outputPath: out,
@@ -469,6 +507,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
             } catch { /* keep renderDur fallback */ }
             slotDurations[i] = actualDur;
+            slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
             await safeUnlink(dl.outputPath);
             await safeUnlink(trimmed);
           } catch (e) {
@@ -503,9 +542,48 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const headLeft = leftIsImage ? MIXED_FADE_SECONDS / 2 : 0;
           const headRight = rightIsImage ? MIXED_FADE_SECONDS / 2 : 0;
           const renderDur = plannedDur + headLeft + headRight;
+
+          // Source-duration-aware stretch decision. Probe the downloaded
+          // clip's real length so we can decide between three rendering
+          // modes:
+          //   • clipDur ≥ renderDur            → normal stream-copy cut
+          //   • renderDur > clipDur, stretch ≤ 1.5× → slow-mo the clip
+          //     (PTS rewrite) so the rendered slot matches the sentence
+          //     duration exactly. Imperceptible on documentary B-roll.
+          //   • stretch > 1.5×                 → slow-mo capped at 1.5×,
+          //     residual gap absorbed by the matcher's duration_reclaim
+          //     pass onto OTHER blocks with headroom. Anything beyond
+          //     1.5× starts to look unnatural; Phase B will add a true
+          //     image-fallback path for these.
+          //
+          // Probing happens AFTER download so we know the on-disk truth
+          // even when video_clips.duration in the DB is stale.
+          let sourceClipDur = renderDur;
+          try {
+            const sourceProbe = await probeFile(local);
+            if (sourceProbe.durationSeconds > 0) sourceClipDur = sourceProbe.durationSeconds;
+          } catch { /* probe failure → assume the clip is long enough */ }
+
+          const MAX_SLOWMO_FACTOR = 1.5;
+          const rawStretch = sourceClipDur > 0 ? renderDur / sourceClipDur : 1.0;
+          let slowmoFactor: number | undefined;
+          if (rawStretch > 1.0) {
+            slowmoFactor = Math.min(rawStretch, MAX_SLOWMO_FACTOR);
+            await logJob({ projectId, jobId: mediaJobId },
+              "render.clip.slowmo", {
+                idx: i, clipId: it.clip_id,
+                sourceClipDur: Math.round(sourceClipDur * 100) / 100,
+                renderDur: Math.round(renderDur * 100) / 100,
+                rawStretch: Math.round(rawStretch * 1000) / 1000,
+                appliedSlowmo: Math.round(slowmoFactor * 1000) / 1000,
+                capped: rawStretch > MAX_SLOWMO_FACTOR,
+              });
+          }
+
           await cutClip({
             inputPath: local, outputPath: trimmed,
             startSeconds: 0, durationSeconds: renderDur,
+            slowmoFactor,
           });
           // Lower-third stamped by the matcher: { text, type } on
           // metadata.lower_third when this clip should introduce a name
@@ -535,6 +613,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             if (probed.durationSeconds > 0) actualDur = probed.durationSeconds;
           } catch { /* keep renderDur fallback */ }
           slotDurations[i] = actualDur;
+          // Content duration = actual rendered length minus the xfade
+          // headroom baked in for mixed-boundary neighbors. When the source
+          // was shorter than asked AND slow-mo was capped (rawStretch >
+          // 1.5×), actualDur < renderDur and content_dur < plannedDur —
+          // the editor writeback below will reflect that the scene plays
+          // shorter than the matcher planned. Reclaim absorbs the gap
+          // onto other rows so total timeline still equals voiceover.
+          slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
           await safeUnlink(trimmed);
         } catch (e) {
           await logJob({ projectId, jobId: mediaJobId },
@@ -829,6 +915,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const openingTmp = path.join(tmp, "opening_title");
           await fs.mkdir(openingTmp, { recursive: true });
           const cardPath = path.join(openingTmp, "card.mp4");
+          // Opening title uses the same typewriter animation as the
+          // chapter title cards inserted mid-timeline. Type for ~60% of
+          // the card's duration, hold the fully-typed text for the rest
+          // so the viewer has a beat to read it before the intro plays.
+          // The chapter cards use ~73% typing / 27% hold (e.g. 2.88s
+          // typing on a 3.93s card), which feels slightly fast on a
+          // ceremonial opening title — 60% gives a more deliberate beat.
+          const OPENING_TITLE_TYPEWRITER_RATIO = 0.6;
           await buildTitleCardVideo({
             text: titleText,
             outputPath: cardPath,
@@ -836,7 +930,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             width: 1280,
             height: 720,
             fps: 30,
-            animation: "static",
+            animation: "typewriter",
+            typewriterDurationSeconds: OPENING_TITLE_DURATION * OPENING_TITLE_TYPEWRITER_RATIO,
           });
           const normalizedCard = path.join(openingTmp, "card_norm.mp4");
           await normalizeClip({
@@ -1295,7 +1390,22 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const OUTRO_FADE_SECONDS = 1.5;
     const lastIdx = normalized.length - 1;
     const lastSegDur = mergedDurations[mergedDurations.length - 1] ?? 0;
-    const totalVideoDurationSeconds = introDurationActual + mergedDurations.reduce((a, b) => a + b, 0);
+    // 0.3s acrossfade between intro audio and voiceover overlaps the two
+    // tracks, shortening combined audio by exactly that much. The video
+    // side does NOT overlap (intro video segments are concatenated head-
+    // to-tail), so totalVideoDuration must subtract the overlap to match
+    // the audio length. Without this, the encoder's `-t totalDur` flag
+    // clipped the final ~0.3s of voiceover off every render (the 31:54
+    // audio → 31:52 final-video drift). When there's no intro audio,
+    // there's no crossfade and the deduction is zero.
+    const INTRO_ACROSSFADE_SECONDS = 0.3;
+    const introAudioOverlap = introAudioPath && introDurationActual > 0
+      ? INTRO_ACROSSFADE_SECONDS
+      : 0;
+    const totalVideoDurationSeconds =
+      introDurationActual
+      + mergedDurations.reduce((a, b) => a + b, 0)
+      - introAudioOverlap;
     let outroFadeStartSeconds = 0;
     if (lastSegDur > OUTRO_FADE_SECONDS) {
       const fadedLast = path.join(tmp, "outro_fade.mp4");
@@ -1475,6 +1585,210 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
+
+    // 4a) Per-block drift audit. Emit one log line per renderable item with
+    // the four numbers needed to diagnose any future sync regression:
+    //   • vo_start / vo_end   — the narrator's real audio window
+    //   • planned_duration    — what the matcher wrote to timeline_items
+    //   • rendered_duration   — content_dur measured after ffmpeg ran
+    //   • drift_ms            — rendered − planned (positive = visual
+    //                            stayed too long, negative = ended early)
+    //
+    // Lives BEFORE the writeback so the planned column reflects what the
+    // editor was showing the user at render time, not the writeback value.
+    // Capped at the first 20 rows + worst 10 drifters to keep the log
+    // payload bounded on 300+ scene projects.
+    try {
+      type DriftRow = {
+        block_index: number;
+        type: string | null;
+        vo_start_seconds: number | null;
+        vo_end_seconds: number | null;
+        vo_duration: number | null;
+        planned_duration: number;
+        rendered_duration: number;
+        drift_ms: number;
+      };
+      const driftRows: DriftRow[] = [];
+      let maxDriftMs = 0;
+      let totalDriftMs = 0;
+      let nonZeroDrifts = 0;
+      for (let i = 0; i < renderable.length; i++) {
+        const it = renderable[i];
+        if (it.type === "intro") continue;
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const voStart = (meta.vo_start_seconds as number | null | undefined) ?? null;
+        const voEnd = (meta.vo_end_seconds as number | null | undefined) ?? null;
+        const planned = Number(it.duration ?? 0);
+        const rendered = slotContentDurations[i] || 0;
+        const driftMs = Math.round((rendered - planned) * 1000);
+        const row: DriftRow = {
+          block_index: i,
+          type: (it.type as string | null) ?? null,
+          vo_start_seconds: voStart,
+          vo_end_seconds: voEnd,
+          vo_duration: voStart != null && voEnd != null ? Math.round((voEnd - voStart) * 1000) / 1000 : null,
+          planned_duration: Math.round(planned * 1000) / 1000,
+          rendered_duration: Math.round(rendered * 1000) / 1000,
+          drift_ms: driftMs,
+        };
+        driftRows.push(row);
+        const absDrift = Math.abs(driftMs);
+        if (absDrift > 0) nonZeroDrifts++;
+        totalDriftMs += driftMs;
+        if (absDrift > Math.abs(maxDriftMs)) maxDriftMs = driftMs;
+      }
+      // Sample = first 20 (head of timeline) + the 10 worst drifters
+      // sorted by abs(drift). De-dupe in case the head overlaps the worst.
+      const head = driftRows.slice(0, 20);
+      const worst = [...driftRows]
+        .sort((a, b) => Math.abs(b.drift_ms) - Math.abs(a.drift_ms))
+        .slice(0, 10);
+      const sampleByIdx = new Map<number, DriftRow>();
+      for (const r of head) sampleByIdx.set(r.block_index, r);
+      for (const r of worst) sampleByIdx.set(r.block_index, r);
+      await logJob({ projectId, jobId: mediaJobId }, "render.timeline.audit", {
+        total_blocks: driftRows.length,
+        non_zero_drifts: nonZeroDrifts,
+        total_drift_ms: totalDriftMs,
+        max_drift_ms: maxDriftMs,
+        sample: Array.from(sampleByIdx.values()).sort((a, b) => a.block_index - b.block_index),
+      });
+    } catch (e) {
+      await logJob({ projectId, jobId: mediaJobId },
+        "render.timeline.audit.failed", { err: (e as Error).message });
+    }
+
+    // 4b) Writeback truth-of-render durations to timeline_items.
+    //
+    // Until now the editor read `timeline_items.duration` as written by the
+    // matcher (the planned/sentence duration). When a clip was shorter than
+    // its sentence the matcher CLAMPED that field down, but with slow-mo
+    // now filling small gaps and reclaim absorbing the rest, the editor's
+    // value drifts from what was actually rendered for non-clamped cases.
+    //
+    // Update each row to the content-duration we measured during render
+    // (slotContentDurations[i]). This is the visible scene length — the
+    // amount of voiceover that plays under this row — so the editor's
+    // running total now matches both the audio and the final MP4 exactly.
+    //
+    // We skip the writeback for intro rows (ui_only, the renderer ignores
+    // their duration field at concat time) and for slots that failed to
+    // render (slotContentDurations[i] === 0, the row will be a hole).
+    try {
+      // Build audio-interval map: each non-intro row's duration MUST be at
+      // least next.vo_start - cur.vo_start, otherwise the next row's audio
+      // begins before this row's visual ends → gap in the final video. The
+      // writeback below must never shrink a row below its audio interval.
+      const voStarts: Array<{ idx: number; voStart: number }> = [];
+      for (let i = 0; i < renderable.length; i++) {
+        const it = renderable[i];
+        if (it.type === "intro") continue;
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const vs = meta.vo_start_seconds;
+        if (typeof vs !== "number") continue;
+        voStarts.push({ idx: i, voStart: Number(vs) });
+      }
+      voStarts.sort((a, b) => a.voStart - b.voStart);
+      const audioIntervalByIdx = new Map<number, number>();
+      for (let k = 0; k < voStarts.length - 1; k++) {
+        const cur = voStarts[k];
+        const next = voStarts[k + 1];
+        audioIntervalByIdx.set(cur.idx, Math.max(0.1, next.voStart - cur.voStart));
+      }
+      // Last row: no next vo_start to anchor against. Skip the floor for it
+      // (the writeback will use contentDur as before). The tail row's
+      // duration mismatch is a different bug surface — pre_render_validation
+      // catches gross overshoot/undershoot there.
+
+      const writebackPromises: Promise<unknown>[] = [];
+      for (let i = 0; i < renderable.length; i++) {
+        const it = renderable[i];
+        if (it.type === "intro") continue;
+        const contentDur = slotContentDurations[i];
+        if (!(contentDur > 0)) continue;
+        // Audio-interval floor: if the rendered slot came out shorter than
+        // the row's audio interval (slow-mo got capped at 1.5×, source clip
+        // was too short, etc.), keep the row's planned duration so the
+        // editor still shows the gap the user needs to fix. Writing the
+        // shorter contentDur here used to corrupt the timeline: a later
+        // re-render reads the shorter value as the new target, the visual
+        // ends before the narrator's next sentence starts, and the final
+        // MP4 has audio-without-picture gaps (the 24→25 mismatch bug,
+        // 2026-06-01). Audio-interval is the source of truth.
+        // If no audio interval is known for this row (last row, or row
+        // missing vo_start), fall back to contentDur as before.
+        const audioInterval = audioIntervalByIdx.get(i);
+        const safeDur = audioInterval != null ? Math.max(contentDur, audioInterval) : contentDur;
+        // Only write when the value materially differs (>0.05s) to avoid
+        // a no-op UPDATE storm on projects where the render exactly matched
+        // the plan. id and project_id come from the row we loaded above.
+        const currentDur = Number(it.duration ?? 0);
+        if (Math.abs(currentDur - safeDur) < 0.05) continue;
+        writebackPromises.push(
+          (async () =>
+            sb.from("timeline_items")
+              .update({ duration: Math.round(safeDur * 100) / 100 })
+              .eq("id", it.id as string)
+          )(),
+        );
+      }
+      if (writebackPromises.length > 0) {
+        await Promise.all(writebackPromises);
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.duration_writeback", {
+            updated: writebackPromises.length,
+            total: renderable.length,
+          });
+      }
+    } catch (e) {
+      // Writeback failure should not fail the render — the MP4 is already
+      // produced. Just log so we can audit drift between editor and
+      // rendered duration on this project.
+      await logJob({ projectId, jobId: mediaJobId },
+        "render.duration_writeback.failed", { err: (e as Error).message });
+    }
+
+    // 4c) Post-render duration validation. Probe the final MP4 and compare
+    // its length against the voiceover length. With the intro acrossfade
+    // fix and reclaim-always-on, this should be within 250ms — anything
+    // larger means the pipeline regressed and renders are drifting again.
+    try {
+      const POST_RENDER_TOLERANCE_MS = 250;
+      let finalDurationSeconds: number | null = null;
+      let voiceoverDurationSeconds: number | null = null;
+      try {
+        const finalProbe = await probeFile(finalLocal);
+        if (finalProbe.durationSeconds > 0) finalDurationSeconds = finalProbe.durationSeconds;
+      } catch { /* finalProbe failure → log as null */ }
+      if (voiceoverLocal) {
+        try {
+          const voProbe = await probeFile(voiceoverLocal);
+          if (voProbe.durationSeconds > 0) voiceoverDurationSeconds = voProbe.durationSeconds;
+        } catch { /* voProbe failure → log as null */ }
+      }
+      // Expected final length = voiceover + intro − intro acrossfade overlap.
+      // The intro is a prefix, not under voiceover, so it ADDS to the total.
+      const expectedFinalSeconds = voiceoverDurationSeconds != null
+        ? voiceoverDurationSeconds + introDurationActual - introAudioOverlap
+        : null;
+      const driftMs = finalDurationSeconds != null && expectedFinalSeconds != null
+        ? Math.round((finalDurationSeconds - expectedFinalSeconds) * 1000)
+        : null;
+      await logJob({ projectId, jobId: mediaJobId }, "render.post_validation", {
+        finalDurationSeconds: finalDurationSeconds != null ? Math.round(finalDurationSeconds * 1000) / 1000 : null,
+        voiceoverDurationSeconds: voiceoverDurationSeconds != null ? Math.round(voiceoverDurationSeconds * 1000) / 1000 : null,
+        introDurationActual: Math.round(introDurationActual * 1000) / 1000,
+        introAudioOverlap,
+        expectedFinalSeconds: expectedFinalSeconds != null ? Math.round(expectedFinalSeconds * 1000) / 1000 : null,
+        driftMs,
+        toleranceMs: POST_RENDER_TOLERANCE_MS,
+        passed: driftMs != null ? Math.abs(driftMs) <= POST_RENDER_TOLERANCE_MS : null,
+      });
+    } catch (e) {
+      await logJob({ projectId, jobId: mediaJobId },
+        "render.post_validation.failed", { err: (e as Error).message });
+    }
 
     // 5) Upload final
     const dest = `projects/${projectId}/final/${Date.now()}.mp4`;

@@ -46,16 +46,36 @@ export function BlockEditorScreen({
   const clips = useMemo(() => clipsQ.data?.clips ?? [], [clipsQ.data?.clips]);
   const clipById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
 
-  // Pool of every image_url already used somewhere on the timeline. Scene
-  // blocks fall back to this list when their own image_url 404s, so an
-  // approved row never renders as an empty grey tile.
-  const timelineImagePool = useMemo(
-    () =>
-      Array.from(
-        new Set(items.map((it) => it.image_url).filter((v): v is string => !!v)),
-      ),
-    [items],
-  );
+  // Per-block fallback URLs. When a scene's saved image_url fails to load
+  // in the browser (hotlink-block, CORS, expired CDN URL, transient 404),
+  // we walk THIS block's own matcher-considered candidates from
+  // metadata.image_candidates — i.e. other URLs the matcher found for this
+  // specific sentence. We DO NOT borrow image_urls from other scenes
+  // anymore: that produced misleading cards showing a topically-unrelated
+  // image from a different block (e.g. "The Conversation" poster appearing
+  // under courtroom narration because another block had been matched to
+  // the word "conversation"). When all of this block's candidates fail
+  // too, the SceneBlock falls back to a typed placeholder — the user can
+  // see the row's image is broken and click Replace.
+  const fallbackUrlsByItemId = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const it of items) {
+      const meta = it.metadata as Record<string, unknown> | null | undefined;
+      const candidates = Array.isArray(meta?.image_candidates)
+        ? (meta!.image_candidates as Array<{ url?: unknown }>)
+        : [];
+      const urls: string[] = [];
+      const seen = new Set<string>();
+      for (const c of candidates) {
+        const url = typeof c?.url === "string" ? c.url : null;
+        if (!url || seen.has(url) || url === it.image_url) continue;
+        seen.add(url);
+        urls.push(url);
+      }
+      map.set(it.id, urls);
+    }
+    return map;
+  }, [items]);
 
   // The block whose media is being replaced. When non-null, the replace
   // modal opens. We track the whole row so the modal can decide what tab
@@ -263,7 +283,7 @@ export function BlockEditorScreen({
               <SceneBlock
                 index={i}
                 thumbnail={thumbnail}
-                fallbackThumbnails={timelineImagePool}
+                fallbackThumbnails={fallbackUrlsByItemId.get(it.id) ?? []}
                 scriptText={it.script_text}
                 overlayText={it.overlay_text}
                 durationSec={it.duration}
@@ -399,12 +419,38 @@ function ReplaceMediaDialog({
     [items],
   );
 
-  // The project's image pool is every image_url that any row currently uses.
-  // Dedupe so the same image doesn't render twice if it's on multiple rows.
-  const imagePool = useMemo(
-    () => Array.from(new Set(items.map((it) => it.image_url).filter((v): v is string => !!v))),
-    [items],
-  );
+  // The project's image pool, in two tiers:
+  //   1. For the row currently being edited, the matcher's per-block
+  //      candidates from metadata.image_candidates (the URLs it actually
+  //      considered for THIS sentence — winner + the alternatives it
+  //      rejected). These are listed first because they're the relevant
+  //      swap options for the open block.
+  //   2. Then every other image_url already used on the timeline, deduped.
+  //      These act as "borrow from another scene" picks.
+  // Without tier 1 the pool only showed images already assigned somewhere
+  // on the timeline, so the user could never swap in a candidate the matcher
+  // looked at but didn't pick — leading to the "where's this image from?"
+  // problem the editor was reporting.
+  const imagePool = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const targetCandidates = Array.isArray(target?.metadata?.image_candidates)
+      ? (target!.metadata!.image_candidates as Array<{ url?: unknown }>)
+      : [];
+    for (const c of targetCandidates) {
+      const url = typeof c?.url === "string" ? c.url : null;
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    for (const it of items) {
+      const url = it.image_url;
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    return out;
+  }, [items, target]);
 
   const currentTab = target?.type === "image" ? "images" : "clips";
 

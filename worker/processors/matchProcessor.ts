@@ -20,6 +20,7 @@ import {
 import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages } from "@/lib/images/fetch";
 import { verifyPoolAsset } from "@/lib/ai/pool-verification";
+import { verifyImageMatchesScript } from "@/lib/ai/verify";
 import { lookupReference } from "@/lib/ai/face-references";
 import { splitTranscriptIntoSentences } from "@/lib/ai/sentences";
 import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
@@ -142,6 +143,54 @@ const SCRIPT_PHRASE_CONNECTORS = new Set<string>([
   "of", "the", "and", "for", "in", "on", "at", "de", "la", "le", "van", "von",
 ]);
 
+// Single common nouns that double as famous movie / book / song titles.
+// When the script uses these as plain English words ("recording judges'
+// desk conversations", "the statement was leaked") the image-search engines
+// happily return the famous-work poster — a 1974 Coppola film for
+// "conversation", a thriller for "the statement", etc. Strictly worse than
+// a celebrity fallback. We block them as STANDALONE one-word queries from:
+//   1. mentioned_entities (Tier 1 reference query),
+//   2. script-phrase extraction (fallback proper-noun search).
+// Multi-word phrases containing these tokens are still allowed — "The
+// Conversation Pit" stays, "The Statement Building" stays. The trap is
+// purely the one-word-title collision.
+const COMMON_NOUN_TITLE_BLOCKLIST = new Set<string>([
+  "conversation", "conversations",
+  "statement", "statements",
+  "witness", "witnesses",
+  "case", "cases",
+  "story", "stories",
+  "interview", "interviews",
+  "trial", "trials",
+  "verdict", "verdicts",
+  "deal", "deals",
+  "contract", "contracts",
+  "secret", "secrets",
+  "letter", "letters",
+  "message", "messages",
+  "decision", "decisions",
+  "announcement", "announcements",
+  "scandal", "scandals",
+  "incident", "incidents",
+  "accident", "accidents",
+  "meeting", "meetings",
+  "marriage", "wedding",
+  "divorce", "funeral",
+  "rumor", "rumors", "rumour", "rumours",
+  "exchange", "exchanges",
+  "recording", "recordings",
+]);
+
+function isCommonNounTitle(s: string): boolean {
+  const norm = s.toLowerCase().trim().replace(/^the\s+/, "").replace(/[.,!?;:]+$/, "");
+  if (!norm) return false;
+  // Only block when the whole query is a single common-noun token (after
+  // stripping a leading "the"). Multi-word phrases keep their proper-noun
+  // signal even if one word is in the blocklist.
+  if (/\s/.test(norm)) return false;
+  return COMMON_NOUN_TITLE_BLOCKLIST.has(norm);
+}
+
 // Extract proper-noun-like phrases from narration text. Returns search-ready
 // strings, longest first (so multi-word references like "District Court of
 // Utah" outrank single-word "Utah"). Used as a last-resort visual search
@@ -192,6 +241,9 @@ export function extractScriptPhrases(text: string): string[] {
     if (seen.has(key)) continue;
     seen.add(key);
     if (p.replace(/\s+/g, "").length < 3) continue;
+    // Drop single common-noun tokens that collide with famous titles
+    // ("Conversation" → 1974 Coppola film poster from CSE).
+    if (isCommonNounTitle(p)) continue;
     out.push(p);
   }
   // Longest first — "District Court of Utah" before "Utah".
@@ -480,6 +532,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   }
   const mainCelebritySex = mainCelebrity ? inferPersonSex(mainCelebrity) : null;
 
+  // Project-level topic string used by the script-aware image verifier. The
+  // verifier asks "is this image on-topic for the narration?" — without a
+  // topic anchor it has no way to reject a Nazi/swastika graphic captioned
+  // "The Statement" attached to a Britain's Got Talent script line. We
+  // combine the main celebrity with the top tv_show / movie / company so
+  // queries like "The Statement" or "Case Closed" can be evaluated against
+  // the actual project subject. Empty when neither is known — the verifier
+  // skips gracefully in that case.
+  const topShowEntity = (allEntities.find((e) => e.type === "tv_show") ??
+    allEntities.find((e) => e.type === "movie") ??
+    allEntities.find((e) => e.type === "company")
+  )?.value;
+  const projectTopic = [mainCelebrity, topShowEntity].filter(Boolean).join(" — ");
+
   function scoreIntroCandidate(c: ClipForMatch): number {
     const labelStr = (c.labels ?? []).join(" ").toLowerCase();
     // The clip stage tags the head-of-source window (start ~ 0s) so the
@@ -763,16 +829,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       //    the fields enrichment reads — type-cast is safe.
       const enrichment = buildEnrichmentLookup(sentences, hints as unknown as BlockPlan[]);
 
-      // 5) Build the block sequence. Image hold policy "fixed_5s" keeps
-      //    the existing 5s-per-image behavior so long sentences split
-      //    into multiple 5s holds of the same subject (matches the spec
-      //    the renderer already implements).
+      // 5) Build the block sequence. Image hold policy "sentence_duration"
+      //    means each block's `duration` is the narrator's real spoken time
+      //    for that sentence (vo_end − vo_start), so visuals change exactly
+      //    when narration changes — no fixed 5s clamp. Long sentences
+      //    (> IMAGE_SPLIT_THRESHOLD) are still split into multiple image
+      //    fragments sharing the same subject, but each fragment's duration
+      //    is `sentence_duration / N` (no rounding), keeping total = sentence.
       const built = buildBlockSequenceFromTranscript({
         sentences: aligned,
         enrichment,
         titleCardTextByParagraph,
         mainCelebrity: mainCelebrity ?? "",
-        imageHoldPolicy: "fixed_5s",
+        imageHoldPolicy: "sentence_duration",
       });
 
       blocks = built.blocks.map((p) => ({ type: p.type, duration: p.duration }));
@@ -822,9 +891,37 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       hints = rebuiltHints;
 
       usedTranscriptDrivenBuilder = true;
+
+      // Alignment sanity audit. The sum of aligned sentence durations
+      // should equal the voiceover audio length. If they diverge by more
+      // than ALIGN_DRIFT_THRESHOLD seconds, the picture timeline and the
+      // audio will fall out of sync — the symptom the user sees as 1-2s
+      // of misalignment near title cards or numeric phrases. Log so a
+      // human can correlate a misaligned render with where it went wrong.
+      const ALIGN_DRIFT_THRESHOLD = 2.0;
+      const lastAligned = aligned[aligned.length - 1];
+      const alignmentSpanSeconds = lastAligned ? lastAligned.vo_end : 0;
+      const alignmentDriftSeconds = voiceoverSeconds > 0
+        ? Math.round((alignmentSpanSeconds - voiceoverSeconds) * 10) / 10
+        : 0;
+      const sentencesNotAligned = aligned.filter((s) => !s.aligned).length;
+      // Find the first synthesized sentence — that's where alignment fell
+      // off the rails. The matcher's downstream behavior degrades after
+      // this point, so surfacing the location helps debugging.
+      const firstSynthesizedIdx = aligned.findIndex((s) => !s.aligned);
+
       await logJob({ projectId, jobId: mediaJobId }, "match.transcript_driven_builder", {
         sentences: sentences.length,
         alignedSentences: aligned.filter((s) => s.aligned).length,
+        sentencesNotAligned,
+        firstSynthesizedSentenceIdx: firstSynthesizedIdx,
+        firstSynthesizedSentenceText: firstSynthesizedIdx >= 0
+          ? aligned[firstSynthesizedIdx].text.slice(0, 80)
+          : null,
+        voiceoverSeconds: Math.round(voiceoverSeconds * 10) / 10,
+        alignmentSpanSeconds: Math.round(alignmentSpanSeconds * 10) / 10,
+        alignmentDriftSeconds,
+        alignmentDriftExceedsThreshold: Math.abs(alignmentDriftSeconds) > ALIGN_DRIFT_THRESHOLD,
         enrichedSentences: enrichment.matchedSentences,
         unmatchedSentences: enrichment.unmatched,
         titleCardsInserted: built.titleCardsInserted,
@@ -1184,14 +1281,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         const dur = isLast ? Math.round(remaining * 10) / 10 : perSlot;
         remaining = Math.round((remaining - dur) * 10) / 10;
         newBlocks.push({ type: "image", duration: dur });
-        // Only the FIRST fragment carries the source hint text — the
+        // Every fragment carries the SAME source hint text — the
         // narration that text represents is being spoken across the full
-        // span of the original block, but printing it on every fragment
-        // duplicates the line in the editor (the user sees the same
-        // script_text on 2-3 scenes in a row). Subsequent fragments are
-        // visual continuations of the same narrative beat, so they get
-        // an empty hint text and inherit null script_text downstream.
-        newHintTexts.push(k === 0 ? (blockHintTexts[i] ?? null) : null);
+        // span of the original block. The old behavior (only k=0 got
+        // the text, k>=1 got null) was meant to avoid duplicate text in
+        // the editor, but that null fell through to buildBlockTexts'
+        // proportional word-slicer in the blockTexts derivation step
+        // (line 1257 below), which pads each slice by ±1s of neighbor
+        // words. The result was visible OVERLAP text on the fragment
+        // (e.g. "didn't say was louder. This is the full story. Private
+        // conversations..." straddling the previous sentence's end and
+        // the next sentence's start). Showing the same sentence on each
+        // fragment is correct: that sentence IS being narrated under
+        // every fragment, the fragments are just visual subdivisions.
+        newHintTexts.push(blockHintTexts[i] ?? null);
         // Section titles only ride the FIRST fragment so we don't render
         // the same title card multiple times in a row.
         newSectionTitles.push(k === 0 ? (blockSectionTitles[i] ?? null) : null);
@@ -2107,19 +2210,186 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           pickSourceCounts.filler_any++;
           pickSource = "filler_any";
         }
-        // Clamp planned duration to the clip's real length. The renderer's
-        // cutClip uses ffmpeg -t which produces a file no longer than the
-        // source, so anything we record above the clip's real duration is
-        // a lie that surfaces as editor-total ≠ rendered-total. We keep
-        // the clamped seconds in durationReclaimSeconds so a later pass
-        // can stretch other footage blocks to absorb the gap.
         const clipDur = clipDurationById.get(assigned.clipId) ?? 0;
-        let realDuration = block.duration;
-        if (clipDur > 0 && clipDur < block.duration) {
-          durationReclaimSeconds += block.duration - clipDur;
-          durationClampedCount++;
-          realDuration = Math.round(clipDur * 10) / 10;
+        // Phase B: split this block into sub-rows when the clip is too
+        // short for slow-mo to cover the sentence. Slow-mo handles up to
+        // 1.5× stretch invisibly (Phase A); beyond that, audio-visual
+        // sync requires filling the rest of the sentence with another
+        // visual rather than stretching the clip further or pushing the
+        // gap onto OTHER blocks via reclaim.
+        //
+        // Decision: stretch = sentence_duration / clipDur
+        //   stretch ≤ 1.5  → ONE row (slow-mo handles small gaps)
+        //   stretch > 1.5  → TWO sub-rows split at clipDur boundary:
+        //     • Sub-row A: this clip, played at natural speed for clipDur
+        //     • Sub-row B: a SECOND clip from the block's scored candidates
+        //                  (preferred), or an image of the resolved subject
+        //                  (fallback in a later pass — see needs_fallback_visual)
+        //
+        // The sub-rows share the same script_text so the editor shows
+        // the same sentence on both rows; the user can review/replace
+        // either half independently. vo_start/vo_end are sliced
+        // proportionally so each sub-row covers its own audio window.
+        const SLOWMO_COVERAGE_LIMIT = 1.5;
+        const stretch = clipDur > 0 ? block.duration / clipDur : 1.0;
+        const needsSplit = clipDur > 0 && stretch > SLOWMO_COVERAGE_LIMIT;
+
+        if (needsSplit) {
+          // ──────────── Phase B split path ────────────
+          // Sub-row A — Clip A at natural speed, covers the first clipDur
+          // seconds of the sentence's audio window.
+          const blockVoStartSec = blockVoStart[i];
+          const blockVoEndSec = blockVoEnd[i];
+          const haveVo = blockVoStartSec != null && blockVoEndSec != null;
+          const subAVoStart = haveVo ? blockVoStartSec : null;
+          const subAVoEnd = haveVo ? (blockVoStartSec as number) + clipDur : null;
+          const subBVoStart = subAVoEnd;
+          const subBVoEnd = haveVo ? blockVoEndSec : null;
+          const remainder = Math.max(0.1, block.duration - clipDur);
+
+          // Pick Clip B from this block's scored candidates. Prefer:
+          //   1. Not already used elsewhere in the timeline
+          //   2. Different source than Clip A (existing variety rule)
+          //   3. Highest Gemini score (candidates are already score-sorted)
+          const candidates = scoresByBlock.get(i) ?? [];
+          const clipASourceId = clipSourceId.get(assigned.clipId) ?? null;
+          let clipB: { clipId: string; score: number } | null = null;
+          // Pass 1: different source.
+          for (const cand of candidates) {
+            if (cand.clip_id === assigned.clipId) continue;
+            if (usedClipIds.has(cand.clip_id)) continue;
+            const candSrc = clipSourceId.get(cand.clip_id) ?? null;
+            if (clipASourceId && candSrc && candSrc === clipASourceId) continue;
+            clipB = { clipId: cand.clip_id, score: cand.score };
+            break;
+          }
+          // Pass 2: any unused (relax the different-source rule).
+          if (!clipB) {
+            for (const cand of candidates) {
+              if (cand.clip_id === assigned.clipId) continue;
+              if (usedClipIds.has(cand.clip_id)) continue;
+              clipB = { clipId: cand.clip_id, score: cand.score };
+              break;
+            }
+          }
+
+          // Push sub-row A.
+          items.push({
+            project_id: projectId,
+            clip_id: assigned.clipId,
+            type: "footage",
+            position: position++,
+            duration: clipDur,
+            script_text: blockText || null,
+            overlay_text: null,
+            metadata: {
+              planned: true,
+              planned_duration: clipDur,
+              clip_duration: clipDur,
+              duration_clamped: false,
+              match_score: assigned.score,
+              match_base_score: assigned.baseScore ?? null,
+              match_bonus: assigned.bonus ?? null,
+              match_bonus_breakdown: assigned.bonusBreakdown ?? null,
+              match_reason: assigned.reason ?? null,
+              pick_source: pickSource,
+              block_index: i,
+              split_sub_row: "A",
+              split_total_sub_rows: 2,
+              split_reason: `stretch_${Math.round(stretch * 100) / 100}x_exceeds_${SLOWMO_COVERAGE_LIMIT}x`,
+              ...planHintFor(i),
+              vo_start_seconds: subAVoStart,
+              vo_end_seconds: subAVoEnd,
+            },
+            approved: false,
+          });
+          assignedFootageCount++;
+
+          // Push sub-row B.
+          if (clipB) {
+            const clipBDur = clipDurationById.get(clipB.clipId) ?? 0;
+            // Clip B might also be shorter than the remainder. Clamp it;
+            // the residual goes into durationReclaimSeconds so the reclaim
+            // pass can absorb the tail onto other rows. This is the rare
+            // case where BOTH the primary AND secondary clip are short —
+            // mathematically impossible to fix with footage alone here.
+            let subBDur = remainder;
+            if (clipBDur > 0 && clipBDur < remainder) {
+              durationReclaimSeconds += remainder - clipBDur;
+              durationClampedCount++;
+              subBDur = clipBDur;
+            }
+            usedClipIds.add(clipB.clipId);
+            items.push({
+              project_id: projectId,
+              clip_id: clipB.clipId,
+              type: "footage",
+              position: position++,
+              duration: subBDur,
+              script_text: blockText || null,
+              overlay_text: null,
+              metadata: {
+                planned: true,
+                planned_duration: remainder,
+                clip_duration: clipBDur || null,
+                duration_clamped: subBDur < remainder,
+                match_score: clipB.score,
+                match_reason: "phase_b_split_secondary_clip",
+                pick_source: "split_secondary_clip",
+                block_index: i,
+                split_sub_row: "B",
+                split_total_sub_rows: 2,
+                ...planHintFor(i),
+                vo_start_seconds: subBVoStart,
+                vo_end_seconds: subBVoEnd,
+              },
+              approved: false,
+            });
+            assignedFootageCount++;
+          } else {
+            // No second clip available → push a placeholder image row.
+            // Pass 2 (the reference-driven image pass) walks items with
+            // needs_fallback_visual=true and fills them via
+            // tryPersonImageFallback(resolved_subject). Until then,
+            // image_url stays null and the renderer would skip it; we
+            // rely on Pass 2 always succeeding for the main celebrity.
+            items.push({
+              project_id: projectId,
+              clip_id: null,
+              type: "image",
+              position: position++,
+              duration: remainder,
+              script_text: blockText || null,
+              overlay_text: null,
+              metadata: {
+                placeholder: true,
+                planned: true,
+                needs_fallback_visual: true,
+                downgraded_from: "footage",
+                downgrade_reason: "phase_b_split_no_second_clip",
+                pick_source: "split_image_tail",
+                block_index: i,
+                split_sub_row: "B",
+                split_total_sub_rows: 2,
+                ...planHintFor(i),
+                vo_start_seconds: subBVoStart,
+                vo_end_seconds: subBVoEnd,
+              },
+              approved: false,
+            });
+            // NOTE: not counting this in assignedFootageCount because it's
+            // an image, but it WAS supposed to be footage so the
+            // downgradedCount metric should reflect it.
+            downgradedCount++;
+          }
+          continue;
         }
+
+        // ──────────── Phase A path (≤ 1.5× stretch) ────────────
+        // Slow-mo at the renderer handles small shortfalls invisibly.
+        // We still record planned_duration vs clip_duration so the
+        // editor can show the user the planned slot length.
+        const realDuration = block.duration;
         items.push({
           project_id: projectId,
           clip_id: assigned.clipId,
@@ -2132,7 +2402,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             planned: true,
             planned_duration: block.duration,
             clip_duration: clipDur || null,
-            duration_clamped: realDuration < block.duration,
+            duration_clamped: false,
             match_score: assigned.score,
             match_base_score: assigned.baseScore ?? null,
             match_bonus: assigned.bonus ?? null,
@@ -2265,15 +2535,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       const isGeographicNonLandmark = isCountryOrRegion(primaryEntity);
       const isBareDate = isDateOnly(primaryEntity);
 
+      // Single common-noun titles (e.g. "Conversation", "Statement") are
+      // dropped here too — Gemini occasionally labels a sentence containing
+      // the common noun as subject_type "movie" with primaryEntity "The
+      // Conversation". Without this guard the type-router fires
+      // "The Conversation movie poster" and CSE returns the 1974 film.
+      const isCommonNounTrap = isCommonNounTitle(primaryEntity);
       switch (subjectType) {
         case "company":
-          out.push({ query: `${primaryEntity} logo`, reason: `subject_type:company:${primaryEntity}`, imgType: "logo" });
+          if (!isCommonNounTrap) {
+            out.push({ query: `${primaryEntity} logo`, reason: `subject_type:company:${primaryEntity}`, imgType: "logo" });
+          }
           break;
         case "movie":
-          out.push({ query: `${primaryEntity} movie poster`, reason: `subject_type:movie:${primaryEntity}` });
+          if (!isCommonNounTrap) {
+            out.push({ query: `${primaryEntity} movie poster`, reason: `subject_type:movie:${primaryEntity}` });
+          }
           break;
         case "show":
-          out.push({ query: `${primaryEntity} tv show poster`, reason: `subject_type:show:${primaryEntity}` });
+          if (!isCommonNounTrap) {
+            out.push({ query: `${primaryEntity} tv show poster`, reason: `subject_type:show:${primaryEntity}` });
+          }
           break;
         case "place":
           // Drop country / state / region "places" — they return flags and
@@ -2300,10 +2582,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
 
     // Tier 1: each mentioned entity verbatim. Highest precision — the script
-    // named something concrete (a movie, a place, a person).
+    // named something concrete (a movie, a place, a person). Single common-
+    // noun tokens that collide with famous-work titles are dropped (see
+    // COMMON_NOUN_TITLE_BLOCKLIST) — those queries return the famous-work
+    // poster from CSE, never on-topic visuals.
     for (const ent of mentionedEntities) {
       const e = ent.trim();
       if (!e) continue;
+      if (isCommonNounTitle(e)) continue;
       out.push({ query: e, reason: `mentioned_entity:${e}` });
     }
     // Tier 2: subject + reference. Most reference→image work lives here.
@@ -2351,6 +2637,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const phrases = extractScriptPhrases(scriptText);
     if (phrases.length === 0) return [];
     const subjLower = (subject ?? "").trim().toLowerCase();
+    // Project-level context anchor for script-phrase searches. Without this,
+    // a bare phrase like "The Statement" lifted from a BGT script returns a
+    // swastika graphic captioned "The Statement / Case Closed" because Google
+    // Image Search has no idea the phrase is part of a Britain's Got Talent
+    // narration. Prefixing the main celebrity (and the show, if known) keeps
+    // the search inside the project's topic universe.
+    const contextAnchor = (mainCelebrity ?? "").trim();
     const out: Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> = [];
     for (const p of phrases) {
       const pl = p.toLowerCase();
@@ -2361,11 +2654,23 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       if (isCountryOrRegion(p)) continue;
       // Skip bare dates.
       if (isDateOnly(p)) continue;
+      // Contextualized query first, bare phrase second. The contextualized
+      // form keeps the search tied to the project's topic; the bare form is
+      // kept as a fallback for the rare case where the phrase IS a real-world
+      // proper noun the contextualized search misses ("District Court of
+      // Utah" returns courthouses fine on its own).
+      if (contextAnchor && pl !== contextAnchor.toLowerCase()) {
+        out.push({
+          query: `${contextAnchor} ${p}`,
+          reason: `script_phrase_contextual:${contextAnchor}:${p}`,
+        });
+      }
       out.push({ query: p, reason: `script_phrase:${p}` });
     }
-    // Cap to 3 queries per block — image fetches cost money and time, and
-    // beyond the top phrases we're typically scraping the barrel.
-    return out.slice(0, 3);
+    // Cap to 4 queries per block — image fetches cost money and time, and
+    // beyond the top phrases we're typically scraping the barrel. Bumped
+    // from 3 to 4 to fit one contextualized + one bare for the top phrases.
+    return out.slice(0, 4);
   }
 
   // Image reuse cooldown (per client spec: 2-4 minutes for same image).
@@ -2635,8 +2940,68 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // (common nouns like "transcript", "recordings") and produces
     // pages of nonsense Gemini rejects. Treat a null binding as
     // celebrity_default so the same protective short-circuit applies.
-    const blockEntity: BlockEntityBinding =
+    let blockEntity: BlockEntityBinding =
       rawBlockEntity ?? { type: "celebrity_default", name: mainCelebrity ?? "" };
+    let narrativeSubjectOverride = false;
+
+    // Narrative-subject anchor (Option B).
+    //
+    // Gemini sometimes extracts a place/event/general entity as the
+    // block subject when the narration is actually ABOUT the project
+    // celebrity AT that place/event. Example: "The BGT auditions at
+    // the London Palladium proceeded the way they always did." — Gemini
+    // tags the block as { type: "place", name: "London Palladium" },
+    // and the matcher faithfully searches for Palladium photos. Image
+    // search returns BGT promotional shots featuring random contestants
+    // (because the venue hosts BGT), Gemini verifier accepts them
+    // (they ARE from the Palladium), and the editor shows the wrong
+    // person on screen during narration about Walliams.
+    //
+    // The fix: when the block's subject is a non-person AND the project
+    // celebrity is mentioned in this block or the surrounding ±1 block
+    // window, override to celebrity_default. The celebrity image path
+    // shows a clean Walliams photo instead of place-context noise.
+    //
+    // We don't override "company" / "movie" / "show" / "tv_show"
+    // because those entities have canonical visual identities (logos,
+    // posters) the user does want to see. Only "place", "event",
+    // "general", and "object" get the override — these are subjects
+    // where image search reliably drifts into context-photos with
+    // wrong people in frame.
+    const NARRATIVE_OVERRIDE_TYPES = new Set(["place", "event", "general", "object"]);
+    if (
+      mainCelebrity &&
+      blockEntity.type !== "celebrity_default" &&
+      blockEntity.type !== "person" &&
+      subjectType &&
+      NARRATIVE_OVERRIDE_TYPES.has(subjectType)
+    ) {
+      const celebLower = mainCelebrity.toLowerCase();
+      const celebLastName = mainCelebrity.toLowerCase().split(/\s+/).slice(-1)[0];
+      // Widen the window to ±3 blocks. Documentary narration often
+      // separates the SETUP sentence (e.g. "On January twenty twenty,
+      // microphones at the London Palladium picked up something...")
+      // from the PAYOFF sentence naming the celebrity ("what David
+      // Walliams said next..."). The Palladium block needs to know
+      // about the Walliams reference 2-3 sentences later to fire the
+      // override. The previous ±1 window was too narrow and missed
+      // most of these setup-payoff pairs — every block in the test
+      // logs showed narrativeSubjectOverride:false.
+      const WINDOW = 3;
+      const windowTexts: string[] = [];
+      for (let off = -WINDOW; off <= WINDOW; off++) {
+        const idx = blockIdx + off;
+        if (idx < 0 || idx >= blockTexts.length) continue;
+        windowTexts.push((blockTexts[idx] ?? "").toLowerCase());
+      }
+      const celebMentioned = windowTexts.some(
+        (t) => t.includes(celebLower) || (celebLastName.length >= 4 && t.includes(celebLastName)),
+      );
+      if (celebMentioned) {
+        blockEntity = { type: "celebrity_default", name: mainCelebrity };
+        narrativeSubjectOverride = true;
+      }
+    }
     void logJob({ projectId, jobId: mediaJobId }, "match.image_block_entity_state", {
       blockIndex: blockIdx,
       blockEntity: { type: blockEntity.type, name: blockEntity.name },
@@ -2644,6 +3009,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       subjectType,
       refs0: refs[0] ?? null,
       ents0: ents[0] ?? null,
+      narrativeSubjectOverride,
     });
     // Note: text-grounding for block_entity is enforced upstream in
     // analyze's normalizeBlockEntities — by the time hints reach the
@@ -2837,6 +3203,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     const scriptQueries = buildScriptPhraseQueries(scriptText, resolvedSubject ?? mainCelebrity ?? null);
     const queries = [...refQueries, ...scriptQueries];
     const nowSec = blockStartSec[blockIdx];
+    // Accumulate every candidate URL we considered across all queries for
+    // this block. Persisted to metadata.image_candidates so the editor's
+    // Replace Media panel can offer alternatives, not just the single chosen
+    // image. Cap at CANDIDATE_RECORD_CAP to keep the timeline_items row
+    // size reasonable (each entry is ~3 short strings).
+    const CANDIDATE_RECORD_CAP = 20;
+    const seenCandidateUrls = new Set<string>();
+    const consideredCandidates: Array<{ url: string; source: string; query: string }> = [];
     let filled = false;
     for (const q of queries) {
       try {
@@ -2863,6 +3237,18 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           imgType: q.imgType,
           requireContextTokens: ctxTokens.length > 0 ? ctxTokens : undefined,
         });
+        // Record every candidate this query produced (before verification
+        // runs) so the editor's Replace Media panel can offer alternatives.
+        // We skip URLs we've already recorded for this block; we DO include
+        // URLs that fail entity / script verification below, because once a
+        // human reviewer is in the loop they can decide for themselves. We
+        // tag the loser candidates so the UI can de-prioritise them.
+        for (const f of fetched) {
+          if (seenCandidateUrls.has(f.url)) continue;
+          if (consideredCandidates.length >= CANDIDATE_RECORD_CAP) break;
+          seenCandidateUrls.add(f.url);
+          consideredCandidates.push({ url: f.url, source: f.source, query: q.query });
+        }
         // Slice 5: per-block verification gate. Map the block's subject_type
         // to a closed-world BlockEntityType and ask Gemini whether each
         // fetched image actually depicts the entity Gemini named. This
@@ -2892,6 +3278,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // verification call runs inside the find predicate so we stop at
         // the first acceptable URL instead of paying for every candidate
         // in fetched[] — matters because each verify call hits Gemini.
+        //
+        // Two-stage verification per candidate:
+        //   1. Entity gate (verifyPoolAsset) when the block resolves to a
+        //      concrete entity — "is this a real photo of <London Palladium>?"
+        //   2. Script gate (verifyImageMatchesScript) ALWAYS, when we have a
+        //      project topic — "would a viewer of <topic> find this image
+        //      on-topic for this narration?" Stage 2 catches the failure
+        //      mode where Stage 1 was skipped (block_entity is celebrity_
+        //      default / general) and a literal-phrase search ("The
+        //      Statement") returned an image matching the words but in the
+        //      wrong world entirely.
         let pick: (typeof fetched)[number] | undefined;
         for (const f of fetched) {
           if (refUrlSet.has(f.url)) continue;
@@ -2912,6 +3309,35 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               continue;
             }
           }
+          // Script-aware gate. Runs on every pick when we have a topic and
+          // script text — fail-open on Gemini errors (thrown exceptions
+          // keep the candidate) so we don't gut the pool on rate-limit
+          // blips. Only "yes" passes; both "no" and "uncertain" reject.
+          // We tightened from "no-only" because the symptom was an image
+          // matching a literal common noun in the script ("Conversation"
+          // → 1974 Coppola poster) that Gemini judged "uncertain" — those
+          // never belong on a celebrity documentary, so we'd rather lose
+          // the rare edge case and fall through to the person fallback.
+          if (projectTopic && scriptText) {
+            try {
+              const scriptVerdict = await verifyImageMatchesScript({
+                candidateUrl: f.url,
+                topic: projectTopic,
+                scriptText,
+              });
+              if (scriptVerdict.verdict !== "yes") {
+                void logJob({ projectId, jobId: mediaJobId }, "match.image_block_script_verify.rejected", {
+                  blockIndex: blockIdx, topic: projectTopic,
+                  url: f.url, verdict: scriptVerdict.verdict,
+                  reason: scriptVerdict.reason.slice(0, 120),
+                  query: q.query,
+                });
+                continue;
+              }
+            } catch {
+              // verify outage — keep the candidate.
+            }
+          }
           pick = f;
           break;
         }
@@ -2928,6 +3354,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         meta.image_entity = verifyName || refs[0] || ents[0] || null;
         meta.image_reason = q.reason;
         meta.image_pick_source = q.reason.startsWith("script_phrase:") ? "script_phrase" : "reference_driven";
+        // Persist the considered-candidates list for the editor's pool. We
+        // also include the chosen URL in this list (defensive — the loop
+        // recorded it above when we saw it in `fetched`, but a future change
+        // could break that ordering). De-dupe is handled by seenCandidateUrls.
+        meta.image_candidates = consideredCandidates;
         item.metadata = meta;
         // Slice 4b: stamp the verification metadata onto the timeline_item
         // so the Replace Media UI (Slice 7) can show which entity this
@@ -2974,6 +3405,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         meta.image_entity = personPick.query;
         meta.image_reason = "person_image_fallback";
         meta.image_pick_source = "person_fallback";
+        // Person-fallback path: include the person-pool URL on the pick at
+        // position 0 plus the reference-stage considered candidates (which
+        // didn't pass) so the editor can offer them as user-overridable
+        // swaps. The reference candidates won't be auto-picked, but a human
+        // can choose differently — that's the point of the Replace panel.
+        const fallbackCandidates = [
+          { url: personPick.url, source: personPick.source, query: personPick.query },
+          ...consideredCandidates.filter((c) => c.url !== personPick.url),
+        ].slice(0, CANDIDATE_RECORD_CAP);
+        meta.image_candidates = fallbackCandidates;
+        item.metadata = meta;
+      } else if (consideredCandidates.length > 0) {
+        // No fallback either, but we still considered candidates — surface
+        // them so the user has SOMETHING to pick from in the editor.
+        const meta = (item.metadata ?? {}) as Record<string, unknown>;
+        meta.image_candidates = consideredCandidates;
         item.metadata = meta;
       }
     }
@@ -3881,16 +4328,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // name an entity for this side. Each candidate is Gemini-verified
     // against the entity name BEFORE acceptance — without this, a query
     // like "The Sun" (a newspaper) returned photos of our solar system's
-    // sun, which the gate now rejects so we fall through to the person
-    // image. Strict mode (rejectUncertain) is on because half-frame
-    // slots are visually obvious — an "uncertain" celebrity image is
-    // better than an "uncertain" off-topic image.
+    // sun, which the gate now rejects so we fall through to single-image
+    // downgrade. Strict mode (rejectUncertain) is on because half-frame
+    // slots are visually obvious — an "uncertain" image is too risky.
     //
     // Derive the entity type from the hint's subject_type so the verify
     // gate prompts Gemini with the right framing ("is this a photo of
     // the company X" vs "is this a photo of the person X"). Default to
     // "company" when unknown — most non-person split entities in this
     // pipeline are companies / publications (The Sun, Guardian, Fremantle).
+    //
+    // No person-image fallback. Split-screens are editorially supposed to
+    // show TWO different entities side-by-side; if we can't find a real
+    // entity image for one side, the block downgrades to a single-image
+    // block (see caller below). Falling back to the project celebrity's
+    // photo cache for a split half produced two failure modes:
+    //   1. Same subject on both halves (visually weird "split" of one
+    //      person against themselves).
+    //   2. Broken / placeholder images returned by CDNs (the "speech
+    //      bubble icon" placeholder), since the celebrity cache pulls
+    //      from Getty/Hello/Daily Mail URLs that sometimes return
+    //      a "no image" graphic with HTTP 200.
     if (entity && entity.trim()) {
       const q = entity.trim();
       const hintSubjectType = hints[blockIdx]?.subject_type;
@@ -3925,7 +4383,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           } catch {
             // Verify failure (Gemini outage) — fail closed for split entities
             // because the cost of a wrong image is high (literally "the sun"
-            // for "The Sun"). Skip this candidate; person fallback will run.
+            // for "The Sun"). Skip this candidate; block downgrades to single.
             continue;
           }
           return { url: f.url, query: q, source: f.source, reason: `split_entity:${q}` };
@@ -3935,21 +4393,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           "match.split.fetch_failed", { blockIndex: blockIdx, query: q, err: (e as Error).message });
       }
     }
-    // Tier 2 — person-image fallback. Pulls from the project celebrity's
-    // photo cache (same path image blocks use when their reference search
-    // fails). Honours the forbidden-URL set so the two halves never end
-    // up with the same person photo. Skips the reuse cooldown because a
-    // half-frame slot can repeat a person photo seen elsewhere — that
-    // still beats a random pool image.
-    const personPick = await tryPersonImageFallback(blockIdx);
-    if (personPick && !forbiddenUrls.has(personPick.url)) {
-      return {
-        url: personPick.url,
-        query: personPick.query,
-        source: personPick.source,
-        reason: "split_person_fallback",
-      };
-    }
+    // No fallback. Caller handles null by downgrading the block to a
+    // single full-frame image (using whichever side did resolve), or to
+    // a footage / image block if neither resolved.
     return null;
   }
   for (const item of items) {
@@ -4145,6 +4591,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       resolverCtx,
     );
     await logJob({ projectId, jobId: mediaJobId }, "match.script_markers_applied", { ...stats });
+    // Surface forced-clip trims as their own job log entry so the doc
+    // author can see exactly which clips were shortened and by how much.
+    // Two thresholds are reported per the user spec (2026-05-31):
+    //   • Every trim is logged (debug audit trail) so we can correlate
+    //     any visual misalignment with the trim that caused it.
+    //   • Trims where requested - trimmed > 2s are flagged as warnings —
+    //     the doc author picked a clip noticeably longer than the
+    //     section narration and probably wants to fix the doc. Sub-2s
+    //     trims are silent (renderer-level rounding territory).
+    if (stats.forcedClipTrimmings.length > 0) {
+      const WARN_OVERFLOW_SECONDS = 2;
+      const warnings = stats.forcedClipTrimmings.filter(
+        (t) => t.requestedDur - t.trimmedDur > WARN_OVERFLOW_SECONDS,
+      );
+      await logJob({ projectId, jobId: mediaJobId }, "match.forced_clip_trimmed", {
+        count: stats.forcedClipTrimmings.length,
+        warningCount: warnings.length,
+        trims: stats.forcedClipTrimmings,
+        warnings,
+      });
+    }
 
     // Audit log: which lower-third markers got a canonical override vs.
     // were left to the celebrity fallback. Useful for the doc writer to
@@ -4171,6 +4638,323 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         resolved: overrideAudit.filter((r) => r.resolved).length,
         unresolved: overrideAudit.filter((r) => !r.resolved).length,
         rows: overrideAudit,
+      });
+    }
+  }
+
+  // ---- vo-start-driven duration pass (2026-06-01) ---------------------
+  // Each non-intro row's `duration` must equal the audio interval it owns:
+  //   duration = next_row.vo_start_seconds - cur.vo_start_seconds
+  //
+  // Why this pass exists:
+  //   Without it, per-row durations drift away from the row's real spoken
+  //   audio window. Footage rows get clamped to short clip lengths
+  //   (clipDur < spoken), image rows get inflated by proportional-fit to
+  //   absorb the leftover, and the title-card padding logic dumps even
+  //   more time onto the row preceding each title card. End result:
+  //   image holds 8.33s for sentences the narrator finishes in 4.96s
+  //   (block #11 in the user's BGT project, 2026-06-01).
+  //
+  //   Deepgram already gives us each sentence's exact vo_start. The
+  //   correct visual hold time is just the delta to the next row's
+  //   vo_start — no estimation, no padding, no proportional fit.
+  //
+  // Clip-too-short handling:
+  //   Footage rows where the matched clip is shorter than the audio
+  //   interval rely on the renderer's slow-motion path (up to 1.5×) to
+  //   fill the gap. Beyond 1.5×, the renderer caps the stretch and the
+  //   residual is absorbed by the legacy reclaim/proportional-fit pass
+  //   below. This pass deliberately does NOT clamp footage rows down to
+  //   their clip length — that's the renderer's call at render time, not
+  //   the matcher's.
+  //
+  // Rows skipped:
+  //   • intro                         — separate audio axis (pre-roll)
+  //   • duration_clamped: true        — forced YouTube clips with a pinned
+  //                                     duration the doc author chose
+  //   • title_card with typewriter    — pinned to typewriter_seconds; the
+  //                                     trailing visual hold (HOLD_TAIL)
+  //                                     is intentionally NOT audio time
+  //                                     and stays on the row's duration
+  //
+  // The last non-intro row's duration = voiceoverSeconds - cur.vo_start.
+  {
+    type Row = (typeof items)[number];
+    const adjustable: Array<{ row: Row; voStart: number }> = [];
+    for (const it of items) {
+      if (it.type === "intro") continue;
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const vs = meta.vo_start_seconds;
+      if (typeof vs !== "number") continue;
+      adjustable.push({ row: it, voStart: Number(vs) });
+    }
+    // Sort by vo_start so the delta-to-next math is correct regardless of
+    // the items[] insertion order. (applyScriptMarkers splices title-card
+    // rows in reverse order — sequential index ≠ audio-time order until
+    // we sort here.)
+    adjustable.sort((a, b) => a.voStart - b.voStart);
+
+    let adjustedCount = 0;
+    let totalDriftBefore = 0;
+    let totalDriftAfter = 0;
+    let forcedClipsStretched = 0;
+    for (let k = 0; k < adjustable.length; k++) {
+      const cur = adjustable[k];
+      const meta = (cur.row.metadata ?? {}) as Record<string, unknown>;
+      // Title cards always keep their typewriter+hold duration. The hold
+      // tail is a visual beat, not audio time, so the next row's vo_start
+      // is naturally less than (this.vo_start + this.duration) — and
+      // that's correct.
+      if (cur.row.type === "title_card") continue;
+      const next = adjustable[k + 1];
+      const targetEnd = next ? next.voStart : voiceoverSeconds;
+      const audioInterval = targetEnd - cur.voStart;
+      const oldDuration = Number(cur.row.duration ?? 0);
+      totalDriftBefore += Math.abs(oldDuration - audioInterval);
+      // Forced YouTube clips AND title-card-padded rows carry
+      // duration_clamped: true. In BOTH cases the correct visual hold
+      // time is the audio interval — anything longer leaks visual past
+      // the narrator's next sentence (the 32s-overshoot bug, 2026-06-01).
+      //
+      // - audioInterval > current: EXTEND. For forced clips this means
+      //   the source window is shorter than the narration; renderer
+      //   applies slow-mo (≤1.5×) to fill. We stash the original window
+      //   so the renderer can compute the stretch factor.
+      // - audioInterval < current: SHRINK. Two cases produce this:
+      //     (a) marker padding stamped duration_clamped on the row
+      //         preceding a title card (markers.ts); shrinking restores
+      //         the audio-aligned duration.
+      //     (b) a forced YouTube clip whose source window is longer than
+      //         the section's narration budget; shrinking trims the
+      //         playback so the next row's visual lands on its narration.
+      if (meta.duration_clamped === true) {
+        const sourceWindowDur = oldDuration;
+        const newDuration = Math.max(0.3, Math.round(audioInterval * 100) / 100);
+        if (audioInterval > sourceWindowDur + 0.05) {
+          // EXTEND path — stash source window for slow-mo factor.
+          meta.forced_clip_source_window_seconds = Math.round(sourceWindowDur * 100) / 100;
+          cur.row.duration = newDuration;
+          meta.vo_end_seconds = cur.voStart + newDuration;
+          cur.row.metadata = meta;
+          forcedClipsStretched++;
+          adjustedCount++;
+          totalDriftAfter += Math.abs(newDuration - audioInterval);
+          continue;
+        }
+        if (audioInterval + 0.05 < sourceWindowDur) {
+          // SHRINK path — clamp the playback to the audio interval.
+          cur.row.duration = newDuration;
+          meta.vo_end_seconds = cur.voStart + newDuration;
+          // Forced clips: also trim the source end so the renderer plays
+          // start..start+newDuration, not the original (longer) window.
+          const forcedClip = meta.forced_clip as
+            | { youtube_url?: string; start_seconds?: number; end_seconds?: number }
+            | undefined;
+          if (forcedClip && typeof forcedClip.start_seconds === "number") {
+            forcedClip.end_seconds = forcedClip.start_seconds + newDuration;
+            meta.forced_clip = forcedClip;
+          }
+          cur.row.metadata = meta;
+          adjustedCount++;
+          totalDriftAfter += Math.abs(newDuration - audioInterval);
+          continue;
+        }
+        // Else: already matches within tolerance. Leave alone.
+        totalDriftAfter += Math.abs(oldDuration - audioInterval);
+        continue;
+      }
+      // Regular footage / image / split rows: simple delta-to-next rule.
+      const newDuration = Math.max(0.3, Math.round(audioInterval * 100) / 100);
+      cur.row.duration = newDuration;
+      meta.vo_end_seconds = cur.voStart + newDuration;
+      cur.row.metadata = meta;
+      if (Math.abs(oldDuration - newDuration) > 0.05) adjustedCount++;
+      totalDriftAfter += Math.abs(newDuration - audioInterval);
+    }
+    await logJob({ projectId, jobId: mediaJobId }, "match.vo_start_duration_pass", {
+      rowsSeen: adjustable.length,
+      rowsAdjusted: adjustedCount,
+      forcedClipsStretched,
+      totalAbsDriftBefore: Math.round(totalDriftBefore * 10) / 10,
+      totalAbsDriftAfter: Math.round(totalDriftAfter * 10) / 10,
+    });
+
+    // ---- title-card anchor pass (2026-06-01) ----------------------------
+    // The client requires title cards to appear at the EXACT video time the
+    // narrator says them — no drift tolerance. Even after the vo_start
+    // duration pass above, small per-row residuals (rounding to 0.01s
+    // precision, image-fragment slot sums, slow-mo cap residue) accumulate
+    // by the time playback reaches a title card. On a 10-minute timeline
+    // that's typically 1-3s of drift, and the title card shows that much
+    // late vs. the narrator.
+    //
+    // Strategy: SECTION-BASED DRIFT DISTRIBUTION.
+    //   A "section" is the run of rows between two title cards (or from the
+    //   start of the timeline to the first title card, or from the last
+    //   title card to the end). Drift accumulates within a section; we
+    //   measure it at the section's end (the next title card) and spread
+    //   the correction across EVERY row in the section.
+    //
+    //   Dumping the full drift on a single row (the one before the title
+    //   card) would shift that row's visual 1-3s out of sync with its own
+    //   spoken sentence — the narrator's first word of the title bleeds
+    //   under the previous clip, or the previous sentence's tail cuts mid-
+    //   word. Spreading evenly keeps every row within ±0.1s of its sentence
+    //   (imperceptible) while the title card lands exactly on its beat.
+    //
+    // Section eligibility:
+    //   • Adjustable rows: footage, image, split_2/4 (visual-only, the
+    //     viewer doesn't notice ±0.1s shifts on these).
+    //   • NOT adjustable: title_card (pinned to typewriter+hold), forced
+    //     YouTube clips with duration_clamped (doc author chose the
+    //     window length and trimmed it intentionally).
+    //   • Sections with zero adjustable rows fall back to the single-row
+    //     dump on the row immediately before the title card.
+    //
+    // Edge cases:
+    //   • intro rows skipped (own audio axis).
+    //   • Min 0.3s per-row floor — if shrinking would push a row below
+    //     that, the residual rolls to the next eligible row in the same
+    //     section.
+    {
+      let titleCardsAnchored = 0;
+      let titleCardsResidualDrift = 0;
+      let rowsTouched = 0;
+      let cumulativeVideo = 0;
+      const nonIntroRows = items.filter((it) => it.type !== "intro");
+
+      function isAdjustable(row: (typeof nonIntroRows)[number]): boolean {
+        if (row.type === "title_card") return false;
+        if (row.type === "intro") return false;
+        const m = (row.metadata ?? {}) as Record<string, unknown>;
+        if (m.duration_clamped === true) return false;
+        return true;
+      }
+
+      // Apply a signed delta across `rows`, evenly per row, respecting the
+      // 0.3s floor. Returns the amount actually absorbed (== delta unless
+      // the floor blocked some rows). Negative delta = shrink, positive =
+      // extend. The function distributes residue when individual rows
+      // can't take their full share.
+      function distributeDelta(rows: typeof nonIntroRows, delta: number): number {
+        if (rows.length === 0 || Math.abs(delta) < 0.01) return 0;
+        // Iterative distribution: each pass tries to add `share` to every
+        // row. Rows blocked by the 0.3s floor return their actual absorbed
+        // amount; the residue is redistributed across the still-eligible
+        // rows. Bails after a few passes if the residue can't be absorbed.
+        let remaining = delta;
+        for (let pass = 0; pass < 5 && Math.abs(remaining) > 0.01; pass++) {
+          const eligible: typeof nonIntroRows = [];
+          for (const r of rows) {
+            const d = Number(r.duration ?? 0);
+            // For shrinking (negative remaining), the row must have headroom
+            // above 0.3s. For extending, every row is eligible.
+            if (remaining > 0 || d > 0.31) eligible.push(r);
+          }
+          if (eligible.length === 0) break;
+          const share = remaining / eligible.length;
+          let absorbedThisPass = 0;
+          for (const r of eligible) {
+            const cur = Number(r.duration ?? 0);
+            const target = cur + share;
+            const next = Math.max(0.3, target);
+            const actual = next - cur;
+            if (Math.abs(actual) < 0.005) continue;
+            r.duration = Math.round(next * 100) / 100;
+            const m = (r.metadata ?? {}) as Record<string, unknown>;
+            const vs = m.vo_start_seconds;
+            if (typeof vs === "number") {
+              m.vo_end_seconds = Number(vs) + next;
+              r.metadata = m;
+            }
+            absorbedThisPass += actual;
+          }
+          if (Math.abs(absorbedThisPass) < 0.005) break;
+          remaining -= absorbedThisPass;
+        }
+        return delta - remaining;
+      }
+
+      // Walk the timeline, recording section boundaries (the rows in
+      // nonIntroRows[] between title cards). At each title card, measure
+      // drift and distribute across the section that just ended.
+      let sectionStart = 0;
+      for (let k = 0; k < nonIntroRows.length; k++) {
+        const cur = nonIntroRows[k];
+        if (cur.type === "title_card") {
+          const meta = (cur.metadata ?? {}) as Record<string, unknown>;
+          const vs = meta.vo_start_seconds;
+          if (typeof vs === "number" && k > 0) {
+            const target = Number(vs);
+            const drift = target - cumulativeVideo;
+            if (Math.abs(drift) > 0.05) {
+              const section = nonIntroRows.slice(sectionStart, k).filter(isAdjustable);
+              let absorbed = 0;
+              if (section.length > 0) {
+                absorbed = distributeDelta(section, drift);
+                rowsTouched += section.length;
+              } else {
+                // No adjustable row in the section — fall back to the row
+                // immediately before the title card. Better to dump 1-2s on
+                // one clamped row than leave the title card desynced.
+                const prev = nonIntroRows[k - 1];
+                if (prev) {
+                  absorbed = distributeDelta([prev], drift);
+                  rowsTouched += 1;
+                }
+              }
+              cumulativeVideo += absorbed;
+              titleCardsAnchored++;
+              titleCardsResidualDrift += Math.abs(drift - absorbed);
+            }
+          }
+          sectionStart = k + 1; // next section starts after this title card
+        }
+        cumulativeVideo += Number(cur.duration ?? 0);
+      }
+
+      // Final section anchor: distribute the trailing drift across rows
+      // AFTER the last title card so the final visual ends exactly when
+      // the narrator finishes. Without this, a 1-3s mismatch at the end
+      // produces either silent visual tail (narrator finished, picture
+      // still playing) or audio cutoff (narrator still talking, picture
+      // ended). Either way, the last frame of the video doesn't match
+      // the last word of the script.
+      //
+      // Target: cumulativeVideo (after all rows) === voiceoverSeconds.
+      // The section is every adjustable row from `sectionStart` to the
+      // end of nonIntroRows[].
+      let finalSectionAnchored = false;
+      let finalSectionResidual = 0;
+      if (sectionStart < nonIntroRows.length) {
+        const finalDrift = voiceoverSeconds - cumulativeVideo;
+        if (Math.abs(finalDrift) > 0.05) {
+          const finalSection = nonIntroRows.slice(sectionStart).filter(isAdjustable);
+          let absorbed = 0;
+          if (finalSection.length > 0) {
+            absorbed = distributeDelta(finalSection, finalDrift);
+            rowsTouched += finalSection.length;
+          } else {
+            // No adjustable row — dump on the last non-intro row regardless
+            // of its clamped status. Better to stretch one row than leave
+            // a 2s silent tail at the end of the video.
+            const last = nonIntroRows[nonIntroRows.length - 1];
+            if (last) {
+              absorbed = distributeDelta([last], finalDrift);
+              rowsTouched += 1;
+            }
+          }
+          finalSectionAnchored = true;
+          finalSectionResidual = Math.abs(finalDrift - absorbed);
+        }
+      }
+
+      await logJob({ projectId, jobId: mediaJobId }, "match.title_card_anchor_pass", {
+        titleCardsAnchored,
+        finalSectionAnchored,
+        rowsTouched,
+        residualDriftSeconds: Math.round(titleCardsResidualDrift * 100) / 100,
+        finalSectionResidualSeconds: Math.round(finalSectionResidual * 100) / 100,
       });
     }
   }
@@ -4222,12 +5006,21 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     predictedMultiplier < PROP_FIT_SAFE_MIN ||
     predictedMultiplier > PROP_FIT_SAFE_MAX;
 
-  // Reclaim runs when:
-  //   • We're on the legacy hint-driven path (always), OR
-  //   • The transcript-driven path's proportional fit would be too
-  //     extreme (>10% per-block distortion). Reclaim absorbs the bulk
-  //     adjustment so proportional fit stays in the imperceptible range.
-  const shouldUseReclaim = !usedTranscriptDrivenBuilder || propFitWouldBeExtreme;
+  // Reclaim + proportional-fit are LEGACY passes superseded by the
+  // vo_start_duration_pass above. The new pass already sets every row's
+  // duration to its exact audio interval (next.vo_start - cur.vo_start),
+  // so the picture timeline naturally equals voiceoverSeconds row-by-row.
+  // Letting reclaim and proportional-fit run on top would UNDO that
+  // alignment — they sum the live timeline, compare to voiceoverSeconds,
+  // and redistribute any residual onto image rows, which is exactly the
+  // inflation behavior the new pass replaces (e.g. block #11's 4.96s
+  // narration getting padded to 7.99s, 2026-06-01 BGT project).
+  //
+  // Gate: when the transcript-driven builder ran, the new pass owns
+  // duration assignment. Skip reclaim and proportional-fit entirely.
+  // For legacy projects without transcript_words / Gemini hints, the
+  // builder falls back and these passes are still needed.
+  const shouldUseReclaim = !usedTranscriptDrivenBuilder;
   if (liveGap > 0.1 && shouldUseReclaim) {
     durationReclaimSeconds = liveGap;
   }
@@ -4346,7 +5139,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // rows were clamped to clip lengths), we expand instead of compress
   // using the same proportional rule, so the gap is absorbed evenly
   // rather than appearing as silent visual at the end.
-  {
+  //
+  // Skipped on the transcript-driven path: the vo_start_duration_pass
+  // above already aligned every row to its exact audio interval. Running
+  // proportional fit here would scale those exact values away from the
+  // narration windows again — the same bug that caused block #11 to hold
+  // for 7.99s when its real spoken time is 4.96s.
+  if (!usedTranscriptDrivenBuilder) {
     const target = voiceoverSeconds;
     const adjustableType = (it: { type?: string | null }) =>
       it.type !== "intro" && it.type !== "title_card";
@@ -4385,11 +5184,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         const it = adjustableItems[k];
         const cur = Number(it.duration ?? 0);
         const ceiling = ceilingFor(it);
-        const scaled = Math.round(cur * multiplier * 10) / 10;
-        // Clamp to [1.0, ceiling]. Track any portion that couldn't be
-        // absorbed (when expand wanted to push past the clip's length)
-        // so we can redistribute it across other rows.
-        const want = Math.max(1.0, scaled);
+        // 0.01s precision (was 0.1s). Per-row accumulated rounding error
+        // drops 10× — on a 128-row project that's the difference between
+        // ±0.5s overshoot and ±0.05s overshoot. The editor displays
+        // durations rounded to 0.1s but stores the precise value, so the
+        // user-visible scene times are unchanged.
+        const scaled = Math.round(cur * multiplier * 100) / 100;
+        // Lower the per-row floor from 1.0s to 0.3s. Short narration
+        // sentences (1-2s) were being bumped up to 1.0s by the old floor,
+        // each contributing 0.5-0.9s of overshoot. The transcript-driven
+        // builder's short-sentence merger already absorbs sub-second
+        // sentences into neighbors; any sub-1s row that survives is a
+        // legitimate brief beat that should hold for its real duration,
+        // not get inflated.
+        const want = Math.max(0.3, scaled);
         const capped = Math.min(want, ceiling);
         it.duration = capped;
         // Use the local `capped` value (not it.duration) for the running
@@ -4401,13 +5209,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         }
       }
       // Tail row absorbs the residue so the body sums to adjustableTarget
-      // exactly. Floor at 1s. When expanding and the tail's clip ceiling
-      // can't absorb the full residue, the leftover stretches across the
-      // image rows (which have no clip ceiling) on a second pass.
+      // exactly. When expanding and the tail's clip ceiling can't absorb
+      // the full residue, the leftover stretches across the image rows
+      // (which have no clip ceiling) on a second pass.
       if (adjustableItems.length > 0) {
         const tail = adjustableItems[adjustableItems.length - 1];
         const tailCeiling = ceilingFor(tail);
-        const want = Math.max(1.0, Math.round((adjustableTarget - cumulative) * 10) / 10);
+        const want = Math.max(0.3, Math.round((adjustableTarget - cumulative) * 100) / 100);
         const capped = Math.min(want, tailCeiling);
         tail.duration = capped;
         cumulative += capped;
@@ -4416,15 +5224,32 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // rows hit their clip ceilings), distribute the gap across IMAGE
       // rows only — they have no clip-source ceiling and can hold a
       // single image for any length without source-media issues.
-      let gap = adjustableTarget - cumulative;
-      if (gap > 0.1) {
+      //
+      // Lossless distribution: divide the gap proportionally without
+      // rounding each per-row addition to 0.1s. The previous version
+      // computed `perImage = Math.round((gap / N) * 10) / 10` which on
+      // small gaps (<0.05s per row) rounded to 0 (no-op, gap unabsorbed)
+      // and on medium gaps rounded UP to 0.1s on EVERY row, adding far
+      // more than the gap requested (50 rows × 0.1s = +5s on a 3s gap).
+      // We use float division and let the LAST image row absorb residue.
+      const gap = adjustableTarget - cumulative;
+      if (Math.abs(gap) > 0.05) {
         const imageRows = adjustableItems.filter((it) => it.type === "image");
         if (imageRows.length > 0) {
-          const perImage = Math.round((gap / imageRows.length) * 10) / 10;
-          for (const it of imageRows) {
+          const exactPerImage = gap / imageRows.length;
+          let added = 0;
+          for (let k = 0; k < imageRows.length - 1; k++) {
+            const it = imageRows[k];
             const cur = Number(it.duration ?? 0);
-            it.duration = Math.round((cur + perImage) * 10) / 10;
+            const next = Math.max(0.3, Math.round((cur + exactPerImage) * 100) / 100);
+            added += next - cur;
+            it.duration = next;
           }
+          // Tail image row absorbs the residue so the sum changes by exactly `gap`.
+          const tailImg = imageRows[imageRows.length - 1];
+          const tailImgCur = Number(tailImg.duration ?? 0);
+          const residue = gap - added;
+          tailImg.duration = Math.max(0.3, Math.round((tailImgCur + residue) * 100) / 100);
         }
       }
     }
@@ -4440,6 +5265,28 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       multiplier: Math.round((adjustableTarget / Math.max(0.1, initialAdjustable)) * 10000) / 10000,
       adjustableRows: items.filter(adjustableType).length,
       fixedRows: items.filter((it) => !adjustableType(it) && it.type !== "intro").length,
+    });
+  }
+
+  // Pre-render duration validation. After reclaim + proportional fit, the
+  // non-intro timeline_items sum should equal voiceoverSeconds to within
+  // 0.1s. If it doesn't, the render will start with a baked-in drift that
+  // no amount of slow-mo or reclaim downstream can fix. Log loudly so
+  // operators see it in match logs before render even starts.
+  {
+    const nonIntroSum = items
+      .filter((it) => it.type !== "intro")
+      .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+    const driftSeconds = nonIntroSum - voiceoverSeconds;
+    const driftMs = Math.round(driftSeconds * 1000);
+    const PRE_RENDER_TOLERANCE_MS = 100;
+    await logJob({ projectId, jobId: mediaJobId }, "match.pre_render_validation", {
+      voiceoverSeconds,
+      timelineSumSeconds: Math.round(nonIntroSum * 1000) / 1000,
+      driftMs,
+      toleranceMs: PRE_RENDER_TOLERANCE_MS,
+      passed: Math.abs(driftMs) <= PRE_RENDER_TOLERANCE_MS,
+      itemCount: items.filter((it) => it.type !== "intro").length,
     });
   }
 

@@ -229,7 +229,12 @@ function sumGroupDuration(
 export function buildBlockSequenceFromTranscript(
   args: TranscriptBuildArgs,
 ): TranscriptBuildResult {
-  const { sentences, enrichment, titleCardTextByParagraph, mainCelebrity, imageHoldPolicy } = args;
+  // imageHoldPolicy is accepted for forward compatibility but no longer
+  // gates the multi-image split — long image sentences always split
+  // (sentence_duration / N per slot) and short ones hold for the exact
+  // sentence duration. The narrator's spoken time is the source of truth
+  // either way.
+  const { sentences, enrichment, titleCardTextByParagraph, mainCelebrity } = args;
   const blocks: PlannedBlockWithHint[] = [];
   const blockSentenceIndex: number[] = [];
   const blockGroupId: string[] = [];
@@ -395,68 +400,94 @@ export function buildBlockSequenceFromTranscript(
   for (let i = 0; i < workingSentences.length; i++) {
     const s = workingSentences[i];
     const enr = workingEnrichments[i];
+    const fullSentenceDuration = Math.max(0.1, s.vo_end - s.vo_start);
 
     // Title-card prepend. Only triggers on the FIRST sentence of a
     // blue-bold paragraph (is_section_first_sentence is set by the
     // splitter when titleCardParagraphIndices includes that paragraph).
+    //
+    // The renderer plays the title card SEQUENTIALLY, not as a true overlay
+    // (no compositing pipeline for live title-on-video). To keep the picture
+    // timeline equal to the voiceover timeline, we CONSUME a slice of the
+    // sentence's spoken time for the title card and SHIFT the sentence's
+    // content block to start AFTER the title card. Net: title-card seconds
+    // + sentence-content seconds == sentence's spoken duration. Without
+    // this, every title card added 5s of phantom timeline time, which
+    // showed up downstream as 1-2s of misalignment after the validator's
+    // reclaim pass smeared the overrun across neighboring rows.
+    let titleCardConsumed = 0;
     if (s.is_section_first_sentence) {
       const titleText = (titleCardTextByParagraph.get(s.paragraph_index) ?? "").trim();
       if (titleText) {
-        blocks.push({
-          type: "title_card",
-          duration: TITLE_CARD_HOLD_SECONDS,
-          text: "",
-          resolved_subject: enr.resolved_subject,
-          section_title: titleText,
-          // Title card overlays the first 5s of the sentence's audio —
-          // the vo window starts at the sentence's start and ends 5s
-          // later (or at the sentence's end if the sentence is shorter
-          // than 5s, which is rare but defensive).
-          vo_start_seconds: s.vo_start,
-          vo_end_seconds: Math.min(s.vo_start + TITLE_CARD_HOLD_SECONDS, s.vo_end),
-          paragraph_index: s.paragraph_index,
-        });
-        blockSentenceIndex.push(i);
-        blockGroupId.push(`title-${s.paragraph_index}`);
-        blockIsTitleCard.push(true);
-        titleCardsInserted++;
+        // Title card duration = min(default 5s, sentence_duration − floor).
+        // We keep at least 1s of sentence-content time so the sentence row
+        // still exists in the editor for review/swap. When the sentence is
+        // shorter than the floor + 1s, skip the title card entirely — the
+        // sentence is too short to coexist with a card.
+        const MIN_SENTENCE_AFTER_CARD = 1.0;
+        const maxCard = fullSentenceDuration - MIN_SENTENCE_AFTER_CARD;
+        if (maxCard > 0.5) {
+          const cardDur = Math.min(TITLE_CARD_HOLD_SECONDS, maxCard);
+          blocks.push({
+            type: "title_card",
+            duration: cardDur,
+            // Use the section TITLE as the title card row's text so the
+            // matcher's blockTexts lookup picks it up via the hint-text path
+            // instead of falling back to buildBlockTexts' proportional word
+            // slicer. The proportional slicer accumulates by block.duration
+            // and doesn't know about title cards, so it carves the first ~5s
+            // of the section's first sentence words and writes that as the
+            // title card row's script_text — which then displays in the
+            // editor as a corrupted prefix of the next sentence. Stamping
+            // the section title here makes the editor row show the title
+            // itself, and leaves the sentence row's text undisturbed.
+            text: titleText,
+            resolved_subject: enr.resolved_subject,
+            section_title: titleText,
+            vo_start_seconds: s.vo_start,
+            vo_end_seconds: s.vo_start + cardDur,
+            paragraph_index: s.paragraph_index,
+          });
+          blockSentenceIndex.push(i);
+          blockGroupId.push(`title-${s.paragraph_index}`);
+          blockIsTitleCard.push(true);
+          titleCardsInserted++;
+          titleCardConsumed = cardDur;
+        }
       }
     }
 
     // Sentence's own content block.
     // Demote Gemini title_card recommendations to footage — title cards
     // come EXCLUSIVELY from blue-bold doc markers, never from Gemini.
-    // Matches the policy already in matchProcessor.ts:4195-4198.
-    //
-    // Note: split_4 is NOT in the VisualType enum so it can never appear
-    // here. The matchProcessor.ts has a defensive split_4 → image downgrade
-    // for the legacy hint path which historically allowed split_4; the
-    // new builder consumes the strict VisualType set so the check would
-    // be dead code (and now a TS error).
     let effectiveType: PlannedBlockWithHint["type"] = enr.recommended_visual_type;
     if (effectiveType === "title_card") effectiveType = "footage";
 
-    const sentenceDuration = Math.max(0.1, s.vo_end - s.vo_start);
+    // Effective sentence window AFTER the title-card slice. The audio still
+    // plays the full sentence underneath, but the picture timeline only
+    // covers the remainder so the picture sum equals the voiceover sum.
+    const sentenceStart = s.vo_start + titleCardConsumed;
+    const sentenceDuration = Math.max(0.1, fullSentenceDuration - titleCardConsumed);
     const groupId = groupIds[i];
 
-    if (effectiveType === "image" && imageHoldPolicy === "fixed_5s" && sentenceDuration > IMAGE_HOLD_SECONDS + 1.5) {
-      // Long image sentence + fixed_5s policy → split into N back-to-back
-      // ~IMAGE_HOLD_SECONDS slots sharing the same enrichment. Each slot
-      // points back to the SAME sentence index so the editor still
-      // shows one row per sentence (the renderer plays N visuals
-      // under one row's audio range).
+    if (effectiveType === "image" && sentenceDuration > IMAGE_HOLD_SECONDS + 1.5) {
+      // Long image sentence → split into N back-to-back fragments sharing
+      // the same enrichment. Sizing is exact: slot_duration =
+      // sentenceDuration / N, with the LAST slot absorbing the floating-
+      // point residue so the sum equals sentenceDuration exactly.
       const slots = Math.max(2, Math.round(sentenceDuration / IMAGE_HOLD_SECONDS));
       const slotDur = sentenceDuration / slots;
+      let accumulated = 0;
       for (let k = 0; k < slots; k++) {
-        const slotStart = s.vo_start + k * slotDur;
-        const slotEnd = s.vo_start + (k + 1) * slotDur;
+        const isLast = k === slots - 1;
+        const dur = isLast ? sentenceDuration - accumulated : slotDur;
+        const slotStart = sentenceStart + accumulated;
+        const slotEnd = slotStart + dur;
+        accumulated += dur;
         blocks.push({
           type: "image",
-          duration: Math.round(slotDur * 10) / 10,
-          // First slot carries the sentence text; subsequent slots are
-          // visual continuations of the same sentence (editor sees one
-          // row total because they share blockSentenceIndex).
-          text: k === 0 ? s.text : "",
+          duration: dur,
+          text: s.text,
           resolved_subject: enr.resolved_subject,
           section_title: undefined,
           specific_visual_references: enr.specific_visual_references,
@@ -476,12 +507,12 @@ export function buildBlockSequenceFromTranscript(
       continue;
     }
 
-    // Single block — duration equals the sentence's real spoken time
-    // (or the title card holds a fixed 5s of it, but the sentence's own
-    // block still spans the full sentence underneath).
+    // Single block — duration equals the post-card remainder of the
+    // sentence's spoken time. The narrator's vo_end is unchanged in the
+    // audio; only the picture row is shorter to make room for the card.
     blocks.push({
       type: effectiveType,
-      duration: Math.round(sentenceDuration * 10) / 10,
+      duration: sentenceDuration,
       text: s.text,
       resolved_subject: enr.resolved_subject,
       section_title: undefined,
@@ -491,7 +522,7 @@ export function buildBlockSequenceFromTranscript(
       visual_priority: enr.visual_priority,
       block_entity: enr.block_entity,
       paragraph_index: s.paragraph_index,
-      vo_start_seconds: s.vo_start,
+      vo_start_seconds: sentenceStart,
       vo_end_seconds: s.vo_end,
     });
     blockSentenceIndex.push(i);

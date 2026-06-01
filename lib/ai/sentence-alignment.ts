@@ -44,6 +44,52 @@ function normalizeWord(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9']/g, "");
 }
 
+// ============================================================================
+// Number-word ↔ digit canonicalization.
+//
+// Deepgram transcribes "2020" while the doc reads "twenty twenty". Without a
+// canonical form the alignment's head/tail triplet search fails on every
+// year, age, count, etc. — and the cascade silently drops sentence rows
+// (the alignment falls back to estimation; subsequent sentences desync; the
+// editor ends up missing whole sentences after a numeric phrase).
+//
+// We map BOTH sides into the same digit form before tokenizing. The
+// algorithm is intentionally narrow: only number-words and number-runs that
+// are common in voiceover narration (years, ages, simple counts up to 100,
+// "two thousand twenty four" style years). Anything else passes through
+// unchanged so we don't over-fit.
+// ============================================================================
+
+const NUMBER_WORDS: Record<string, number> = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+  fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18,
+  nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60,
+  seventy: 70, eighty: 80, ninety: 90,
+};
+const SCALE_WORDS: Record<string, number> = {
+  hundred: 100, thousand: 1000,
+};
+
+// Per-token canonicalization. Maps a single token to a canonical form so
+// the doc's "twenty" matches Deepgram's "twenty" regardless of source —
+// AND a single number-word like "eighteen" matches Deepgram's "18" when
+// the model decides to emit digits. We deliberately stay PER-TOKEN: we do
+// NOT try to collapse "twenty twenty" → "2020" because that would break
+// index alignment with the Deepgram word timings (we need one canonical
+// token per original timing entry to read .start/.end by index later).
+//
+// The remaining cross-form case (doc "twenty twenty" vs Deepgram "2020"
+// as a single token) is handled at the call site by ALSO trying a
+// digit-concatenated variant of the needle when the plain match fails.
+function canonicalizeToken(tok: string): string {
+  if (!tok) return tok;
+  if (/^\d+$/.test(tok)) return tok;
+  if (tok in NUMBER_WORDS) return String(NUMBER_WORDS[tok]);
+  if (tok in SCALE_WORDS) return String(SCALE_WORDS[tok]);
+  return tok;
+}
+
 // Tokenize a sentence by whitespace, normalize each token, drop empties.
 // Used to extract the head/tail brackets for each sentence.
 function tokenize(text: string): string[] {
@@ -51,27 +97,31 @@ function tokenize(text: string): string[] {
     .trim()
     .split(/\s+/)
     .map(normalizeWord)
-    .filter((t) => t.length > 0);
+    .filter((t) => t.length > 0)
+    .map(canonicalizeToken);
 }
 
 // Look for an exact contiguous run of `needle` words inside the Deepgram
 // stream starting at `from`. Returns the index of the first matched word
-// in `timings`, or -1 if not found. We allow up to MAX_SKIPS positions of
-// drift inside the needle — sometimes Deepgram splits a contraction
-// ("don't" → "do" + "n't") or transcribes a filler word that the doc
-// doesn't have. Skipping past those keeps the bracket match robust.
+// in `timings`, or -1 if not found.
+//
+// Both sides are canonicalized through normalizeWord + numeric collapse so
+// that "twenty twenty" (3 tokens after canonicalization: "2020") matches
+// Deepgram's "2020" (one token), and vice versa. We pre-canonicalize the
+// timings stream ONCE per align call (passed in here) so this hot loop
+// doesn't re-normalize on every probe.
 function findRun(
-  timings: WordTiming[],
+  canonicalTimingTokens: string[],
   needle: string[],
   from: number,
   searchLimit: number,
 ): number {
   if (needle.length === 0) return -1;
-  const lastValid = Math.min(timings.length - needle.length, from + searchLimit);
+  const lastValid = Math.min(canonicalTimingTokens.length - needle.length, from + searchLimit);
   for (let i = from; i <= lastValid; i++) {
     let ok = true;
     for (let j = 0; j < needle.length; j++) {
-      if (normalizeWord(timings[i + j].word) !== needle[j]) {
+      if (canonicalTimingTokens[i + j] !== needle[j]) {
         ok = false;
         break;
       }
@@ -176,6 +226,11 @@ export function alignSentencesToWords(
   let wordCursor = 0;
   let lastEndSeconds = 0;
 
+  // Pre-canonicalize Deepgram tokens ONCE. Index-aligned with `timings` so
+  // we still read .start/.end by the same index. findRun walks this canonical
+  // array; everything else still indexes into `timings` directly.
+  const canonicalTimingTokens = timings.map((t) => canonicalizeToken(normalizeWord(t.word)));
+
   for (let sIdx = 0; sIdx < sentences.length; sIdx++) {
     const s = sentences[sIdx];
     const tokens = tokenize(s.text);
@@ -196,7 +251,7 @@ export function alignSentencesToWords(
     const head = tokens.slice(0, Math.min(BRACKET_LEN, tokens.length));
     const tail = tokens.slice(Math.max(0, tokens.length - BRACKET_LEN));
 
-    const headIdx = findRun(timings, head, wordCursor, HEAD_SEARCH_LIMIT);
+    const headIdx = findRun(canonicalTimingTokens, head, wordCursor, HEAD_SEARCH_LIMIT);
 
     if (headIdx < 0) {
       // No head match in the search window. Synthesize: this sentence's
@@ -245,7 +300,7 @@ export function alignSentencesToWords(
 
     // Look for the tail bracket after the head's match.
     const tailSearchStart = headIdx + head.length;
-    const tailIdx = findRun(timings, tail, tailSearchStart, TAIL_SEARCH_LIMIT);
+    const tailIdx = findRun(canonicalTimingTokens, tail, tailSearchStart, TAIL_SEARCH_LIMIT);
 
     if (tailIdx >= 0) {
       const lastIdx = tailIdx + tail.length - 1;
@@ -302,18 +357,28 @@ export function alignSentencesToWords(
   // any narration pause between them belongs visually to the sentence
   // that just finished.
   //
-  // We also enforce monotonicity: if sentence k's vo_start landed before
+  // We still enforce monotonicity: if sentence k's vo_start landed before
   // sentence k-1's vo_end (rare — happens when the synthesizer overshot
-  // on a missed alignment), pull k's start forward to k-1's end.
+  // on a missed alignment), pull k's start forward to k-1's end so rows
+  // don't overlap each other.
+  //
+  // We DO NOT absorb trailing silence into the preceding sentence anymore.
+  // Previously this sweep extended cur.vo_end to next.vo_start so the
+  // timeline had no "unowned" silence — but that meant duration =
+  // vo_end − vo_start included pause time, while vo_start itself still
+  // pointed at the real spoken start. The two fields then disagreed about
+  // where each row sat on the audio timeline. Downstream code (the editor
+  // script_text label, the marker dedup window math, the per-block
+  // verifier) all read vo_start_seconds as a real audio anchor; inflating
+  // duration but not vo_start made every row past the first silence drift
+  // by exactly the accumulated pause time. Letting silence stay
+  // un-attributed keeps duration honest; the proportional-fit pass
+  // downstream redistributes any timeline-vs-voiceover residual.
   for (let i = 0; i < result.length - 1; i++) {
     const cur = result[i];
     const next = result[i + 1];
     if (next.vo_start < cur.vo_end) {
-      // Monotonicity: trim cur back to next's start. This preserves
-      // narration order even when the synthesizer overestimated.
-      cur.vo_end = next.vo_start;
-    } else if (next.vo_start > cur.vo_end) {
-      // Trailing silence: extend cur to next's start.
+      // Monotonicity only — trim cur back to next's start.
       cur.vo_end = next.vo_start;
     }
     if (cur.vo_end < cur.vo_start) cur.vo_end = cur.vo_start;

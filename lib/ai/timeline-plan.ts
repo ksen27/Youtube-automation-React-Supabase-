@@ -30,10 +30,13 @@ export const DURATION_RANGES: Record<BlockType, DurationRange> = {
   // threshold) without being forced into a split it doesn't need.
   // The min prevents degenerate 0.4s flashes from 1-word sentences.
   footage: { min: 3,  max: 7  },
-  // Per-image hold is still 5s per user spec. The sentence-aligned planner
-  // honors this by SPLITTING long sentences (>~6s) across multiple 5s image
-  // blocks rather than stretching one image, so the contract holds.
-  image:   { min: 5,  max: 5  },
+  // Image blocks now follow the narrator's exact spoken time (vo_end −
+  // vo_start), so the range is widened. The transcript-driven builder splits
+  // long sentences into multiple image fragments sharing the same subject
+  // (see IMAGE_SPLIT_THRESHOLD), so no single image holds longer than ~7s
+  // in practice. Lower bound 1s prevents degenerate flash frames on
+  // 1-word sentences; upper bound 15s is a hard safety ceiling.
+  image:   { min: 1,  max: 15 },
   // Black title cards for section breaks. Fixed 5s hold per client spec —
   // matches the per-image hold so a card reads as a deliberate beat, not a
   // flash. The block-builder clamps to this range, so a long sentence on a
