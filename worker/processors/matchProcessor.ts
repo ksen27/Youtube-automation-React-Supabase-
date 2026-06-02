@@ -2508,6 +2508,15 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   ): Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> {
     const out: Array<{ query: string; reason: string; imgType?: "photo" | "logo" }> = [];
     const subj = (resolvedSubject ?? mainCelebrity ?? "").trim();
+    // Project-level context anchor — the celebrity the script is about.
+    // Bare proper-noun queries ("The Conversation", "Matisse", "Advertising
+    // Week") were returning the literal Wikipedia/CSE result (the 1974 film
+    // poster, a Matisse painting, an event promo poster) instead of imagery
+    // tied to the project's topic. Prefixing the anchor keeps the search
+    // inside the project's universe — same gating we already apply in
+    // buildScriptPhraseQueries.
+    const contextAnchor = (mainCelebrity ?? "").trim();
+    const anchorLower = contextAnchor.toLowerCase();
 
     // Phase D: type-aware routing. When Gemini has typed the block's subject
     // (company / movie / show / place / event / song / object), the docs spec
@@ -2541,20 +2550,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // Conversation". Without this guard the type-router fires
       // "The Conversation movie poster" and CSE returns the 1974 film.
       const isCommonNounTrap = isCommonNounTitle(primaryEntity);
+      // Prefix the project's celebrity anchor onto subject-type queries so
+      // generic entity names ("The Conversation", "Advertising Week",
+      // "December") return imagery tied to the project's topic instead of
+      // the literal famous-work or calendar-page result. When the entity
+      // already starts with the anchor we skip the prefix to avoid
+      // duplicate tokens.
+      const entityLower = primaryEntity.toLowerCase();
+      const needsAnchor = contextAnchor && !entityLower.startsWith(anchorLower);
+      const anchored = needsAnchor ? `${contextAnchor} ${primaryEntity}` : primaryEntity;
       switch (subjectType) {
         case "company":
           if (!isCommonNounTrap) {
-            out.push({ query: `${primaryEntity} logo`, reason: `subject_type:company:${primaryEntity}`, imgType: "logo" });
+            out.push({ query: `${anchored} logo`, reason: `subject_type:company:${primaryEntity}`, imgType: "logo" });
           }
           break;
         case "movie":
           if (!isCommonNounTrap) {
-            out.push({ query: `${primaryEntity} movie poster`, reason: `subject_type:movie:${primaryEntity}` });
+            out.push({ query: `${anchored} movie poster`, reason: `subject_type:movie:${primaryEntity}` });
           }
           break;
         case "show":
           if (!isCommonNounTrap) {
-            out.push({ query: `${primaryEntity} tv show poster`, reason: `subject_type:show:${primaryEntity}` });
+            out.push({ query: `${anchored} tv show poster`, reason: `subject_type:show:${primaryEntity}` });
           }
           break;
         case "place":
@@ -2562,7 +2580,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           // outline maps, never on-topic photographs. The footage fallback
           // does a better job (Dave Kindig clip + segment context).
           if (!isGeographicNonLandmark) {
-            out.push({ query: primaryEntity, reason: `subject_type:place:${primaryEntity}` });
+            out.push({ query: anchored, reason: `subject_type:place:${primaryEntity}` });
           }
           break;
         case "event":
@@ -2570,11 +2588,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           // pages and stock photos. Only route named events through the
           // archival query.
           if (!isBareDate) {
-            out.push({ query: `${primaryEntity} archival footage`, reason: `subject_type:event:${primaryEntity}` });
+            out.push({ query: `${anchored} archival footage`, reason: `subject_type:event:${primaryEntity}` });
           }
           break;
         case "object":
-          out.push({ query: primaryEntity, reason: `subject_type:object:${primaryEntity}` });
+          out.push({ query: anchored, reason: `subject_type:object:${primaryEntity}` });
           break;
         // "person" and "general" fall through to the reference / subject
         // anchor path below — the existing flow handles them.
@@ -2586,11 +2604,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // noun tokens that collide with famous-work titles are dropped (see
     // COMMON_NOUN_TITLE_BLOCKLIST) — those queries return the famous-work
     // poster from CSE, never on-topic visuals.
+    //
+    // Bare entity queries are prefixed with the project's celebrity anchor
+    // for the same reason buildScriptPhraseQueries does it: a query like
+    // "The Conversation" returns the 1974 film poster, "Matisse" returns a
+    // painting, "Advertising Week" returns a conference promo — none of
+    // which belong in a BGT/Cowell timeline. Prefixing keeps the search
+    // inside the project's topic universe. Country/region and bare-date
+    // entities are dropped outright (flags, maps, calendar pages).
     for (const ent of mentionedEntities) {
       const e = ent.trim();
       if (!e) continue;
       if (isCommonNounTitle(e)) continue;
-      out.push({ query: e, reason: `mentioned_entity:${e}` });
+      if (isCountryOrRegion(e)) continue;
+      if (isDateOnly(e)) continue;
+      const eLower = e.toLowerCase();
+      if (contextAnchor && !eLower.startsWith(anchorLower) && eLower !== anchorLower) {
+        out.push({
+          query: `${contextAnchor} ${e}`,
+          reason: `mentioned_entity_contextual:${contextAnchor}:${e}`,
+        });
+      } else {
+        out.push({ query: e, reason: `mentioned_entity:${e}` });
+      }
     }
     // Tier 2: subject + reference. Most reference→image work lives here.
     // "tattoo" / "mother" / "Frida" combine with the celebrity name to
@@ -2654,22 +2690,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       if (isCountryOrRegion(p)) continue;
       // Skip bare dates.
       if (isDateOnly(p)) continue;
-      // Contextualized query first, bare phrase second. The contextualized
-      // form keeps the search tied to the project's topic; the bare form is
-      // kept as a fallback for the rare case where the phrase IS a real-world
-      // proper noun the contextualized search misses ("District Court of
-      // Utah" returns courthouses fine on its own).
+      // Contextualized query only — the bare-phrase fallback was leaking
+      // literal-text graphics into the timeline. Examples that shipped to
+      // the editor before this gate tightened:
+      //   - "The Statement" → red graphic with "STATEMENT" lettering
+      //   - "Advertising Week" → a conference promo poster
+      //   - "twenty fourteen" / "YouTube" → calendar pages, YouTube logos
+      // The contextualized form keeps the search inside the project's topic
+      // (e.g. "Simon Cowell statement", "Simon Cowell Walliams") which is
+      // what the script is actually about. We only fall back to the bare
+      // phrase when there's NO context anchor — i.e. no main celebrity was
+      // extracted for this project, which is rare.
       if (contextAnchor && pl !== contextAnchor.toLowerCase()) {
         out.push({
           query: `${contextAnchor} ${p}`,
           reason: `script_phrase_contextual:${contextAnchor}:${p}`,
         });
+      } else {
+        out.push({ query: p, reason: `script_phrase:${p}` });
       }
-      out.push({ query: p, reason: `script_phrase:${p}` });
     }
     // Cap to 4 queries per block — image fetches cost money and time, and
-    // beyond the top phrases we're typically scraping the barrel. Bumped
-    // from 3 to 4 to fit one contextualized + one bare for the top phrases.
+    // beyond the top phrases we're typically scraping the barrel. With the
+    // bare-phrase fallback removed, this is one query per phrase, so we
+    // get up to 4 distinct phrases per block to try.
     return out.slice(0, 4);
   }
 
@@ -2862,7 +2906,23 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     source: string;
     query: string;
   } | null> {
-    const subj = (blockResolvedSubjects[blockIdx] || mainCelebrity || "").trim();
+    // Only use blockResolvedSubjects[blockIdx] when Gemini classified it as
+    // an actual person — otherwise non-person strings like "YouTube",
+    // "Britain's Got Talent", "Advertising Week" feed buildPersonPhotoCache
+    // and end up as the block's "celebrity photo" (a Getty stock image of
+    // a YouTube monitor was leaking in via query `"YouTube"`).
+    //
+    // For non-person resolved subjects, fall through to mainCelebrity so
+    // the spec-required behaviour ("If an exact image/visual cannot be
+    // found → fallback to the PERSON image. NEVER use random unrelated
+    // visuals.") actually shows the project celebrity.
+    const resolvedSubjectType = blockSubjectTypes[blockIdx] ?? null;
+    const resolvedSubject = blockResolvedSubjects[blockIdx];
+    const subj = (
+      (resolvedSubjectType === "person" && resolvedSubject)
+        ? resolvedSubject
+        : (mainCelebrity || "")
+    ).trim();
     if (!subj) return null;
     const nowSec = blockStartSec[blockIdx];
     const fetched = await buildPersonPhotoCache(subj);
@@ -4779,184 +4839,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       totalAbsDriftAfter: Math.round(totalDriftAfter * 10) / 10,
     });
 
-    // ---- title-card anchor pass (2026-06-01) ----------------------------
-    // The client requires title cards to appear at the EXACT video time the
-    // narrator says them — no drift tolerance. Even after the vo_start
-    // duration pass above, small per-row residuals (rounding to 0.01s
-    // precision, image-fragment slot sums, slow-mo cap residue) accumulate
-    // by the time playback reaches a title card. On a 10-minute timeline
-    // that's typically 1-3s of drift, and the title card shows that much
-    // late vs. the narrator.
-    //
-    // Strategy: SECTION-BASED DRIFT DISTRIBUTION.
-    //   A "section" is the run of rows between two title cards (or from the
-    //   start of the timeline to the first title card, or from the last
-    //   title card to the end). Drift accumulates within a section; we
-    //   measure it at the section's end (the next title card) and spread
-    //   the correction across EVERY row in the section.
-    //
-    //   Dumping the full drift on a single row (the one before the title
-    //   card) would shift that row's visual 1-3s out of sync with its own
-    //   spoken sentence — the narrator's first word of the title bleeds
-    //   under the previous clip, or the previous sentence's tail cuts mid-
-    //   word. Spreading evenly keeps every row within ±0.1s of its sentence
-    //   (imperceptible) while the title card lands exactly on its beat.
-    //
-    // Section eligibility:
-    //   • Adjustable rows: footage, image, split_2/4 (visual-only, the
-    //     viewer doesn't notice ±0.1s shifts on these).
-    //   • NOT adjustable: title_card (pinned to typewriter+hold), forced
-    //     YouTube clips with duration_clamped (doc author chose the
-    //     window length and trimmed it intentionally).
-    //   • Sections with zero adjustable rows fall back to the single-row
-    //     dump on the row immediately before the title card.
-    //
-    // Edge cases:
-    //   • intro rows skipped (own audio axis).
-    //   • Min 0.3s per-row floor — if shrinking would push a row below
-    //     that, the residual rolls to the next eligible row in the same
-    //     section.
-    {
-      let titleCardsAnchored = 0;
-      let titleCardsResidualDrift = 0;
-      let rowsTouched = 0;
-      let cumulativeVideo = 0;
-      const nonIntroRows = items.filter((it) => it.type !== "intro");
-
-      function isAdjustable(row: (typeof nonIntroRows)[number]): boolean {
-        if (row.type === "title_card") return false;
-        if (row.type === "intro") return false;
-        const m = (row.metadata ?? {}) as Record<string, unknown>;
-        if (m.duration_clamped === true) return false;
-        return true;
-      }
-
-      // Apply a signed delta across `rows`, evenly per row, respecting the
-      // 0.3s floor. Returns the amount actually absorbed (== delta unless
-      // the floor blocked some rows). Negative delta = shrink, positive =
-      // extend. The function distributes residue when individual rows
-      // can't take their full share.
-      function distributeDelta(rows: typeof nonIntroRows, delta: number): number {
-        if (rows.length === 0 || Math.abs(delta) < 0.01) return 0;
-        // Iterative distribution: each pass tries to add `share` to every
-        // row. Rows blocked by the 0.3s floor return their actual absorbed
-        // amount; the residue is redistributed across the still-eligible
-        // rows. Bails after a few passes if the residue can't be absorbed.
-        let remaining = delta;
-        for (let pass = 0; pass < 5 && Math.abs(remaining) > 0.01; pass++) {
-          const eligible: typeof nonIntroRows = [];
-          for (const r of rows) {
-            const d = Number(r.duration ?? 0);
-            // For shrinking (negative remaining), the row must have headroom
-            // above 0.3s. For extending, every row is eligible.
-            if (remaining > 0 || d > 0.31) eligible.push(r);
-          }
-          if (eligible.length === 0) break;
-          const share = remaining / eligible.length;
-          let absorbedThisPass = 0;
-          for (const r of eligible) {
-            const cur = Number(r.duration ?? 0);
-            const target = cur + share;
-            const next = Math.max(0.3, target);
-            const actual = next - cur;
-            if (Math.abs(actual) < 0.005) continue;
-            r.duration = Math.round(next * 100) / 100;
-            const m = (r.metadata ?? {}) as Record<string, unknown>;
-            const vs = m.vo_start_seconds;
-            if (typeof vs === "number") {
-              m.vo_end_seconds = Number(vs) + next;
-              r.metadata = m;
-            }
-            absorbedThisPass += actual;
-          }
-          if (Math.abs(absorbedThisPass) < 0.005) break;
-          remaining -= absorbedThisPass;
-        }
-        return delta - remaining;
-      }
-
-      // Walk the timeline, recording section boundaries (the rows in
-      // nonIntroRows[] between title cards). At each title card, measure
-      // drift and distribute across the section that just ended.
-      let sectionStart = 0;
-      for (let k = 0; k < nonIntroRows.length; k++) {
-        const cur = nonIntroRows[k];
-        if (cur.type === "title_card") {
-          const meta = (cur.metadata ?? {}) as Record<string, unknown>;
-          const vs = meta.vo_start_seconds;
-          if (typeof vs === "number" && k > 0) {
-            const target = Number(vs);
-            const drift = target - cumulativeVideo;
-            if (Math.abs(drift) > 0.05) {
-              const section = nonIntroRows.slice(sectionStart, k).filter(isAdjustable);
-              let absorbed = 0;
-              if (section.length > 0) {
-                absorbed = distributeDelta(section, drift);
-                rowsTouched += section.length;
-              } else {
-                // No adjustable row in the section — fall back to the row
-                // immediately before the title card. Better to dump 1-2s on
-                // one clamped row than leave the title card desynced.
-                const prev = nonIntroRows[k - 1];
-                if (prev) {
-                  absorbed = distributeDelta([prev], drift);
-                  rowsTouched += 1;
-                }
-              }
-              cumulativeVideo += absorbed;
-              titleCardsAnchored++;
-              titleCardsResidualDrift += Math.abs(drift - absorbed);
-            }
-          }
-          sectionStart = k + 1; // next section starts after this title card
-        }
-        cumulativeVideo += Number(cur.duration ?? 0);
-      }
-
-      // Final section anchor: distribute the trailing drift across rows
-      // AFTER the last title card so the final visual ends exactly when
-      // the narrator finishes. Without this, a 1-3s mismatch at the end
-      // produces either silent visual tail (narrator finished, picture
-      // still playing) or audio cutoff (narrator still talking, picture
-      // ended). Either way, the last frame of the video doesn't match
-      // the last word of the script.
-      //
-      // Target: cumulativeVideo (after all rows) === voiceoverSeconds.
-      // The section is every adjustable row from `sectionStart` to the
-      // end of nonIntroRows[].
-      let finalSectionAnchored = false;
-      let finalSectionResidual = 0;
-      if (sectionStart < nonIntroRows.length) {
-        const finalDrift = voiceoverSeconds - cumulativeVideo;
-        if (Math.abs(finalDrift) > 0.05) {
-          const finalSection = nonIntroRows.slice(sectionStart).filter(isAdjustable);
-          let absorbed = 0;
-          if (finalSection.length > 0) {
-            absorbed = distributeDelta(finalSection, finalDrift);
-            rowsTouched += finalSection.length;
-          } else {
-            // No adjustable row — dump on the last non-intro row regardless
-            // of its clamped status. Better to stretch one row than leave
-            // a 2s silent tail at the end of the video.
-            const last = nonIntroRows[nonIntroRows.length - 1];
-            if (last) {
-              absorbed = distributeDelta([last], finalDrift);
-              rowsTouched += 1;
-            }
-          }
-          finalSectionAnchored = true;
-          finalSectionResidual = Math.abs(finalDrift - absorbed);
-        }
-      }
-
-      await logJob({ projectId, jobId: mediaJobId }, "match.title_card_anchor_pass", {
-        titleCardsAnchored,
-        finalSectionAnchored,
-        rowsTouched,
-        residualDriftSeconds: Math.round(titleCardsResidualDrift * 100) / 100,
-        finalSectionResidualSeconds: Math.round(finalSectionResidual * 100) / 100,
-      });
-    }
+    // (Title-card anchor pass moved below — runs after reclaim and
+    // proportional-fit so it has the final word on title-card alignment.
+    // See "title-card hard-anchor pass" further down.)
   }
 
   // Recompute the reclaim target AFTER applyScriptMarkers ran. The marker
@@ -5265,6 +5150,211 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       multiplier: Math.round((adjustableTarget / Math.max(0.1, initialAdjustable)) * 10000) / 10000,
       adjustableRows: items.filter(adjustableType).length,
       fixedRows: items.filter((it) => !adjustableType(it) && it.type !== "intro").length,
+    });
+  }
+
+  // ---- title-card hard-anchor pass (2026-06-02) -----------------------
+  // Runs LAST, after vo_start_duration_pass + reclaim + proportional-fit,
+  // so it has the final word on title-card alignment. The client requires
+  // title cards to appear at the EXACT video time the narrator speaks them
+  // — no drift tolerance — while other clips and images can drift by small
+  // amounts without the viewer noticing.
+  //
+  // Strategy: SECTION-BASED DRIFT DISTRIBUTION + HARD SNAP.
+  //   A "section" is the run of rows between two title cards (or from the
+  //   start to the first title card, or from the last title card to the
+  //   end). For each title card we measure cumulative video time at that
+  //   point and compare to the title card's vo_start. We distribute the
+  //   delta across every adjustable row in the section first; any residual
+  //   after distribution gets hard-snapped onto a single row so the title
+  //   card lands within 0.01s of its narrated moment.
+  //
+  // Why this lives AFTER proportional-fit (was BEFORE in the original
+  // pass): proportional-fit scales every adjustable row by a fixed
+  // multiplier to make the timeline total equal voiceoverSeconds. That
+  // scaling silently re-introduces drift at every title card (each row
+  // shifts by a few percent, cumulative drift at a card 60 rows in can
+  // hit 1-2s). Running the anchor after proportional-fit reverses this
+  // for the title-card-adjacent rows specifically.
+  //
+  // Why sort by vo_start: applyScriptMarkers (markers.ts) splices title-
+  // card rows in REVERSE doc-marker order to keep splice indices stable.
+  // After that, items[] is no longer in audio-time order — a title card
+  // can sit BEFORE an adjacent script row whose vo_start is earlier than
+  // its own. Walking items[] in array order accumulates wrong durations
+  // and the drift measurement at each title card becomes meaningless.
+  // Sorting by vo_start (with the title card itself anchored at its own
+  // vs) gives a correct audio-time walk.
+  //
+  // Adjustable rows: footage, image, split_2/4. NOT: intro, title_card.
+  // Doc-author-forced YouTube clips carry duration_clamped: true and were
+  // ALREADY corrected by the vo_start_duration_pass earlier, so they're
+  // also excluded here (re-stretching their playback breaks the YouTube
+  // window the doc author chose). The padded row immediately preceding
+  // a title card (markers.ts marks it duration_clamped too) is similarly
+  // excluded; if drift remains after proportional distribution, we hard-
+  // snap onto a single non-clamped row at the section tail.
+  {
+    type Row = (typeof items)[number];
+    const nonIntroRows = items.filter((it: Row) => it.type !== "intro");
+
+    // Sort by vo_start. Items without vo_start metadata fall through to
+    // the end (defensive — every non-intro row in the transcript-driven
+    // builder has vo_start_seconds, but legacy projects may not).
+    function voOf(row: Row): number {
+      const m = (row.metadata ?? {}) as Record<string, unknown>;
+      const vs = m.vo_start_seconds;
+      return typeof vs === "number" ? Number(vs) : Number.POSITIVE_INFINITY;
+    }
+    nonIntroRows.sort((a: Row, b: Row) => voOf(a) - voOf(b));
+
+    function isAdjustable(row: Row): boolean {
+      if (row.type === "title_card") return false;
+      if (row.type === "intro") return false;
+      const m = (row.metadata ?? {}) as Record<string, unknown>;
+      if (m.duration_clamped === true) return false;
+      return true;
+    }
+
+    function distributeDelta(rows: Row[], delta: number): number {
+      if (rows.length === 0 || Math.abs(delta) < 0.005) return 0;
+      let remaining = delta;
+      for (let pass = 0; pass < 5 && Math.abs(remaining) > 0.005; pass++) {
+        const eligible: Row[] = [];
+        for (const r of rows) {
+          const d = Number(r.duration ?? 0);
+          if (remaining > 0 || d > 0.31) eligible.push(r);
+        }
+        if (eligible.length === 0) break;
+        const share = remaining / eligible.length;
+        let absorbedThisPass = 0;
+        for (const r of eligible) {
+          const cur = Number(r.duration ?? 0);
+          const target = cur + share;
+          const next = Math.max(0.3, target);
+          const actual = next - cur;
+          if (Math.abs(actual) < 0.005) continue;
+          r.duration = Math.round(next * 100) / 100;
+          const m = (r.metadata ?? {}) as Record<string, unknown>;
+          const vs = m.vo_start_seconds;
+          if (typeof vs === "number") {
+            m.vo_end_seconds = Number(vs) + next;
+            r.metadata = m;
+          }
+          absorbedThisPass += actual;
+        }
+        if (Math.abs(absorbedThisPass) < 0.005) break;
+        remaining -= absorbedThisPass;
+      }
+      return delta - remaining;
+    }
+
+    // Hard-snap: dump the entire delta on a single row, ignoring the
+    // duration_clamped filter so we can pin the title card EXACTLY.
+    // Caller picks the snap target — typically the row immediately
+    // before the title card. We still respect the 0.3s floor.
+    function hardSnap(row: Row | undefined, delta: number): number {
+      if (!row || Math.abs(delta) < 0.005) return 0;
+      const cur = Number(row.duration ?? 0);
+      const next = Math.max(0.3, Math.round((cur + delta) * 100) / 100);
+      const actual = next - cur;
+      row.duration = next;
+      const m = (row.metadata ?? {}) as Record<string, unknown>;
+      const vs = m.vo_start_seconds;
+      if (typeof vs === "number") {
+        m.vo_end_seconds = Number(vs) + next;
+        row.metadata = m;
+      }
+      return actual;
+    }
+
+    let titleCardsAnchored = 0;
+    let titleCardsResidualDrift = 0;
+    let rowsTouched = 0;
+    let hardSnaps = 0;
+    let cumulativeVideo = 0;
+    let sectionStart = 0;
+    const anchorAudit: Array<{
+      vo_start: number; before: number; after: number; section_rows: number;
+    }> = [];
+
+    for (let k = 0; k < nonIntroRows.length; k++) {
+      const cur = nonIntroRows[k];
+      if (cur.type === "title_card") {
+        const target = voOf(cur);
+        if (Number.isFinite(target) && k > 0) {
+          const driftBefore = target - cumulativeVideo;
+          if (Math.abs(driftBefore) > 0.005) {
+            const section = nonIntroRows.slice(sectionStart, k).filter(isAdjustable);
+            distributeDelta(section, driftBefore);
+            rowsTouched += section.length;
+
+            // Re-measure cumulative video by re-walking nonIntroRows[0..k-1]
+            // after distribution. Trusting distributeDelta's return value is
+            // unsafe because each row gets Math.round(×100)/100 rounded —
+            // the per-row rounding accumulates to a 0.01-0.1s sum-vs-
+            // returned-absorbed mismatch, which leaves the title card
+            // landing slightly off the narrator. We measure the truth and
+            // snap any residual onto the row immediately before the title
+            // card.
+            //
+            // The snap target is nonIntroRows[k-1] regardless of duration_
+            // clamped. markers.ts marks that row clamped specifically to
+            // absorb title-card alignment padding — re-snapping here is
+            // exactly what that clamp was designed for.
+            let cumAtCard = 0;
+            for (let q = 0; q < k; q++) {
+              cumAtCard += Number(nonIntroRows[q].duration ?? 0);
+            }
+            const residual = target - cumAtCard;
+            if (Math.abs(residual) > 0.005) {
+              const snapTarget = nonIntroRows[k - 1];
+              const snapped = hardSnap(snapTarget, residual);
+              if (Math.abs(snapped) > 0.005) hardSnaps++;
+              cumAtCard += snapped;
+            }
+            cumulativeVideo = cumAtCard;
+            titleCardsAnchored++;
+            titleCardsResidualDrift += Math.abs(target - cumAtCard);
+            anchorAudit.push({
+              vo_start: Math.round(target * 100) / 100,
+              before: Math.round(driftBefore * 100) / 100,
+              after: Math.round((target - cumAtCard) * 100) / 100,
+              section_rows: section.length,
+            });
+          }
+        }
+        sectionStart = k + 1;
+      }
+      cumulativeVideo += Number(cur.duration ?? 0);
+    }
+
+    // Final section anchor — make the total video equal voiceoverSeconds.
+    let finalSectionAnchored = false;
+    let finalSectionResidual = 0;
+    if (sectionStart < nonIntroRows.length) {
+      const finalDrift = voiceoverSeconds - cumulativeVideo;
+      if (Math.abs(finalDrift) > 0.05) {
+        const finalSection = nonIntroRows.slice(sectionStart).filter(isAdjustable);
+        let absorbed = distributeDelta(finalSection, finalDrift);
+        rowsTouched += finalSection.length;
+        const residual = finalDrift - absorbed;
+        if (Math.abs(residual) > 0.005) {
+          absorbed += hardSnap(nonIntroRows[nonIntroRows.length - 1], residual);
+        }
+        finalSectionAnchored = true;
+        finalSectionResidual = Math.abs(finalDrift - absorbed);
+      }
+    }
+
+    await logJob({ projectId, jobId: mediaJobId }, "match.title_card_anchor_pass", {
+      titleCardsAnchored,
+      finalSectionAnchored,
+      rowsTouched,
+      hardSnaps,
+      residualDriftSeconds: Math.round(titleCardsResidualDrift * 100) / 100,
+      finalSectionResidualSeconds: Math.round(finalSectionResidual * 100) / 100,
+      anchors: anchorAudit,
     });
   }
 

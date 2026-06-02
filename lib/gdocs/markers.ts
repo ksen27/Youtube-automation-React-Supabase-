@@ -134,6 +134,75 @@ function findPhraseIndex(
   return -1;
 }
 
+// Common-word stoplist used by the distinctive-token anchor. We rank
+// title-card tokens by "uncommonness" and keep the top few to retry the
+// phrase search when the full-phrase exact match fails — handles the
+// case where one ASR slip (mis-transcribed word, comma-pause filler)
+// breaks the contiguous match for an otherwise correct title.
+const COMMON_TITLE_TOKENS = new Set<string>([
+  "a","an","the","and","or","but","of","to","in","on","at","for","with","by",
+  "is","was","are","were","be","been","being","that","this","these","those",
+  "it","its","as","from","into","about","over","under","up","down","out",
+  "he","she","they","we","you","i","his","her","their","our","my","your",
+  "what","which","who","whom","whose","when","where","why","how",
+  "not","no","so","if","than","then","do","does","did","done","kept","keep",
+]);
+
+// Distinctive-token fallback for title cards. When the full contiguous
+// phrase doesn't match (one ASR slip kills the whole search), retry with
+// progressively shorter "core" sub-phrases built from the rarest tokens
+// (proper nouns first, common words last). Returns the audio index where
+// the first matching sub-phrase starts, or -1 if nothing anchors.
+//
+// We keep sub-phrases CONTIGUOUS in the original token order so we don't
+// match across unrelated sentence boundaries — pulling "Walliams" + "fights"
+// from the title finds them only when they appear together in the audio.
+function findTitlePhraseIndexLoose(
+  words: WordTiming[],
+  phraseTokens: string[],
+  fromIndex: number,
+): { idx: number; matchedTokens: string[] } | null {
+  if (phraseTokens.length === 0) return null;
+  // Score each token by uncommonness: 0 for stoplist, 1 otherwise. Then
+  // walk contiguous windows of the original phrase, preferring windows
+  // that maximize uncommon-token count for their length.
+  const distinctive: number[] = [];
+  for (let i = 0; i < phraseTokens.length; i++) {
+    if (!COMMON_TITLE_TOKENS.has(phraseTokens[i])) distinctive.push(i);
+  }
+  if (distinctive.length === 0) return null;
+  // Try windows in decreasing length: full uncommon-only set, then
+  // shrinking ranges centered around the first distinctive token.
+  // We try a couple of contiguous sub-phrases of the ORIGINAL phrase
+  // (keeping word order, stopwords included) anchored on distinctive
+  // tokens — that matches the doc title's reading order while tolerating
+  // a missing/changed word at the edges.
+  const attempts: string[][] = [];
+  // Attempt 1: shortest contiguous slice covering all distinctive tokens.
+  if (distinctive.length >= 2) {
+    const lo = distinctive[0];
+    const hi = distinctive[distinctive.length - 1];
+    attempts.push(phraseTokens.slice(lo, hi + 1));
+  }
+  // Attempt 2: the first 2-3 distinctive tokens as a tight contiguous block
+  // anchored at the first distinctive token. Length capped at 3 so a
+  // single ASR slip in the middle still anchors.
+  if (distinctive.length >= 2) {
+    const lo = distinctive[0];
+    const hiIdx = Math.min(distinctive.length - 1, 2);
+    const hi = distinctive[hiIdx];
+    const block = phraseTokens.slice(lo, hi + 1);
+    if (block.length > 0 && block.length <= 5) attempts.push(block);
+  }
+  // Attempt 3: just the first distinctive token (last-resort anchor).
+  attempts.push([phraseTokens[distinctive[0]]]);
+  for (const sub of attempts) {
+    const idx = findPhraseIndex(words, sub, fromIndex);
+    if (idx >= 0) return { idx, matchedTokens: sub };
+  }
+  return null;
+}
+
 // Compute each item's voiceover-relative start time.
 //
 // Prefer metadata.vo_start_seconds when the matcher recorded it (this is
@@ -281,6 +350,16 @@ function applyLowerThirdVisualOverride(
 ): void {
   if (!resolverCtx) return;
   const meta = (item.metadata ?? {}) as Record<string, unknown>;
+  // Doc-authored forced clips (YouTube cuts attached to a title_card or
+  // title_card_clip) must keep their video — the doc author picked that
+  // exact source window on purpose. The lower_third's text overlay is
+  // already stamped in meta.lower_third by the caller; we only skip the
+  // VISUAL swap here so the forced clip plays as authored.
+  if (meta.forced_clip) {
+    meta.lower_third_skipped_on_forced_clip = true;
+    item.metadata = meta;
+    return;
+  }
   const resolution = resolveLowerThird(markerText, resolverCtx);
   if (resolution) {
     item.image_url = resolution.reference_url;
@@ -638,9 +717,24 @@ export function applyScriptMarkers(
         ? cursorFromMap
         : sectionStartIdx;
     }
-    const idx = offsetAnchoredIdx >= 0
+    let idx = offsetAnchoredIdx >= 0
       ? offsetAnchoredIdx
       : findPhraseIndex(words, tokens, Math.floor(searchStart));
+    // Title-card fallback: when the full contiguous phrase fails (one
+    // ASR slip — uncommon name transcribed differently, comma-pause
+    // filler — kills the whole match), retry with the rarest contiguous
+    // sub-phrase from the title. Keeps the title anchored to the right
+    // section even when Deepgram disagrees with the doc on one word.
+    // The matched token count is used below so the visual hold reflects
+    // only the sub-phrase that actually anchored.
+    let looseTokens: string[] | null = null;
+    if (idx < 0 && m.kind === "title_card" && offsetAnchoredIdx < 0) {
+      const loose = findTitlePhraseIndexLoose(words, tokens, Math.floor(searchStart));
+      if (loose) {
+        idx = loose.idx;
+        looseTokens = loose.matchedTokens;
+      }
+    }
     // For lower-thirds, also enforce the upper bound — don't accept a
     // hit that sits past the next title-card's audio anchor (that would
     // be a different section).
@@ -666,7 +760,13 @@ export function applyScriptMarkers(
       const key = tokens.join(" ");
       phraseSearchCursor.set(key, idx + tokens.length);
     }
-    const lastIdx = idx + tokens.length - 1;
+    // tEnd marks the end of the matched audio span. For an exact full-phrase
+    // match this is the last token of the title; for a loose match it's the
+    // last token of the sub-phrase that actually anchored (otherwise tEnd
+    // would extrapolate past the matched audio and inflate typewriterDuration
+    // into silence).
+    const matchedLen = looseTokens ? looseTokens.length : tokens.length;
+    const lastIdx = idx + matchedLen - 1;
     resolved.push({
       marker: m,
       t: words[idx].start,

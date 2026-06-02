@@ -295,7 +295,7 @@ export const MAX_RANK_SCORE = 220;
 // clips (30–120s) on YouTube — applying the talking-head floor would reject
 // exactly the visuals we need for places, events, and historical moments.
 const DURATION_WINDOWS: Record<IntentType, { min: number; max: number; sweetMin: number; sweetMax: number }> = {
-  talking_head: { min: 120, max: 1500, sweetMin: 240, sweetMax: 900 },
+  talking_head: { min: 120, max: 2100, sweetMin: 240, sweetMax: 900 },
   broll:        { min: 20,  max: 1200, sweetMin: 30,  sweetMax: 240 },
   archival:     { min: 20,  max: 1500, sweetMin: 60,  sweetMax: 600 },
 };
