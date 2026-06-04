@@ -338,29 +338,88 @@ SCRIPT:
 // Query generation
 // ---------------------------------------------------------------------------
 
-export function buildSearchQueries(entities: ExtractedEntity[]): string[] {
+// Footage-style suffixes for the primary subject. These target the clean,
+// single-person footage the pipeline wants — interviews, podcasts, event and
+// behind-the-scenes appearances — rather than news/commentary/reaction content.
+// Order matters: the highest-yield clean-footage formats come first so that
+// when a per-channel query cap is applied, the best styles survive.
+export const SUBJECT_FOOTAGE_SUFFIXES = [
+  "interview",
+  "speaking",
+  "podcast",
+  "press conference",
+  "behind the scenes",
+  "red carpet",
+  "live appearance",
+  "documentary",
+  "event",
+  "public appearance",
+  "exclusive footage",
+  "candid footage",
+  "archive footage",
+  "workshop",
+] as const;
+
+// Build subject-FIRST search queries. The discovery stage looks for clean
+// footage of the primary person — NOT for videos that match sentence wording.
+// Every query is anchored on a person's name; the bare-name query and the
+// footage-style suffixes are what surface interviews/podcasts/appearances.
+//
+// Secondary entities (movies, shows, events) are paired with the primary
+// subject only — never searched standalone — so a "courtroom" or "wedding
+// venue" never becomes its own keyword search. This is the concrete
+// implementation of "search by subject, not by script."
+//
+// `forChannel`: when building queries to run scoped to a single reference
+// channel, we keep the set small (bare name + top footage styles) because the
+// channel filter already guarantees on-source results and channel-scoped
+// search.list calls cost the same ~100 quota units each.
+export function buildSearchQueries(
+  entities: ExtractedEntity[],
+  opts?: { forChannel?: boolean; maxQueries?: number },
+): string[] {
   const celebs = entities.filter((e) => e.type === "celebrity").map((e) => e.value);
   const people = entities.filter((e) => e.type === "related_person").map((e) => e.value);
   const movies = entities.filter((e) => e.type === "movie").map((e) => e.value);
   const shows  = entities.filter((e) => e.type === "tv_show").map((e) => e.value);
   const events = entities.filter((e) => e.type === "event").map((e) => e.value);
-  const places = entities.filter((e) => e.type === "place").map((e) => e.value);
 
   const queries = new Set<string>();
   const main = celebs[0];
+
+  // Scoped reference-channel search: bare name is enough (the channel filter
+  // does the narrowing); add a couple of top footage styles for variety.
+  if (opts?.forChannel) {
+    for (const c of celebs) {
+      queries.add(c);
+      queries.add(`${c} interview`);
+      queries.add(`${c} podcast`);
+    }
+    if (queries.size === 0 && entities.length) queries.add(entities[0].value);
+    return Array.from(queries).slice(0, 6);
+  }
+
+  // Open-YouTube fallback: subject name + footage-style suffixes for the
+  // primary subject, plus bare names for secondary people.
   if (main) {
-    queries.add(`${main} interview`);
-    queries.add(`${main} red carpet`);
-    queries.add(`${main} behind the scenes`);
+    queries.add(main);
+    for (const suffix of SUBJECT_FOOTAGE_SUFFIXES) queries.add(`${main} ${suffix}`);
   }
   for (const c of celebs) queries.add(`${c} interview`);
-  for (const c of celebs) for (const m of movies) queries.add(`${c} ${m}`);
-  for (const c of celebs) for (const s of shows)  queries.add(`${c} ${s}`);
-  for (const c of celebs) for (const p of people) queries.add(`${c} ${p}`);
-  for (const c of celebs) for (const e of events) queries.add(`${c} ${e}`);
-  for (const c of celebs) for (const p of places) queries.add(`${c} ${p}`);
+  // Pair the primary subject with secondary entities — never standalone — so
+  // the footage still centres on the person, just in a specific context.
+  for (const m of movies) if (main) queries.add(`${main} ${m}`);
+  for (const s of shows)  if (main) queries.add(`${main} ${s}`);
+  for (const e of events) if (main) queries.add(`${main} ${e}`);
+  for (const p of people) queries.add(`${p} interview`);
   if (queries.size === 0 && entities.length) queries.add(entities[0].value);
-  return Array.from(queries).slice(0, 12);
+  // The query set is intentionally ordered highest-signal first (bare name,
+  // then footage suffixes in SUBJECT_FOOTAGE_SUFFIXES order, then secondary
+  // pairings). The caller slices to maxQueries — and, for quota control, can
+  // stop iterating early once it has collected enough candidates (yield-based
+  // cap) rather than always running the full set. Default 14 preserves the
+  // previous behaviour for callers that don't pass a cap.
+  return Array.from(queries).slice(0, opts?.maxQueries ?? 14);
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import { processClipJob }       from "./processors/clipProcessor";
 import { processMatchJob }      from "./processors/matchProcessor";
 import { processRenderJob }     from "./processors/renderProcessor";
 import { processScriptClipJob } from "./processors/scriptClipProcessor";
+import { markJobFailedIfExhausted, sweepStalledJobs } from "./reconcile";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -93,7 +94,23 @@ function startWorker<T>(
     });
     if (isTransient) console.log(line); else console.error(line);
   });
-  w.on("failed", (job, err) => console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job?.id, msg: "job.failed.event", err: err.message })));
+  w.on("failed", (job, err) => {
+    console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job?.id, msg: "job.failed.event", err: err.message }));
+    // BullMQ has finished its own bookkeeping; if this was the LAST retry the
+    // media_jobs row would otherwise be frozen at running/p=5 forever (the
+    // processor body never reached its terminal write). Reconcile it to
+    // failed so the UI's per-step aggregate can advance instead of hanging
+    // the whole project on "Generate clips". jobId === mediaJobId by design.
+    if (!job) return;
+    void markJobFailedIfExhausted(
+      job.id,
+      (job.attemptsMade ?? 0) + 1,
+      job.opts?.attempts ?? 1,
+      err.message,
+    ).catch((e) =>
+      console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job?.id, msg: "reconcile.failed_event.error", err: (e as Error).message })),
+    );
+  });
   return w;
 }
 
@@ -108,8 +125,27 @@ workers.push(startWorker(QUEUE_NAMES.render,     processRenderJob,     1));
 // proxies during a heavy ingest of a script-doc with many title cards.
 workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadConcurrency));
 
+// Periodic stall sweeper — the safety net for the case where on("failed")
+// never fires (hard OOM kill, Fly machine eviction). Any media_jobs row stuck
+// running/queued past the lock window gets marked failed and the pipeline is
+// re-advanced. The cutoff is lockDuration (15 min) + a 5 min margin so a job
+// legitimately mid-await on a long ffmpeg/yt-dlp call is never swept — those
+// only heartbeat updated_at between awaits.
+const SWEEP_INTERVAL_MS = 5 * 60_000;
+const SWEEP_STALE_MS = 900_000 + 5 * 60_000; // lockDuration + 5 min
+const sweepTimer = setInterval(() => {
+  void sweepStalledJobs(SWEEP_STALE_MS)
+    .then((n) => {
+      if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
+    })
+    .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+}, SWEEP_INTERVAL_MS);
+// Don't keep the process alive solely for the sweep timer.
+sweepTimer.unref?.();
+
 async function shutdown(signal: string) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.shutdown", signal }));
+  clearInterval(sweepTimer);
   // Order matters: close workers first so they finish their current job and
   // stop polling, then close the Queue/QueueEvents objects, then quit the
   // shared Redis connection. Quitting Redis first would race in-flight

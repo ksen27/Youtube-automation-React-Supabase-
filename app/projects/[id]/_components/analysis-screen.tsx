@@ -4,16 +4,19 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
+  Check,
   ChevronDown,
   ChevronRight,
   Layers,
   Loader2,
   PlayCircle,
+  Plus,
   RefreshCw,
   Search,
   Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Chip } from "@/components/ui/chip";
 import { StepCard, type StepState } from "@/components/ui/step-card";
@@ -41,6 +44,14 @@ interface PreviewCandidate {
   // saved payloads predate the classifier — those candidates render
   // without a chip.
   source_type?: "interview" | "news" | "archival" | "other";
+  // Provenance flags (entity-driven payloads): surfaced as badges so the user
+  // can see at a glance that a source came from a reference channel or was
+  // previously approved.
+  from_reference_channel?: boolean;
+  from_approved?: boolean;
+  // Footage style (entity-driven payloads): "interview", "red carpet",
+  // "talk show", "show", etc. Shown as a chip so the user can see variety.
+  footage_style?: string;
 }
 
 interface SegmentUnderstanding {
@@ -89,13 +100,28 @@ interface TimelinePlanSummary {
   generatedClips: number;
 }
 
+// One source-video pool per celebrity/entity — the primary review unit in the
+// subject-first redesign. `target` is how many of these the user should select
+// for this entity (duration-driven). Candidates are pre-ranked desc.
+interface EntityGroup {
+  value: string;
+  type: string;
+  target: number;
+  candidates: PreviewCandidate[];
+}
+
 interface AnalyzeResponse {
   projectId: string;
   totalDurationSeconds: number;
   voiceoverDurationSeconds: number;
   estimatedDurationSeconds: number;
   wordCount: number;
+  // Duration-driven counts (present on entity-driven payloads).
+  sourceTarget?: number;
+  reviewPoolSize?: number;
   plan: TimelinePlanSummary;
+  // Primary view (entity-driven payloads). Older payloads only have segments.
+  entities?: EntityGroup[];
   segments: SegmentAnalysis[];
 }
 
@@ -107,6 +133,34 @@ const STEPS = [
   { key: "searching" as const, label: "Finding source videos", icon: Search },
   { key: "results" as const, label: "Ready for review", icon: PlayCircle },
 ];
+
+// All videoIds present in a payload — entity pools when entity-driven, else
+// segment pools. Used to drop stale saved selections that no longer exist.
+function collectVideoIds(d: AnalyzeResponse): Set<string> {
+  const ids = new Set<string>();
+  if (d.entities?.length) {
+    for (const e of d.entities) for (const c of e.candidates) ids.add(c.videoId);
+  } else {
+    for (const seg of d.segments) for (const c of seg.candidates) ids.add(c.videoId);
+  }
+  return ids;
+}
+
+// The AI-suggested default selection. Entity-driven: top `target` videos per
+// entity (the duration-derived count). Legacy: top 5 per segment.
+function defaultSelection(d: AnalyzeResponse): Set<string> {
+  const ids = new Set<string>();
+  if (d.entities?.length) {
+    for (const e of d.entities) {
+      for (const c of e.candidates.slice(0, Math.max(1, e.target))) ids.add(c.videoId);
+    }
+  } else {
+    for (const seg of d.segments) {
+      for (const c of seg.candidates.slice(0, 5)) ids.add(c.videoId);
+    }
+  }
+  return ids;
+}
 
 export function AnalysisScreen({
   projectId,
@@ -121,6 +175,12 @@ export function AnalysisScreen({
   const [data, setData] = useState<AnalyzeResponse | null>(null);
   const [openSegments, setOpenSegments] = useState<Set<number>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // Per-entity expand/collapse state (entity-driven view).
+  const [openEntities, setOpenEntities] = useState<Set<string>>(new Set());
+  // Cards the user explicitly removed (wrong person / unrelated). Hidden from
+  // view and dropped from selection. Distinct from "unselected" — a removed
+  // card doesn't come back when toggling selection.
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
 
   // Hydrate from the saved analyze job so re-visiting the screen doesn't
   // wipe and re-run Gemini + YouTube search. The POST handler persists the
@@ -173,12 +233,9 @@ export function AnalysisScreen({
     },
     onSuccess: (d) => {
       setData(d);
-      const initial = new Set<string>();
-      for (const seg of d.segments) {
-        for (const c of seg.candidates.slice(0, 5)) initial.add(c.videoId);
-      }
-      setSelected(initial);
+      setSelected(defaultSelection(d));
       setOpenSegments(new Set([0]));
+      if (d.entities?.length) setOpenEntities(new Set([d.entities[0].value]));
       setPhase("results");
       // Refresh the saved-payload cache so a future remount re-hydrates from
       // the new run instead of the previous one. selectedVideoIds=null so
@@ -203,13 +260,13 @@ export function AnalysisScreen({
   const addSource = useMutation<
     { accepted: boolean; reason?: string; candidate?: PreviewCandidate },
     Error,
-    { videoUrl: string; segmentIndex: number }
+    { videoUrl: string; segmentIndex?: number; entityValue?: string }
   >({
-    mutationFn: async ({ videoUrl, segmentIndex }) => {
+    mutationFn: async ({ videoUrl, segmentIndex, entityValue }) => {
       const r = await fetch(`/api/projects/${projectId}/analyze/add-source`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoUrl, segmentIndex }),
+        body: JSON.stringify({ videoUrl, segmentIndex, entityValue }),
       });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error ?? `Failed (${r.status})`);
@@ -217,11 +274,18 @@ export function AnalysisScreen({
     },
     onSuccess: (j, vars) => {
       if (!j.accepted || !j.candidate) return;
-      // Mutate the in-memory analyze payload so the picker re-renders
-      // with the new card. We do this immutably so React detects the
-      // change.
+      // Mutate the in-memory analyze payload so the picker re-renders with the
+      // new card. Immutable update so React detects the change. Entity path
+      // appends to the entity pool; legacy path to the segment pool.
       setData((cur) => {
         if (!cur) return cur;
+        if (vars.entityValue && cur.entities?.length) {
+          const next = { ...cur, entities: cur.entities.map((e) => ({ ...e })) };
+          const ent = next.entities!.find((e) => e.value === vars.entityValue);
+          if (!ent) return cur;
+          ent.candidates = [...ent.candidates, j.candidate!];
+          return next;
+        }
         const next = { ...cur, segments: cur.segments.map((s) => ({ ...s })) };
         const seg = next.segments.find((s) => s.index === vars.segmentIndex);
         if (!seg) return cur;
@@ -272,29 +336,22 @@ export function AnalysisScreen({
     if (saved) {
       // Rehydrate prior results — no Gemini/YouTube spend on re-visit.
       setData(saved);
-      const initial = new Set<string>();
+      let initial: Set<string>;
       if (savedSelected && savedSelected.length > 0) {
         // User has a saved selection from a previous visit — restore exactly
         // what they had checked. Filter to IDs that still exist in the
         // current payload (stale IDs that were removed from candidates
         // should not appear as ghost selections).
-        const validIds = new Set<string>();
-        for (const seg of saved.segments) {
-          for (const c of seg.candidates) validIds.add(c.videoId);
-        }
-        for (const v of savedSelected) {
-          if (validIds.has(v)) initial.add(v);
-        }
+        const validIds = collectVideoIds(saved);
+        initial = new Set(savedSelected.filter((v) => validIds.has(v)));
       } else {
-        // No saved selection (first visit after analyze, or migrating from
-        // a payload that predates this feature) — fall back to the top 5
-        // candidates per segment as the AI-suggested default.
-        for (const seg of saved.segments) {
-          for (const c of seg.candidates.slice(0, 5)) initial.add(c.videoId);
-        }
+        // No saved selection — fall back to the AI-suggested default
+        // (top `target` per entity, or top 5 per segment for old payloads).
+        initial = defaultSelection(saved);
       }
       setSelected(initial);
       setOpenSegments(new Set([0]));
+      if (saved.entities?.length) setOpenEntities(new Set([saved.entities[0].value]));
       setPhase("results");
       return;
     }
@@ -449,35 +506,100 @@ export function AnalysisScreen({
             durationSec={totals.durationSec}
             segmentCount={totals.segments}
             selected={totals.selected}
+            sourceTarget={data.sourceTarget}
             plan={data.plan}
           />
 
-          <div className="space-y-3">
-            {data.segments.map((seg) => (
-              <SegmentPanel
-                key={seg.index}
-                segment={seg}
-                open={openSegments.has(seg.index)}
-                onToggle={() => {
-                  const next = new Set(openSegments);
-                  if (next.has(seg.index)) next.delete(seg.index);
-                  else next.add(seg.index);
-                  setOpenSegments(next);
-                }}
-                selectedIds={selected}
-                onToggleVideo={(videoId) => {
-                  const next = new Set(selected);
-                  if (next.has(videoId)) next.delete(videoId);
-                  else next.add(videoId);
-                  setSelected(next);
-                }}
-                onAddSource={(videoUrl) =>
-                  addSource.mutateAsync({ videoUrl, segmentIndex: seg.index })
-                }
-                addingSource={addSource.isPending}
-              />
-            ))}
-          </div>
+          {/* In-app YouTube search — manually find + add source videos on top
+            of the AI search. Searches whole YouTube + reference channels. */}
+          {data.entities?.length ? (
+            <YoutubeSearchBox
+              projectId={projectId}
+              entities={data.entities.map((e) => e.value)}
+              alreadyAddedIds={collectVideoIds(data)}
+              onAdded={(entityValue, candidate) => {
+                setData((cur) => {
+                  if (!cur?.entities) return cur;
+                  const next = { ...cur, entities: cur.entities.map((e) => ({ ...e })) };
+                  const ent = next.entities!.find((e) => e.value === entityValue);
+                  if (!ent) return cur;
+                  if (ent.candidates.some((c) => c.videoId === candidate.videoId)) return cur;
+                  ent.candidates = [candidate, ...ent.candidates];
+                  return next;
+                });
+                setSelected((cur) => new Set(cur).add(candidate.videoId));
+                setOpenEntities((cur) => new Set(cur).add(entityValue));
+              }}
+            />
+          ) : null}
+
+          {data.entities?.length ? (
+            // Primary: per-entity source-video pools.
+            <div className="space-y-3">
+              {data.entities.map((ent) => (
+                <EntityPanel
+                  key={ent.value}
+                  entity={ent}
+                  open={openEntities.has(ent.value)}
+                  onToggle={() => {
+                    const next = new Set(openEntities);
+                    if (next.has(ent.value)) next.delete(ent.value);
+                    else next.add(ent.value);
+                    setOpenEntities(next);
+                  }}
+                  selectedIds={selected}
+                  removedIds={removed}
+                  onToggleVideo={(videoId) => {
+                    const next = new Set(selected);
+                    if (next.has(videoId)) next.delete(videoId);
+                    else next.add(videoId);
+                    setSelected(next);
+                  }}
+                  onRemoveVideo={(videoId) => {
+                    setRemoved((cur) => new Set(cur).add(videoId));
+                    setSelected((cur) => {
+                      if (!cur.has(videoId)) return cur;
+                      const next = new Set(cur);
+                      next.delete(videoId);
+                      return next;
+                    });
+                  }}
+                  onAddSource={(videoUrl) =>
+                    addSource.mutateAsync({ videoUrl, entityValue: ent.value })
+                  }
+                  addingSource={addSource.isPending}
+                />
+              ))}
+            </div>
+          ) : (
+            // Legacy fallback: per-segment panels (old saved payloads).
+            <div className="space-y-3">
+              {data.segments.map((seg) => (
+                <SegmentPanel
+                  key={seg.index}
+                  segment={seg}
+                  open={openSegments.has(seg.index)}
+                  onToggle={() => {
+                    const next = new Set(openSegments);
+                    if (next.has(seg.index)) next.delete(seg.index);
+                    else next.add(seg.index);
+                    setOpenSegments(next);
+                  }}
+                  selectedIds={selected}
+                  onToggleVideo={(videoId) => {
+                    const next = new Set(selected);
+                    if (next.has(videoId)) next.delete(videoId);
+                    else next.add(videoId);
+                    setSelected(next);
+                  }}
+                  onAddSource={(videoUrl) =>
+                    addSource.mutateAsync({ videoUrl, segmentIndex: seg.index })
+                  }
+                  addingSource={addSource.isPending}
+                />
+              ))}
+            </div>
+          )}
 
           <StickyConfirmBar
             selected={totals.selected}
@@ -540,18 +662,24 @@ function SummaryStrip({
   durationSec,
   segmentCount,
   selected,
+  sourceTarget,
   plan,
 }: {
   durationSec: number;
   segmentCount: number;
   selected: number;
+  sourceTarget?: number;
   plan: TimelinePlanSummary;
 }) {
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         <Stat label="Voiceover duration" value={fmtMinutes(durationSec)} />
-        <Stat label="Parts" value={String(segmentCount)} />
+        {sourceTarget != null ? (
+          <Stat label="Suggested sources" value={String(sourceTarget)} />
+        ) : (
+          <Stat label="Parts" value={String(segmentCount)} />
+        )}
         <Stat label="Videos selected" value={String(selected)} highlight={selected > 0} />
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -613,6 +741,426 @@ function SegmentSkeletons() {
         </Card>
       ))}
     </div>
+  );
+}
+
+// Per-entity source-video pool — the primary review unit. Shows one collapsible
+// card per celebrity/entity with its candidate grid, the duration-driven
+// selection target, and per-card select / remove actions.
+// In-app YouTube search picker. The user types a query, sees thumbnail results
+// from the whole of YouTube + their reference channels, picks which entity a
+// result belongs to, and clicks Add — the video is added directly (no quality
+// filtering) to that entity's pool and auto-selected. This sits on top of the
+// AI search so the user can hand-pick sources they know are correct.
+function YoutubeSearchBox({
+  projectId,
+  entities,
+  alreadyAddedIds,
+  onAdded,
+}: {
+  projectId: string;
+  entities: string[];
+  alreadyAddedIds: Set<string>;
+  onAdded: (entityValue: string, candidate: PreviewCandidate) => void;
+}) {
+  interface YtSearchResult {
+    videoId: string;
+    url: string;
+    title: string;
+    channelTitle: string;
+    durationSeconds: number;
+    thumbnailUrl: string;
+    from_reference_channel: boolean;
+  }
+
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<YtSearchResult[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  // Which entity each picked video should be assigned to. Defaults to the
+  // first (main) entity; the user can change it per result before adding.
+  const [entityFor, setEntityFor] = useState<string>(entities[0] ?? "");
+  // Per-result add state so each button shows its own spinner/added tick.
+  const [adding, setAdding] = useState<Set<string>>(new Set());
+  const [added, setAdded] = useState<Set<string>>(new Set());
+
+  const search = useMutation<{ results: YtSearchResult[] }, Error, string>({
+    mutationFn: async (q) => {
+      const r = await fetch(`/api/projects/${projectId}/analyze/search-youtube`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? `Search failed (${r.status})`);
+      return j;
+    },
+    onSuccess: (j) => { setResults(j.results); setError(null); },
+    onError: (e) => { setError(e.message); setResults(null); },
+  });
+
+  async function addResult(res: YtSearchResult) {
+    const target = entityFor || entities[0];
+    if (!target) return;
+    setAdding((cur) => new Set(cur).add(res.videoId));
+    try {
+      const r = await fetch(`/api/projects/${projectId}/analyze/add-source`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoUrl: res.url, entityValue: target, skipFilters: true }),
+      });
+      const j = await r.json();
+      if (!r.ok || !j.accepted) {
+        setError(j.reason ?? j.error ?? "Could not add this video.");
+        return;
+      }
+      setAdded((cur) => new Set(cur).add(res.videoId));
+      onAdded(target, j.candidate as PreviewCandidate);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setAdding((cur) => { const n = new Set(cur); n.delete(res.videoId); return n; });
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Search className="h-4 w-4 text-brand-300" /> Search YouTube for sources
+        </CardTitle>
+        <CardDescription>
+          Find and add source videos yourself — searches all of YouTube and your reference channels. Added videos skip the quality filters.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <form
+          className="flex items-stretch gap-2"
+          onSubmit={(e) => { e.preventDefault(); const q = query.trim(); if (q) search.mutate(q); }}
+        >
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="e.g. David Walliams BGT red carpet"
+            disabled={search.isPending}
+          />
+          <Button type="submit" variant="gradient" disabled={!query.trim() || search.isPending}>
+            {search.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+            Search YouTube
+          </Button>
+        </form>
+
+        {/* Entity assignment — which pool added videos go into. */}
+        {entities.length > 1 && (
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-fg-muted">Add picks to:</span>
+            <select
+              value={entityFor}
+              onChange={(e) => setEntityFor(e.target.value)}
+              className="rounded-md border border-border bg-surface-2 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+            >
+              {entities.map((ev) => (
+                <option key={ev} value={ev}>{ev}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {error && (
+          <div className="flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {results && results.length === 0 && (
+          <p className="text-sm text-fg-muted">No results for “{query}”.</p>
+        )}
+
+        {results && results.length > 0 && (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {results.map((res) => (
+              <SearchResultCard
+                key={res.videoId}
+                res={res}
+                isAdded={added.has(res.videoId) || alreadyAddedIds.has(res.videoId)}
+                isAdding={adding.has(res.videoId)}
+                onAdd={() => addResult(res)}
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// One search-result card with inline click-to-play preview. Clicking the play
+// overlay swaps the thumbnail for a YouTube iframe so the user can watch the
+// video before adding it — mirrors the AI-search VideoCard's preview. Each card
+// owns its own `playing` state so multiple previews can be open independently.
+function SearchResultCard({
+  res,
+  isAdded,
+  isAdding,
+  onAdd,
+}: {
+  res: {
+    videoId: string;
+    url: string;
+    title: string;
+    channelTitle: string;
+    durationSeconds: number;
+    thumbnailUrl: string;
+    from_reference_channel: boolean;
+  };
+  isAdded: boolean;
+  isAdding: boolean;
+  onAdd: () => void;
+}) {
+  const [playing, setPlaying] = useState(false);
+  return (
+    <div className="group relative overflow-hidden rounded-[10px] border border-border bg-surface">
+      <div className="relative aspect-video bg-bg-elevated">
+        {playing ? (
+          <iframe
+            src={`https://www.youtube.com/embed/${res.videoId}?autoplay=1&rel=0&modestbranding=1`}
+            title={res.title}
+            className="h-full w-full"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+          />
+        ) : (
+          <>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={res.thumbnailUrl} alt="" loading="lazy" className="h-full w-full object-cover" />
+            <button
+              type="button"
+              onClick={() => setPlaying(true)}
+              className="absolute inset-0 grid place-items-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
+              aria-label="Preview video"
+            >
+              <span className="grid h-11 w-11 place-items-center rounded-full bg-white/95 text-black shadow-lg">
+                <PlayCircle className="h-6 w-6" />
+              </span>
+            </button>
+            {res.from_reference_channel && (
+              <span className="absolute top-1.5 left-1.5 rounded bg-indigo-600/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white shadow-sm">
+                Reference channel
+              </span>
+            )}
+            {res.durationSeconds > 0 && (
+              <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-white">
+                {fmtClock(res.durationSeconds)}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+      <div className="p-2.5 space-y-1.5">
+        <p className="line-clamp-2 text-xs font-medium leading-snug text-fg">{res.title}</p>
+        <p className="truncate text-[11px] text-fg-muted">{res.channelTitle}</p>
+        <Button
+          type="button"
+          size="sm"
+          variant={isAdded ? "outline" : "soft"}
+          className="w-full"
+          disabled={isAdded || isAdding}
+          onClick={onAdd}
+        >
+          {isAdding ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            : isAdded ? <><Check className="h-3.5 w-3.5" /> Added</>
+            : <><Plus className="h-3.5 w-3.5" /> Add source</>}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// mm:ss clock for the search result thumbnails.
+function fmtClock(s: number): string {
+  const m = Math.floor(s / 60);
+  const r = String(Math.max(0, s % 60)).padStart(2, "0");
+  return `${m}:${r}`;
+}
+
+function EntityPanel({
+  entity,
+  open,
+  onToggle,
+  selectedIds,
+  removedIds,
+  onToggleVideo,
+  onRemoveVideo,
+  onAddSource,
+  addingSource,
+}: {
+  entity: EntityGroup;
+  open: boolean;
+  onToggle: () => void;
+  selectedIds: Set<string>;
+  removedIds: Set<string>;
+  onToggleVideo: (videoId: string) => void;
+  onRemoveVideo: (videoId: string) => void;
+  onAddSource: (videoUrl: string) => Promise<{ accepted: boolean; reason?: string }>;
+  addingSource: boolean;
+}) {
+  const visible = entity.candidates.filter((c) => !removedIds.has(c.videoId));
+  const selectedCount = visible.filter((c) => selectedIds.has(c.videoId)).length;
+  // Manual add-source state — one input per entity pool.
+  const [addUrl, setAddUrl] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addBusy, setAddBusy] = useState(false);
+  return (
+    <Card className="overflow-hidden">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between p-5 text-left hover:bg-surface-hover transition-colors"
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg gradient-brand text-white text-sm font-semibold shadow-sm">
+            {entity.value.slice(0, 1).toUpperCase()}
+          </span>
+          <div className="min-w-0">
+            <div className="text-base font-semibold truncate">{entity.value}</div>
+            <div className="text-xs text-fg-muted capitalize">{entity.type.replace(/_/g, " ")}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <Chip tone={selectedCount >= entity.target ? "keyword" : "person"}>
+            {selectedCount} / {entity.target} selected
+          </Chip>
+          {open ? (
+            <ChevronDown className="h-4 w-4 text-fg-muted" />
+          ) : (
+            <ChevronRight className="h-4 w-4 text-fg-muted" />
+          )}
+        </div>
+      </button>
+
+      {open && (
+        <div className="border-t border-border p-5">
+          {/* Manual add-source. Paste a known-good YouTube URL to append it to
+            this entity's pool; the backend runs the same rank + verify filters
+            as the AI search and surfaces a rejection reason inline. */}
+          <form
+            className="mb-3 flex items-stretch gap-2"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const url = addUrl.trim();
+              if (!url) return;
+              setAddBusy(true);
+              setAddError(null);
+              try {
+                const res = await onAddSource(url);
+                if (res.accepted) setAddUrl("");
+                else setAddError(res.reason ?? "Could not add this video.");
+              } catch (err) {
+                setAddError((err as Error).message);
+              } finally {
+                setAddBusy(false);
+              }
+            }}
+          >
+            <input
+              type="url"
+              value={addUrl}
+              onChange={(e) => { setAddUrl(e.target.value); setAddError(null); }}
+              placeholder={`Paste a YouTube URL to add a ${entity.value} source…`}
+              className="flex-1 rounded-md border border-border bg-surface-2 px-3 py-2 text-sm placeholder:text-fg-subtle focus:outline-none focus:ring-2 focus:ring-brand-500"
+              disabled={addBusy || addingSource}
+            />
+            <Button
+              type="submit"
+              variant="outline"
+              size="sm"
+              disabled={!addUrl.trim() || addBusy || addingSource}
+            >
+              {addBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Add source"}
+            </Button>
+          </form>
+          {addError && (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+              <span>{addError}</span>
+            </div>
+          )}
+          {selectedCount < entity.target && visible.length >= entity.target && (
+            <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-300">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+              Select {entity.target} source{entity.target === 1 ? "" : "s"} for {entity.value} for the best footage coverage.
+            </div>
+          )}
+          {visible.length === 0 ? (
+            <EmptyState
+              icon={<Search className="h-5 w-5" />}
+              title="No source videos"
+              description="Nothing found for this entity, or all were removed."
+            />
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {visible.map((c) => (
+                <div key={c.videoId} className="relative">
+                  {/* Origin + footage-style badges + remove overlay. EVERY card
+                    shows where it came from: Approved (previously approved for
+                    this entity), Reference channel (one of the user's curated
+                    channels), or YouTube (open whole-YouTube search). */}
+                  <div className="absolute top-1.5 left-1.5 z-20 flex flex-wrap gap-1 max-w-[80%]">
+                    {c.from_approved && (
+                      <span className="rounded bg-emerald-600/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white shadow-sm">
+                        Approved
+                      </span>
+                    )}
+                    {c.from_reference_channel && (
+                      <span className="rounded bg-indigo-600/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white shadow-sm">
+                        Reference channel
+                      </span>
+                    )}
+                    {!c.from_reference_channel && !c.from_approved && (
+                      <span className="rounded bg-rose-600/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white shadow-sm">
+                        YouTube
+                      </span>
+                    )}
+                    {c.footage_style === "show" && (
+                      <span className="rounded bg-amber-600/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white shadow-sm">
+                        Show footage
+                      </span>
+                    )}
+                    {c.footage_style && !["show", "approved", "general", "interview"].includes(c.footage_style) && (
+                      <span className="rounded bg-slate-700/90 px-1.5 py-0.5 text-[10px] font-medium capitalize text-white shadow-sm">
+                        {c.footage_style}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveVideo(c.videoId)}
+                    className="absolute bottom-1.5 left-1.5 z-20 rounded bg-black/70 px-2 py-0.5 text-[10px] font-medium text-white hover:bg-danger/90 transition-colors"
+                    aria-label="Remove (wrong person / unrelated)"
+                    title="Remove this source (wrong person / unrelated)"
+                  >
+                    Remove
+                  </button>
+                  <VideoCard
+                    videoId={c.videoId}
+                    thumbnail={c.thumbnailUrl}
+                    title={c.title}
+                    channel={c.channelTitle}
+                    durationSec={c.durationSeconds}
+                    score={c.displayScore}
+                    rawScore={c.score}
+                    reasons={c.reasons}
+                    sourceType={c.source_type}
+                    selected={selectedIds.has(c.videoId)}
+                    onToggle={() => onToggleVideo(c.videoId)}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 

@@ -11,15 +11,23 @@ import {
   type SegmentUnderstanding,
 } from "@/lib/ai/segments";
 import { planTimeline } from "@/lib/ai/timeline-plan";
-import { searchYoutube, rankCandidate, loadChannelRules } from "@/lib/youtube/search";
-import { extractEntities, extractProjectContext } from "@/lib/ai/gemini";
+import {
+  rankCandidate,
+  loadChannelRules,
+  loadReferenceChannels,
+  searchYoutubeCached,
+  loadApprovedSourceVideos,
+  hydrateVideoIds,
+  type IntentType,
+} from "@/lib/youtube/search";
+import { extractEntities, extractProjectContext, buildSearchQueries, type ExtractedEntity } from "@/lib/ai/gemini";
 import {
   buildReferenceRoster,
   type ReferenceEntity,
   type ReferenceEntityType,
 } from "@/lib/ai/face-references";
 import { verifyPoolAsset } from "@/lib/ai/pool-verification";
-import { getEnv } from "@/lib/env";
+import { getEnv, computeSourceVideoTarget } from "@/lib/env";
 import { classifySourceType } from "@/lib/youtube/source-type";
 
 // Synchronous "Analyze & Search" — does Gemini segmentation/understanding plus
@@ -407,628 +415,429 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       })),
     });
 
-    // Resolve a query → its "primary named person", if any. We scan the
-    // query for each roster person's full name; longest match wins (so
-    // "Simon Cowell David Walliams" picks Walliams when both are present
-    // BUT the celebrity always beats a secondary — that's intentional,
-    // we want celebrity-anchored queries to verify against the celebrity
-    // even when they also name a secondary character). Returns null when
-    // no roster person appears in the query.
-    function resolveQueryPerson(query: string): { displayName: string; lower: string } | null {
-      const q = query.toLowerCase();
-      const celebLower = (mainCelebrity ?? "").toLowerCase();
-      if (celebLower && q.includes(celebLower)) {
-        return { displayName: mainCelebrity!, lower: celebLower };
-      }
-      let best: { displayName: string; lower: string; len: number } | null = null;
-      for (const [key, v] of personRuns.entries()) {
-        if (q.includes(key) && (!best || key.length > best.len)) {
-          best = { displayName: v.displayName, lower: key, len: key.length };
-        }
-      }
-      return best ? { displayName: best.displayName, lower: best.lower } : null;
-    }
-
-    // 2) YouTube search per intent. We'll dedupe across the whole project but
-    // still attribute the best score to a single segment for the preview UI.
+    // 2) SUBJECT-FIRST DISCOVERY (entity-driven, not per-segment).
+    //
+    // The redesign flips discovery from "search per narration segment" to
+    // "find the best source videos of the target entities, then generate clips
+    // from them." We build ONE query set per major entity, search three tiers
+    // in priority order, pool ALL candidates globally, rank, and group the
+    // pool BY ENTITY for review. Segments still exist (the matcher needs their
+    // text + understanding downstream) but they no longer drive search.
+    //
+    // Tiers (priority order, per the spec):
+    //   1. Previously-approved sources (cross-project memory) — 0 API units
+    //   2. Reference channels (user-curated) — ~1 unit each via playlistItems
+    //   3. Open YouTube — 100 units each, yield-capped + cached + yt-dlp fallback
     await setProjectStatus(id, "searching");
     const { approved, blocked } = await loadChannelRules();
+    const referenceChannels = await loadReferenceChannels();
+    const envDisco = getEnv();
 
+    // Duration-driven target: how many source videos to SELECT, and how many
+    // candidates to surface for review. 8 per 5 min, clamped [3, 30]; pool 1.5×.
+    const { target: sourceTarget, reviewPoolSize } =
+      computeSourceVideoTarget(voiceoverDurationSeconds);
+
+    // The entities we actually search for: the main celebrity + every other
+    // person/company/show the matcher will need footage of, deduped. Each
+    // becomes a search "subject" with its own query expansion + candidate pool.
+    interface SearchEntity { value: string; type: string }
+    const searchEntities: SearchEntity[] = [];
+    const seenSearchEntity = new Set<string>();
+    function pushSearchEntity(value: string, type: string) {
+      const k = value.trim().toLowerCase();
+      if (!k || seenSearchEntity.has(k)) return;
+      seenSearchEntity.add(k);
+      searchEntities.push({ value: value.trim(), type });
+    }
+    if (mainCelebrity) pushSearchEntity(mainCelebrity, "celebrity");
+    // Secondary people only get their own pool when their narration footprint
+    // crosses the clip threshold — otherwise the matcher fills them from a
+    // Wikipedia photo and a YouTube pool would be wasted quota.
+    for (const [key, info] of personRuns.entries()) {
+      if (key === (mainCelebrity ?? "").toLowerCase()) continue;
+      if (info.maxRun >= SECONDARY_PERSON_CLIP_THRESHOLD) {
+        pushSearchEntity(info.displayName, "related_person");
+      }
+    }
+    await logJob({ projectId: id, jobId: mediaJobId }, "analyze.discovery.entities", {
+      entities: searchEntities.map((e) => `${e.type}:${e.value}`),
+      sourceTarget, reviewPoolSize,
+    });
+
+    // The candidate shape, with the entity it was discovered under so the
+    // payload can group by entity for review.
+    type EntityCandidate = PreviewCandidate & { entity_value: string; entity_type: string; from_reference_channel: boolean; from_approved: boolean; footage_style: string };
+    const globalPool = new Map<string, EntityCandidate>();
     const seenVideo = new Set<string>();
-    const segmentAnalyses: SegmentAnalysis[] = [];
 
-    // 2a) Character-anchored query lane. Runs ONCE per analyze, independent
-    // of segment topics. These queries return videos where the celebrity
-    // is the on-screen subject — clean interview / red-carpet / talk-show
-    // footage that fills celebrity_default narration blocks ("He was a
-    // man known for…", "Three years on the show…") where the matcher
-    // doesn't need a specific event, just the person on screen.
-    //
-    // Each accepted character clip is added to a pool. After the
-    // story-aware segment loop runs, the pool is merged into every
-    // segment's candidate list — segments with thin pickings get the
-    // most benefit, segments already saturated with story-aware
-    // candidates use the pool as filler. The existing rankCandidate
-    // scoring and per-segment top-8 trim keep the picker manageable.
-    //
-    // Verification uses the same two-stage pipeline as story-aware
-    // candidates (thumb + body frames), so character clips meet the
-    // same quality bar.
-    const envForCharLane = getEnv();
-    const characterPool: PreviewCandidate[] = [];
-    if (envForCharLane.ANALYZE_CHARACTER_LANE_ENABLED && mainCelebrity) {
-      const characterTemplates = [
-        `${mainCelebrity} interview`,
-        `${mainCelebrity} talk show`,
-        `${mainCelebrity} red carpet`,
-        `${mainCelebrity} press junket`,
-        `${mainCelebrity} behind the scenes`,
-      ];
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.character_lane.start", {
-        mainCelebrity, templates: characterTemplates.length,
+    // Reusable per-candidate verifier (same two-stage thumb+body gate as the
+    // old per-segment path, now subject-anchored to the entity being searched).
+    // Returns the accepted candidate or null when rejected. Logs rejections.
+    async function rankAndVerify(
+      c: Awaited<ReturnType<typeof hydrateVideoIds>>[number],
+      entity: SearchEntity,
+      matchedQuery: string,
+      opts: {
+        referenceChannel: boolean;
+        fromApproved: boolean;
+        // Footage style this query targets — drives the variety diversifier and
+        // the editorial display. "person" = clean on-camera footage of the
+        // subject; "show" = subject within a named show/event (e.g. BGT).
+        footageStyle?: string;
+        intentType?: IntentType;
+        sourceIntent?: PreviewCandidate["source_intent"];
+      },
+    ): Promise<EntityCandidate | null> {
+      const isMain = entity.type === "celebrity";
+      const ranked = rankCandidate({
+        candidate: c,
+        mainCelebrity: entity.value,
+        aliases: isMain ? subjectAliases : [entity.value],
+        contextTerms: isMain ? contextTerms : [],
+        segmentEntities: [],
+        segmentTopic: "",
+        matchedQuery,
+        inheritedSegment: false,
+        keywords: isMain ? contextTerms.slice(0, 6) : [],
+        approvedChannelIds: approved,
+        blockedChannelIds: blocked,
+        intentType: opts.intentType ?? "talking_head",
+        referenceChannel: opts.referenceChannel,
+        // Subject-first discovery ALWAYS requires a real subject anchor so a
+        // many-celebrity reference channel can't leak the wrong person.
+        requireSubjectAnchor: true,
       });
-      for (const query of characterTemplates) {
-        let cands: Awaited<ReturnType<typeof searchYoutube>> = [];
-        try {
-          cands = await searchYoutube({ query, maxResults: PER_INTENT_RESULTS });
-        } catch (e) {
-          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.character_lane.search_failed", {
-            query, err: (e as Error).message,
-          });
-          continue;
-        }
-        let accepted = 0;
-        let dupes = 0;
-        const charRejectTally: Record<string, number> = {};
-        // Pre-filter dupes outside the parallel block.
-        const charCandsToProcess = cands.filter((c) => {
-          if (seenVideo.has(c.videoId)) { dupes++; return false; }
-          return true;
+      if (ranked.rejected) {
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.rejected", {
+          entity: entity.value, videoId: c.videoId, reason: ranked.rejectReason ?? "unknown",
         });
-
-        type CharResult =
-          | { kind: "rejected_rank"; reason: string }
-          | { kind: "rejected_verify"; reason: string }
-          | { kind: "accepted"; cand: typeof cands[number]; ranked: ReturnType<typeof rankCandidate> };
-
-        async function processCharCandidate(c: typeof cands[number]): Promise<CharResult> {
-          const ranked = rankCandidate({
-            candidate: c,
-            mainCelebrity,
-            aliases: subjectAliases,
-            contextTerms,
-            segmentEntities: [],
-            segmentTopic: "",
-            matchedQuery: query,
-            inheritedSegment: false,
-            keywords: contextTerms.slice(0, 6),
-            approvedChannelIds: approved,
-            blockedChannelIds: blocked,
-            intentType: "talking_head",
+        return null;
+      }
+      // Face-verify gate (only when enabled; default off — the ranker + the
+      // subject-anchored queries do the filtering, per the env comment).
+      if (envDisco.ANALYZE_FACE_VERIFY_ENABLED && entity.type !== "company") {
+        const thumb = `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`;
+        let thumbVerdict;
+        try {
+          thumbVerdict = await verifyPoolAsset({
+            projectId: id, entityType: "person", entityName: entity.value, candidateUrl: thumb,
           });
-          if (ranked.rejected) {
-            return { kind: "rejected_rank", reason: ranked.rejectReason ?? "unknown" };
-          }
-          // Face-verify gate. When ANALYZE_FACE_VERIFY_ENABLED is false the
-          // ranker's score is the only filter — story-aware queries now do
-          // the work the verify gate used to do (on-topic candidates land
-          // first). Returning early here also skips the body-frame loop
-          // below, which depends on the thumb verdict.
-          if (!envForCharLane.ANALYZE_FACE_VERIFY_ENABLED) {
-            return { kind: "accepted", cand: c, ranked };
-          }
-          const thumb = `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`;
-          const thumbVerdict = await verifyPoolAsset({
-            projectId: id,
-            entityType: "person",
-            entityName: mainCelebrity!,
-            candidateUrl: thumb,
+        } catch { thumbVerdict = null; }
+        if (thumbVerdict?.verdict === "no") {
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.verify_rejected", {
+            entity: entity.value, videoId: c.videoId, reason: thumbVerdict.reason?.slice(0, 120),
           });
-          if (thumbVerdict.verdict === "no") {
-            return { kind: "rejected_verify", reason: "verify_no" };
-          }
-          const bodyEnabled = envForCharLane.ANALYZE_BODY_VERIFY_ENABLED && thumbVerdict.verdict !== "skipped";
+          return null;
+        }
+        const bodyEnabled = envDisco.ANALYZE_BODY_VERIFY_ENABLED && thumbVerdict?.verdict !== "skipped";
+        if (bodyEnabled) {
           const bodyVerdicts: Array<"yes" | "no" | "uncertain" | "skipped"> = [];
-          if (bodyEnabled) {
-            for (const frameUrl of [
-              `https://i.ytimg.com/vi/${c.videoId}/1.jpg`,
-              `https://i.ytimg.com/vi/${c.videoId}/2.jpg`,
-              `https://i.ytimg.com/vi/${c.videoId}/3.jpg`,
-            ]) {
-              try {
-                const bv = await verifyPoolAsset({
-                  projectId: id,
-                  entityType: "person",
-                  entityName: mainCelebrity!,
-                  candidateUrl: frameUrl,
-                });
-                bodyVerdicts.push(bv.verdict);
-                if (thumbVerdict.verdict === "uncertain" && bv.verdict === "yes") break;
-              } catch {
-                bodyVerdicts.push("skipped");
-              }
-            }
+          for (const frameUrl of [
+            `https://i.ytimg.com/vi/${c.videoId}/1.jpg`,
+            `https://i.ytimg.com/vi/${c.videoId}/2.jpg`,
+            `https://i.ytimg.com/vi/${c.videoId}/3.jpg`,
+          ]) {
+            try {
+              const bv = await verifyPoolAsset({
+                projectId: id, entityType: "person", entityName: entity.value, candidateUrl: frameUrl,
+              });
+              bodyVerdicts.push(bv.verdict);
+              if (thumbVerdict?.verdict === "uncertain" && bv.verdict === "yes") break;
+            } catch { bodyVerdicts.push("skipped"); }
           }
           const bodyNoCount = bodyVerdicts.filter((v) => v === "no").length;
-          if (thumbVerdict.verdict === "yes" && bodyEnabled && bodyNoCount >= 2) {
-            return { kind: "rejected_verify", reason: "verify_thumbnail_bait" };
+          if (bodyNoCount >= 2) {
+            await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.verify_rejected", {
+              entity: entity.value, videoId: c.videoId, reason: "no_subject_in_body",
+              body: bodyVerdicts.join(","),
+            });
+            return null;
           }
-          // Same loosened rule as the story lane: rejection requires
-          // affirmative "no" body evidence, not just absence of "yes".
-          // All-uncertain body verdicts now accept (was reject).
-          if (thumbVerdict.verdict === "uncertain" && bodyEnabled && bodyNoCount >= 2) {
-            return { kind: "rejected_verify", reason: "verify_no_subject_in_body" };
-          }
-          return { kind: "accepted", cand: c, ranked };
         }
+      }
+      return {
+        videoId: c.videoId,
+        url: c.url,
+        title: c.title,
+        channelTitle: c.channelTitle,
+        durationSeconds: c.durationSeconds,
+        thumbnailUrl: `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`,
+        score: ranked.score,
+        displayScore: ranked.displayScore,
+        reasons: ranked.reasons,
+        rejected: false,
+        matched_query: matchedQuery,
+        intended_subject: entity.value,
+        source_intent: opts.sourceIntent ?? "person",
+        source_type: classifySourceType({ channelTitle: c.channelTitle, videoTitle: c.title }),
+        entity_value: entity.value,
+        entity_type: entity.type,
+        from_reference_channel: opts.referenceChannel,
+        from_approved: opts.fromApproved,
+        footage_style: opts.footageStyle ?? "interview",
+      };
+    }
 
-        // Parallel verify across all character candidates for this query.
-        const charResults = await Promise.all(charCandsToProcess.map(processCharCandidate));
+    // Fold an accepted candidate into the global pool, keeping the higher score
+    // on duplicates (a reference/approved hit shouldn't be overwritten by a
+    // weaker open-YouTube one).
+    function foldIn(cand: EntityCandidate | null) {
+      if (!cand) return;
+      seenVideo.add(cand.videoId);
+      const prev = globalPool.get(cand.videoId);
+      if (!prev || cand.score > prev.score) globalPool.set(cand.videoId, cand);
+    }
 
-        // Serial collection: apply seenVideo recheck + tallies + push.
-        for (const r of charResults) {
-          if (r.kind === "rejected_rank" || r.kind === "rejected_verify") {
-            const k = r.reason;
-            charRejectTally[k] = (charRejectTally[k] ?? 0) + 1;
-            continue;
+    // Per-entity discovery. We run the three tiers until we have enough
+    // candidates for this entity's share of the review pool (yield-based cap on
+    // open YouTube to bound quota).
+    const perEntityTarget = Math.max(
+      reviewPoolSize,
+      Math.ceil(reviewPoolSize / Math.max(1, searchEntities.length)) * searchEntities.length,
+    );
+    const perEntityShare = Math.ceil(perEntityTarget / Math.max(1, searchEntities.length));
+
+    for (let ei = 0; ei < searchEntities.length; ei++) {
+      const entity = searchEntities[ei];
+      const entityEntities = [{ type: entity.type, value: entity.value } as ExtractedEntity];
+      // Reuse buildSearchQueries for footage-style expansion; cap to ~10 to
+      // bound quota, ordered highest-signal first.
+      const openQueries = buildSearchQueries(entityEntities as ExtractedEntity[], { maxQueries: 10 });
+      // Reference channels are searched with a SINGLE bare-subject query, not
+      // the footage-suffix set. Reference search lists the channel's uploads and
+      // filters by query tokens against title+description — so a suffixed query
+      // like "<name> red carpet" would demand "red"+"carpet" literally appear,
+      // which channel uploads rarely do, and would return almost nothing.
+      // Instead we pull EVERY upload that names the subject (title or
+      // description) and let the style-diversifier surface the variety (red
+      // carpet / event / talk show …) from whatever that channel actually
+      // posted. One query per channel also keeps quota minimal.
+      const channelQuery = entity.value;
+      const acceptedForEntity = () =>
+        Array.from(globalPool.values()).filter((c) => c.entity_value === entity.value).length;
+
+      // Derive a coarse footage style from a query's suffix so the review pool
+      // can be diversified by style (interview / red carpet / talk show / event
+      // / behind the scenes …) instead of returning 8 interviews. The style is
+      // just the query text minus the subject name.
+      const footageStyleFor = (q: string): string => {
+        const stripped = q.toLowerCase().replace(entity.value.toLowerCase(), "").trim();
+        return stripped || "general";
+      };
+
+      // Infer a footage style from an upload's OWN title (used for
+      // reference-channel results, which are found via a bare-name query so the
+      // query itself carries no style). Scans for the known footage-style
+      // phrases; falls back to "general" when none match.
+      const STYLE_PHRASES = [
+        "red carpet", "press conference", "behind the scenes", "talk show",
+        "live appearance", "public appearance", "interview", "podcast",
+        "documentary", "event", "exclusive", "archive",
+      ];
+      const footageStyleFromTitle = (title: string): string => {
+        const t = title.toLowerCase();
+        return STYLE_PHRASES.find((p) => t.includes(p)) ?? "general";
+      };
+
+      // SHOW / EVENT lane (main celebrity only). Pair the subject with the
+      // script's named shows/events (e.g. "David Walliams Britain's Got
+      // Talent") so the pool includes clear footage of the subject WITHIN the
+      // show the script is actually about — not just generic interviews. These
+      // are tagged broll/archival and given reserved slots in the editorial
+      // grouping below so interviews can't crowd them out.
+      const showQueries: string[] = [];
+      if (entity.type === "celebrity") {
+        const showsEvents = projectEntities
+          .filter((e) => e.type === "tv_show" || e.type === "movie" || e.type === "event")
+          .map((e) => e.value)
+          .slice(0, 4);
+        for (const se of showsEvents) showQueries.push(`${entity.value} ${se}`);
+      }
+
+      // ----- Tier 1: previously-approved sources (0 units) -----
+      try {
+        const approvedVids = await loadApprovedSourceVideos([entity.value]);
+        if (approvedVids.length) {
+          const hydrated = await hydrateVideoIds(approvedVids.map((v) => v.youtubeVideoId)).catch(() => []);
+          for (const c of hydrated) {
+            if (seenVideo.has(c.videoId)) continue;
+            foldIn(await rankAndVerify(c, entity, `${entity.value} (approved)`, { referenceChannel: false, fromApproved: true, footageStyle: "approved" }));
           }
-          if (seenVideo.has(r.cand.videoId)) { dupes++; continue; }
-          accepted++;
-          seenVideo.add(r.cand.videoId);
-          characterPool.push({
-            videoId: r.cand.videoId,
-            url: r.cand.url,
-            title: r.cand.title,
-            channelTitle: r.cand.channelTitle,
-            durationSeconds: r.cand.durationSeconds,
-            thumbnailUrl: `https://i.ytimg.com/vi/${r.cand.videoId}/mqdefault.jpg`,
-            score: r.ranked.score,
-            displayScore: r.ranked.displayScore,
-            reasons: r.ranked.reasons,
-            rejected: false,
-            matched_query: query,
-            intended_subject: mainCelebrity,
-            source_intent: "person",
-            source_type: classifySourceType({
-              channelTitle: r.cand.channelTitle,
-              videoTitle: r.cand.title,
-            }),
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.approved", {
+            entity: entity.value, found: approvedVids.length, hydrated: hydrated.length,
           });
         }
-        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.character_lane.query_summary", {
-          query, fetched: cands.length, accepted, dupes, rejected: charRejectTally,
+      } catch (e) {
+        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.approved_failed", {
+          entity: entity.value, err: (e as Error).message?.slice(0, 200),
         });
       }
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.character_lane.done", {
-        poolSize: characterPool.length,
+
+      // ----- Tier 2: reference channels (~1 unit each via playlistItems) -----
+      // One bare-subject query per channel; pull a generous slice of the
+      // channel's subject uploads so the diversifier has variety to work with.
+      for (const ch of referenceChannels) {
+        if (acceptedForEntity() >= perEntityShare) break;
+        try {
+          const cands = await searchYoutubeCached({ query: channelQuery, channelId: ch.channelId, maxResults: 25 });
+          for (const c of cands) {
+            if (seenVideo.has(c.videoId)) continue;
+            // Footage style is derived from the upload's OWN title (e.g. a
+            // "… red carpet …" upload → "red carpet") rather than the query,
+            // so the diversifier can still bucket reference-channel results by
+            // style even though we searched with a bare name.
+            foldIn(await rankAndVerify(c, entity, channelQuery, {
+              referenceChannel: true, fromApproved: false,
+              footageStyle: footageStyleFromTitle(c.title),
+            }));
+          }
+        } catch (e) {
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.ref_failed", {
+            entity: entity.value, channel: ch.channelId, err: (e as Error).message?.slice(0, 160),
+          });
+        }
+      }
+
+      // ----- Tier 3: open YouTube (yield-capped) -----
+      for (const q of openQueries) {
+        if (acceptedForEntity() >= perEntityShare) break;
+        try {
+          const cands = await searchYoutubeCached({ query: q, maxResults: PER_INTENT_RESULTS });
+          for (const c of cands) {
+            if (seenVideo.has(c.videoId)) continue;
+            foldIn(await rankAndVerify(c, entity, q, { referenceChannel: false, fromApproved: false, footageStyle: footageStyleFor(q) }));
+          }
+        } catch (e) {
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.open_failed", {
+            entity: entity.value, q, err: (e as Error).message?.slice(0, 160),
+          });
+        }
+      }
+
+      // ----- Show / event lane (reserved-slot footage) -----
+      // Always run regardless of the yield cap so the pool gets at least a
+      // chance at show-specific footage even when interviews already filled it.
+      for (const q of showQueries) {
+        try {
+          const cands = await searchYoutubeCached({ query: q, maxResults: PER_INTENT_RESULTS });
+          for (const c of cands) {
+            if (seenVideo.has(c.videoId)) continue;
+            foldIn(await rankAndVerify(c, entity, q, {
+              referenceChannel: false, fromApproved: false,
+              footageStyle: "show", intentType: "broll", sourceIntent: "broll",
+            }));
+          }
+        } catch (e) {
+          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.show_failed", {
+            entity: entity.value, q, err: (e as Error).message?.slice(0, 160),
+          });
+        }
+      }
+
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.entity_done", {
+        entity: entity.value, accepted: acceptedForEntity(),
+      });
+      await setMediaJob(mediaJobId, {
+        progress: 40 + Math.floor(((ei + 1) / Math.max(1, searchEntities.length)) * 45),
       });
     }
 
+    // Group the global pool by entity for the review payload, applying the
+    // per-entity review-pool cap and the news/non-news editorial balance.
+    const poolByEntity = new Map<string, EntityCandidate[]>();
+    for (const c of globalPool.values()) {
+      const arr = poolByEntity.get(c.entity_value) ?? [];
+      arr.push(c);
+      poolByEntity.set(c.entity_value, arr);
+    }
+    interface EntityGroup {
+      value: string;
+      type: string;
+      target: number;        // how many to select for this entity
+      candidates: EntityCandidate[];
+    }
+    const entityGroups: EntityGroup[] = [];
+    // Split the project-wide source target across entities (main celebrity gets
+    // the lion's share; secondaries get at least 1 each).
+    const entityTarget = (e: SearchEntity, idx: number): number => {
+      if (searchEntities.length === 1) return sourceTarget;
+      if (idx === 0) return Math.max(1, sourceTarget - (searchEntities.length - 1));
+      return 1;
+    };
+    // Reserve a small number of show/event ("clear footage within the show")
+    // slots so interviews can't crowd them out, per client direction (keep
+    // 1-2 BGT-style sources).
+    const SHOW_RESERVED_SLOTS = 2;
+    for (let ei = 0; ei < searchEntities.length; ei++) {
+      const entity = searchEntities[ei];
+      const all = (poolByEntity.get(entity.value) ?? []).sort((a, b) => b.score - a.score);
+
+      // 1) Reserve show-lane footage first (top by score), capped.
+      const showPicks = all.filter((c) => c.footage_style === "show").slice(0, SHOW_RESERVED_SLOTS);
+      const showIds = new Set(showPicks.map((c) => c.videoId));
+      const rest = all.filter((c) => !showIds.has(c.videoId));
+
+      // 2) Diversify the remaining slots ACROSS footage styles via round-robin
+      //    so the pool isn't 8 interviews. Bucket by style, then take one from
+      //    each style in turn (each bucket already score-sorted). A news cap
+      //    still applies so a scandal entity doesn't render as all-news.
+      const remainingSlots = Math.max(0, reviewPoolSize - showPicks.length);
+      const newsCap = Math.ceil(reviewPoolSize / 2);
+      const byStyle = new Map<string, EntityCandidate[]>();
+      for (const c of rest) {
+        const arr = byStyle.get(c.footage_style) ?? [];
+        arr.push(c);
+        byStyle.set(c.footage_style, arr);
+      }
+      // Style order: highest-scoring style first, but then round-robin.
+      const styleOrder = Array.from(byStyle.keys()).sort(
+        (a, b) => (byStyle.get(b)![0]?.score ?? 0) - (byStyle.get(a)![0]?.score ?? 0),
+      );
+      const diversified: EntityCandidate[] = [];
+      let newsCount = 0;
+      let added = true;
+      while (diversified.length < remainingSlots && added) {
+        added = false;
+        for (const style of styleOrder) {
+          if (diversified.length >= remainingSlots) break;
+          const bucket = byStyle.get(style)!;
+          // Pull the next unused candidate of this style, respecting news cap.
+          while (bucket.length) {
+            const cand = bucket.shift()!;
+            if (cand.source_type === "news" && newsCount >= newsCap) continue;
+            diversified.push(cand);
+            if (cand.source_type === "news") newsCount++;
+            added = true;
+            break;
+          }
+        }
+      }
+      // Show picks lead the list so they're visible; rest sorted by score.
+      const candidates = [...showPicks, ...diversified.sort((a, b) => b.score - a.score)];
+      entityGroups.push({ value: entity.value, type: entity.type, target: entityTarget(entity, ei), candidates });
+    }
+
+    // Build segmentAnalyses for the matcher + back-compat consumers. Segments
+    // keep their text/understanding; their candidate pool is the FULL global
+    // pool (top reviewPoolSize by score) so any clip can serve any section —
+    // the matcher re-ranks per section on labels + provenance anyway.
+    const segmentAnalyses: SegmentAnalysis[] = [];
+    const globalSorted = Array.from(globalPool.values()).sort((a, b) => b.score - a.score);
+
+    // Build segmentAnalyses for the matcher + back-compat consumers. Each
+    // segment keeps its text + understanding; its candidate pool is the global
+    // pool's top reviewPoolSize by score. The matcher re-ranks per section on
+    // labels + provenance, so any clip can serve any section — segments no
+    // longer own a private candidate bucket.
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
       const u = understandings[i];
-      const segCandidates: PreviewCandidate[] = [];
-      // Per-segment keywords give the ranker a tight signal — long generic
-      // documentaries shouldn't outrank a focused b-roll clip just because
-      // they hit more of the project's overall keyword bag.
-      const segKeywords = Array.from(new Set([...(u.relatedKeywords ?? []), u.mainTopic].filter(Boolean)));
-      const segmentRejectionTotals: Record<string, number> = {};
-      let segmentRejectedTotal = 0;
-      // Per-segment subject anchor info logged once up front so rejection
-      // reasons make sense when paging through the log.
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segment.subject", {
-        segment: i,
-        global_main_subject: mainCelebrity ?? null,
-        segment_subject: u.segmentSubject || null,
-        inherited_subject: u.inheritedSubject,
-        segment_topic: u.segmentTopic || null,
-        generated_queries: u.searchIntents.map((it) => it.query),
-      });
-      for (const intent of u.searchIntents) {
-        const intentType = intent.intentType ?? "talking_head";
-        // Phase B: per-query provenance. The analyze route classifies
-        // source_intent from the searchIntent's own intentType (Gemini
-        // already labelled it as talking_head / broll / archival) instead
-        // of re-running the regex classifier from searchProcessor. This is
-        // strictly better signal — Gemini saw the script context. The
-        // intended_subject is the project's main celebrity for every
-        // query; broll/archival queries still depict that celebrity's
-        // story even when the literal subject is a place or event.
-        const sourceIntent: PreviewCandidate["source_intent"] =
-          intentType === "broll" ? "broll" :
-          intentType === "archival" ? "archival" :
-          mainCelebrity && intent.query.toLowerCase().includes(mainCelebrity.toLowerCase()) ? "person" :
-          "generic";
-
-        // Hybrid secondary-person policy. If this intent's primary person
-        // is a secondary character whose narration footprint is below the
-        // threshold (default: < 4 consecutive blocks), skip the YouTube
-        // search entirely — the matcher will fill their block(s) with the
-        // Wikipedia reference photo. Burning quota + verification on Bruno
-        // clips when the script names him once is pure waste.
-        //
-        // We still proceed when the intent's person is:
-        //   - the project celebrity (always clip-search)
-        //   - a secondary person with run >= threshold (longer paragraph)
-        //   - null (entity / place / non-person intent — keep going)
-        const intentPerson = resolveQueryPerson(intent.query);
-        if (
-          intentPerson &&
-          mainCelebrity &&
-          intentPerson.lower !== mainCelebrity.toLowerCase()
-        ) {
-          const run = personRuns.get(intentPerson.lower)?.maxRun ?? 0;
-          if (run < SECONDARY_PERSON_CLIP_THRESHOLD) {
-            await logJob({ projectId: id, jobId: mediaJobId }, "analyze.intent.skipped_for_photo_path", {
-              segment: i, query: intent.query, person: intentPerson.displayName, maxRun: run,
-              threshold: SECONDARY_PERSON_CLIP_THRESHOLD,
-            });
-            continue;
-          }
-        }
-
-        let cands: Awaited<ReturnType<typeof searchYoutube>> = [];
-        try {
-          cands = await searchYoutube({ query: intent.query, maxResults: PER_INTENT_RESULTS });
-        } catch (e) {
-          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.search.failed", {
-            segment: i, query: intent.query, err: (e as Error).message,
-          });
-          continue;
-        }
-        const rejectTally: Record<string, number> = {};
-        let accepted = 0;
-        let dupes = 0;
-        // Pre-filter duplicates upfront so we don't burn parallel verify
-        // capacity on candidates we'd skip anyway. seenVideo dedup runs
-        // serially BEFORE the verify loop (cheap; no Gemini cost) and
-        // again AFTER (in case another query inside this segment loop
-        // already added the same video — rare across queries).
-        const candsToProcess = cands.filter((c) => {
-          if (seenVideo.has(c.videoId)) { dupes++; return false; }
-          return true;
-        });
-        // Per-segment data needed inside each candidate's promise. Hoisted
-        // so all candidates of this query share it.
-        const segmentEntities = Array.from(new Set([
-          ...(u.people ?? []),
-          ...(u.places ?? []),
-          ...(u.events ?? []),
-        ].filter(Boolean)));
-        const env = getEnv();
-
-        // Per-candidate verifier. Returns a structured result so the
-        // serial collection loop below can apply seenVideo + push without
-        // races. Pure read-only of shared state; no mutation here.
-        type CandResult =
-          | { kind: "rejected_rank"; videoId: string; reason: string; reasons: string[]; score: number }
-          | { kind: "rejected_verify_thumb"; videoId: string; title: string; verifyTargetName: string; verdict: string; reason: string }
-          | { kind: "rejected_verify_body"; videoId: string; title: string; verifyTargetName: string; thumbVerdict: string; bodyVerdicts: string[]; reason: string }
-          | { kind: "accepted"; videoId: string; cand: Awaited<ReturnType<typeof searchYoutube>>[number]; ranked: ReturnType<typeof rankCandidate>; verifyTargetName: string | null; thumbVerdict: string | null; bodyVerdicts: string[] };
-
-        async function processCandidate(c: typeof candsToProcess[number]): Promise<CandResult> {
-          const ranked = rankCandidate({
-            candidate: c,
-            mainCelebrity,
-            aliases: subjectAliases,
-            contextTerms,
-            segmentEntities,
-            segmentTopic: u.segmentTopic || u.mainTopic,
-            matchedQuery: intent.query,
-            inheritedSegment: u.inheritedSubject,
-            keywords: segKeywords,
-            approvedChannelIds: approved,
-            blockedChannelIds: blocked,
-            intentType,
-          });
-          // analyze.cand log fires inside the per-candidate promise. Order
-          // across parallel candidates may differ from cands[] order, but
-          // each log entry still carries videoId so traces remain readable.
-          await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand", {
-            segment: i,
-            query: intent.query,
-            intentType,
-            videoId: c.videoId,
-            title: c.title.slice(0, 100),
-            channelTitle: c.channelTitle,
-            durationSeconds: c.durationSeconds,
-            score: ranked.score,
-            rejected: ranked.rejected,
-            rejectReason: ranked.rejectReason ?? null,
-            reasons: ranked.reasons,
-          });
-          if (ranked.rejected) {
-            return {
-              kind: "rejected_rank",
-              videoId: c.videoId,
-              reason: ranked.rejectReason ?? "unknown",
-              reasons: ranked.reasons,
-              score: ranked.score,
-            };
-          }
-          // Same verifyTarget resolution as the serial version. intentPerson
-          // is closed over from the outer scope (per-intent constant).
-          const verifyTarget = (() => {
-            if (
-              intentPerson &&
-              mainCelebrity &&
-              intentPerson.lower !== mainCelebrity.toLowerCase()
-            ) {
-              return { name: intentPerson.displayName };
-            }
-            if (mainCelebrity) return { name: mainCelebrity };
-            return null;
-          })();
-          if (!verifyTarget) {
-            return { kind: "accepted", videoId: c.videoId, cand: c, ranked, verifyTargetName: null, thumbVerdict: null, bodyVerdicts: [] };
-          }
-          // Face-verify gate. When ANALYZE_FACE_VERIFY_ENABLED is false we
-          // accept the candidate based on rank alone — the new narration-
-          // aware queries do the on-topic filtering the verify gate used
-          // to do, and we avoid the Gemini Vision spend per candidate.
-          if (!env.ANALYZE_FACE_VERIFY_ENABLED) {
-            return { kind: "accepted", videoId: c.videoId, cand: c, ranked, verifyTargetName: verifyTarget.name, thumbVerdict: null, bodyVerdicts: [] };
-          }
-          const thumb = `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`;
-          const thumbVerdict = await verifyPoolAsset({
-            projectId: id,
-            entityType: "person",
-            entityName: verifyTarget.name,
-            candidateUrl: thumb,
-          });
-          if (thumbVerdict.verdict === "no") {
-            return {
-              kind: "rejected_verify_thumb",
-              videoId: c.videoId,
-              title: c.title,
-              verifyTargetName: verifyTarget.name,
-              verdict: thumbVerdict.verdict,
-              reason: thumbVerdict.reason,
-            };
-          }
-          // Body-frame check. Runs SEQUENTIALLY within this candidate's
-          // promise (each frame can short-circuit the next on uncertain →
-          // yes), but multiple candidates run their body checks in
-          // parallel because they're in separate promises.
-          const bodyEnabled = env.ANALYZE_BODY_VERIFY_ENABLED && thumbVerdict.verdict !== "skipped";
-          const bodyVerdicts: Array<"yes" | "no" | "uncertain" | "skipped"> = [];
-          if (bodyEnabled) {
-            const bodyFrameUrls = [
-              `https://i.ytimg.com/vi/${c.videoId}/1.jpg`,
-              `https://i.ytimg.com/vi/${c.videoId}/2.jpg`,
-              `https://i.ytimg.com/vi/${c.videoId}/3.jpg`,
-            ];
-            for (const frameUrl of bodyFrameUrls) {
-              try {
-                const bv = await verifyPoolAsset({
-                  projectId: id,
-                  entityType: "person",
-                  entityName: verifyTarget.name,
-                  candidateUrl: frameUrl,
-                });
-                bodyVerdicts.push(bv.verdict);
-                if (thumbVerdict.verdict === "uncertain" && bv.verdict === "yes") break;
-              } catch {
-                bodyVerdicts.push("skipped");
-              }
-            }
-          }
-          const bodyNoCount = bodyVerdicts.filter((v) => v === "no").length;
-          const bodyYesCount = bodyVerdicts.filter((v) => v === "yes").length;
-          let bodyReject: string | null = null;
-          if (thumbVerdict.verdict === "yes" && bodyEnabled && bodyNoCount >= 2) {
-            // Thumbnail says yes, body contradicts → bait (custom thumb
-            // shows the celebrity, body shows someone else). Keep this
-            // strict — bait is a confident-positive evidence signal.
-            bodyReject = "thumbnail_bait";
-          } else if (thumbVerdict.verdict === "uncertain" && bodyEnabled && bodyNoCount >= 2) {
-            // Thumbnail uncertain AND body has 2+ explicit "no" verdicts →
-            // the celebrity is genuinely absent from the body. Earlier
-            // rule required a body "yes" to accept, but that turned out
-            // to over-reject when Gemini Vision is in a cautious mood
-            // (returns "uncertain" for every frame). New rule: require
-            // affirmative "no" evidence to reject, not just absence of
-            // "yes" evidence. All-uncertain body now accepts.
-            bodyReject = "no_subject_in_body";
-          }
-          if (bodyReject) {
-            return {
-              kind: "rejected_verify_body",
-              videoId: c.videoId,
-              title: c.title,
-              verifyTargetName: verifyTarget.name,
-              thumbVerdict: thumbVerdict.verdict,
-              bodyVerdicts,
-              reason: bodyReject,
-            };
-          }
-          return {
-            kind: "accepted",
-            videoId: c.videoId,
-            cand: c,
-            ranked,
-            verifyTargetName: verifyTarget.name,
-            thumbVerdict: thumbVerdict.verdict,
-            bodyVerdicts,
-          };
-        }
-
-        // Run all candidates of this query in parallel. Each candidate is
-        // independent; the Gemini face-verify cache deduplicates any
-        // accidental same-URL calls. Total wall-time per query drops from
-        // ~60s (6 candidates × ~10s) to ~10s (max single-candidate time).
-        const candResults = await Promise.all(candsToProcess.map(processCandidate));
-
-        // Serial collection pass: apply seenVideo dedup, accumulate tallies,
-        // and push accepted candidates. Order follows candResults[] order
-        // (which is candsToProcess[] order, which is the YouTube ranking).
-        for (const r of candResults) {
-          if (r.kind === "rejected_rank") {
-            const k = r.reason;
-            rejectTally[k] = (rejectTally[k] ?? 0) + 1;
-            segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
-            segmentRejectedTotal++;
-            continue;
-          }
-          if (r.kind === "rejected_verify_thumb") {
-            const k = "verify_no";
-            rejectTally[k] = (rejectTally[k] ?? 0) + 1;
-            segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
-            segmentRejectedTotal++;
-            await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand_verify.rejected", {
-              segment: i, videoId: r.videoId, title: r.title.slice(0, 100),
-              intentType, sourceIntent, verify_target: r.verifyTargetName,
-              verdict: r.verdict, reason: r.reason.slice(0, 120),
-              stage: "thumbnail",
-            });
-            continue;
-          }
-          if (r.kind === "rejected_verify_body") {
-            const k = `verify_${r.reason}`;
-            rejectTally[k] = (rejectTally[k] ?? 0) + 1;
-            segmentRejectionTotals[k] = (segmentRejectionTotals[k] ?? 0) + 1;
-            segmentRejectedTotal++;
-            await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand_verify.rejected", {
-              segment: i, videoId: r.videoId, title: r.title.slice(0, 100),
-              intentType, sourceIntent, verify_target: r.verifyTargetName,
-              thumb_verdict: r.thumbVerdict,
-              body_verdicts: r.bodyVerdicts.join(","),
-              reason: r.reason,
-              stage: "body",
-            });
-            continue;
-          }
-          // Accepted. Race-safe seenVideo recheck — possible only if two
-          // queries (rare) returned the same videoId; the second drops.
-          if (seenVideo.has(r.videoId)) { dupes++; continue; }
-          if (r.bodyVerdicts.length > 0) {
-            await logJob({ projectId: id, jobId: mediaJobId }, "analyze.cand_verify.accepted", {
-              segment: i, videoId: r.videoId, title: r.cand.title.slice(0, 80),
-              thumb_verdict: r.thumbVerdict,
-              body_verdicts: r.bodyVerdicts.join(","),
-            });
-          }
-          accepted++;
-          seenVideo.add(r.videoId);
-          segCandidates.push({
-            videoId: r.cand.videoId,
-            url: r.cand.url,
-            title: r.cand.title,
-            channelTitle: r.cand.channelTitle,
-            durationSeconds: r.cand.durationSeconds,
-            thumbnailUrl: `https://i.ytimg.com/vi/${r.cand.videoId}/mqdefault.jpg`,
-            score: r.ranked.score,
-            displayScore: r.ranked.displayScore,
-            reasons: r.ranked.reasons,
-            rejected: false,
-            matched_query: intent.query,
-            intended_subject: mainCelebrity ?? null,
-            source_intent: sourceIntent,
-            source_type: classifySourceType({
-              channelTitle: r.cand.channelTitle,
-              videoTitle: r.cand.title,
-            }),
-          });
-        }
-        await logJob({ projectId: id, jobId: mediaJobId }, "analyze.query.summary", {
-          segment: i,
-          query: intent.query,
-          intentType,
-          mainCelebrity: mainCelebrity ?? null,
-          keywords: segKeywords,
-          fetched: cands.length,
-          accepted,
-          dupes,
-          rejected: rejectTally,
-        });
-      }
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.segment.summary", {
-        segment: i,
-        global_main_subject: mainCelebrity ?? null,
-        segment_subject: u.segmentSubject || null,
-        inherited_subject: u.inheritedSubject,
-        segment_topic: u.segmentTopic || null,
-        generated_queries: u.searchIntents.map((it) => it.query),
-        rejected_results_count: segmentRejectedTotal,
-        rejection_reason: segmentRejectionTotals,
-      });
-      // Merge in the character pool — but ONLY a small fixed number of
-      // entries per segment. Earlier behaviour spliced every character
-      // clip into every segment, which flooded the per-segment pool with
-      // generic celebrity content (5 templates × N candidates each) and
-      // crowded out the story-aware results. New policy: keep the segment
-      // "mostly story" by taking the top CHARACTER_POOL_PER_SEGMENT
-      // character clips by score, after the -15 penalty. Story-aware
-      // candidates still win when both are present; the character clips
-      // serve as visual-variety filler for segments where the story
-      // search returns thin pickings.
-      //
-      // We pick from the highest-scoring character clips first so a single
-      // segment doesn't end up with the bottom of the pool. The penalty is
-      // applied BEFORE sorting so the comparison is apples-to-apples with
-      // story candidates that already accumulated their scores naturally.
-      const CHARACTER_POOL_PER_SEGMENT = 2;
-      const segVideoIds = new Set(segCandidates.map((c) => c.videoId));
-      const candidateCharClips = characterPool
-        .filter((c) => !segVideoIds.has(c.videoId))
-        .map((c) => ({
-          ...c,
-          score: Math.max(0, c.score - 15),
-          displayScore: Math.max(0, c.displayScore - 10),
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, CHARACTER_POOL_PER_SEGMENT);
-      for (const charCand of candidateCharClips) segCandidates.push(charCand);
-      segCandidates.sort((a, b) => b.score - a.score);
       const segDuration = Math.max(0, seg.endSeconds - seg.startSeconds);
       const segBlockCount = Math.max(1, Math.ceil(segDuration / plan.avgBlockSeconds));
       const segFootageNeeded = Math.ceil(segBlockCount * 0.6);
       const segImagesNeeded = Math.ceil(segBlockCount * 0.4);
-
-      // Editorial balance cap.
-      //
-      // Per client direction, a per-segment pool should NOT be dominated by
-      // news-format videos even when the narration is about a news event.
-      // On scandal segments the story-anchored queries naturally pull news
-      // hits because words like "lawsuit", "settlement", "scandal", and
-      // year tokens are exactly what YouTube treats as news-query signals.
-      // Without a cap, every slot ends up tagged source_type:"news" and
-      // the final video reads as a news segment, not a documentary.
-      //
-      // Hard 50/50 rule: of 8 cards per segment, at most NEWS_CAP can be
-      // news. Non-news cards (interview / archival / other) get the
-      // remaining slots even if their ranker scores are lower. We take
-      // both buckets in score-descending order so the BEST news and the
-      // BEST non-news land in the picker — we only refuse extra news
-      // once the cap is hit.
-      //
-      // If non-news is thinner than (8 - NEWS_CAP), the leftover slots
-      // are filled from any remaining news cards so we never under-fill
-      // a segment that genuinely has nothing else available.
-      const PICKER_TOTAL = 8;
-      const NEWS_CAP = 4;
-      const newsCands = segCandidates.filter((c) => c.source_type === "news");
-      const otherCands = segCandidates.filter((c) => c.source_type !== "news");
-      const pickedNews = newsCands.slice(0, NEWS_CAP);
-      const otherTarget = PICKER_TOTAL - pickedNews.length;
-      const pickedOther = otherCands.slice(0, otherTarget);
-      // If non-news ran out before filling its share, top up with extra news.
-      const leftover = PICKER_TOTAL - pickedNews.length - pickedOther.length;
-      const extraNews = leftover > 0 ? newsCands.slice(NEWS_CAP, NEWS_CAP + leftover) : [];
-      // Re-sort the union by score so the picker UI still shows the
-      // strongest matches first within the capped pool.
-      const trimmedCandidates = [...pickedNews, ...pickedOther, ...extraNews]
-        .sort((a, b) => b.score - a.score);
-      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.editorial_cap", {
-        segment: i,
-        total: trimmedCandidates.length,
-        news: trimmedCandidates.filter((c) => c.source_type === "news").length,
-        interview: trimmedCandidates.filter((c) => c.source_type === "interview").length,
-        archival: trimmedCandidates.filter((c) => c.source_type === "archival").length,
-        other: trimmedCandidates.filter((c) => c.source_type === "other").length,
-        news_cap: NEWS_CAP,
-        dropped_news: Math.max(0, newsCands.length - pickedNews.length - extraNews.length),
-      });
+      const segCandidates = globalSorted.slice(0, reviewPoolSize);
       segmentAnalyses.push({
         index: seg.index,
         startSeconds: seg.startSeconds,
@@ -1036,47 +845,51 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         wordCount: seg.wordCount,
         textPreview: seg.text.slice(0, 220),
         understanding: u,
-        candidates: trimmedCandidates,
+        candidates: segCandidates,
         plan: {
           durationSeconds: segDuration,
           blockCount: segBlockCount,
           footageNeeded: segFootageNeeded,
           imagesNeeded: segImagesNeeded,
-          generatedClips: trimmedCandidates.length,
+          generatedClips: segCandidates.length,
           requiredClips: segFootageNeeded,
         },
       });
-      await setMediaJob(mediaJobId, {
-        progress: 35 + Math.floor(((i + 1) / segments.length) * 55),
-      });
     }
+    await setMediaJob(mediaJobId, { progress: 88 });
 
     // 3) Persist all candidates so the workspace can re-render preview state
-    //    without re-running the Gemini + YouTube spend.
-    const rows = segmentAnalyses.flatMap((s) =>
-      s.candidates.map((c) => ({
-        project_id: id,
-        youtube_video_id: c.videoId,
-        url: c.url,
-        title: c.title,
-        description: null,
-        channel_id: null,
-        channel_title: c.channelTitle,
-        duration_seconds: c.durationSeconds,
-        score: c.score,
-        status: "candidate" as const,
-        metadata: {
-          segment_index: s.index,
-          thumbnail_url: c.thumbnailUrl,
-          reasons: c.reasons,
-          display_score: c.displayScore,
-          matched_query: c.matched_query,
-          intended_subject: c.intended_subject,
-          source_intent: c.source_intent,
-          source_type: c.source_type,
-        },
-      }))
-    );
+    //    without re-running the Gemini + YouTube spend. One row per UNIQUE
+    //    candidate in the global pool (deduped), tagged with the entity it was
+    //    discovered under. segment_index is null — candidates are project-wide
+    //    in the entity-driven model; the matcher binds clips to sections later.
+    const rows = Array.from(globalPool.values()).map((c) => ({
+      project_id: id,
+      youtube_video_id: c.videoId,
+      url: c.url,
+      title: c.title,
+      description: null,
+      channel_id: null,
+      channel_title: c.channelTitle,
+      duration_seconds: c.durationSeconds,
+      score: c.score,
+      status: "candidate" as const,
+      metadata: {
+        segment_index: null,
+        entity_value: c.entity_value,
+        entity_type: c.entity_type,
+        from_reference_channel: c.from_reference_channel,
+        from_approved: c.from_approved,
+        thumbnail_url: c.thumbnailUrl,
+        reasons: c.reasons,
+        display_score: c.displayScore,
+        matched_query: c.matched_query,
+        intended_subject: c.intended_subject,
+        source_intent: c.source_intent,
+        source_type: c.source_type,
+        footage_style: c.footage_style,
+      },
+    }));
     if (rows.length) {
       const { error } = await sb.from("youtube_search_results").insert(rows);
       if (error) {
@@ -1084,16 +897,43 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       }
     }
 
-    const totalGeneratedClips = segmentAnalyses.reduce(
-      (s, seg) => s + seg.plan.generatedClips,
-      0,
-    );
+    // Entity-grouped review payload. This is the primary view the UI renders:
+    // one source-video pool per celebrity/entity, with a per-entity selection
+    // target. We strip the internal-only flags the UI doesn't need.
+    const entitiesPayload = entityGroups.map((g) => ({
+      value: g.value,
+      type: g.type,
+      target: g.target,
+      candidates: g.candidates.map((c) => ({
+        videoId: c.videoId,
+        url: c.url,
+        title: c.title,
+        channelTitle: c.channelTitle,
+        durationSeconds: c.durationSeconds,
+        thumbnailUrl: c.thumbnailUrl,
+        score: c.score,
+        displayScore: c.displayScore,
+        reasons: c.reasons,
+        rejected: false,
+        matched_query: c.matched_query,
+        intended_subject: c.intended_subject,
+        source_intent: c.source_intent,
+        source_type: c.source_type,
+        from_reference_channel: c.from_reference_channel,
+        from_approved: c.from_approved,
+        footage_style: c.footage_style,
+      })),
+    }));
+
+    const totalGeneratedClips = globalPool.size;
     const payload = {
       projectId: id,
       totalDurationSeconds,
       voiceoverDurationSeconds,
       estimatedDurationSeconds,
       wordCount: transcript.split(/\s+/).filter(Boolean).length,
+      sourceTarget,
+      reviewPoolSize,
       plan: {
         voiceoverSeconds: plan.voiceoverSeconds,
         avgBlockSeconds: plan.avgBlockSeconds,
@@ -1103,6 +943,10 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         bucket: plan.bucket,
         generatedClips: totalGeneratedClips,
       },
+      // Primary view: source videos grouped by entity.
+      entities: entitiesPayload,
+      // Retained for the matcher + back-compat consumers (each segment's
+      // candidate list is the shared global pool).
       segments: segmentAnalyses,
     };
 

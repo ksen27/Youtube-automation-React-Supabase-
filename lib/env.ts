@@ -74,6 +74,23 @@ const ServerEnvSchema = z.object({
   // and compete with story-aware candidates via the existing ranker.
   ANALYZE_CHARACTER_LANE_ENABLED: z.coerce.boolean().default(true),
   MAX_VIDEOS_PER_PROJECT: z.coerce.number().int().positive().default(5),
+  // Subject-first source-video target. The number of source videos we aim to
+  // SELECT scales with voiceover duration instead of a flat constant: the
+  // longer the narration, the more distinct footage sources it needs. Client
+  // direction: 8 source videos per 5 minutes of audio. computeSourceVideoTarget
+  // below turns these knobs into a per-project count.
+  //   PER_WINDOW   – source videos per SOURCE_TARGET_WINDOW_SECONDS of audio.
+  //   WINDOW       – the window the rate is expressed over (300s = 5min).
+  //   FLOOR/CEIL   – clamp so very short clips still get a few sources and very
+  //                  long ones don't explode the download/clip workload.
+  SOURCE_TARGET_PER_WINDOW: z.coerce.number().int().positive().default(8),
+  SOURCE_TARGET_WINDOW_SECONDS: z.coerce.number().int().positive().default(300),
+  SOURCE_TARGET_FLOOR: z.coerce.number().int().positive().default(3),
+  SOURCE_TARGET_CEILING: z.coerce.number().int().positive().default(30),
+  // How many candidates to surface for review per the selected target. The
+  // review pool is larger than the target so the user has real choice when
+  // pruning wrong-person / off-topic videos. 1.5× the target by default.
+  SOURCE_REVIEW_POOL_FACTOR: z.coerce.number().positive().default(1.5),
   MIN_SUCCESSFUL_VIDEOS_PER_PROJECT: z.coerce.number().int().nonnegative().default(2),
   MAX_FALLBACK_PROMOTIONS_PER_PROJECT: z.coerce.number().int().nonnegative().default(5),
   MAX_CLIPS_PER_VIDEO: z.coerce.number().int().positive().default(20),
@@ -218,4 +235,29 @@ export function computeProjectClipCap(voiceoverSeconds: number | null | undefine
   const plan = planTimeline(voiceoverSeconds);
   const target = Math.ceil(plan.footageBlocks * env.CLIP_OVERSAMPLING_FACTOR);
   return Math.min(env.MAX_CLIP_CAP, Math.max(env.MIN_CLIP_CAP, target));
+}
+
+// How many SOURCE VIDEOS to target for a project, sized to voiceover length.
+// This replaces the flat MAX_VIDEOS_PER_PROJECT for the subject-first
+// discovery/review flow: the count scales at SOURCE_TARGET_PER_WINDOW per
+// SOURCE_TARGET_WINDOW_SECONDS (default 8 per 5 min), clamped to
+// [FLOOR, CEILING]. Falls back to the floor when duration isn't known yet.
+//
+// Returns BOTH the target (how many to select) and the review pool size (how
+// many candidates to surface for pruning, = target × SOURCE_REVIEW_POOL_FACTOR).
+export function computeSourceVideoTarget(
+  voiceoverSeconds: number | null | undefined,
+): { target: number; reviewPoolSize: number } {
+  const env = getEnv();
+  let target: number;
+  if (!voiceoverSeconds || voiceoverSeconds <= 0) {
+    target = env.SOURCE_TARGET_FLOOR;
+  } else {
+    const raw = Math.round(
+      (voiceoverSeconds / env.SOURCE_TARGET_WINDOW_SECONDS) * env.SOURCE_TARGET_PER_WINDOW,
+    );
+    target = Math.min(env.SOURCE_TARGET_CEILING, Math.max(env.SOURCE_TARGET_FLOOR, raw));
+  }
+  const reviewPoolSize = Math.max(target, Math.round(target * env.SOURCE_REVIEW_POOL_FACTOR));
+  return { target, reviewPoolSize };
 }

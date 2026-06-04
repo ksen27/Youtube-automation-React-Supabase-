@@ -38,9 +38,19 @@ export const dynamic = "force-dynamic";
 
 const UuidSchema = z.string().uuid();
 
+// Accepts EITHER an entityValue (entity-driven payloads — the primary path) OR
+// a segmentIndex (legacy per-segment payloads). Exactly one is required.
 const BodySchema = z.object({
   videoUrl: z.string().min(1),
-  segmentIndex: z.number().int().nonnegative(),
+  entityValue: z.string().min(1).optional(),
+  segmentIndex: z.number().int().nonnegative().optional(),
+  // When true, skip the ranker + face-verify gates and add the video as-is.
+  // Used by the in-app YouTube search picker: the user explicitly chose the
+  // thumbnail, so their pick wins over the automated quality filters. The
+  // candidate is still hydrated (so we have real metadata) and deduped.
+  skipFilters: z.boolean().optional(),
+}).refine((b) => b.entityValue != null || b.segmentIndex != null, {
+  message: "entityValue or segmentIndex required",
 });
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -52,7 +62,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!parsedBody.success) {
     return NextResponse.json({ error: "invalid body", issues: parsedBody.error.flatten() }, { status: 400 });
   }
-  const { videoUrl, segmentIndex } = parsedBody.data;
+  const { videoUrl, segmentIndex, entityValue, skipFilters } = parsedBody.data;
   const videoId = extractYoutubeVideoId(videoUrl);
   if (!videoId) {
     return NextResponse.json({ accepted: false, reason: "not a valid YouTube URL" });
@@ -75,6 +85,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const mediaJobId = latest.id as string;
   const meta = (latest.metadata ?? {}) as Record<string, unknown>;
   const payload = (meta.payload ?? null) as null | {
+    entities?: Array<{
+      value: string;
+      type: string;
+      target: number;
+      candidates: Array<Record<string, unknown>>;
+    }>;
     segments: Array<{
       index: number;
       understanding: {
@@ -94,14 +110,27 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   if (!payload) {
     return NextResponse.json({ error: "no analyze payload to amend" }, { status: 409 });
   }
-  const segment = payload.segments.find((s) => s.index === segmentIndex);
-  if (!segment) {
+
+  // Locate the target pool. Entity-driven payloads amend payload.entities[];
+  // legacy payloads amend payload.segments[]. We resolve `segment` (the
+  // understanding source for the ranker) and `targetPool` (where the new
+  // candidate is appended) up front so the rest of the handler is path-agnostic.
+  const entityGroup = entityValue
+    ? (payload.entities ?? []).find((e) => e.value.toLowerCase() === entityValue.toLowerCase())
+    : undefined;
+  const segment = entityValue
+    ? undefined
+    : payload.segments.find((s) => s.index === segmentIndex);
+  if (entityValue && !entityGroup) {
+    return NextResponse.json({ error: `entity "${entityValue}" not found` }, { status: 400 });
+  }
+  if (!entityValue && !segment) {
     return NextResponse.json({ error: `segment ${segmentIndex} not found` }, { status: 400 });
   }
-  // Already in this segment? Refuse to add a duplicate; the user is
-  // probably re-pasting a URL they already have.
-  if (segment.candidates.some((c) => (c as { videoId?: string }).videoId === videoId)) {
-    return NextResponse.json({ accepted: false, reason: "already in this segment's pool" });
+  const targetPool = (entityGroup?.candidates ?? segment!.candidates) as Array<Record<string, unknown>>;
+  // Already in this pool? Refuse a duplicate (user re-pasting a known URL).
+  if (targetPool.some((c) => (c as { videoId?: string }).videoId === videoId)) {
+    return NextResponse.json({ accepted: false, reason: "already in this pool" });
   }
 
   let cand: Awaited<ReturnType<typeof fetchYoutubeVideoMeta>>;
@@ -117,16 +146,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ accepted: false, reason: "video unavailable (private / deleted / region-blocked)" });
   }
 
-  // Run the ranker with the same inputs analyze used. We pull the
-  // project's main celebrity + context terms from the existing entity
-  // rows so the score reflects the same per-segment signal the AI's
-  // automatic picks had.
-  const u = segment.understanding ?? {};
-  const segmentEntities = Array.from(new Set([
-    ...(u.people ?? []),
-    ...(u.places ?? []),
-    ...(u.events ?? []),
-  ].filter(Boolean)));
+  // Run the ranker with the same inputs analyze used. The subject differs by
+  // path: entity-driven payloads rank against the entity the user is adding to;
+  // legacy segment payloads rank against the project celebrity + segment
+  // understanding.
+  const u = segment?.understanding ?? {};
 
   // Look up celebrity + aliases + context terms from project_entities,
   // matching the analyze pipeline's behaviour.
@@ -135,12 +159,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     .select("type, value")
     .eq("project_id", id);
   const celebrityFromEnts = (entRows ?? []).find((r) => r.type === "celebrity")?.value as string | undefined;
-  const mainCelebrity = celebrityFromEnts ?? (u.segmentSubject || undefined);
-  const subjectAliases = mainCelebrity ? [mainCelebrity] : [];
-  const contextTerms = (entRows ?? [])
+  const projectCompanies = (entRows ?? [])
     .filter((r) => r.type === "company")
     .map((r) => String(r.value))
     .slice(0, 10);
+
+  // Subject = the entity (entity path) or the project celebrity (legacy path).
+  const mainCelebrity = entityGroup?.value ?? celebrityFromEnts ?? (u.segmentSubject || undefined);
+  const subjectAliases = mainCelebrity ? [mainCelebrity] : [];
+  // Context/segment anchors only apply on the legacy segment path; the entity
+  // path is a clean "footage of this person" search with no segment context.
+  const contextTerms = entityGroup ? [] : projectCompanies;
+  const segmentEntities = entityGroup
+    ? []
+    : Array.from(new Set([
+        ...(u.people ?? []),
+        ...(u.places ?? []),
+        ...(u.events ?? []),
+      ].filter(Boolean)));
 
   const { approved, blocked } = await loadChannelRules();
   const env = getEnv();
@@ -151,15 +187,19 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     aliases: subjectAliases,
     contextTerms,
     segmentEntities,
-    segmentTopic: u.segmentTopic || u.mainTopic || "",
+    segmentTopic: entityGroup ? "" : (u.segmentTopic || u.mainTopic || ""),
     matchedQuery: videoUrl,
-    inheritedSegment: u.inheritedSubject ?? false,
-    keywords: u.relatedKeywords ?? [],
+    inheritedSegment: entityGroup ? false : (u.inheritedSubject ?? false),
+    keywords: entityGroup ? [] : (u.relatedKeywords ?? []),
     approvedChannelIds: approved,
     blockedChannelIds: blocked,
     intentType: "talking_head",
   });
-  if (ranked.rejected) {
+  // Quality gates are skipped for explicit manual picks (the in-app YouTube
+  // search picker). The user chose this thumbnail; their choice overrides the
+  // ranker/face-verify. We still hydrated real metadata above, so the row is
+  // well-formed. A score of 0 from the ranker is fine — it just sorts low.
+  if (ranked.rejected && !skipFilters) {
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.add_source.rejected", {
       videoId, reason: ranked.rejectReason, reasons: ranked.reasons,
     });
@@ -170,8 +210,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     });
   }
 
-  // Face / body verify — gated by the analyze flag like the AI search.
-  if (env.ANALYZE_FACE_VERIFY_ENABLED && mainCelebrity) {
+  // Face / body verify — gated by the analyze flag like the AI search. Skipped
+  // for manual picks.
+  if (!skipFilters && env.ANALYZE_FACE_VERIFY_ENABLED && mainCelebrity) {
     const thumb = `https://i.ytimg.com/vi/${cand.videoId}/mqdefault.jpg`;
     let thumbVerdict;
     try {
@@ -220,6 +261,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     intended_subject: mainCelebrity ?? null,
     source_intent: "person" as const,
     source_type: sourceType,
+    // Entity-path candidates carry the same provenance the AI search emits so
+    // the UI badges + confirm-sources approval recording work identically.
+    ...(entityGroup
+      ? { entity_value: entityGroup.value, entity_type: entityGroup.type, from_reference_channel: false, from_approved: false }
+      : {}),
   };
 
   // Persist to youtube_search_results — same row shape as the analyze
@@ -237,7 +283,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     score: ranked.score,
     status: "candidate" as const,
     metadata: {
-      segment_index: segmentIndex,
+      segment_index: entityGroup ? null : segmentIndex,
+      entity_value: entityGroup?.value ?? null,
+      entity_type: entityGroup?.type ?? null,
+      from_reference_channel: false,
+      from_approved: false,
       thumbnail_url: thumbnailUrl,
       reasons: newCandidate.reasons,
       display_score: ranked.displayScore,
@@ -264,10 +314,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "could not persist candidate" }, { status: 500 });
   }
 
-  // Patch the saved payload so a refresh sees the new candidate
-  // without re-running analyze.
-  segment.candidates.push(newCandidate as unknown as Record<string, unknown>);
-  segment.plan.generatedClips = segment.candidates.length;
+  // Patch the saved payload so a refresh sees the new candidate without
+  // re-running analyze. Push into whichever pool we resolved (entity or
+  // segment); update the segment plan counter only on the legacy path.
+  targetPool.push(newCandidate as unknown as Record<string, unknown>);
+  if (segment) segment.plan.generatedClips = segment.candidates.length;
   const newMetadata = { ...meta, payload };
   const { error: mdErr } = await sb
     .from("media_jobs")

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { createMediaJob, setProjectStatus, logJob } from "@/lib/jobs/db";
 import { enqueueDownload } from "@/lib/jobs/queue";
+import { recordApprovedSource } from "@/lib/youtube/search";
 
 // Persist the user's video selection from the Analyze & Search screen, then
 // kick off the existing download pipeline (one media_job per accepted video).
@@ -28,7 +29,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const sb = getServerSupabase();
   const { data: candidates, error: candErr } = await sb
     .from("youtube_search_results")
-    .select("youtube_video_id, url, title, channel_id, channel_title, duration_seconds")
+    .select("youtube_video_id, url, title, channel_id, channel_title, duration_seconds, metadata")
     .eq("project_id", id)
     .in("youtube_video_id", parsed.data.selectedVideoIds);
   if (candErr) return NextResponse.json({ error: candErr.message }, { status: 500 });
@@ -64,6 +65,36 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     .eq("status", "candidate");
 
   await setProjectStatus(id, "downloading");
+
+  // Record each confirmed source as APPROVED for its entity — cross-project
+  // memory (Phase 3). A future project featuring the same celebrity re-surfaces
+  // these as top-ranked candidates at zero API cost. Best-effort: an approval
+  // write failure must not block the download pipeline.
+  for (const c of candidates) {
+    const md = (c.metadata ?? {}) as Record<string, unknown>;
+    const entityValue = typeof md.entity_value === "string" ? md.entity_value
+      : typeof md.intended_subject === "string" ? md.intended_subject : "";
+    if (!entityValue) continue;
+    try {
+      await recordApprovedSource({
+        entityValue,
+        entityType: typeof md.entity_type === "string" ? md.entity_type : null,
+        fromProjectId: id,
+        video: {
+          youtubeVideoId: c.youtube_video_id,
+          url: c.url ?? null,
+          title: c.title ?? null,
+          channelId: c.channel_id ?? null,
+          channelTitle: c.channel_title ?? null,
+          durationSeconds: c.duration_seconds ?? null,
+        },
+      });
+    } catch (e) {
+      await logJob({ projectId: id }, "confirm_sources.approve_failed", {
+        videoId: c.youtube_video_id, err: (e as Error).message?.slice(0, 160),
+      });
+    }
+  }
 
   for (const c of candidates) {
     const url = c.url ?? `https://www.youtube.com/watch?v=${c.youtube_video_id}`;

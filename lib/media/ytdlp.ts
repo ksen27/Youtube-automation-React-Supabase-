@@ -55,6 +55,12 @@ function isProxyRelatedError(stderr: string): boolean {
     s.includes("http error 403") ||                  // forbidden — often proxy-IP-block
     s.includes("too many requests") ||
     s.includes("unable to download webpage") ||      // generic network / blocked
+    s.includes("unable to download api page") ||     // YT innertube API via dead proxy
+    s.includes("tunnel connection failed") ||        // proxy gateway 502/503 on CONNECT
+    s.includes("502 bad gateway") ||
+    s.includes("503 service") ||
+    s.includes("proxyerror") ||                      // python urllib ProxyError
+    s.includes("unable to connect to proxy") ||      // dead/unreachable proxy endpoint
     s.includes("connection reset") ||
     s.includes("operation timed out") ||
     s.includes("read timed out")
@@ -152,6 +158,87 @@ export async function downloadYoutubeAudio(opts: YtDlpRunOptions): Promise<YtDlp
     ?? entries.find((f) => f.startsWith(opts.videoId));
   if (!found) throw new Error(`yt-dlp audio finished but no output file found for ${opts.videoId}`);
   return { outputPath: path.join(opts.outputDir, found) };
+}
+
+// ---------------------------------------------------------------------------
+// Search (quota-free fallback for the YouTube Data API)
+// ---------------------------------------------------------------------------
+
+// One raw result line from `yt-dlp ytsearchN: --dump-json --flat-playlist`.
+// flat-playlist keeps it cheap (no per-video page fetch): we get id/title/
+// channel/duration without hydrating each video. Fields are best-effort —
+// yt-dlp's flat output omits some depending on the extractor version.
+export interface YtDlpSearchResult {
+  videoId: string;
+  title: string;
+  channelId: string | null;
+  channelTitle: string | null;
+  durationSeconds: number | null;
+}
+
+// Search YouTube via yt-dlp instead of the Data API. Costs ZERO API quota —
+// this is the fallback for when search.list returns 403 quotaExceeded. It
+// scrapes YouTube's search results page, so it's against the Data API ToS and
+// more fragile than the official path; callers should prefer the API and only
+// reach here when quota is exhausted.
+//
+// Returns up to `maxResults` results. `channelId`, when set, scopes the search
+// to that channel by querying its handle via the ytsearch query — but yt-dlp
+// has no reliable channel filter on ytsearch, so channel-scoped fallback is
+// best-effort and the caller should filter by channelId afterwards.
+export async function searchYoutubeViaYtDlp(
+  query: string,
+  maxResults = 15,
+  signal?: AbortSignal,
+): Promise<YtDlpSearchResult[]> {
+  const searchSpec = `ytsearch${Math.max(1, Math.min(50, maxResults))}:${query}`;
+  const lines: string[] = [];
+  let buffer = "";
+  await runYtDlpWithProxyRetry({
+    buildArgs: (proxy) => [
+      "--dump-json",
+      "--flat-playlist",
+      "--no-warnings",
+      "--no-progress",
+      "--ignore-errors",
+      "--socket-timeout", "30",
+      ...(proxy ? ["--proxy", proxy] : []),
+      searchSpec,
+    ],
+    label: `searchYoutubeViaYtDlp[${query.slice(0, 40)}]`,
+    signal,
+    onLog: (chunk) => {
+      // --dump-json emits one JSON object per line on stdout. Accumulate and
+      // split on newlines; a trailing partial line is kept in `buffer`.
+      buffer += chunk;
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (line.startsWith("{")) lines.push(line);
+      }
+    },
+  });
+  if (buffer.trim().startsWith("{")) lines.push(buffer.trim());
+
+  const out: YtDlpSearchResult[] = [];
+  for (const line of lines) {
+    let obj: Record<string, unknown>;
+    try { obj = JSON.parse(line); } catch { continue; }
+    const id = typeof obj.id === "string" ? obj.id : null;
+    if (!id) continue;
+    const dur = typeof obj.duration === "number" ? obj.duration : null;
+    out.push({
+      videoId: id,
+      title: typeof obj.title === "string" ? obj.title : "",
+      channelId: typeof obj.channel_id === "string" ? obj.channel_id
+               : typeof obj.uploader_id === "string" ? obj.uploader_id : null,
+      channelTitle: typeof obj.channel === "string" ? obj.channel
+                  : typeof obj.uploader === "string" ? obj.uploader : null,
+      durationSeconds: dur,
+    });
+  }
+  return out;
 }
 
 // Run yt-dlp with proxy rotation on retry. The build callback receives the

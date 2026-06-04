@@ -1,13 +1,40 @@
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { searchYoutubeViaYtDlp } from "@/lib/media/ytdlp";
 
 // YouTube Data API v3 wrapper.
-// Quota: each search.list call is ~100 units; videos.list is 1.
-// API key: enable "YouTube Data API v3" at https://console.cloud.google.com/apis
+// Quota: each search.list call is ~100 units; videos.list is 1;
+// playlistItems.list is 1. API key: enable "YouTube Data API v3" at
+// https://console.cloud.google.com/apis
 
 const SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
 const VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos";
+const CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels";
+const PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems";
+
+// TTL for cached search results. Footage queries are stable day-to-day, so a
+// 14-day window trades a little freshness for a large quota saving on repeat
+// subjects across projects.
+const SEARCH_CACHE_TTL_DAYS = 14;
+
+// Error sentinel: thrown (and detected) when the Data API returns a
+// quota-exhaustion error. Callers catch this to fall back to yt-dlp search.
+export class YoutubeQuotaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "YoutubeQuotaError";
+  }
+}
+
+// YouTube signals quota exhaustion with HTTP 403 and a body whose reason is
+// "quotaExceeded" / "dailyLimitExceeded". We match on the raw body text since
+// we only have the stringified error here.
+function isQuotaError(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  const b = body.toLowerCase();
+  return b.includes("quotaexceeded") || b.includes("dailylimitexceeded");
+}
 
 export interface YoutubeCandidate {
   videoId: string;
@@ -33,6 +60,11 @@ export interface SearchInput {
   query: string;
   maxResults?: number;
   relevanceLanguage?: string;
+  // When set, restricts the search to a single channel (YouTube's native
+  // `channelId` filter on search.list). This is how the subject-centric
+  // pipeline searches reference channels FIRST: run the subject queries
+  // scoped to each reference channel before ever touching open YouTube.
+  channelId?: string;
 }
 
 const SearchItemSchema = z.object({
@@ -48,6 +80,91 @@ const SearchItemSchema = z.object({
     liveBroadcastContent: z.string().optional(),
   }),
 });
+
+// Lightweight result for the FAST manual-search path: snippet-only, no
+// videos.list hydration. A search picker only needs a thumbnail, title, and
+// channel — duration/privacy/aspect are resolved later at add-time.
+export interface FastSearchResult {
+  videoId: string;
+  url: string;
+  title: string;
+  channelTitle: string;
+  channelId: string;
+  thumbnailUrl: string;
+}
+
+// search.list snippet carries thumbnails directly — we read the medium/high
+// thumbnail off it so the fast path needs zero extra calls.
+const FastSearchItemSchema = z.object({
+  id: z.object({ kind: z.string(), videoId: z.string().optional() }),
+  snippet: z.object({
+    title: z.string(),
+    channelId: z.string(),
+    channelTitle: z.string(),
+    thumbnails: z.object({
+      default: z.object({ url: z.string().optional() }).optional(),
+      medium: z.object({ url: z.string().optional() }).optional(),
+      high: z.object({ url: z.string().optional() }).optional(),
+    }).optional(),
+  }),
+});
+
+// FAST search for the in-app manual picker. ONE search.list call (no videos.list
+// hydration, no per-channel loop). Renders thumbnails straight from the search
+// snippet, so it's near-instant — matching a typical "type and see results"
+// picker. Quota: ~100 units per call. Falls back to yt-dlp on quota exhaustion.
+export async function searchYoutubeFast(query: string, maxResults = 24): Promise<FastSearchResult[]> {
+  const env = getEnv();
+  if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");
+  const params = new URLSearchParams({
+    part: "snippet",
+    q: query,
+    type: "video",
+    maxResults: String(Math.min(50, Math.max(1, maxResults))),
+    relevanceLanguage: "en",
+    safeSearch: "moderate",
+    videoEmbeddable: "true",
+    key: env.YOUTUBE_API_KEY,
+  });
+  const r = await fetch(`${SEARCH_URL}?${params}`);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    if (isQuotaError(r.status, txt)) {
+      // Quota out — fall back to yt-dlp scrape (no hydration; build thumb URL).
+      const scraped = await searchYoutubeViaYtDlp(query, maxResults).catch(() => []);
+      return scraped.map((s) => ({
+        videoId: s.videoId,
+        url: `https://www.youtube.com/watch?v=${s.videoId}`,
+        title: s.title,
+        channelTitle: s.channelTitle ?? "",
+        channelId: s.channelId ?? "",
+        thumbnailUrl: `https://i.ytimg.com/vi/${s.videoId}/mqdefault.jpg`,
+      }));
+    }
+    throw new Error(`YouTube search failed: ${r.status} ${txt.slice(0, 300)}`);
+  }
+  const json = await r.json();
+  const out: FastSearchResult[] = [];
+  for (const raw of json.items ?? []) {
+    const safe = FastSearchItemSchema.safeParse(raw);
+    if (!safe.success) continue;
+    if (safe.data.id.kind !== "youtube#video" || !safe.data.id.videoId) continue;
+    const id = safe.data.id.videoId;
+    const thumbs = safe.data.snippet.thumbnails;
+    const thumbnailUrl =
+      thumbs?.high?.url || thumbs?.medium?.url || thumbs?.default?.url ||
+      `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
+    out.push({
+      videoId: id,
+      url: `https://www.youtube.com/watch?v=${id}`,
+      title: safe.data.snippet.title,
+      channelTitle: safe.data.snippet.channelTitle,
+      channelId: safe.data.snippet.channelId,
+      thumbnailUrl,
+    });
+  }
+  return out;
+}
 
 // YouTube's thumbnail object always mirrors the source video's aspect ratio:
 // horizontal 16:9 video → horizontal thumbnail; vertical 9:16 Short → vertical
@@ -141,10 +258,17 @@ export async function searchYoutube(input: SearchInput): Promise<YoutubeCandidat
     videoEmbeddable: "true",
     key: env.YOUTUBE_API_KEY,
   });
+  // Scope to a single channel when requested. With channelId set, YouTube
+  // returns only that channel's uploads matching `q` — the basis of
+  // reference-channel-first discovery.
+  if (input.channelId) params.set("channelId", input.channelId);
 
   const r = await fetch(`${SEARCH_URL}?${params}`);
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
+    if (isQuotaError(r.status, txt)) {
+      throw new YoutubeQuotaError(`YouTube search quota exceeded: ${txt.slice(0, 200)}`);
+    }
     throw new Error(`YouTube search failed: ${r.status} ${txt.slice(0, 300)}`);
   }
   const json = await r.json();
@@ -156,38 +280,246 @@ export async function searchYoutube(input: SearchInput): Promise<YoutubeCandidat
     ids.push(safe.data.id.videoId);
   }
   if (!ids.length) return [];
+  return hydrateVideoIds(ids);
+}
 
-  // Hydrate with full duration / privacy info
-  const vparams = new URLSearchParams({
-    part: "snippet,contentDetails,status",
-    id: ids.join(","),
-    key: env.YOUTUBE_API_KEY,
-  });
-  const vr = await fetch(`${VIDEOS_URL}?${vparams}`);
-  if (!vr.ok) {
-    const txt = await vr.text().catch(() => "");
-    throw new Error(`YouTube videos.list failed: ${vr.status} ${txt.slice(0, 300)}`);
-  }
-  const vjson = await vr.json();
+// Hydrate a list of video ids to full YoutubeCandidate[] via videos.list
+// (1 quota unit per call, up to 50 ids). Shared by searchYoutube and the
+// yt-dlp fallback path (which only gets ids + sparse metadata from scraping
+// and needs the official call for accurate duration / privacy / aspect).
+// Batches into groups of 50 (the videos.list id cap).
+export async function hydrateVideoIds(ids: string[]): Promise<YoutubeCandidate[]> {
+  const env = getEnv();
+  if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");
   const out: YoutubeCandidate[] = [];
-  for (const raw of vjson.items ?? []) {
-    const safe = VideoItemSchema.safeParse(raw);
-    if (!safe.success) continue;
-    out.push({
-      videoId: safe.data.id,
-      url: `https://www.youtube.com/watch?v=${safe.data.id}`,
-      title: safe.data.snippet.title,
-      description: safe.data.snippet.description ?? "",
-      channelId: safe.data.snippet.channelId,
-      channelTitle: safe.data.snippet.channelTitle,
-      durationSeconds: parseISO8601Duration(safe.data.contentDetails.duration),
-      isLive: safe.data.snippet.liveBroadcastContent === "live"
-            || safe.data.snippet.liveBroadcastContent === "upcoming",
-      privacyStatus: safe.data.status?.privacyStatus ?? "public",
-      aspectRatio: pickAspectRatio(safe.data.snippet.thumbnails),
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    const vparams = new URLSearchParams({
+      part: "snippet,contentDetails,status",
+      id: batch.join(","),
+      key: env.YOUTUBE_API_KEY,
     });
+    const vr = await fetch(`${VIDEOS_URL}?${vparams}`);
+    if (!vr.ok) {
+      const txt = await vr.text().catch(() => "");
+      if (isQuotaError(vr.status, txt)) {
+        throw new YoutubeQuotaError(`YouTube videos.list quota exceeded: ${txt.slice(0, 200)}`);
+      }
+      throw new Error(`YouTube videos.list failed: ${vr.status} ${txt.slice(0, 300)}`);
+    }
+    const vjson = await vr.json();
+    for (const raw of vjson.items ?? []) {
+      const safe = VideoItemSchema.safeParse(raw);
+      if (!safe.success) continue;
+      out.push({
+        videoId: safe.data.id,
+        url: `https://www.youtube.com/watch?v=${safe.data.id}`,
+        title: safe.data.snippet.title,
+        description: safe.data.snippet.description ?? "",
+        channelId: safe.data.snippet.channelId,
+        channelTitle: safe.data.snippet.channelTitle,
+        durationSeconds: parseISO8601Duration(safe.data.contentDetails.duration),
+        isLive: safe.data.snippet.liveBroadcastContent === "live"
+              || safe.data.snippet.liveBroadcastContent === "upcoming",
+        privacyStatus: safe.data.status?.privacyStatus ?? "public",
+        aspectRatio: pickAspectRatio(safe.data.snippet.thumbnails),
+      });
+    }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Quota-aware cached search
+// ---------------------------------------------------------------------------
+
+// Normalize a query (+ optional channel) into a stable cache key. Lowercase +
+// whitespace-collapse so "Simon Cowell  interview" and "simon cowell interview"
+// share a cache row.
+function cacheKeyFor(query: string, channelId?: string): string {
+  const q = query.trim().toLowerCase().replace(/\s+/g, " ");
+  return `${q}|${channelId ?? ""}`;
+}
+
+// Look up a non-expired cache row. Returns the cached candidates, or null on
+// miss / expiry / error (a cache failure must never break search).
+async function readSearchCache(query: string, channelId?: string): Promise<YoutubeCandidate[] | null> {
+  try {
+    const sb = getServerSupabase();
+    const key = cacheKeyFor(query, channelId);
+    const { data, error } = await sb
+      .from("youtube_search_cache")
+      .select("candidates, expires_at")
+      .eq("cache_key", key)
+      .maybeSingle();
+    if (error || !data) return null;
+    if (new Date(data.expires_at as string).getTime() < nowMs()) return null;
+    const cands = data.candidates as unknown;
+    return Array.isArray(cands) ? (cands as YoutubeCandidate[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Persist (upsert) search results into the cache with a fresh TTL. Best-effort:
+// a write failure is logged-as-swallowed since it only costs a future cache hit.
+async function writeSearchCache(
+  query: string,
+  channelId: string | undefined,
+  candidates: YoutubeCandidate[],
+  source: "api" | "ytdlp",
+): Promise<void> {
+  try {
+    const sb = getServerSupabase();
+    const key = cacheKeyFor(query, channelId);
+    const expires = new Date(nowMs() + SEARCH_CACHE_TTL_DAYS * 86400_000).toISOString();
+    await sb.from("youtube_search_cache").upsert(
+      {
+        cache_key: key,
+        query: query.trim(),
+        channel_id: channelId ?? null,
+        candidates: candidates as unknown as object,
+        source,
+        expires_at: expires,
+      },
+      { onConflict: "cache_key" },
+    );
+  } catch {
+    // ignore — cache is an optimization, not a correctness requirement
+  }
+}
+
+// Wall-clock helper kept in one place so it's easy to stub in tests.
+function nowMs(): number {
+  return Date.now();
+}
+
+// Reference-channel recall via the uploads playlist (1 quota unit per 50
+// videos) instead of a channel-scoped search.list (100 units). Every channel's
+// uploads live in a playlist whose id is the channel id with "UC" → "UU". We
+// list recent uploads cheaply, then filter client-side by the query terms.
+// This makes the user's PREFERRED footage tier almost free on quota.
+//
+// Tradeoff vs. search.list: playlistItems returns uploads in reverse-chron
+// order, not relevance order, and our client-side term filter is coarser than
+// YouTube's search ranking. That's acceptable here — reference channels are
+// curated, so "recent uploads matching the subject" is exactly what we want,
+// and hydrateVideoIds + rankCandidate re-rank afterward.
+export async function searchReferenceChannelViaPlaylist(
+  channelId: string,
+  query: string,
+  maxResults = 25,
+): Promise<YoutubeCandidate[]> {
+  const env = getEnv();
+  if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");
+  if (!/^UC[0-9A-Za-z_-]{22}$/.test(channelId)) {
+    // Not a canonical channel id — can't derive the uploads playlist. Caller
+    // should fall back to channel-scoped search.list.
+    throw new Error(`not a canonical channel id: ${channelId}`);
+  }
+  const uploadsPlaylistId = "UU" + channelId.slice(2);
+  const params = new URLSearchParams({
+    part: "contentDetails",
+    playlistId: uploadsPlaylistId,
+    maxResults: String(Math.min(50, Math.max(1, maxResults))),
+    key: env.YOUTUBE_API_KEY,
+  });
+  const r = await fetch(`${PLAYLIST_ITEMS_URL}?${params}`);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    if (isQuotaError(r.status, txt)) {
+      throw new YoutubeQuotaError(`playlistItems quota exceeded: ${txt.slice(0, 200)}`);
+    }
+    throw new Error(`playlistItems failed: ${r.status} ${txt.slice(0, 300)}`);
+  }
+  const json = await r.json();
+  const ids: string[] = [];
+  for (const item of json.items ?? []) {
+    const vid = item?.contentDetails?.videoId;
+    if (typeof vid === "string") ids.push(vid);
+  }
+  if (!ids.length) return [];
+  const hydrated = await hydrateVideoIds(ids);
+  // Client-side relevance filter on the channel's uploads. A reference channel
+  // can cover MANY celebrities, so an OR-of-tokens filter ("david" OR
+  // "walliams") leaks wrong-person uploads (a "Prince George" video whose
+  // description happens to say "David"). For a multi-token query (a full name
+  // like "David Walliams"), require ALL tokens present — that's a strong proxy
+  // for "this upload actually names the subject". Single-token queries keep the
+  // looser OR. The authoritative subject gate is still rankCandidate's
+  // requireSubjectAnchor; this just avoids hydrating obvious misses.
+  const tokens = tokenizeKeyword(query);
+  if (tokens.length === 0) return hydrated;
+  return hydrated.filter((c) => {
+    const hay = `${c.title} ${c.description}`.toLowerCase();
+    return tokens.length >= 2
+      ? tokens.every((t) => hay.includes(t))
+      : tokens.some((t) => hay.includes(t));
+  });
+}
+
+// Top-level quota-aware search used by the discovery pipeline. Resolution order:
+//   1. Cache hit (0 units)
+//   2. Reference channel → playlistItems (~1 unit) when channelId is canonical
+//      Open YouTube → search.list (100 units)
+//   3. On YoutubeQuotaError from the API → yt-dlp scrape (0 units), hydrate via
+//      videos.list only if quota wasn't the videos.list call that failed.
+// Results are written back to the cache on every miss.
+export async function searchYoutubeCached(input: SearchInput): Promise<YoutubeCandidate[]> {
+  const { query, channelId, maxResults } = input;
+
+  const cached = await readSearchCache(query, channelId);
+  if (cached) return cached;
+
+  // ----- API path -----
+  try {
+    let results: YoutubeCandidate[];
+    if (channelId && /^UC[0-9A-Za-z_-]{22}$/.test(channelId)) {
+      // Reference channel: cheap playlist recall. Fall back to channel-scoped
+      // search.list if the playlist path errors for a non-quota reason.
+      try {
+        results = await searchReferenceChannelViaPlaylist(channelId, query, maxResults ?? 25);
+      } catch (e) {
+        if (e instanceof YoutubeQuotaError) throw e;
+        results = await searchYoutube(input);
+      }
+    } else {
+      results = await searchYoutube(input);
+    }
+    await writeSearchCache(query, channelId, results, "api");
+    return results;
+  } catch (e) {
+    if (!(e instanceof YoutubeQuotaError)) throw e;
+    // ----- Quota-exhausted fallback: yt-dlp scrape -----
+    const scraped = await searchYoutubeViaYtDlp(query, maxResults ?? 15).catch(() => []);
+    if (scraped.length === 0) return [];
+    // Try to hydrate via videos.list (1 unit each) for accurate duration /
+    // privacy / aspect. If that ALSO hits quota, synthesize minimal candidates
+    // from the scraped metadata so discovery still produces something.
+    const ids = scraped.map((s) => s.videoId);
+    let hydrated: YoutubeCandidate[];
+    try {
+      hydrated = await hydrateVideoIds(ids);
+    } catch {
+      hydrated = scraped.map((s) => ({
+        videoId: s.videoId,
+        url: `https://www.youtube.com/watch?v=${s.videoId}`,
+        title: s.title,
+        description: "",
+        channelId: s.channelId ?? "",
+        channelTitle: s.channelTitle ?? "",
+        durationSeconds: s.durationSeconds ?? 0,
+        isLive: false,
+        privacyStatus: "public",
+        aspectRatio: null,
+      }));
+    }
+    // Channel-scoped fallback can't use YouTube's native channel filter, so
+    // filter to the requested channel client-side.
+    const filtered = channelId ? hydrated.filter((c) => c.channelId === channelId) : hydrated;
+    await writeSearchCache(query, channelId, filtered, "ytdlp");
+    return filtered;
+  }
 }
 
 // Pick the aspect ratio off the highest-resolution thumbnail that has
@@ -268,6 +600,24 @@ export interface RankInput {
   approvedChannelIds: Set<string>;
   blockedChannelIds: Set<string>;
   intentType?: IntentType;
+  // True when this candidate came from a reference-channel-scoped search
+  // (Phase A of the subject-centric pipeline). Reference channels are
+  // user-curated sources of clean subject footage, so they get a large
+  // bonus that lets them outrank open-YouTube fallback results even when a
+  // fallback title token-matches slightly better. Distinct from
+  // `approvedChannelIds` (the legacy global allowlist) so the two bonuses
+  // don't silently compound; reference search sets this flag explicitly.
+  referenceChannel?: boolean;
+  // STRICT subject gate. When true, a candidate is rejected unless it has a
+  // real subject anchor — the full subject name / a strong alias, or a context
+  // term, in the title / description / channel. A lone keyword token ("david")
+  // is NOT enough. This is the fix for wrong-person leakage: a user-curated
+  // reference channel that ALSO covers other celebrities was leaking "Prince
+  // George" / "Meghan Markle" uploads into a David Walliams pool because a
+  // single common-name token satisfied the old content-signal gate. The
+  // subject-first discovery pipeline sets this for every candidate; the legacy
+  // per-segment path leaves it off so its keyword-driven behaviour is unchanged.
+  requireSubjectAnchor?: boolean;
 }
 
 export interface RankedCandidate extends YoutubeCandidate {
@@ -278,18 +628,20 @@ export interface RankedCandidate extends YoutubeCandidate {
   rejectReason?: string;
 }
 
-// Theoretical max raw score after the subject-anchor refactor:
+// Theoretical max raw score after the subject-centric re-tune:
 //   +50 subject in title/desc/channel
 //   +35 context term in title/desc
 //   +25 segment topic word in title/desc
 //   +20 matched query contains the subject
 //   +15 channel name contains the subject (heuristic celebrity channel)
-//   +25 approved channel
+//   +60 reference channel (user-curated subject footage source)
+//   +25 approved channel (legacy global allowlist)
 //   +10 sweet-spot duration
-//   +40 keyword token cap (unchanged)
-// Total = 220. The UI bar normalises through MAX_RANK_SCORE so a +50/+20 hit
-// still renders as a healthy bar without saturating.
-export const MAX_RANK_SCORE = 220;
+//   +20 keyword token cap (down-weighted from +40 — keywords are now a weak
+//        tie-breaker, not a discovery driver)
+// Total = 260. The UI bar normalises through MAX_RANK_SCORE so a reference-
+// channel subject hit renders strong without every result saturating at 100.
+export const MAX_RANK_SCORE = 260;
 
 // Duration windows per intent. b-roll and archival often surface as short
 // clips (30–120s) on YouTube — applying the talking-head floor would reject
@@ -464,7 +816,22 @@ export function rankCandidate(input: RankInput): RankedCandidate {
     if (titleLower.includes(t)) { titleHits++; reasons.push(`title:${t}`); }
     else if (descLower.includes(t)) { descHits++; reasons.push(`desc:${t}`); }
   }
-  score += Math.min(titleHits * 6 + descHits * 2, 40);
+  // Subject-first re-tune: keyword/script tokens are now a weak tie-breaker,
+  // not a driver. We discover footage by SUBJECT, not by sentence wording, so
+  // the keyword contribution is capped low (was +40, now +20) and per-token
+  // weights are halved (3/1 vs 6/2). A result still needs ≥1 content signal
+  // (subject / context / segment-entity / keyword) to survive, but a pile of
+  // generic keyword hits can no longer outweigh a real subject match.
+  score += Math.min(titleHits * 3 + descHits * 1, 20);
+
+  // Reference-channel bonus (+60). The dominant signal after the subject
+  // anchor itself: a user added this channel precisely because it produces the
+  // clean, on-style footage we want. Big enough that a reference-channel
+  // result beats an open-YouTube fallback with the same subject hit.
+  if (input.referenceChannel) {
+    score += 60;
+    reasons.push("reference channel");
+  }
 
   const approvedChannelHit = input.approvedChannelIds.has(c.channelId);
   if (approvedChannelHit) {
@@ -480,9 +847,39 @@ export function rankCandidate(input: RankInput): RankedCandidate {
 
   // Penalize obvious junk. (#shorts handled earlier as a hard reject; this
   // covers compilations and ranking-style videos that don't yield clean
-  // single-subject cuts.)
-  for (const bad of ["compilation", "funniest moments", "tier list"]) {
-    if (titleLower.includes(bad)) { score -= 10; reasons.push(`-junk:${bad}`); }
+  // single-subject cuts.) The subject-first redesign added the editorial
+  // formats the client explicitly flagged as low-value source material —
+  // fan edits, reaction/commentary videos, top-N listicles, and slideshows.
+  // These are heuristics on the title token; a strong subject hit elsewhere
+  // can still keep a borderline title in the pool, but the penalty is large
+  // enough that a "Simon Cowell reaction compilation" loses to a clean
+  // "Simon Cowell interview".
+  // Multi-word / unambiguous phrases: plain substring match is safe.
+  for (const bad of [
+    "compilation",
+    "funniest moments",
+    "tier list",
+    "fan edit",
+    "fan-edit",
+    "fanedit",
+    "fancam",
+    "reacts to",
+    "commentary",
+    "top 10",
+    "top10",
+    "top ten",
+    "slideshow",
+  ]) {
+    if (titleLower.includes(bad)) { score -= 20; reasons.push(`-junk:${bad}`); }
+  }
+  // Short ambiguous tokens that need a word boundary so we don't penalise
+  // "credited"/"edition"/"meditation" (edit) or "creaction" etc. \b on each
+  // side keeps the match to the standalone word.
+  for (const bad of ["reaction", "edit", "explained"]) {
+    if (new RegExp(`\\b${bad}\\b`, "i").test(titleLower)) {
+      score -= 20;
+      reasons.push(`-junk:${bad}`);
+    }
   }
   // Penalise titles that scream "unrelated product / tutorial / company
   // profile" — these are the exact failure modes the user flagged (iPhone
@@ -519,6 +916,16 @@ export function rankCandidate(input: RankInput): RankedCandidate {
     return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "inherited segment without subject/context anchor" };
   }
 
+  // STRICT subject gate (subject-first discovery). The result MUST name the
+  // subject (full name / strong alias) or a context term — a lone keyword
+  // token isn't enough. This is what stops wrong-person leakage from
+  // many-celebrity reference channels. The reference-channel +60 bonus does
+  // NOT exempt a result from this check; a "reference" upload of the wrong
+  // person is exactly what we're rejecting.
+  if (input.requireSubjectAnchor && !subjectHit && !contextHit && !segmentEntityHit) {
+    return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "no subject anchor (wrong person / off-topic)" };
+  }
+
   // Require at least one real content signal. Duration alone (+10) used to
   // wave through tourist clips and unrelated paparazzi videos because the
   // ranker had nothing else to weigh — they passed the duration window and
@@ -533,6 +940,180 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   const displayScore = Math.max(0, Math.min(100, Math.round((score / MAX_RANK_SCORE) * 100)));
 
   return { ...c, score, displayScore, reasons, rejected: false };
+}
+
+// ---------------------------------------------------------------------------
+// Approved source videos (cross-project memory — Phase 3 search tier)
+// ---------------------------------------------------------------------------
+
+// Normalize an entity value into the cross-project lookup key. Lowercase +
+// whitespace-collapse so "Simon Cowell" and "simon  cowell" map to one row.
+export function entityKeyFor(entityValue: string): string {
+  return entityValue.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export interface ApprovedSourceVideo {
+  youtubeVideoId: string;
+  url: string | null;
+  title: string | null;
+  channelId: string | null;
+  channelTitle: string | null;
+  durationSeconds: number | null;
+}
+
+// Look up previously-approved source videos for a set of entity values. Used as
+// the second discovery tier (between reference channels and open YouTube): a
+// video the user approved for "Simon Cowell" in an earlier project is seeded as
+// a top candidate in a new Simon Cowell project at ZERO API cost. Dedupes by
+// videoId across entities; ordered by approved_count desc (most-trusted first).
+export async function loadApprovedSourceVideos(entityValues: string[]): Promise<ApprovedSourceVideo[]> {
+  const keys = Array.from(new Set(entityValues.map(entityKeyFor).filter(Boolean)));
+  if (keys.length === 0) return [];
+  const sb = getServerSupabase();
+  const { data, error } = await sb
+    .from("approved_source_videos")
+    .select("youtube_video_id, url, title, channel_id, channel_title, duration_seconds, approved_count")
+    .in("entity_key", keys)
+    .order("approved_count", { ascending: false });
+  if (error) throw new Error(`approved sources: ${error.message}`);
+  const seen = new Set<string>();
+  const out: ApprovedSourceVideo[] = [];
+  for (const r of data ?? []) {
+    if (!r.youtube_video_id || seen.has(r.youtube_video_id)) continue;
+    seen.add(r.youtube_video_id);
+    out.push({
+      youtubeVideoId: r.youtube_video_id,
+      url: r.url ?? null,
+      title: r.title ?? null,
+      channelId: r.channel_id ?? null,
+      channelTitle: r.channel_title ?? null,
+      durationSeconds: r.duration_seconds ?? null,
+    });
+  }
+  return out;
+}
+
+// Record that the user approved a source video for an entity. Upserts on
+// (entity_key, youtube_video_id), bumping approved_count on repeat approvals so
+// the most-trusted sources surface first in future lookups. Best-effort: a
+// write failure is surfaced to the caller (route) but should not block the
+// user's approval action.
+export async function recordApprovedSource(params: {
+  entityValue: string;
+  entityType?: string | null;
+  video: ApprovedSourceVideo;
+  fromProjectId?: string | null;
+}): Promise<void> {
+  const sb = getServerSupabase();
+  const entity_key = entityKeyFor(params.entityValue);
+  if (!entity_key || !params.video.youtubeVideoId) return;
+  // Read current count to bump it (Supabase has no atomic increment in the JS
+  // client without an RPC; a read-then-write race only undercounts trust, which
+  // is harmless for ranking).
+  const { data: existing } = await sb
+    .from("approved_source_videos")
+    .select("approved_count")
+    .eq("entity_key", entity_key)
+    .eq("youtube_video_id", params.video.youtubeVideoId)
+    .maybeSingle();
+  const nextCount = ((existing?.approved_count as number | undefined) ?? 0) + 1;
+  const { error } = await sb.from("approved_source_videos").upsert(
+    {
+      entity_key,
+      entity_type: params.entityType ?? null,
+      youtube_video_id: params.video.youtubeVideoId,
+      url: params.video.url,
+      title: params.video.title,
+      channel_id: params.video.channelId,
+      channel_title: params.video.channelTitle,
+      duration_seconds: params.video.durationSeconds,
+      approved_from_project_id: params.fromProjectId ?? null,
+      approved_count: nextCount,
+    },
+    { onConflict: "entity_key,youtube_video_id" },
+  );
+  if (error) throw new Error(`record approved source: ${error.message}`);
+}
+
+// A reference channel the subject-centric pipeline searches first, ordered by
+// `priority` (lower runs first). Only enabled, approved rows with a channelId
+// are eligible.
+export interface ReferenceChannel {
+  channelId: string;
+  channelTitle: string | null;
+  priority: number;
+}
+
+// Load enabled reference channels in search order (priority asc, then oldest
+// first as a stable tie-breaker). These are the channels Phase A of the search
+// processor scopes its subject queries to before any open YouTube fallback.
+export async function loadReferenceChannels(): Promise<ReferenceChannel[]> {
+  const sb = getServerSupabase();
+  const { data, error } = await sb
+    .from("channel_rules")
+    .select("channel_id, channel_title, priority, created_at")
+    .eq("rule", "approved")
+    .eq("enabled", true)
+    .order("priority", { ascending: true })
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`Reference channels: ${error.message}`);
+  const out: ReferenceChannel[] = [];
+  for (const r of data ?? []) {
+    if (!r.channel_id) continue;
+    out.push({ channelId: r.channel_id, channelTitle: r.channel_title ?? null, priority: r.priority ?? 100 });
+  }
+  return out;
+}
+
+// Resolve a user-pasted channel reference (a /channel/UC… URL, an @handle, a
+// /c/ or /user/ vanity URL, or a bare handle) to its canonical channelId +
+// title. Returns null when nothing resolves. Used by the settings UI when a
+// user adds a reference channel — we store the resolved UC… id, never the
+// raw handle, because search.list's channelId filter only accepts UC ids.
+export async function resolveChannel(ref: string): Promise<{ channelId: string; channelTitle: string } | null> {
+  const env = getEnv();
+  if (!env.YOUTUBE_API_KEY) throw new Error("YOUTUBE_API_KEY not configured");
+  const raw = ref.trim();
+  if (!raw) return null;
+
+  // 1) Already a canonical channel id (UC… , 24 chars) or /channel/UC… URL.
+  const channelIdMatch = raw.match(/(UC[0-9A-Za-z_-]{22})/);
+  if (channelIdMatch) {
+    const params = new URLSearchParams({ part: "snippet", id: channelIdMatch[1], key: env.YOUTUBE_API_KEY });
+    const r = await fetch(`${CHANNELS_URL}?${params}`);
+    if (r.ok) {
+      const json = await r.json();
+      const item = (json.items ?? [])[0];
+      if (item) return { channelId: item.id, channelTitle: item.snippet?.title ?? raw };
+    }
+  }
+
+  // 2) Handle (@name) — channels.list supports forHandle directly.
+  const handleMatch = raw.match(/@([A-Za-z0-9._-]+)/) ?? (/^[A-Za-z0-9._-]+$/.test(raw) ? [raw, raw] : null);
+  if (handleMatch) {
+    const params = new URLSearchParams({ part: "snippet", forHandle: handleMatch[1], key: env.YOUTUBE_API_KEY });
+    const r = await fetch(`${CHANNELS_URL}?${params}`);
+    if (r.ok) {
+      const json = await r.json();
+      const item = (json.items ?? [])[0];
+      if (item) return { channelId: item.id, channelTitle: item.snippet?.title ?? raw };
+    }
+  }
+
+  // 3) Last resort — search.list for the name and take the top channel hit.
+  // Covers legacy /c/ and /user/ vanity URLs that have no handle.
+  const q = raw.replace(/https?:\/\/(www\.)?youtube\.com\/(c\/|user\/)?/i, "").replace(/@/, "");
+  const params = new URLSearchParams({
+    part: "snippet", q, type: "channel", maxResults: "1", key: env.YOUTUBE_API_KEY,
+  });
+  const r = await fetch(`${SEARCH_URL}?${params}`);
+  if (r.ok) {
+    const json = await r.json();
+    const item = (json.items ?? [])[0];
+    const id = item?.id?.channelId;
+    if (id) return { channelId: id, channelTitle: item.snippet?.title ?? raw };
+  }
+  return null;
 }
 
 export async function loadChannelRules(): Promise<{ approved: Set<string>; blocked: Set<string> }> {
