@@ -170,20 +170,34 @@ export function ScriptMarkersPanel({ projectId }: { projectId: string }) {
 
       {grouped.titleCards.length > 0 && (
         <Section title="Title cards">
-          {grouped.titleCards.map((m) => (
-            <MarkerRow
-              key={m.id}
-              label={
-                m.kind === "title_card"
-                  ? m.text || "(no title text)"
-                  : `↳ extra clip ${m.ordinal}`
-              }
-              detail={fmtRange(m.start_seconds, m.end_seconds)}
-              marker={m}
-              onRetry={() => retry.mutate(m.id)}
-              retrying={retry.isPending && retry.variables === m.id}
-            />
-          ))}
+          {grouped.titleCards.map((m) =>
+            // Clipless title card: a blue-bold heading with no force clip
+            // under it. It renders as a standalone on-screen title card with
+            // no source clip to download, so there's no timestamp range and
+            // no download status to show — render a simple label row instead
+            // of a MarkerRow (which would show a bogus "?" range + Pending).
+            m.kind === "title_card" && !m.youtube_url ? (
+              <div key={m.id} className="flex items-center gap-2 py-1">
+                <span className="truncate text-fg" title={m.text}>
+                  {m.text || "(no title text)"}
+                </span>
+                <span className="text-fg-muted">— title card (no clip)</span>
+              </div>
+            ) : (
+              <MarkerRow
+                key={m.id}
+                label={
+                  m.kind === "title_card"
+                    ? m.text || "(no title text)"
+                    : `↳ extra clip ${m.ordinal}`
+                }
+                detail={fmtRange(m.start_seconds, m.end_seconds)}
+                marker={m}
+                onRetry={() => retry.mutate(m.id)}
+                retrying={retry.isPending && retry.variables === m.id}
+              />
+            ),
+          )}
         </Section>
       )}
 

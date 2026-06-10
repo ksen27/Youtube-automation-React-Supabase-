@@ -14,7 +14,8 @@ import {
   getEnv,
 } from "@/lib/env";
 import { labelClipFromThumbnail, isJunkCategory } from "@/lib/ai/gemini";
-import { verifyPoolAsset } from "@/lib/ai/pool-verification";
+import { verifyClipFrameCombined, detectSourceWatermark } from "@/lib/ai/verify";
+import { lookupReference } from "@/lib/ai/face-references";
 
 export async function processClipJob(data: ClipJobData): Promise<void> {
   const env = getEnv();
@@ -67,6 +68,10 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // only contain the co-host — the failure the user reported on blocks
   // 31/32/34 (Walliams apology blocks filled with Cowell footage).
   let mainCelebrityForVerify: string | null = null;
+  // Reference photo for the celebrity, resolved ONCE per clip job. The
+  // combined per-frame check needs it to answer "is the celebrity present".
+  // Null when face-verify is off, no celebrity, or no reference resolved.
+  let celebrityReferenceUrl: string | null = null;
   if (env.CLIP_FACE_VERIFY_ENABLED) {
     const { data: entRows } = await sb
       .from("project_entities")
@@ -77,6 +82,41 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       .limit(1);
     const top = (entRows ?? [])[0];
     mainCelebrityForVerify = top?.value ? String(top.value).trim() : null;
+
+    // PER-SOURCE PERSON OVERRIDE. The pipeline now builds a separate source pool
+    // PER person (the celebrity AND each heavily-featured secondary like David
+    // Walliams). A clip cut from a David Walliams source must be face-checked
+    // against DAVID WALLIAMS, not the project celebrity — otherwise a Walliams
+    // clip that shows only a child (Walliams off-frame) is asked "is Simon
+    // Cowell here?", the answer is merely "uncertain" (not a confident "no"),
+    // and the off-target clip ships. We resolve the person this source was
+    // discovered under via youtube_search_results.metadata.entity_value and,
+    // when it's a real person with a reference photo, verify against THEM.
+    // Falls back to the project celebrity when the source isn't person-specific.
+    const { data: srcRow } = await sb
+      .from("youtube_search_results")
+      .select("metadata")
+      .eq("project_id", projectId)
+      .eq("youtube_video_id", vs.youtube_video_id)
+      .limit(1)
+      .maybeSingle();
+    const srcMeta = (srcRow?.metadata as Record<string, unknown> | null) ?? {};
+    const srcEntityValue =
+      typeof srcMeta.entity_value === "string" ? srcMeta.entity_value.trim() : "";
+    const srcEntityType =
+      typeof srcMeta.entity_type === "string" ? srcMeta.entity_type : "";
+    const isPersonSource =
+      srcEntityValue &&
+      (srcEntityType === "celebrity" || srcEntityType === "related_person" || srcEntityType === "person");
+    if (isPersonSource && srcEntityValue.toLowerCase() !== (mainCelebrityForVerify ?? "").toLowerCase()) {
+      // This source belongs to a specific (secondary) person — verify against them.
+      mainCelebrityForVerify = srcEntityValue;
+    }
+
+    if (mainCelebrityForVerify) {
+      const ref = await lookupReference(projectId, "person", mainCelebrityForVerify).catch(() => null);
+      celebrityReferenceUrl = ref?.reference_url ?? null;
+    }
   }
   // When the user supplied an explicit intro URL + timestamp, the renderer
   // cuts the intro directly from that source and ignores anything tagged
@@ -165,7 +205,43 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   const usableSeconds = Math.max(0, vs.duration_seconds - 10 - CLIP_DURATION_MIN_SECONDS - 1);
   const minStride = CLIP_DURATION_MIN_SECONDS;
   const physicalMax = Math.max(1, Math.floor(usableSeconds / minStride) + 1);
+  // `cappedCount` is how many SURVIVING clips we want from this source.
   const cappedCount = Math.min(targetCount, physicalMax);
+  // Backfill reserve. We size the CANDIDATE pool so clips lost to ffmpeg
+  // failure / dirty-footage / wrong-person / junk drops can be replaced,
+  // keeping the surviving count near `cappedCount` — WITHOUT cutting the
+  // whole source.
+  //
+  // History: a previous version set poolCount = physicalMax (the source's
+  // FULL non-overlapping window set) so that very high-drop sources could
+  // keep trying alternative windows until the target survived. That had two
+  // bad side effects the user reported:
+  //   1. On long sources physicalMax is huge (a 25-min source at a 5 s MIN
+  //      stride ≈ 300 windows). totalClips on the job metadata showed that
+  //      enormous number ("ready clips count is very large"), and the lane
+  //      loop ground through hundreds of windows — each costing an ffmpeg
+  //      cut + thumbnail + up to 4 Gemini Vision calls — so the clip step
+  //      crawled even when the source was perfectly usable.
+  //   2. Because every loss triggered another reserve window, a source whose
+  //      gates were merely a bit strict attempted far more windows than it
+  //      ever needed.
+  //
+  // New rule: the pool is the target plus a BOUNDED reserve. We take the
+  // larger of the proportional reserve (cappedCount × (1 + buffer)) and a
+  // small absolute floor, then cap it at CLIP_MAX_POOL_FACTOR × cappedCount
+  // and at physicalMax. This still absorbs a normal drop rate (the lanes
+  // early-stop at `succeeded >= cappedCount`, so clean sources never cut the
+  // full reserve) but stops a long source from exploding into hundreds of
+  // candidate windows.
+  const reserveTarget = Math.max(
+    cappedCount + 2,
+    Math.ceil(cappedCount * (1 + env.CLIP_BACKFILL_BUFFER_FACTOR)),
+  );
+  const poolCount = Math.min(
+    physicalMax,
+    Math.ceil(cappedCount * env.CLIP_MAX_POOL_FACTOR),
+    reserveTarget,
+  );
 
   // Pull the source MP4 from R2 to local tmp. Done lazily — only once we know
   // the cap hasn't already been reached, so a no-op clip job doesn't pay for
@@ -175,6 +251,94 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   await downloadToFile(sourceStoragePath, sourceLocal);
 
   try {
+
+  // ---- WHOLE-SOURCE WATERMARK / CAPTION GATE ---------------------------
+  // Decide ONCE per source whether the entire video carries persistent
+  // burned-in graphics: a logo / channel bug / site watermark (e.g. a
+  // "HOLLYWOOD SECRETS" corner logo, a "werewolftvseries.com" URL strip), OR
+  // a baked-in caption / subtitle track (word-by-word "GREAT"-style pop-ups
+  // synced to speech). Both run for the WHOLE video, so the per-clip
+  // cleanliness gate is the wrong tool — it samples only 3 frames of a short
+  // clip, and (a) Gemini routinely misses a small corner logo on some of
+  // them, while (b) word-by-word captions show DIFFERENT text each frame so
+  // they read as a transient lower-third the majority rule deliberately
+  // keeps. Here we sample frames spread across the WHOLE runtime; a graphic
+  // present on most of them is persistent, and we SKIP the entire source
+  // (per the "skip the whole source" decision) rather than cut clips from it.
+  //
+  // Gated behind CLIP_CLEAN_FOOTAGE_ENABLED (same toggle as the per-clip
+  // clean gate — this is the source-level half of the same feature).
+  if (env.CLIP_CLEAN_FOOTAGE_ENABLED) {
+    const SAMPLE_FRAMES = 5;
+    // Sample inside [10s, duration-2s] to skip intro title cards and end
+    // screens, which would otherwise bias the vote toward "branded".
+    const lead = 10;
+    const tail = 2;
+    const span = Math.max(0, (vs.duration_seconds - tail) - lead);
+    const wmFrameDests: string[] = [];
+    const wmFrameUrls: string[] = [];
+    if (span > 0) {
+      for (let i = 0; i < SAMPLE_FRAMES; i++) {
+        // Evenly spaced across the usable span (midpoints of N buckets).
+        const at = lead + Math.round((span * (i + 0.5)) / SAMPLE_FRAMES);
+        const localPath = path.join(sourceTmp, `${vs.youtube_video_id}_wm_${i}.jpg`);
+        const dest = `projects/${projectId}/clips/${vs.youtube_video_id}_wm_${i}.jpg`;
+        try {
+          await generateThumbnail({ inputPath: sourceLocal, outputPath: localPath, atSeconds: at });
+          const up = await uploadFile(localPath, dest, "image/jpeg");
+          wmFrameDests.push(dest);
+          wmFrameUrls.push(up.publicUrl);
+        } catch (e) {
+          void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+            "clip.source_watermark.frame_failed", { at, err: (e as Error).message?.slice(0, 120) });
+        } finally {
+          await safeUnlink(localPath);
+        }
+      }
+    }
+
+    if (wmFrameUrls.length > 0) {
+      const wm = await detectSourceWatermark({ frameUrls: wmFrameUrls });
+      await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+        "clip.source_watermark.checked", {
+          framesChecked: wm.framesChecked,
+          logoFrames: wm.logoFrames,
+          captionFrames: wm.captionFrames,
+          watermarked: wm.watermarked,
+          reasonClass: wm.reasonClass,
+          artifact: wm.artifact,
+        });
+      // The sampled frames were uploaded only for this check — remove them
+      // whether or not we skip, so we don't pay to keep them in storage.
+      if (wmFrameDests.length > 0) await removeFiles(wmFrameDests);
+
+      if (wm.watermarked) {
+        // Whole source carries a persistent burned-in logo/watermark OR a
+        // baked-in caption track — skip it. Cut no clips. The source is
+        // marked clipped (not failed) so the run proceeds with the other
+        // sources; matching will fill the timeline from clean footage.
+        const what = wm.reasonClass === "caption"
+          ? "burned-in captions"
+          : "logo/watermark";
+        await sb.from("video_sources").update({ status: "clipped" }).eq("id", videoSourceId);
+        await setMediaJob(mediaJobId, {
+          status: "completed", progress: 100,
+          metadata: {
+            videoSourceId,
+            skipped_reason: wm.reasonClass === "caption"
+              ? "source_captioned"
+              : "source_watermarked",
+            skipped: `whole source has ${what} (${wm.artifact || "on majority of frames"})`,
+            framesChecked: wm.framesChecked,
+            logoFrames: wm.logoFrames,
+            captionFrames: wm.captionFrames,
+          },
+        });
+        await maybeEnqueueMatch(projectId);
+        return;
+      }
+    }
+  }
 
   // Try scene-detection first — cuts at visual boundaries beat blind
   // uniform sampling (no half-shots, cleaner thumbnails). Fall back to
@@ -189,49 +353,77 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   try {
     const scenes = await detectSceneTimestamps({ inputPath: sourceLocal });
     sceneCount = scenes.length;
+    // Generate `poolCount` (target + reserve) candidate windows, not just the
+    // target — the surplus is the backfill reserve consumed below when clips
+    // fail or are dropped.
     const fromScenes = pickFromScenes({
       scenes,
       duration: vs.duration_seconds,
-      targetCount: cappedCount,
+      targetCount: poolCount,
       minDuration: CLIP_DURATION_MIN_SECONDS,
       maxDuration: CLIP_DURATION_MAX_SECONDS,
       minGapSeconds: 20,
       skipLeadSeconds: 10,
     });
-    if (fromScenes.length >= cappedCount) {
+    if (fromScenes.length >= poolCount) {
       windows = fromScenes;
       timestampSource = "scene_detect";
     } else if (fromScenes.length > 0) {
       // Scene-detect found *some* boundaries but not enough. Pad with
       // uniform samples (default duration) that don't collide with the
       // scene picks.
-      const uniform = pickClipTimestamps(vs.duration_seconds, cappedCount)
+      const uniform = pickClipTimestamps(vs.duration_seconds, poolCount)
         .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
-      windows = mergeWithMinGap([...fromScenes, ...uniform], minStride, cappedCount);
+      windows = mergeWithMinGap([...fromScenes, ...uniform], minStride, poolCount);
       timestampSource = "scene_detect_then_uniform";
     } else {
-      windows = pickClipTimestamps(vs.duration_seconds, cappedCount)
+      windows = pickClipTimestamps(vs.duration_seconds, poolCount)
         .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
       timestampSource = "uniform";
     }
   } catch (e) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
       "clip.scene_detect.failed", { err: (e as Error).message });
-    windows = pickClipTimestamps(vs.duration_seconds, cappedCount)
+    windows = pickClipTimestamps(vs.duration_seconds, poolCount)
       .map((t) => ({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS }));
     timestampSource = "uniform";
   }
 
-  // Reserve a head-of-source window (t=0) as a dedicated intro candidate.
+  // Reserve a head-of-source window as a dedicated intro candidate.
   // The general-purpose timestamps above all skip the first 10 s to avoid
   // channel bumpers, which means the matcher's intro selector has nothing
   // from the actual opening shot to choose from — so the rendered intro
   // ended up being a mid-source clip with a narrator's voice instead of
-  // the celebrity's. We prepend index 0 here, dedup against any general
-  // timestamp that happens to also fall at 0, and tag the resulting clip
-  // so the matcher can prefer it.
+  // the celebrity's. We prepend this window here, dedup against any general
+  // timestamp that happens to fall nearby, and tag the resulting clip so the
+  // matcher can prefer it.
+  //
+  // We do NOT start this window at t=0. Many of these sources open with a
+  // full-screen DISCLAIMER / "viewer discretion" card that runs ~10-15 s
+  // before the first real shot; a t=0 intro window cut straight from that
+  // card put the disclaimer in the 0:00–0:06 intro slot (and, when the
+  // clean gate missed the textured card, leaked it into scene footage too).
+  // Starting the intro head a bit later lands it past the disclaimer on the
+  // actual opening footage, while still being early enough to be a genuine
+  // "opening shot" with the celebrity's intro audio. Clamped for short
+  // sources so the window never runs past the end.
   const INTRO_CANDIDATE_LABEL = "intro_candidate";
-  const introHeadStart = 0;
+  // Marks a clip that may serve as the intro (audio shot) but must NEVER be
+  // reused as regular scene footage — e.g. a disclaimer / text card that
+  // failed the clean-footage gate. The matcher excludes these from the scene
+  // pool. See dropForDirty handling for intro-head clips below.
+  const NOT_SCENE_ELIGIBLE_LABEL = "not_scene_eligible";
+  // Offset past the opening disclaimer/bumper. 12 s clears the typical
+  // disclaimer card; on a source too short to host a clip at 12 s we fall
+  // back to the latest start that still fits a full default-length clip
+  // (and t=0 if even that doesn't fit — a source that short has no room for
+  // a disclaimer anyway).
+  const INTRO_HEAD_PREFERRED_OFFSET = 12;
+  const introHeadLatestFit = Math.max(
+    0,
+    vs.duration_seconds - CLIP_DURATION_DEFAULT_SECONDS - 1,
+  );
+  const introHeadStart = Math.min(INTRO_HEAD_PREFERRED_OFFSET, introHeadLatestFit);
   const introTimestampIndex = (() => {
     if (userIntroProvided) return -1;
     if (vs.duration_seconds < CLIP_DURATION_MIN_SECONDS + 1) return -1;
@@ -245,6 +437,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       count: windows.length,
       requested: targetCount,
       cappedCount,
+      poolCount,
       duration: vs.duration_seconds,
       projectCap,
       perSourceQuota,
@@ -262,6 +455,16 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   let succeeded = 0;
   let failed = 0;
   let droppedJunk = 0;
+  // Reason-split drop counters (droppedJunk is the sum). These let the
+  // clip.summary log show WHICH gate is costing the most clips on a source:
+  //   droppedLabelJunk → the Vision labeler tagged the frame a junk category
+  //   droppedDirty     → clean-footage gate (logo / watermark / on-screen text)
+  //   droppedWrongPerson → face gate (confirmed not the target person)
+  // A source ending short with high droppedDirty/droppedWrongPerson is the
+  // signal that the quality gates — not the source length — capped the yield.
+  let droppedLabelJunk = 0;
+  let droppedDirty = 0;
+  let droppedWrongPerson = 0;
   let processed = 0;
   const junkCategoryCounts: Record<string, number> = {};
 
@@ -314,6 +517,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
 
       if (visionLabels && isJunkCategory(visionLabels.visualCategory) && !isIntroHead) {
         droppedJunk++;
+        droppedLabelJunk++;
         junkCategoryCounts[visionLabels.visualCategory] =
           (junkCategoryCounts[visionLabels.visualCategory] ?? 0) + 1;
         await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
@@ -345,176 +549,236 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       // Phase B provenance — same for every clip from this source.
       for (const p of provenanceLabels) labelSet.add(p);
 
-      // Face-reference verification — MULTI-FRAME edition.
+      // COMBINED per-frame quality gate — ONE Gemini call per frame answering
+      // BOTH questions: (1) is the footage clean (no logo/watermark/text/title
+      // card)? and (2) is the main celebrity present? This merges what were two
+      // separate passes (clean-footage + face-verify), halving Gemini Vision
+      // spend on the clip hot path (3 calls instead of 6 for a 3-frame clip).
       //
-      // The single-thumbnail check missed clips where the auto-sampled
-      // frame was a wide panel shot (4 judges, faces tiny, all uncertain)
-      // even when the rest of the clip had a clear close-up of the
-      // celebrity. We now sample THREE frames per clip — start, middle,
-      // end — and short-circuit as soon as ANY frame returns a confident
-      // "yes". This catches the BGT judges-table case the user flagged
-      // where the thumbnail was a wide shot but the clip itself was a
-      // Walliams close-up.
+      // We sample start/mid/end of the cut clip ONCE, run the combined check on
+      // each, then apply two gates:
+      //   - CLEAN (majority): yes/no aggregated across frames. A majority
+      //     "dirty" (2+ of 3) → hard drop. A single transient dirty frame (a
+      //     brief lower-third, a momentary station bug) no longer disqualifies
+      //     an otherwise-clean clip — that any-frame rule was dropping most
+      //     usable clips on perfectly good sources.
+      //   - FACE (majority): yes/no/uncertain aggregated across frames. A
+      //     majority "no" → hard drop (confirmed wrong person). Otherwise the
+      //     face_verify label feeds the matcher's person-first bonus.
       //
-      // Aggregation rules (in order, first hit wins):
-      //   any frame yes        → overall = yes  (keep, full bonus)
-      //   all frames no        → overall = no   (reject — person_gate drops it)
-      //   any uncertain/mixed  → overall = uncertain (keep, half bonus)
-      //   all frames skipped   → overall = skipped (no reference)
-      //
-      // Cost: up to 3× the single-frame cost (~$0.003 per clip). We
-      // short-circuit on the first "yes" so well-shot clips usually
-      // pay only 1 call.
-      //
-      // The intro candidate is exempt — it has its own dedicated
-      // verifier path in the matcher.
-      if (env.CLIP_FACE_VERIFY_ENABLED && mainCelebrityForVerify && !isIntroHead) {
-        // Generate two additional thumbnails (middle and end). The
-        // "start+1" thumbnail is already on disk and uploaded.
+      // The intro candidate is exempt (its own dedicated verifier in the matcher).
+      let dropForNoPerson = false;   // majority "no" → wrong person
+      let dropForDirty = false;      // any frame dirty → unclean footage
+      // The clean-footage gate runs on the intro-head clip TOO. Many YouTube
+      // sources open at t=0 with a "DISCLAIMER / for entertainment purposes"
+      // text card; that frame was previously exempt from every gate (because
+      // intro-head clips skip face/junk checks — the labeler often misses the
+      // celebrity in frame 1) and so the disclaimer card leaked into the pool
+      // and got reused as scene footage. We still cut the intro clip even when
+      // dirty (its AUDIO is the celebrity's intro voice, which is the point),
+      // but a dirty intro frame is BARRED from scene reuse (see scene-eligible
+      // tagging below). Only the FACE gate stays exempt for intro-head clips.
+      const runClean = env.CLIP_CLEAN_FOOTAGE_ENABLED;
+      const runFace = env.CLIP_FACE_VERIFY_ENABLED && !!mainCelebrityForVerify && !isIntroHead;
+      if (runClean || runFace) {
         const midSec = start + Math.max(1, Math.floor(dur / 2));
-        // Clip is `dur` seconds long; sample at end-1 to avoid empty
-        // tail frames on clips that scene-detect snapped tightly.
         const endSec = start + Math.max(1, Math.floor(dur) - 1);
         const thumbMidLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}_mid.jpg`);
         const thumbEndLocal = path.join(clipsTmp, `${vs.youtube_video_id}_${idx}_end.jpg`);
         const thumbMidDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_mid.jpg`;
         const thumbEndDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_end.jpg`;
         const tempDeleteList: string[] = [];
-        const frameVerdicts: Array<"yes" | "no" | "uncertain" | "skipped"> = [];
+        const faceVerdicts: Array<"yes" | "no" | "uncertain"> = [];
+        const cleanVerdicts: Array<"clean" | "dirty" | "uncertain"> = [];
+        const cleanArtifacts: string[] = [];
         const frameReasons: string[] = [];
 
-        async function verifyOne(url: string, label: string): Promise<"yes" | "no" | "uncertain" | "skipped"> {
+        // Run the combined check on one frame. Only the face question is asked
+        // when we have a reference (runFace + celebrityReferenceUrl); otherwise
+        // it returns face="uncertain" and we just get the clean verdict.
+        async function checkFrame(url: string, label: string): Promise<void> {
           try {
-            const v = await verifyPoolAsset({
-              projectId,
-              entityType: "person",
-              entityName: mainCelebrityForVerify!,
-              candidateUrl: url,
+            const r = await verifyClipFrameCombined({
+              frameUrl: url,
+              personName: runFace ? mainCelebrityForVerify! : undefined,
+              referenceUrl: runFace ? celebrityReferenceUrl : null,
             });
-            frameReasons.push(`${label}=${v.verdict}`);
-            return v.verdict;
+            cleanVerdicts.push(r.clean);
+            cleanArtifacts.push(r.cleanArtifact ?? "");
+            faceVerdicts.push(r.face);
+            frameReasons.push(`${label}=clean:${r.clean}/face:${r.face}`);
           } catch (e) {
+            cleanVerdicts.push("uncertain");
+            cleanArtifacts.push("");
+            faceVerdicts.push("uncertain");
             void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-              "clip.face_verify.frame_failed", {
-                start, frame: label, err: (e as Error).message?.slice(0, 120),
-              });
-            return "skipped";
+              "clip.frame_check.failed", { start, frame: label, err: (e as Error).message?.slice(0, 120) });
           }
         }
 
         try {
-          // Start frame (the existing thumbnail, already uploaded).
-          const startVerdict = await verifyOne(thumbUp.publicUrl, "start");
-          frameVerdicts.push(startVerdict);
-
-          // Mid frame. Sample regardless of start verdict so the
-          // aggregation has enough signal to apply the majority rule
-          // (see "Aggregate" below). Earlier versions short-circuited on
-          // start=yes, but that let clips through where the celebrity
-          // appears for ~1s of a 6s clip and the rest shows contestants
-          // (failure mode the user flagged on blocks 102 / 107).
+          // Start frame (already uploaded as thumbUp).
+          await checkFrame(thumbUp.publicUrl, "start");
+          // Mid frame.
           if (midSec > start + 1) {
             try {
-              await generateThumbnail({
-                inputPath: sourceLocal, outputPath: thumbMidLocal, atSeconds: midSec,
-              });
+              await generateThumbnail({ inputPath: sourceLocal, outputPath: thumbMidLocal, atSeconds: midSec });
               const midUp = await uploadFile(thumbMidLocal, thumbMidDest, "image/jpeg");
               tempDeleteList.push(thumbMidDest);
-              const midVerdict = await verifyOne(midUp.publicUrl, "mid");
-              frameVerdicts.push(midVerdict);
+              await checkFrame(midUp.publicUrl, "mid");
             } catch (e) {
               void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-                "clip.face_verify.mid_frame_failed", {
-                  start, err: (e as Error).message?.slice(0, 120),
-                });
+                "clip.frame_check.mid_failed", { start, err: (e as Error).message?.slice(0, 120) });
             } finally {
               await safeUnlink(thumbMidLocal);
             }
           }
-
-          // End frame — always sample (was previously gated on
-          // !includes("yes"); now we collect all three so majority
-          // aggregation can apply consistently).
+          // End frame.
           if (endSec > midSec + 1 && endSec < start + dur) {
             try {
-              await generateThumbnail({
-                inputPath: sourceLocal, outputPath: thumbEndLocal, atSeconds: endSec,
-              });
+              await generateThumbnail({ inputPath: sourceLocal, outputPath: thumbEndLocal, atSeconds: endSec });
               const endUp = await uploadFile(thumbEndLocal, thumbEndDest, "image/jpeg");
               tempDeleteList.push(thumbEndDest);
-              const endVerdict = await verifyOne(endUp.publicUrl, "end");
-              frameVerdicts.push(endVerdict);
+              await checkFrame(endUp.publicUrl, "end");
             } catch (e) {
               void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-                "clip.face_verify.end_frame_failed", {
-                  start, err: (e as Error).message?.slice(0, 120),
-                });
+                "clip.frame_check.end_failed", { start, err: (e as Error).message?.slice(0, 120) });
             } finally {
               await safeUnlink(thumbEndLocal);
             }
           }
 
-          // Aggregate via MAJORITY rule. The previous "any yes wins"
-          // rule was too lenient — a 6s clip with the celebrity visible
-          // for only 1s would pass as "yes" because one of the three
-          // sampled frames happened to land on them, even though 5/6
-          // seconds show contestants / co-judges / wide shots. The
-          // viewer perceives the clip as "wrong character" because the
-          // celebrity isn't on screen most of the time.
-          //
-          // New rule:
-          //   yes  count >= ceil(N/2)  → overall yes
-          //   no   count >= ceil(N/2)  → overall no
-          //   all  skipped             → skipped
-          //   otherwise                → uncertain
-          //
-          // For N=3 frames, this means 2+ yes for "yes" and 2+ no for
-          // "no". Mixed verdicts (1 yes + 2 uncertain, or 1 yes + 1 no
-          // + 1 uncertain) fall through to uncertain — the matcher's
-          // person-first bonus halves for uncertain, making these clips
-          // less competitive against confirmed-yes clips.
-          const yesCount = frameVerdicts.filter((v) => v === "yes").length;
-          const noCount = frameVerdicts.filter((v) => v === "no").length;
-          const skippedCount = frameVerdicts.filter((v) => v === "skipped").length;
-          const total = frameVerdicts.length;
-          const majority = Math.ceil(total / 2);
-          const overallVerdict: "yes" | "no" | "uncertain" | "skipped" =
-            total === 0 ? "skipped" :
-            skippedCount === total ? "skipped" :
-            yesCount >= majority ? "yes" :
-            noCount >= majority ? "no" :
-            "uncertain";
-
-          labelSet.add(`face_verify: ${overallVerdict}`);
-          if (overallVerdict === "no") {
-            for (const l of Array.from(labelSet)) {
-              if (l.startsWith("subject_present:")) labelSet.delete(l);
+          // CLEAN gate — MAJORITY rule (was: any single dirty frame). A clip
+          // is only dropped as dirty when 2+ of the sampled frames are dirty.
+          // The old any-frame rule killed usable clips on a single transient
+          // overlay frame (a brief lower-third, a momentary station bug on the
+          // start frame, a flash of on-screen text), which is the bulk of the
+          // "most clips failed but the video is usable" drops the user saw.
+          // Requiring a majority keeps clips whose footage is clean for most
+          // of their duration while still rejecting clips that are dirty
+          // throughout. Matches the face gate's majority semantics below.
+          if (runClean) {
+            const dirtyCount = cleanVerdicts.filter((v) => v === "dirty").length;
+            const cleanTotal = cleanVerdicts.length;
+            if (cleanTotal > 0 && dirtyCount >= Math.ceil(cleanTotal / 2)) {
+              dropForDirty = true;
             }
-            labelSet.add("subject_present: no");
-            await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-              "clip.face_verify.rejected", {
-                start, person: mainCelebrityForVerify,
-                frames: frameReasons.join(","), framesChecked: frameVerdicts.length,
-              });
-          } else if (frameVerdicts.length > 1) {
-            // Successful multi-frame check — useful signal for tuning.
-            await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-              "clip.face_verify.multi_frame", {
-                start, overall: overallVerdict,
-                frames: frameReasons.join(","), framesChecked: frameVerdicts.length,
-              });
+            // Full-screen TEXT-CARD override — bypasses the majority rule.
+            //
+            // The majority rule protects clips that are clean for most of
+            // their duration from a single transient overlay frame (a brief
+            // lower-third, a momentary station bug). But a DISCLAIMER / title /
+            // text card is static full-screen text for the WHOLE clip — it is
+            // never "clean for most of its duration". Two ways it slips past
+            // the majority rule today:
+            //   - Short clips (≤1-2s) sample only ONE frame, and if Gemini
+            //     reads that frame as clean:"uncertain" (it fails open) the
+            //     dirtyCount is 0 → not dropped. This is the "He showed up."
+            //     block-69 leak: a 1s disclaimer card became scene footage.
+            //   - A clip whose dirty frames don't reach the majority threshold.
+            // When ANY sampled frame is flagged dirty AND its artifact reads as
+            // full-screen text (not a corner bug / transient strip), the clip
+            // is a text card throughout → hard-drop regardless of the count.
+            const FULLSCREEN_TEXT_RE =
+              /\b(disclaimer|viewer discretion|discretion advised|title card|text card|full[- ]?screen text|text screen|text overlay|legal notice|for entertainment purposes|warning screen|notice screen|end screen|credits)\b/i;
+            const hasTextCardFrame = cleanVerdicts.some(
+              (v, i) => v === "dirty" && FULLSCREEN_TEXT_RE.test(cleanArtifacts[i] ?? ""),
+            );
+            if (hasTextCardFrame) {
+              dropForDirty = true;
+            }
+
+            // PERSISTENT LOGO / WATERMARK override — also bypasses the
+            // majority rule, on a different signal than the text-card case.
+            //
+            // A burned-in channel logo or site watermark (e.g. a "HOLLYWOOD
+            // SECRETS" corner bug, a "werewolftvseries.com" URL strip) sits in
+            // the SAME corner on EVERY frame of the clip — it is never
+            // transient. But because it is small, Gemini Vision often only
+            // notices it on one of the three sampled frames and returns
+            // clean:"uncertain" (fail-open) on the others. That yields
+            // dirty=1 / uncertain=2, which never reaches the 2-of-3 majority,
+            // so the watermarked clip leaks into scene footage.
+            //
+            // The discriminator vs. a genuinely-transient lower-third is the
+            // presence of a CONFIDENTLY CLEAN frame: a real shot with a brief
+            // overlay has clean frames elsewhere; a clip stamped with a
+            // persistent logo has none. So: if ANY frame is dirty with a
+            // logo/watermark artifact AND NO frame came back "clean", treat
+            // the bug as persistent and drop. (When a clean frame exists we
+            // fall back to the majority rule — a true transient overlay.)
+            const LOGO_WATERMARK_RE =
+              /\b(logo|watermark|wordmark|station bug|channel bug|brand(?:ing|ed)?|url|website|\.com|\.tv|\.net)\b/i;
+            const anyConfidentlyClean = cleanVerdicts.some((v) => v === "clean");
+            const hasLogoFrame = cleanVerdicts.some(
+              (v, i) => v === "dirty" && LOGO_WATERMARK_RE.test(cleanArtifacts[i] ?? ""),
+            );
+            if (hasLogoFrame && !anyConfidentlyClean) {
+              dropForDirty = true;
+            }
           }
+
+          // FACE gate — majority rule (same as before). 2+ "no" of 3 → drop.
+          if (runFace) {
+            const yesCount = faceVerdicts.filter((v) => v === "yes").length;
+            const noCount = faceVerdicts.filter((v) => v === "no").length;
+            const total = faceVerdicts.length;
+            const majority = Math.ceil(total / 2);
+            const overall: "yes" | "no" | "uncertain" =
+              total === 0 ? "uncertain" :
+              yesCount >= majority ? "yes" :
+              noCount >= majority ? "no" :
+              "uncertain";
+            labelSet.add(`face_verify: ${overall}`);
+            if (overall === "no") dropForNoPerson = true;
+          }
+
+          await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+            "clip.frame_check.done", {
+              start, frames: frameReasons.join(","),
+              clean: cleanVerdicts.join(","), face: faceVerdicts.join(","),
+            });
         } catch (e) {
           void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
-            "clip.face_verify.failed", { start, err: (e as Error).message?.slice(0, 120) });
+            "clip.frame_check.error", { start, err: (e as Error).message?.slice(0, 120) });
         } finally {
-          // Best-effort cleanup of the extra thumbnails uploaded for
-          // verification. Failure to delete here doesn't affect the
-          // clip — just leaves orphaned files in R2.
-          if (tempDeleteList.length > 0) {
-            await removeFiles(tempDeleteList);
-          }
+          if (tempDeleteList.length > 0) await removeFiles(tempDeleteList);
         }
+      }
+
+      // Unclean footage (logo/watermark/text on any frame).
+      // Normal clips are HARD-DROPPED. The intro-head clip is the exception:
+      // we keep it (its audio is the celebrity's intro voice — the reason the
+      // intro clip exists), but we tag it NOT_SCENE_ELIGIBLE so the matcher
+      // never reuses a dirty intro frame (e.g. a t=0 disclaimer card) as
+      // regular scene footage. If a clean opening shot exists elsewhere the
+      // intro selector still prefers it.
+      if (dropForDirty && !isIntroHead) {
+        droppedJunk++;
+        droppedDirty++;
+        junkCategoryCounts["dirty_overlay"] = (junkCategoryCounts["dirty_overlay"] ?? 0) + 1;
+        await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+          "clip.dropped.dirty", { start });
+        await removeFiles([clipDest, thumbDest]);
+        return;
+      }
+      if (dropForDirty && isIntroHead) {
+        labelSet.add(NOT_SCENE_ELIGIBLE_LABEL);
+        await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+          "clip.intro_head.dirty_kept", { start });
+      }
+
+      // Hard drop for confirmed wrong-person clips. The main character is
+      // absent from this clip, so it must not enter the pool (otherwise the
+      // matcher could place it as filler in a block about that character).
+      if (dropForNoPerson) {
+        droppedJunk++;
+        droppedWrongPerson++;
+        junkCategoryCounts["wrong_person"] = (junkCategoryCounts["wrong_person"] ?? 0) + 1;
+        await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+          "clip.dropped.wrong_person", { start, person: mainCelebrityForVerify });
+        await removeFiles([clipDest, thumbDest]);
+        return;
       }
 
       const labels = Array.from(labelSet);
@@ -554,11 +818,24 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // cursor, so a slow clip on one lane doesn't hold up the others. This
   // is the dominant speedup — under serial execution the slowest step
   // (usually labeling on a 503 spike) gates everything.
+  //
+  // Backfill: `windows` holds the target (`cappedCount`) PLUS a reserve
+  // (sized by CLIP_BACKFILL_BUFFER_FACTOR). Lanes keep pulling from the
+  // pool — including the reserve — until `cappedCount` clips have actually
+  // SURVIVED (passed the cut + clean + face gates), or the pool is
+  // exhausted. Because failed/dirty/wrong-person clips don't increment
+  // `succeeded`, each loss is automatically replaced by the next reserve
+  // window. When losses are low we stop early and never cut the full
+  // reserve, so a clean source doesn't over-produce.
   const concurrency = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, windows.length));
   let cursor = 0;
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       while (true) {
+        // Stop pulling new windows once the surviving-clip target is met.
+        // Checked before claiming an index so in-flight lanes can still
+        // finish, but no new reserve window is started unnecessarily.
+        if (succeeded >= cappedCount) return;
         const i = cursor++;
         if (i >= windows.length) return;
         await processOne(i, windows[i]);
@@ -592,19 +869,57 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       succeeded,
       failed,
       droppedJunk,
+      // Reason-split + yield diagnostics (mirrors the clip.summary log) so the
+      // job record / UI can explain a short source: target vs succeeded, and
+      // whether the dirty-overlay or wrong-person gate dominated the drops.
+      droppedLabelJunk,
+      droppedDirty,
+      droppedWrongPerson,
+      target: cappedCount,
+      targetMet: succeeded >= cappedCount,
       junkCategoryCounts,
     },
   });
-  // Per-source summary so we can monitor the junk-filter rate across runs.
-  // High droppedJunk on one source = noisy YouTube upload; high droppedJunk
-  // across many sources = the labeler is over-classifying as junk.
+  // Per-source summary so we can monitor yield + the junk-filter rate across
+  // runs. The pool/target fields show how close this source got to its target
+  // and WHY it fell short when it did:
+  //   - target (cappedCount) vs succeeded → did we hit the goal?
+  //   - poolCount / physicalMax           → how many windows were available to
+  //                                          try (the full source after the
+  //                                          backfill widening) vs how many we
+  //                                          actually attempted (`attempted`)
+  //   - dropRate                          → fraction of attempted clips killed
+  //                                          by ALL gates (junk+dirty+wrong)
+  //   - droppedDirty / droppedWrongPerson → which gate dominated the loss, so a
+  //                                          short source is diagnosable (logo/
+  //                                          text vs face) at a glance
+  //   - poolExhausted                     → true when we tried every window and
+  //                                          STILL came up short — i.e. the
+  //                                          source physically can't yield more
+  //                                          clean clips, not a reserve-too-small
+  //                                          problem.
+  const attempted = processed;
+  const dropRate = attempted > 0
+    ? Math.round((droppedJunk / attempted) * 1000) / 1000
+    : 0;
   await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
     "clip.summary", {
-      attempted: windows.length,
+      attempted,
       succeeded,
       failed,
       droppedJunk,
+      droppedLabelJunk,
+      droppedDirty,
+      droppedWrongPerson,
       junkCategoryCounts,
+      // Yield diagnostics (added with the full-source backfill widening).
+      target: cappedCount,
+      targetMet: succeeded >= cappedCount,
+      poolCount,
+      physicalMax,
+      windowsGenerated: windows.length,
+      poolExhausted: succeeded < cappedCount && attempted >= windows.length,
+      dropRate,
     });
 
   await maybeEnqueueMatch(projectId);

@@ -29,6 +29,18 @@ export interface CutClipOptions {
   // Slow-mo requires a re-encode (libx264) because PTS rewriting can't
   // be done with `-c:v copy`.
   slowmoFactor?: number;
+  // Freeze-hold target (slow-mo branch only). When the source clip is too
+  // short to fill its planned slot even at the max slow-mo factor, the
+  // renderer caps slowmoFactor (e.g. 1.5×) — which leaves the stretched
+  // output SHORTER than durationSeconds. Without this, the clip ends early
+  // and the narrator keeps talking over the next scene, so every later
+  // title card / lower-third drifts off its spoken moment. When set, after
+  // the slow-mo stretch we append `tpad=stop_mode=clone` to hold the last
+  // frame until the output reaches padToFreezeDurationSeconds, so the slot
+  // fills exactly the planned narration time. Ignored when the stretched
+  // content already meets/exceeds the target. Only meaningful with
+  // slowmoFactor > 1.0.
+  padToFreezeDurationSeconds?: number;
   signal?: AbortSignal;
 }
 
@@ -69,19 +81,51 @@ export async function cutClip(opts: CutClipOptions): Promise<void> {
     //                                row-24 5.8s vs expected 8.23s bug
     //                                on 2026-06-01.
     const sourceDuration = opts.durationSeconds / slowmo;
+    // ALWAYS pin the slow-mo output to its exact target duration with a
+    // pad-then-trim: append `tpad=stop_mode=clone` (holds the last frame) and
+    // then cap with output-side `-t target`. This guarantees the rendered
+    // clip is EXACTLY `target` seconds in both failure directions:
+    //   • OVERSHOOT — libx264 + setpts round the stretched stream UP to whole
+    //     frames, so an uncapped slow-mo clip lands ~100–370ms LONGER than
+    //     asked. Across ~150 clips that compounded to ~8s of extra video, so
+    //     the final MP4 ran ~8s past the voiceover (the "video 29:39 vs
+    //     narration 29:31" bug). The output `-t` trims that overshoot off.
+    //   • UNDERSHOOT — when the source is too short to fill the slot even at
+    //     max slow-mo, the stretched stream lands SHORT. The `tpad` clone
+    //     holds the last frame to fill the gap before `-t` trims (the −3.4s
+    //     single-step bug at a too-short clip).
+    // Why tpad is REQUIRED before `-t` (and a bare `-t` is not enough): a bare
+    // output `-t` on the stretched stream caps the wall-clock without holding
+    // a tail, which on an undershoot crops real content short. tpad first,
+    // then `-t`, means `-t` only ever trims cloned padding or the rounding
+    // overshoot — never real footage.
+    //
+    // target = padToFreezeDurationSeconds when the caller pins a specific slot
+    // length (capped case), else the normal durationSeconds. tpad's
+    // stop_duration ADDS seconds after the content (it doesn't pad "up to" a
+    // total) and we don't know the source's exact on-disk length, so we
+    // over-clone by the full target window and let `-t` settle the precise
+    // final duration. Cloned frames encode to near-zero bytes, so over-
+    // cloning is cheap.
+    const target = typeof opts.padToFreezeDurationSeconds === "number"
+      && opts.padToFreezeDurationSeconds > 0
+      ? opts.padToFreezeDurationSeconds
+      : opts.durationSeconds;
+    const vf = `setpts=PTS*${slowmo.toFixed(4)},tpad=stop_mode=clone:stop_duration=${target.toFixed(3)}`;
     const args = [
       "-y",
       "-threads", String(env.FFMPEG_THREADS),
       "-ss", String(opts.startSeconds),
       "-t", String(sourceDuration),
       "-i", opts.inputPath,
-      "-vf", `setpts=PTS*${slowmo.toFixed(4)}`,
+      "-vf", vf,
       "-an",
       "-c:v", "libx264",
       "-preset", "veryfast",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
       "-avoid_negative_ts", "make_zero",
+      "-t", String(target),
       "-movflags", "+faststart",
       opts.outputPath,
     ];
@@ -156,7 +200,9 @@ export async function buildStillVideo(opts: {
   // Optional lower-third overlay. Same semantics as normalizeClip — when the
   // matcher's minute-cadence picker lands on an image block, the renderer
   // burns the proper-noun text in via the shared drawtext recipe.
-  lowerThird?: { text: string };
+  // startOffsetSeconds delays the chyron to the in-clip moment the narrator
+  // says the marked word (see normalizeClip's lowerThird doc).
+  lowerThird?: { text: string; startOffsetSeconds?: number };
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -268,7 +314,11 @@ export async function buildStillVideo(opts: {
   // uses. Appended to the final composite stage so the overlay sits on top
   // of the blurred-bg + zoomed-fg composite.
   const ltFilter = opts.lowerThird?.text
-    ? await buildLowerThirdFilter(opts.lowerThird.text, h)
+    ? await buildLowerThirdFilter(
+        opts.lowerThird.text,
+        h,
+        opts.lowerThird.startOffsetSeconds ?? 0,
+      )
     : null;
   const ltSuffix = ltFilter ? `,${ltFilter}` : "";
 
@@ -327,6 +377,49 @@ export async function buildStillVideo(opts: {
   }
 }
 
+// Build a plain black video segment of `durationSeconds` length. Used as a
+// FILLER when a timeline slot fails to render (e.g. the source clip download
+// timed out): without a filler, the failed slot is silently skipped at concat
+// and its planned narration window collapses, shifting every later segment —
+// including title cards and lower-thirds — permanently off the spoken audio.
+// Holding black for the planned duration keeps cumulative video-time tracking
+// the voiceover so downstream anchors still land on their narrated moment. The
+// viewer sees a brief black hold instead of the whole back half of the video
+// drifting out of sync.
+//
+// Encoder flags match buildStillVideo / normalizeClip BYTE-FOR-BYTE so the
+// final concat stays on the -c:v copy fast path.
+export async function buildBlackVideo(opts: {
+  outputPath: string;
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-f", "lavfi",
+    "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds.toFixed(3)}`,
+    "-an",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 // Build a split-screen still video — two source images placed side-by-side,
 // each filling its half of the frame. Used for blocks Gemini tagged as
 // split_2 ("Salma Hayek and Danny Trejo worked together"). Two inputs,
@@ -349,7 +442,8 @@ export async function buildSplitScreenVideo(opts: {
   // Optional lower-third overlay. Same recipe as normalizeClip /
   // buildStillVideo — when the matcher's minute-cadence picker lands on a
   // split_2 block, the renderer burns the proper-noun text in.
-  lowerThird?: { text: string };
+  // startOffsetSeconds delays the chyron to the spoken-word moment.
+  lowerThird?: { text: string; startOffsetSeconds?: number };
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -388,7 +482,11 @@ export async function buildSplitScreenVideo(opts: {
   // Lower-third drawn after the hstack so it spans both halves of the
   // composite. Skipped when no font is available on the host.
   const ltFilter = opts.lowerThird?.text
-    ? await buildLowerThirdFilter(opts.lowerThird.text, h)
+    ? await buildLowerThirdFilter(
+        opts.lowerThird.text,
+        h,
+        opts.lowerThird.startOffsetSeconds ?? 0,
+      )
     : null;
   const ltSuffix = ltFilter ? `,${ltFilter}` : "";
   const filter =
@@ -847,15 +945,33 @@ export interface NormalizeOptions {
   fps?: number;       // default 30
   // Optional lower-third overlay. When set, the matcher decided this clip
   // should introduce a named entity (person, year, or place). The text is
-  // burned in via ffmpeg's drawtext filter for the first ~3 seconds with a
-  // fade in/out, sitting in the lower-third zone with a translucent bar.
-  lowerThird?: { text: string };
+  // burned in via ffmpeg's drawtext filter for ~3.4s with a slide in/out,
+  // sitting in the lower-third zone with a solid blue chip.
+  //   startOffsetSeconds — in-clip time the chyron begins its slide-in. The
+  //   renderer sets this to (word_vo_start − clip_vo_start) so the chip
+  //   appears exactly when the narrator says the red-marked word, not at the
+  //   clip's start. Omitted/0 → chip appears at clip start (legacy behavior,
+  //   used as the fallback when no word time was resolved).
+  lowerThird?: { text: string; startOffsetSeconds?: number };
   // Retain the source's audio track on the normalized output. Default
   // false — the downstream concat builds the final audio from the
   // voiceover, so individual clips are silent. Forced doc clips that
   // should play their own audio pass true; the renderer then extracts
   // that audio for splicing into the voiceover chain.
   keepAudio?: boolean;
+  // Pin the normalized output to EXACTLY this many seconds via an output-side
+  // `-t`. The footage cut path uses `-c:v copy` (fast stream-copy), which can
+  // only end on a packet/keyframe boundary — so `cutClip(-t renderDur)`
+  // OVERSHOOTS to the next GOP, landing 60-180ms long per clip. The drift is
+  // always positive (never short) and across ~140 footage rows compounded to
+  // ~9s of video past the voiceover (the 2026-06-10 "video 9s longer than
+  // audio" bug). normalizeClip already re-encodes, so capping it with `-t`
+  // here costs nothing and trims the GOP overshoot back to the asked length.
+  // Verified: brings per-clip drift from +60-180ms to ±10ms (single-frame
+  // rounding) with no real frames dropped — the trimmed tail is only the
+  // copy-cut's over-included GOP. Leave undefined for image/title builders;
+  // they're CFR-clean from frame 0 and need no pin.
+  pinDurationSeconds?: number;
   signal?: AbortSignal;
 }
 
@@ -910,11 +1026,20 @@ async function resolveLowerThirdFont(): Promise<string | null> {
 // instead of registering the chip as already-there.
 //
 // Returns null if no font is available on the host.
-async function buildLowerThirdFilter(text: string, height: number): Promise<string | null> {
+async function buildLowerThirdFilter(
+  text: string,
+  height: number,
+  startOffsetSeconds = 0,
+): Promise<string | null> {
   const font = await resolveLowerThirdFont();
   if (!font) return null;
   // Timing: 0.4s slide in, 2.6s hold, 0.4s slide out. Total 3.4s.
-  const start = 0;
+  // `start` is the in-clip time the chyron begins its slide-in. It defaults to
+  // 0 (chip appears at clip start) but the renderer passes the offset of the
+  // red-marked word within this host clip so the chip appears exactly when the
+  // narrator says it. Every gate/interp expression below is already written
+  // relative to `start`, so shifting it is sufficient — no other change.
+  const start = Math.max(0, startOffsetSeconds);
   const slideIn = 0.4;
   const hold = 2.6;
   const slideOut = 0.4;
@@ -1014,7 +1139,11 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   // exactly between normalizeClip() and buildStillVideo() for -c copy to work.
   let vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`;
   if (opts.lowerThird?.text) {
-    const lt = await buildLowerThirdFilter(opts.lowerThird.text, h);
+    const lt = await buildLowerThirdFilter(
+      opts.lowerThird.text,
+      h,
+      opts.lowerThird.startOffsetSeconds ?? 0,
+    );
     // If the host has no usable font, ship the clip without the overlay
     // rather than failing the render. The match.lower_thirds log already
     // tells operators a lower-third was requested.
@@ -1032,6 +1161,13 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     "-pix_fmt", "yuv420p",
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
+    // Trim the copy-cut's GOP overshoot back to the asked length. Placed
+    // before -movflags so it caps the muxed output. Emitted only when the
+    // caller pins a target (the footage path); image/title callers leave it
+    // undefined and keep their exact builder length.
+    ...(typeof opts.pinDurationSeconds === "number" && opts.pinDurationSeconds > 0
+      ? ["-t", String(opts.pinDurationSeconds)]
+      : []),
     "-movflags", "+faststart",
     opts.outputPath,
   ];
@@ -1301,31 +1437,45 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   // pins everything to the silent-video length as a final guard.
   if (hasIntro && opts.voiceoverPath) {
     // Intro mode: input 0 = silent video, 1 = intro audio, 2 = voiceover,
-    // (3 = bg music if provided). Final audio plays the intro for the
-    // first introDurationSeconds, crossfades 0.3s into the voiceover.
+    // (3 = bg music if provided). Final audio plays the intro for the first
+    // introDurationSeconds, then the voiceover starts EXACTLY at intro end —
+    // no overlap (FIX #1).
     //
-    // acrossfade with curve1=tri:curve2=tri is a linear/triangular fade —
-    // smooth, inaudible, the standard production cut. The full duration
-    // of the output equals introDur + voiceoverDur - 0.3s overlap.
+    // The old build used `acrossfade=d=0.3`, which OVERLAPS the two streams:
+    // the voiceover began 0.3s BEFORE intro end and the combined length was
+    // introDur + voiceoverDur - 0.3s. The client needs the narrator to start
+    // precisely when the intro music ends, so we instead:
+    //   • trim the intro to introDur and fade its tail out over 0.2s so the
+    //     cut to the voiceover isn't a hard click,
+    //   • delay the voiceover by introDur (adelay) so it begins at intro end,
+    //     with a tiny 0.15s fade-in to soften its head,
+    //   • amix the two non-overlapping streams (duration=longest) so the
+    //     combined length is introDur + voiceoverDur (no deduction).
     const introDur = opts.introDurationSeconds!;
-    const xfade = 0.3;
+    const introDurMs = Math.round(introDur * 1000);
+    const introFadeOut = 0.2;
+    const introFadeStart = Math.max(0, introDur - introFadeOut);
+    const voFadeIn = 0.15;
     args.push("-i", opts.introAudioPath!);
     args.push("-i", opts.voiceoverPath);
     let filter = "";
     // Trim intro audio to its declared duration so a longer source file
-    // can't bleed into the voiceover section.
-    filter += `[1:a]atrim=duration=${introDur},asetpts=PTS-STARTPTS,volume=1.0[intro];`;
-    filter += `[2:a]volume=${opts.voiceoverGain ?? 1.0},asetpts=PTS-STARTPTS[vo];`;
-    filter += `[intro][vo]acrossfade=d=${xfade}:c1=tri:c2=tri[mainmix]`;
+    // can't bleed into the voiceover section, then fade its tail out.
+    filter += `[1:a]atrim=duration=${introDur},asetpts=PTS-STARTPTS,volume=1.0,afade=t=out:st=${introFadeStart.toFixed(3)}:d=${introFadeOut}[intro];`;
+    // Delay the voiceover so it starts exactly at intro end (introDur), with a
+    // short fade-in beginning at introDur to avoid a hard onset.
+    filter += `[2:a]volume=${opts.voiceoverGain ?? 1.0},asetpts=PTS-STARTPTS,adelay=${introDurMs}|${introDurMs},afade=t=in:st=${introDur.toFixed(3)}:d=${voFadeIn}[vo];`;
+    // No overlap: intro plays 0..introDur, voiceover plays introDur..end.
+    filter += `[intro][vo]amix=inputs=2:duration=longest:dropout_transition=0[mainmix]`;
     if (opts.bgMusicPath) {
       args.push("-stream_loop", "-1", "-i", opts.bgMusicPath);
       // Bg music must NOT play during the intro — only the intro audio is
-      // heard for the first introDur seconds. We delay the bg music so it
-      // starts at the crossfade point (introDur - xfade) and fades in over
-      // the xfade window, matching the voiceover's ramp-up.
-      const bgStart = Math.max(0, introDur - xfade);
+      // heard for the first introDur seconds. Now that there's no crossfade,
+      // the bg music starts exactly at intro end (introDur), fading in over a
+      // short window matching the voiceover's onset.
+      const bgStart = introDur;
       const bgStartMs = Math.round(bgStart * 1000);
-      filter += `;[3:a]asetpts=PTS-STARTPTS,volume=${opts.bgMusicGain ?? 0.15},adelay=${bgStartMs}|${bgStartMs}:all=1,afade=t=in:st=${bgStart.toFixed(3)}:d=${xfade}[bg];`;
+      filter += `;[3:a]asetpts=PTS-STARTPTS,volume=${opts.bgMusicGain ?? 0.15},adelay=${bgStartMs}|${bgStartMs}:all=1,afade=t=in:st=${bgStart.toFixed(3)}:d=${voFadeIn}[bg];`;
       filter += `[mainmix][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
     } else {
       filter += `;[mainmix]anull[aout]`;

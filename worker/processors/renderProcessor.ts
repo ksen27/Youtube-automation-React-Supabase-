@@ -6,12 +6,41 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
 import { getEnv } from "@/lib/env";
+
+// Minimum seconds of host clip that must remain after a lower-third's slide-in
+// begins, so a word spoken near the very end of a clip still produces a
+// visible chip instead of one that slides in as the clip cuts away.
+const MIN_LT_VISIBLE_SECONDS = 1.0;
+
+// Compute the in-clip offset (seconds) at which a lower-third chyron should
+// begin its slide-in, so it appears exactly when the narrator says the
+// red-marked word rather than at the host clip's start. Returns 0 (chip at
+// clip start — the legacy behavior) when the word time or the host's audio
+// start is missing, which is also the fallback for entity-name lower-thirds
+// that carry no per-word timestamp.
+//   lt        — the host row's metadata.lower_third object
+//   hostMeta  — the host row's metadata (for its vo_start_seconds)
+//   headLeft  — mixed-fade headroom baked in FRONT of the rendered content
+//   renderDur — the rendered clip's total length (content + headroom)
+function lowerThirdStartOffset(
+  lt: { vo_start_seconds?: number } | undefined,
+  hostMeta: Record<string, unknown>,
+  headLeft: number,
+  renderDur: number,
+): number {
+  if (!lt || typeof lt.vo_start_seconds !== "number") return 0;
+  const hostVoStart = hostMeta.vo_start_seconds;
+  if (typeof hostVoStart !== "number") return 0;
+  const rawOffset = lt.vo_start_seconds - hostVoStart + headLeft;
+  const maxOffset = Math.max(0, renderDur - MIN_LT_VISIBLE_SECONDS);
+  return Math.min(Math.max(0, rawOffset), maxOffset);
+}
 
 export async function processRenderJob(data: RenderJobData): Promise<void> {
   const sb = getServerSupabase();
@@ -73,15 +102,56 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   // dropped during DB write/read. If non-zero but no overlay appears in the
   // final video, the failure is downstream in the drawtext filter.
   {
-    const ltSummary = { count: 0, samples: [] as Array<{ idx: number; type: string; text: string; source: string }> };
+    // Per-lower-third placement audit. For each LT we log the marked word's
+    // spoken time (lt.vo_start_seconds) against its HOST block's audio window
+    // (block vo_start..vo_end). `wordInBlock` is true when the word the chyron
+    // labels is actually spoken WHILE this block is on screen — i.e. the LT is
+    // on the correct clip. After the 2026-06-10 host-selection fix this should
+    // be true for every LT that carries a word time; a `false` means the
+    // chyron is still landing on the wrong clip. `offsetInClip` is how far into
+    // the block the chyron slides in (word_vo_start − block_vo_start), which is
+    // what the renderer passes as the drawtext start offset.
+    const ltSummary = {
+      count: 0,
+      wordInBlock: 0,
+      wordOutOfBlock: 0,
+      noWordTime: 0,
+      samples: [] as Array<{
+        idx: number; type: string; text: string; source: string;
+        wordVoStart: number | null; blockVoStart: number | null;
+        blockVoEnd: number | null; offsetInClip: number | null; wordInBlock: boolean | null;
+      }>,
+    };
     for (let i = 0; i < renderable.length; i++) {
       const it = renderable[i];
       const meta = (it.metadata ?? {}) as Record<string, unknown>;
-      const lt = meta.lower_third as { text?: string; type?: string } | undefined;
+      const lt = meta.lower_third as
+        | { text?: string; type?: string; vo_start_seconds?: number }
+        | undefined;
       if (lt?.text) {
         ltSummary.count++;
-        if (ltSummary.samples.length < 5) {
-          ltSummary.samples.push({ idx: i, type: String(it.type), text: lt.text, source: String(lt.type ?? "?") });
+        const wordVoStart = typeof lt.vo_start_seconds === "number" ? lt.vo_start_seconds : null;
+        const blockVoStart = typeof meta.vo_start_seconds === "number" ? (meta.vo_start_seconds as number) : null;
+        const blockVoEnd = typeof meta.vo_end_seconds === "number" ? (meta.vo_end_seconds as number) : null;
+        let wordInBlock: boolean | null = null;
+        let offsetInClip: number | null = null;
+        if (wordVoStart != null && blockVoStart != null) {
+          offsetInClip = Math.round((wordVoStart - blockVoStart) * 100) / 100;
+          if (blockVoEnd != null) {
+            wordInBlock = wordVoStart >= blockVoStart - 0.05 && wordVoStart <= blockVoEnd + 0.05;
+          }
+        }
+        if (wordVoStart == null) ltSummary.noWordTime++;
+        else if (wordInBlock === true) ltSummary.wordInBlock++;
+        else if (wordInBlock === false) ltSummary.wordOutOfBlock++;
+        if (ltSummary.samples.length < 10) {
+          ltSummary.samples.push({
+            idx: i, type: String(it.type), text: lt.text, source: String(lt.type ?? "?"),
+            wordVoStart: wordVoStart != null ? Math.round(wordVoStart * 100) / 100 : null,
+            blockVoStart: blockVoStart != null ? Math.round(blockVoStart * 100) / 100 : null,
+            blockVoEnd: blockVoEnd != null ? Math.round(blockVoEnd * 100) / 100 : null,
+            offsetInClip, wordInBlock,
+          });
         }
       }
     }
@@ -214,14 +284,19 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             downloadHttp(rightUrl, rightLocal),
           ]);
           const splitMeta = (it.metadata ?? {}) as Record<string, unknown>;
-          const splitLt = splitMeta.lower_third as { text?: string } | undefined;
+          const splitLt = splitMeta.lower_third as
+            | { text?: string; vo_start_seconds?: number }
+            | undefined;
+          const splitLtOffset = lowerThirdStartOffset(splitLt, splitMeta, headLeft, renderDur);
           await buildSplitScreenVideo({
             leftImagePath: leftLocal,
             rightImagePath: rightLocal,
             outputPath: out,
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
-            lowerThird: splitLt?.text ? { text: splitLt.text } : undefined,
+            lowerThird: splitLt?.text
+              ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
+              : undefined,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
@@ -318,7 +393,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const localImg = path.join(tmp, `img_${idx}`);
           await downloadHttp(it.image_url as string, localImg);
           const imgMeta = (it.metadata ?? {}) as Record<string, unknown>;
-          const imgLt = imgMeta.lower_third as { text?: string } | undefined;
+          const imgLt = imgMeta.lower_third as
+            | { text?: string; vo_start_seconds?: number }
+            | undefined;
+          const imgLtOffset = lowerThirdStartOffset(imgLt, imgMeta, headLeft, renderDur);
           // Cycle through four motion modes per consecutive image so the
           // viewer never sees the same motion twice in a row:
           //   0 → zoom-in
@@ -337,7 +415,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             durationSeconds: renderDur,
             width: 1280, height: 720, fps: 30,
             motionDirection: motion,
-            lowerThird: imgLt?.text ? { text: imgLt.text } : undefined,
+            lowerThird: imgLt?.text
+              ? { text: imgLt.text, startOffsetSeconds: imgLtOffset }
+              : undefined,
           });
           slots[i] = out;
           slotDurations[i] = renderDur;
@@ -414,7 +494,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             .maybeSingle();
           preClipUrl = (markerRow?.clip_storage_url as string | null) ?? null;
         }
-        const lt = meta.lower_third as { text?: string } | undefined;
+        const lt = meta.lower_third as
+          | { text?: string; vo_start_seconds?: number }
+          | undefined;
+        const ltStartOffset = lowerThirdStartOffset(lt, meta, headLeft, renderDur);
 
         if (preClipUrl) {
           // Pre-downloaded path. The asset on R2 is already cut + normalized
@@ -441,7 +524,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               await normalizeClip({
                 inputPath: trimmedPre, outputPath: out,
                 width: 1280, height: 720, fps: 30,
-                lowerThird: lt?.text ? { text: lt.text } : undefined,
+                lowerThird: lt?.text
+                  ? { text: lt.text, startOffsetSeconds: ltStartOffset }
+                  : undefined,
                 keepAudio: true,
               });
               await safeUnlink(trimmedPre);
@@ -497,7 +582,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await normalizeClip({
               inputPath: trimmed, outputPath: out,
               width: 1280, height: 720, fps: 30,
-              lowerThird: lt?.text ? { text: lt.text } : undefined,
+              lowerThird: lt?.text
+                ? { text: lt.text, startOffsetSeconds: ltStartOffset }
+                : undefined,
               keepAudio: true,
             });
             slots[i] = out;
@@ -580,10 +667,23 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               });
           }
 
+          // When slow-mo was capped (clip too short to fill the slot even at
+          // 1.5×), the stretched output would land SHORT of renderDur and the
+          // clip would end before its narration does — drifting every later
+          // title card / lower-third off the spoken word. Pass the renderDur
+          // as a freeze-hold target so cutClip holds the last frame to fill
+          // the slot exactly. Only set it when capped; an uncapped slow-mo (or
+          // a long-enough clip) already fills renderDur, so the freeze is a
+          // no-op there.
+          const freezeTarget =
+            slowmoFactor != null && rawStretch > MAX_SLOWMO_FACTOR
+              ? renderDur
+              : undefined;
           await cutClip({
             inputPath: local, outputPath: trimmed,
             startSeconds: 0, durationSeconds: renderDur,
             slowmoFactor,
+            padToFreezeDurationSeconds: freezeTarget,
           });
           // Lower-third stamped by the matcher: { text, type } on
           // metadata.lower_third when this clip should introduce a name
@@ -591,11 +691,28 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // passes only the text — type is used by the matcher for the
           // first-time-only rule and is irrelevant downstream.
           const meta = (it.metadata ?? {}) as Record<string, unknown>;
-          const lt = meta.lower_third as { text?: string } | undefined;
+          const lt = meta.lower_third as
+            | { text?: string; vo_start_seconds?: number }
+            | undefined;
+          // Delay the chyron to the in-clip moment the narrator says the
+          // red-marked word (falls back to clip start when no word time).
+          const ltStartOffset = lowerThirdStartOffset(lt, meta, headLeft, renderDur);
+          // Pin the normalized footage clip to exactly renderDur. The cut
+          // above (stream-copy in the normal path) overshoots renderDur to the
+          // next keyframe by 60-180ms; this re-encode caps it back so the slot
+          // matches what the timeline planned. We pin to renderDur (NOT the
+          // probed cut length) on purpose: renderDur includes the mixed-fade
+          // headroom that the xfade merge later subtracts, and the headroom
+          // accounting at slotContentDurations below assumes the clip is
+          // exactly renderDur long. Without the pin that assumption was false
+          // and the residual leaked as ~9s of cumulative positive drift.
           await normalizeClip({
             inputPath: trimmed, outputPath: out,
             width: 1280, height: 720, fps: 30,
-            lowerThird: lt?.text ? { text: lt.text } : undefined,
+            lowerThird: lt?.text
+              ? { text: lt.text, startOffsetSeconds: ltStartOffset }
+              : undefined,
+            pinDurationSeconds: renderDur,
           });
           slots[i] = out;
           // Probe the actually-produced clip. When the source footage is
@@ -642,6 +759,52 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         }
       }),
     );
+
+    // ---- failed-slot filler pass ----------------------------------------
+    // A slot that failed to render (source download timeout, ffmpeg error)
+    // leaves slots[i] === null. The merge loop below skips null slots, which
+    // silently DROPS that block's planned narration window — so every later
+    // segment, including title cards and lower-thirds, slides earlier by the
+    // dropped duration and lands off its spoken moment (the audit showed a
+    // single timed-out clip costing 6s of permanent downstream drift).
+    //
+    // Replace each null non-intro slot with a black filler of the block's
+    // PLANNED duration so the timeline hole is held, not collapsed. The
+    // viewer sees a brief black hold; cumulative video-time keeps tracking
+    // the voiceover so downstream anchoring survives one failed clip. We
+    // re-use the planned duration (timeline_items.duration) — not a probe —
+    // because there is no rendered file to probe.
+    {
+      const fillerHeadroom = 0; // filler is a standalone hold; no xfade headroom
+      let fillersInserted = 0;
+      for (let i = 0; i < renderable.length; i++) {
+        if (slots[i] !== null) continue;
+        const it = renderable[i];
+        if (it.type === "intro") continue;
+        const plannedDur = Math.max(0.5, Number(it.duration) || 0);
+        const out = path.join(tmp, `filler_${String(i).padStart(3, "0")}.mp4`);
+        try {
+          await buildBlackVideo({
+            outputPath: out,
+            durationSeconds: plannedDur,
+            width: 1280, height: 720, fps: 30,
+          });
+          slots[i] = out;
+          slotDurations[i] = plannedDur;
+          slotContentDurations[i] = Math.max(0.1, plannedDur - fillerHeadroom);
+          fillersInserted++;
+        } catch (e) {
+          // If even the filler fails, leave the slot null (it'll be skipped
+          // as before) — better a small drift than aborting the whole render.
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.filler.failed", { idx: i, err: (e as Error).message });
+        }
+      }
+      if (fillersInserted > 0) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.filler.inserted", { count: fillersInserted });
+      }
+    }
 
     // Apply transitions at boundaries between successfully-rendered slots.
     // Three cases:
@@ -1390,15 +1553,18 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const OUTRO_FADE_SECONDS = 1.5;
     const lastIdx = normalized.length - 1;
     const lastSegDur = mergedDurations[mergedDurations.length - 1] ?? 0;
-    // 0.3s acrossfade between intro audio and voiceover overlaps the two
-    // tracks, shortening combined audio by exactly that much. The video
-    // side does NOT overlap (intro video segments are concatenated head-
-    // to-tail), so totalVideoDuration must subtract the overlap to match
-    // the audio length. Without this, the encoder's `-t totalDur` flag
-    // clipped the final ~0.3s of voiceover off every render (the 31:54
-    // audio → 31:52 final-video drift). When there's no intro audio,
-    // there's no crossfade and the deduction is zero.
-    const INTRO_ACROSSFADE_SECONDS = 0.3;
+    // FIX #1: the intro audio and voiceover no longer overlap. The ffmpeg
+    // intro path used to acrossfade=0.3s, overlapping the two audio tracks so
+    // combined audio was 0.3s SHORTER than introDur + voiceoverDur, and this
+    // deduction kept the encoder's `-t totalDur` flag from clipping the last
+    // 0.3s of narration. Now the voiceover is adelay'd to start EXACTLY at
+    // intro end (no overlap), so combined audio == introDur + voiceoverDur and
+    // total video == introDurationActual + sum(mergedDurations) with NO
+    // deduction. The overlap constant is therefore 0 — padding
+    // totalVideoDurationSeconds to the full intro + voiceover length is correct
+    // and does NOT re-introduce the narration-clipping bug (there's nothing to
+    // subtract anymore).
+    const INTRO_ACROSSFADE_SECONDS = 0;
     const introAudioOverlap = introAudioPath && introDurationActual > 0
       ? INTRO_ACROSSFADE_SECONDS
       : 0;
@@ -1705,21 +1871,54 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       for (let i = 0; i < renderable.length; i++) {
         const it = renderable[i];
         if (it.type === "intro") continue;
+        // Title cards keep their typewriter + HOLD_TAIL duration, which is
+        // intentionally LONGER than their audio interval (the trailing hold
+        // is a visual beat so the viewer can read the fully-typed card, not
+        // narration time). The matchProcessor vo-start-driven pass skips
+        // title cards for exactly this reason — the writeback must too, or it
+        // would shrink every card to its spoken span and drop the read beat.
+        // Their duration is already correct from match; leave it untouched.
+        if (it.type === "title_card") continue;
+        // Skip duration_clamped rows — forced doc clips (the YouTube window
+        // the author chose) and the title-card padding rows. The
+        // matchProcessor vo-start pass already sized these to their correct
+        // value; overwriting them here with the naive next-vo_start delta is
+        // WRONG because forced clips stacked under one title card can share
+        // (or near-share) a vo_start, making the sorted-delta interval ~0,
+        // which Math.max floors to 0.1s — collapsing ~seconds of forced-clip
+        // video to nothing and pulling everything after it earlier (the
+        // negative-drift jump at stacked-clip sections). Leave clamped rows
+        // exactly as match wrote them.
+        const itMeta = (it.metadata ?? {}) as Record<string, unknown>;
+        if (itMeta.duration_clamped === true) continue;
         const contentDur = slotContentDurations[i];
         if (!(contentDur > 0)) continue;
-        // Audio-interval floor: if the rendered slot came out shorter than
-        // the row's audio interval (slow-mo got capped at 1.5×, source clip
-        // was too short, etc.), keep the row's planned duration so the
-        // editor still shows the gap the user needs to fix. Writing the
-        // shorter contentDur here used to corrupt the timeline: a later
-        // re-render reads the shorter value as the new target, the visual
-        // ends before the narrator's next sentence starts, and the final
-        // MP4 has audio-without-picture gaps (the 24→25 mismatch bug,
-        // 2026-06-01). Audio-interval is the source of truth.
-        // If no audio interval is known for this row (last row, or row
-        // missing vo_start), fall back to contentDur as before.
+        // The audio interval (next.vo_start − cur.vo_start) IS the narration
+        // window this row covers, and it is the source of truth for the row's
+        // duration in BOTH directions:
+        //   • Too SHORT (slow-mo capped, source clip too short) → writing the
+        //     short rendered length would end the visual before the next
+        //     sentence starts, leaving audio-without-picture gaps (the 24→25
+        //     mismatch bug, 2026-06-01). The freeze-hold pass in cutClip now
+        //     pads the PICTURE to fill the slot, so the row's duration must
+        //     stay at the audio interval.
+        //   • Too LONG (slow-mo / xfade headroom made the rendered clip run
+        //     past its narration window) → the PREVIOUS code took
+        //     max(contentDur, audioInterval), which let the inflated rendered
+        //     length win. Persisted back to timeline_items, that pushed every
+        //     later row — including title cards and lower-thirds — later than
+        //     its spoken moment, and because each re-render read the inflated
+        //     value and inflated it AGAIN, the drift ratcheted up every render
+        //     (the cumulative 9–10s "card appears late" bug). Writing the
+        //     audio interval makes each row exactly its narration window, so
+        //     cumulative video-time == voiceover-time at every anchor and the
+        //     writeback is IDEMPOTENT (a re-render writes the same values, no
+        //     compounding).
+        // When no audio interval is known (last row, or row missing vo_start)
+        // there's no narration window to anchor against — fall back to the
+        // rendered content duration as before.
         const audioInterval = audioIntervalByIdx.get(i);
-        const safeDur = audioInterval != null ? Math.max(contentDur, audioInterval) : contentDur;
+        const safeDur = audioInterval != null ? audioInterval : contentDur;
         // Only write when the value materially differs (>0.05s) to avoid
         // a no-op UPDATE storm on projects where the render exactly matched
         // the plan. id and project_id come from the row we loaded above.

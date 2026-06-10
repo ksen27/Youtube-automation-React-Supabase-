@@ -41,6 +41,19 @@ const ServerEnvSchema = z.object({
   // "wrong person in the clip" failure mode where the source thumbnail
   // shows the celebrity but a cut mid-video shows only a co-host.
   CLIP_FACE_VERIFY_ENABLED: z.coerce.boolean().default(true),
+  // "Clear footage only" gate. When on, each cut clip's sampled frames
+  // (start/mid/end) are checked for logos, watermarks, on-screen text/captions,
+  // title cards and end-screens; a clip is DROPPED if any frame is dirty. This
+  // is stricter than the single-frame labeler junk check (which only looks at
+  // the first frame and tolerates lower-third text). Costs up to 3 extra Gemini
+  // Vision calls per clip — reuses the frames already sampled for face verify.
+  CLIP_CLEAN_FOOTAGE_ENABLED: z.coerce.boolean().default(true),
+  // "Celebrity images only" mode. When on, the image pool fetches ONLY the
+  // main celebrity's images — no buildings, places, company/show logos, posters,
+  // or even related people. Blocks that would otherwise show a non-person image
+  // fall back to celebrity footage/image instead. Client requirement: the final
+  // video shows only the celebrity, never off-person imagery.
+  IMAGE_CELEBRITY_ONLY: z.coerce.boolean().default(true),
   // Master toggle for analyze-time face verification. When false, both the
   // thumbnail check AND the body-frame check are skipped — candidates are
   // accepted based on rankCandidate score alone. The verify code path is
@@ -74,6 +87,13 @@ const ServerEnvSchema = z.object({
   // and compete with story-aware candidates via the existing ranker.
   ANALYZE_CHARACTER_LANE_ENABLED: z.coerce.boolean().default(true),
   MAX_VIDEOS_PER_PROJECT: z.coerce.number().int().positive().default(5),
+  // Upper bound on the fraction of content blocks (image + footage) that may
+  // be images. Gemini's per-sentence visual-type call lands ~50% images,
+  // which over-uses the verified image pool (same photo repeats) and reads as
+  // a slideshow. The transcript-driven builder caps images at this ratio and
+  // converts the lowest visual_priority image blocks to footage. 0.40 = 40:60
+  // image:footage; set 0.30 for 30:70. Range (0,1).
+  MAX_IMAGE_RATIO: z.coerce.number().gt(0).lt(1).default(0.40),
   // Subject-first source-video target. The number of source videos we aim to
   // SELECT scales with voiceover duration instead of a flat constant: the
   // longer the narration, the more distinct footage sources it needs. Client
@@ -92,6 +112,42 @@ const ServerEnvSchema = z.object({
   // pruning wrong-person / off-topic videos. 1.5× the target by default.
   SOURCE_REVIEW_POOL_FACTOR: z.coerce.number().positive().default(1.5),
   MIN_SUCCESSFUL_VIDEOS_PER_PROJECT: z.coerce.number().int().nonnegative().default(2),
+  // Appearance-count gate for downloading SOURCE VIDEOS / making CLIPS of a
+  // SECONDARY person (anyone other than the project celebrity). A secondary
+  // person earns the clip-search + download + clip path only when they are the
+  // resolved subject of at least this many narration segments (totalBlocks from
+  // the coreference ranking). Below the threshold they get STILL IMAGES only
+  // (Wikipedia / Brave / Google CSE), which run for everyone regardless. The
+  // main celebrity always qualifies and ignores this gate. Tune UP to spend
+  // YouTube quota + clip-making only on frequently-appearing people; tune DOWN
+  // to give more of the supporting cast real footage. Default 4 (≈28s of
+  // narration at the typical block cadence).
+  SECONDARY_PERSON_VIDEO_THRESHOLD: z.coerce.number().int().positive().default(4),
+  // Person-image pool variety. The main celebrity's photo pool is sized by
+  // audio duration — target ≈ voiceoverSeconds / 10 — so longer videos get
+  // more unique images and no single photo repeats under the reuse cooldown.
+  // PERSON_PHOTO_HARD_CAP clamps that duration-scaled target so very long
+  // audios don't trigger thousands of Gemini face-verify calls (each pool
+  // image costs one verify call). Raise the cap to allow MORE variety on long
+  // videos at the cost of a slower match step. Default 80 (was an inline 40):
+  // a 13-min+ video can now reach the cap instead of being clamped at 40.
+  PERSON_PHOTO_HARD_CAP: z.coerce.number().int().positive().default(80),
+  // How many image-search results each query pulls into the candidate pool
+  // before dedup + face-verify. Higher = more candidates per query (pool
+  // fills in fewer queries) but more verify calls per query. Pool SIZE is
+  // governed by PERSON_PHOTO_HARD_CAP / the duration target, not this — this
+  // only affects how fast the pool fills. Default 12.
+  IMAGES_PER_ENTITY: z.coerce.number().int().positive().default(12),
+  // Concurrency for the matcher's person-photo pool builder. Each fetched
+  // candidate gets one Gemini face-verify (verifyPoolAsset) before it can
+  // enter the cache; serially that is up to ~120 round-trips per person and
+  // is the dominant cost of the match step on image-heavy projects. The
+  // verifies are network-bound (Gemini Vision) and independent per URL, so
+  // running a batch concurrently cuts wall-time roughly by this factor.
+  // verifyPoolAsset has its own per-process LRU cache, so concurrent calls
+  // for the same URL are safe. Default 6 — comfortably under Gemini's
+  // per-key rate limit while collapsing the serial verify chain.
+  MATCH_POOL_VERIFY_CONCURRENCY: z.coerce.number().int().positive().default(6),
   MAX_FALLBACK_PROMOTIONS_PER_PROJECT: z.coerce.number().int().nonnegative().default(5),
   MAX_CLIPS_PER_VIDEO: z.coerce.number().int().positive().default(20),
   // Per-clip pipeline concurrency inside one source. Each "lane" runs
@@ -115,6 +171,28 @@ const ServerEnvSchema = z.object({
   // Higher = matcher has more options to pick from = better matches, but more
   // storage/processing. 1 = no choice, 2 = balanced, 3+ = quality-first.
   CLIP_OVERSAMPLING_FACTOR: z.coerce.number().positive().default(2),
+  // Backfill reserve. Clip cuts are lost three ways — ffmpeg failure, the
+  // clean-footage gate (logo/watermark), and the face gate (wrong person) —
+  // and none are retried, so a source that aims for N clips often ends up
+  // with fewer. To keep the surviving count per source stable, the clip
+  // processor cuts a reserve of EXTRA candidate windows beyond the target
+  // and keeps cutting from the reserve until `target` clips survive (or the
+  // reserve / the source's physical capacity is exhausted). This factor
+  // sizes that reserve as a fraction of the target: 0.5 = +50% extra windows
+  // held in reserve (enough to absorb a ~33% drop rate). Set 0 to disable
+  // backfill (cut exactly the target, no reserve — the old behaviour).
+  CLIP_BACKFILL_BUFFER_FACTOR: z.coerce.number().nonnegative().default(0.5),
+  // Hard ceiling on the candidate-window pool, expressed as a multiple of the
+  // per-source survivor target (`cappedCount`). The backfill reserve
+  // (CLIP_BACKFILL_BUFFER_FACTOR) sizes the pool proportionally, but on a
+  // long source that proportional reserve — and the old "use the whole
+  // source" behaviour — generated hundreds of candidate windows, each costing
+  // an ffmpeg cut + up to 4 Gemini Vision calls. That made the clip step
+  // crawl and showed a huge "totalClips" on the job. This factor caps the
+  // pool at `cappedCount × CLIP_MAX_POOL_FACTOR` so even a heavy-drop source
+  // attempts at most this many windows per target clip. Default 3 = attempt
+  // up to 3× the target before giving up (absorbs a ~66% drop rate).
+  CLIP_MAX_POOL_FACTOR: z.coerce.number().positive().default(3),
   // Lower bound on the project clip cap — prevents under-clipping for very
   // short voiceovers or when voiceover duration isn't known yet.
   MIN_CLIP_CAP: z.coerce.number().int().positive().default(20),

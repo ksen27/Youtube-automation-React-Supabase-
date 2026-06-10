@@ -17,6 +17,10 @@ export interface WikipediaImageResult {
   height: number;
   pageUrl: string;
   pageTitle: string;
+  // Wikipedia's short description (e.g. "Queen of the United Kingdom since
+  // 2022", or "Male given name"). Lets callers detect when a bare name
+  // resolved to a name-origin / disambiguation page instead of a real person.
+  description: string;
 }
 
 /**
@@ -44,6 +48,7 @@ export async function fetchWikipediaImage(query: string): Promise<WikipediaImage
       originalimage?: { source?: string; width?: number; height?: number };
       content_urls?: { desktop?: { page?: string } };
       title?: string;
+      description?: string;
     };
     // Disambiguation pages don't have a useful image; skip them.
     if (json.type === "disambiguation") return null;
@@ -55,6 +60,7 @@ export async function fetchWikipediaImage(query: string): Promise<WikipediaImage
       height: img.height ?? 0,
       pageUrl: json.content_urls?.desktop?.page ?? `https://en.wikipedia.org/wiki/${title}`,
       pageTitle: json.title ?? query,
+      description: json.description ?? "",
     };
   } catch {
     return null;

@@ -18,7 +18,8 @@ import {
   type PlannedBlockWithHint,
 } from "@/lib/ai/timeline-plan";
 import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
-import { fetchImages } from "@/lib/images/fetch";
+import { fetchImages, rehostImageToR2 } from "@/lib/images/fetch";
+import { getEnv } from "@/lib/env";
 import { verifyPoolAsset } from "@/lib/ai/pool-verification";
 import { verifyImageMatchesScript } from "@/lib/ai/verify";
 import { lookupReference } from "@/lib/ai/face-references";
@@ -56,6 +57,49 @@ function legacyEntityToBlockEntityType(legacy: string): BlockEntityType | null {
     default:
       return null;
   }
+}
+
+// Person-image hard gate (the "wrong celebrity slipped into the pool" fix).
+//
+// PRINCIPLE: any image that is supposed to depict a real PERSON must be
+// positively face-matched against that person's reference photo before it can
+// enter a pool. "On-topic for the narration" is NOT "is this the right person"
+// — a glamorous red-carpet photo of the WRONG woman is perfectly on-topic for a
+// celebrity documentary, which is exactly how a mislabeled web image
+// ("Katherine Heigl" that isn't her) used to leak in.
+//
+// This centralises that decision so every fetch site enforces it identically:
+//   - When we know which person the image should depict (the block's named
+//     person, OR — for generic / celebrity_default slots — the project
+//     celebrity), require Gemini to POSITIVELY confirm identity against the
+//     reference. No reference / "uncertain" / "no" → reject. Never fail-open
+//     for a person image.
+//   - When there is no person to check against (no named person AND no project
+//     celebrity), return accept=true so non-person flows are unchanged.
+//
+// `personName` is the person to verify against — pass the block's resolved
+// person when it has one, else the project's main celebrity. Pass null/empty
+// to opt out (caller has no person identity to enforce).
+async function gatePersonImage(args: {
+  projectId: string;
+  personName: string | null | undefined;
+  candidateUrl: string;
+}): Promise<{ accept: boolean; verdict: string; reason: string }> {
+  const name = (args.personName ?? "").trim();
+  if (!name) return { accept: true, verdict: "skipped", reason: "no person to verify against" };
+  const verdict = await verifyPoolAsset(
+    {
+      projectId: args.projectId,
+      entityType: "person",
+      entityName: name,
+      candidateUrl: args.candidateUrl,
+    },
+    // requireConfirmed: only a POSITIVE face-match passes. Missing reference,
+    // "uncertain", and "no" are all rejected — an unconfirmable person image
+    // must never ship as that person.
+    { requireConfirmed: true },
+  );
+  return { accept: verdict.accept, verdict: verdict.verdict, reason: verdict.reason };
 }
 
 // Below this score (0–100), Gemini judged the clip a poor visual fit for the
@@ -324,6 +368,26 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
   await setProjectStatus(projectId, "matching");
 
+  // Heartbeat. The match step does its heavy work — LLM block scoring plus
+  // per-entity image-pool building (fetchImages + verifyPoolAsset, hundreds
+  // of Gemini round-trips) — in one long span with sparse progress writes.
+  // The stall sweeper (worker/reconcile.ts) fails any media_jobs row whose
+  // updated_at hasn't moved past the lock window (~20 min), so on a large
+  // project it used to flip a STILL-RUNNING match job to "failed" mid-flight
+  // — the job then finished and wrote "completed", producing the confusing
+  // "failed, then succeeded" sequence. A metadata write merges (it never
+  // clobbers status/progress) and fires the media_jobs_touch trigger, which
+  // refreshes updated_at — proving the job is alive so the sweeper leaves it
+  // be. unref() so this timer never keeps the worker process alive on its own.
+  const heartbeat = setInterval(() => {
+    void setMediaJob(mediaJobId, { metadata: { heartbeatAt: new Date().toISOString() } })
+      .catch(() => { /* transient DB blip — next tick retries */ });
+  }, 60_000);
+  heartbeat.unref?.();
+  const stopHeartbeat = () => clearInterval(heartbeat);
+
+  try {
+
   const { data: project } = await sb
     .from("projects")
     .select("transcript, voiceover_duration_seconds, transcript_words, intro_source_youtube_url")
@@ -432,6 +496,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     "title card", "watermark", "channel logo", "blank frame", "black frame",
     "uniform color", "solid black", "solid white", "credits", "scrolling text",
     "lower third only", "text only", "quote card",
+    // Disclaimer / legal / text-card screens — clips whose frame is mostly
+    // on-screen text the editor never wants in the final video. These catch
+    // OLD clips that were cut before the clip-stage clean-footage gate existed
+    // (new clips are dropped at creation). Kept broad on purpose.
+    "disclaimer", "legal notice", "for entertainment purposes",
+    "text card", "text screen", "text overlay", "full screen text",
+    "intro card", "outro card", "warning screen", "notice screen",
+  ];
+  // Narrower telltale set used ONLY to screen the heuristic intro fallback
+  // (when the Vision verifier couldn't run). Anything obviously a full-screen
+  // text/legal card should never become the 0:00–0:06 intro slot. Kept a
+  // subset of JUNK_LABEL_TELLTALES focused on cards a head-of-source clip
+  // commonly opens with — the disclaimer / discretion card being the one
+  // that prompted this gate.
+  const INTRO_TEXTCARD_TELLTALES = [
+    "disclaimer", "legal notice", "for entertainment purposes",
+    "viewer discretion", "discretion advised",
+    "text card", "text screen", "text overlay", "full screen text",
+    "title card", "intro card", "warning screen", "notice screen",
   ];
   const droppedJunkAtMatcher: Array<{ id: string; offending: string[] }> = [];
   const clipsForMatch: ClipForMatch[] = [];
@@ -658,6 +741,15 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       .filter((x) => x.thumbnailUrl.length > 0);
     introCandidateCount = verifyInputs.length;
 
+    // Did the Vision verifier actually look at frames and REJECT them all?
+    // We must distinguish that from "the verifier never ran" (no celebrity,
+    // no usable thumbnails, or a Gemini error). When the verifier examined
+    // real candidates and qualified none, its "no" is authoritative — the
+    // top head clip is a title / disclaimer / wrong-speaker card and must
+    // NOT be shipped as the intro. perCandidate is non-empty only when the
+    // model returned per-frame judgements, so it's our "verifier ran" signal.
+    let verifierRanAndRejectedAll = false;
+
     if (mainCelebrity && verifyInputs.length > 0) {
       const verdict = await verifyIntroCandidates(
         mainCelebrity,
@@ -669,17 +761,37 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         const matched = ranked.find((r) => r.c.id === verdict.winnerClipId);
         selectClip(verdict.winnerClipId, matched?.score ?? 0);
         introSelectionTier = "verified";
+      } else if (verdict.perCandidate.length > 0) {
+        verifierRanAndRejectedAll = true;
       }
     }
 
-    // Gemini found no qualifying candidate (or we couldn't run it). Fall
-    // back to the top heuristic pick rather than shipping without an intro
-    // — the heuristic is wrong sometimes, but skipping the intro entirely
-    // is wrong every time.
-    if (!introClipId) {
+    // Fallback policy — only when we still have no intro:
+    //   1. If the verifier RAN and rejected every candidate, trust it and
+    //      SKIP the intro. Re-admitting ranked[0] here is exactly the bug
+    //      that put a t=0 "DISCLAIMER / viewer discretion" text card in the
+    //      0:00–0:06 intro slot: the head clip wins the heuristic, the
+    //      verifier correctly says "no person on camera", and the old
+    //      fallback shipped it anyway. The renderer handles a null intro
+    //      clip gracefully (renders without an intro), so skipping is safe.
+    //   2. If the verifier COULD NOT run (no celebrity / no thumbnails /
+    //      Gemini error), fall back to the top heuristic pick — but screen
+    //      it for text-card telltales first so a disclaimer/title card never
+    //      becomes the intro silently when Vision was unavailable.
+    if (!introClipId && !verifierRanAndRejectedAll) {
       const best = ranked[0];
-      selectClip(best.c.id, best.score);
-      introSelectionTier = "heuristic_fallback";
+      const bestLabels = (best.c.labels ?? []).map((l) => l.toLowerCase());
+      const looksLikeTextCard = bestLabels.some((l) =>
+        INTRO_TEXTCARD_TELLTALES.some((t) => l.includes(t))
+      );
+      if (looksLikeTextCard) {
+        introVerifierReason = introVerifierReason
+          ? `${introVerifierReason}; heuristic fallback skipped (text-card labels)`
+          : "verifier unavailable; heuristic fallback skipped (text-card labels)";
+      } else {
+        selectClip(best.c.id, best.score);
+        introSelectionTier = "heuristic_fallback";
+      }
     }
   }
 
@@ -712,6 +824,35 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // re-download to match the newly-selected intro clip.
       intro_audio_url: null,
     }).eq("id", projectId);
+  }
+
+  // ---- Drop scene-ineligible clips before scene matching ----------------
+  // Intro selection above is the ONLY consumer allowed to see clips tagged
+  // `not_scene_eligible` (a t=0 disclaimer / text card kept solely as a
+  // possible intro AUDIO shot). Everything below — scene scoring, filler
+  // tiers, the whole timeline — must never place these as footage. Pruning
+  // here, after the intro pick is persisted, removes them from every
+  // downstream scene path in one place instead of guarding each loop.
+  // Exception: if the selected intro clip itself is tagged (rare — it won
+  // the intro slot anyway), keep it so the intro reference still resolves;
+  // it's reserved in usedClipIds below and can't land in a scene block.
+  {
+    const before = clipsForMatch.length;
+    for (let i = clipsForMatch.length - 1; i >= 0; i--) {
+      const c = clipsForMatch[i];
+      const notSceneEligible = (c.labels ?? []).some(
+        (l) => l.toLowerCase() === "not_scene_eligible",
+      );
+      if (notSceneEligible && c.id !== introClipId) {
+        clipsForMatch.splice(i, 1);
+      }
+    }
+    const dropped = before - clipsForMatch.length;
+    if (dropped > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.scene_ineligible_filter", {
+        dropped,
+      });
+    }
   }
 
   // ---- Build the block plan first ---------------------------------------
@@ -842,6 +983,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         titleCardTextByParagraph,
         mainCelebrity: mainCelebrity ?? "",
         imageHoldPolicy: "sentence_duration",
+        // Cap images at MAX_IMAGE_RATIO (default 40:60). Gemini's raw
+        // visual-type split lands ~50% images, over-using the photo pool and
+        // reading as a slideshow; the builder converts the lowest-priority
+        // surplus image blocks to footage (footage supply is plentiful).
+        maxImageRatio: getEnv().MAX_IMAGE_RATIO,
       });
 
       blocks = built.blocks.map((p) => ({ type: p.type, duration: p.duration }));
@@ -928,6 +1074,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         shortSentencesGrouped: built.shortSentencesGrouped,
         shortSentencesMerged: built.shortSentencesMerged,
         imageSplitCount: built.imageSplitCount,
+        imagesConvertedToFootage: built.imagesConvertedToFootage,
+        maxImageRatio: getEnv().MAX_IMAGE_RATIO,
         blocksProduced: built.blocks.length,
       });
     } else {
@@ -2758,15 +2906,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // entity-pool personFloor. Scales with voiceoverSeconds so a 10-min
   // video gets ~60 unique celebrity images available to the fallback.
   //
-  // Hard cap at PERSON_PHOTO_HARD_CAP. Each cached image is a separate
-  // Gemini face-verify call; on a 30-min audio the uncapped target was
-  // ~192, multiplied across ~8 entities that's ~1500 Gemini calls just
-  // for the verify gate. With Gemini 503s retrying each call, the match
-  // step was burning 10+ minutes here. A cap of 40 still gives plenty
-  // of visual variety (the documentary-pacing reuse cooldown only needs
-  // ~20 unique photos to avoid back-to-back repeats) while cutting the
-  // verify workload by ~75% on long audios.
-  const PERSON_PHOTO_HARD_CAP = 40;
+  // Hard cap at PERSON_PHOTO_HARD_CAP (env-tunable, default 80). Each cached
+  // image is a separate Gemini face-verify call; on a 30-min audio the
+  // uncapped target was ~192, multiplied across ~8 entities that's ~1500
+  // Gemini calls just for the verify gate, and the match step burned 10+
+  // minutes here on Gemini 503 retries. The cap bounds that cost while still
+  // letting the duration-scaled target (voiceoverSeconds / 10) drive variety:
+  // at 80, audios up to ~13 min hit the duration target before clamping, and
+  // longer ones cap at 80 unique photos — well above the ~20 the reuse
+  // cooldown needs to avoid back-to-back repeats. Raise the env var for more
+  // variety on long videos at the cost of a slower match step.
+  const PERSON_PHOTO_HARD_CAP = getEnv().PERSON_PHOTO_HARD_CAP;
   const personPhotoTarget = Math.min(
     PERSON_PHOTO_HARD_CAP,
     Math.max(20, Math.ceil(voiceoverSeconds / 10)),
@@ -2782,8 +2932,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // the personRuns map through the analyze payload. The match-time
   // recompute is cheap (single linear scan) and stays in sync when
   // block order changes (e.g. via image_block_split).
-  function computeSecondaryPersonRuns(): Map<string, number> {
-    const out = new Map<string, number>();
+  function computeSecondaryPersonRuns(): Map<string, { maxRun: number; totalBlocks: number }> {
+    const out = new Map<string, { maxRun: number; totalBlocks: number }>();
     const celebLower = (mainCelebrity ?? "").trim().toLowerCase();
     let i = 0;
     while (i < blockClosedWorldEntities.length) {
@@ -2800,24 +2950,41 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         j++;
       }
       const run = j - i;
-      const prev = out.get(lo) ?? 0;
-      if (run > prev) out.set(lo, run);
+      const prev = out.get(lo) ?? { maxRun: 0, totalBlocks: 0 };
+      out.set(lo, {
+        maxRun: Math.max(prev.maxRun, run),
+        totalBlocks: prev.totalBlocks + run,
+      });
       i = j;
     }
     return out;
   }
   const secondaryPersonRuns = computeSecondaryPersonRuns();
 
-  // Map a secondary person's max-run length to a photo-cache target size.
-  // The thresholds mirror the docs-spec narrative weight tiers:
-  //   maxRun >= 6 → "co-main" treatment, larger pool
-  //   maxRun 3-5  → "significant secondary", moderate pool
-  //   maxRun 2    → "brief mention", small pool
-  //   maxRun 1    → 0 → caller skips the cache and uses Wikipedia portrait
-  function secondaryPhotoTargetForRun(maxRun: number): number {
-    if (maxRun >= 6) return Math.min(personPhotoTarget, 30);
-    if (maxRun >= 3) return 15;
-    if (maxRun >= 2) return 8;
+  // Map a secondary person's narrative weight to a photo-cache target size.
+  //
+  // We weigh by BOTH the longest consecutive run AND the total footprint, and
+  // take the larger tier. A co-lead like Camilla in a William+Camilla script
+  // is mentioned constantly but ALTERNATES with William, so her consecutive
+  // run is often just 1-2 even though she's the subject of a third of the
+  // blocks. Keying the pool size on maxRun alone gave her target=0 → a single
+  // repeated Wikipedia headshot while William got a pool of dozens — the
+  // "Camilla image is smaller" symptom. Folding in totalBlocks lets a
+  // scattered-but-dominant person earn a real pool. (Mirrors the
+  // maxRun-OR-totalBlocks lesson already applied to analyze discovery.)
+  //   weight >= 6 → "co-main" treatment, larger pool
+  //   weight 3-5  → "significant secondary", moderate pool
+  //   weight 2    → "brief mention", small pool
+  //   weight 1    → 0 → caller skips the cache and uses Wikipedia portrait
+  function secondaryPhotoTargetForRun(info: { maxRun: number; totalBlocks: number }): number {
+    // Total footprint counts a bit less per block than a consecutive run
+    // (scattered mentions are individually weaker signals), so scale it down
+    // before comparing. A person with ~8 total blocks but no long run still
+    // clears the "significant secondary" tier.
+    const weight = Math.max(info.maxRun, Math.round(info.totalBlocks * 0.6));
+    if (weight >= 6) return Math.min(personPhotoTarget, 30);
+    if (weight >= 3) return 15;
+    if (weight >= 2) return 8;
     return 0;
   }
 
@@ -2856,30 +3023,57 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       `${personName} headshot`,
       `${personName} talk show`,
     ];
+    // Face-verify one candidate. Returns the entry to keep, or null to drop.
+    // Fail-open on Gemini outage (keep the candidate) — same policy as the
+    // original serial gate; gutting the cache on a 503 blip is worse than a
+    // rare wrong-person photo. verifyPoolAsset has a per-process LRU cache,
+    // so running these concurrently for distinct URLs is safe.
+    async function verifyCandidate(
+      f: { url: string; source: string },
+      q: string,
+    ): Promise<PersonPhotoCacheEntry | null> {
+      try {
+        const verdict = await verifyPoolAsset({
+          projectId,
+          entityType: "person",
+          entityName: personName,
+          candidateUrl: f.url,
+        }, { requireConfirmed: true });
+        if (!verdict.accept) return null;
+      } catch {
+        // verify failed (Gemini outage etc.) — keep the candidate
+        // rather than gut the cache.
+      }
+      return { url: f.url, source: f.source, query: q };
+    }
+
+    const verifyConcurrency = getEnv().MATCH_POOL_VERIFY_CONCURRENCY;
     for (const q of queries) {
       if (result.length >= target) break;
       try {
         const fetched = await fetchImages(q, 12, { entityType: "celebrity" });
-        for (const f of fetched) {
-          if (seen.has(f.url)) continue;
-          // Face-verify before caching — same gate as the entity pool's
-          // person floor. Stops wrong-person red-carpet co-attendees from
-          // entering the cache. Fail-open on Gemini outage.
-          try {
-            const verdict = await verifyPoolAsset({
-              projectId,
-              entityType: "person",
-              entityName: personName,
-              candidateUrl: f.url,
-            });
-            if (!verdict.accept) continue;
-          } catch {
-            // verify failed (Gemini outage etc.) — keep the candidate
-            // rather than gut the cache.
-          }
-          result.push({ url: f.url, source: f.source, query: q });
+        // Dedup this query's URLs against everything already kept/seen, in
+        // fetch order, before verifying. `seen` is marked now so two URLs
+        // that are identical within the same fetched[] list aren't both
+        // verified.
+        const candidates = fetched.filter((f) => {
+          if (seen.has(f.url)) return false;
           seen.add(f.url);
-          if (result.length >= target) break;
+          return true;
+        });
+        // Face-verify the query's candidates concurrently in bounded
+        // batches. Results are reassembled in the original fetch order so
+        // the cache is deterministic regardless of which verify finishes
+        // first — only timing changes vs. the old serial loop, not which
+        // images win. We stop launching batches once `target` is reached.
+        for (let i = 0; i < candidates.length && result.length < target; i += verifyConcurrency) {
+          const batch = candidates.slice(i, i + verifyConcurrency);
+          const verified = await Promise.all(batch.map((f) => verifyCandidate(f, q)));
+          for (const entry of verified) {
+            if (!entry) continue;
+            if (result.length >= target) break;
+            result.push(entry);
+          }
         }
       } catch {
         // Image search failed for one query — continue with the rest.
@@ -3137,14 +3331,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     ) {
       // Phase 2b: per-secondary photo cache. Before falling back to the
       // single Wikipedia portrait, try the secondary's own photo pool
-      // (sized by their narrative weight = max consecutive block run).
-      // For Cowell with maxRun=8 this yields ~30 verified Cowell photos
-      // instead of repeating his Wikipedia headshot. For brief mentions
-      // (maxRun=1, e.g. Bruno Tonioli) the target is 0 → cache returns
-      // [] → caller falls through to the Wikipedia portrait as before.
+      // (sized by their narrative weight = max consecutive run OR total
+      // footprint, whichever is larger). For Cowell with maxRun=8 this yields
+      // ~30 verified Cowell photos; for a scattered co-lead like Camilla
+      // (low run, high total) it still yields a real pool instead of one
+      // repeated headshot. For true one-off mentions the target is 0 → cache
+      // returns [] → caller falls through to the Wikipedia portrait as before.
       const personLower = resolvedSubject.trim().toLowerCase();
-      const maxRun = secondaryPersonRuns.get(personLower) ?? 1;
-      const target = secondaryPhotoTargetForRun(maxRun);
+      const runInfo = secondaryPersonRuns.get(personLower) ?? { maxRun: 1, totalBlocks: 1 };
+      const maxRun = runInfo.maxRun;
+      const target = secondaryPhotoTargetForRun(runInfo);
       if (target > 0) {
         try {
           const cache = await buildPersonPhotoCache(resolvedSubject, target);
@@ -3261,7 +3457,17 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // a topical image before defaulting to the celebrity.
     const scriptText = blockTexts[blockIdx] ?? "";
     const scriptQueries = buildScriptPhraseQueries(scriptText, resolvedSubject ?? mainCelebrity ?? null);
-    const queries = [...refQueries, ...scriptQueries];
+    // CELEBRITY-ONLY image mode: per-block image queries are forced to the main
+    // celebrity. We drop the script-phrase queries (which surface buildings /
+    // places / logos from capitalized phrases like "London Palladium") and the
+    // entity ref queries, so a block can only ever fetch a celebrity image. If
+    // there's no celebrity (shouldn't happen for these projects), fall back to
+    // the original queries rather than leaving the block with none.
+    const queries = getEnv().IMAGE_CELEBRITY_ONLY
+      ? (mainCelebrity
+          ? [{ query: mainCelebrity, reason: `celebrity_only:${mainCelebrity}`, imgType: "photo" as const }]
+          : [...refQueries, ...scriptQueries])
+      : [...refQueries, ...scriptQueries];
     const nowSec = blockStartSec[blockIdx];
     // Accumulate every candidate URL we considered across all queries for
     // this block. Persisted to metadata.image_candidates so the editor's
@@ -3320,7 +3526,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // Closed-world wins when present — block_entity.type is the
         // analyze-side authoritative binding. Fall back to subject_type
         // routing for legacy blocks that predate block_entity.
+        // CELEBRITY-ONLY mode: the query was forced to the celebrity above, so
+        // the verify gate must check against the celebrity (person), NOT the
+        // block's original entity (e.g. a place) — otherwise a correct
+        // celebrity image gets rejected for "not being London Palladium".
+        const celebOnly = getEnv().IMAGE_CELEBRITY_ONLY && !!mainCelebrity;
         const verifyType: BlockEntityType | null =
+          celebOnly ? "person" :
           blockEntity && blockEntity.type !== "celebrity_default" ? blockEntity.type :
           subjectType === "person" ? "person" :
           subjectType === "company" ? "company" :
@@ -3333,7 +3545,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // common nouns like "transcript", "announcement", "private"
         // which produce pages of nonsensical Gemini verify rejections
         // (`entity_type: "company", entity_name: "transcript"`).
-        const verifyName = (blockEntity?.name || refs[0] || ents[0] || "").trim();
+        const verifyName = celebOnly ? mainCelebrity! : (blockEntity?.name || refs[0] || ents[0] || "").trim();
         // Take the first non-duplicate, verification-passing image. The
         // verification call runs inside the find predicate so we stop at
         // the first acceptable URL instead of paying for every candidate
@@ -3350,6 +3562,11 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         //      Statement") returned an image matching the words but in the
         //      wrong world entirely.
         let pick: (typeof fetched)[number] | undefined;
+        // The original publisher URL of the chosen candidate, captured before
+        // the in-loop rehost mutates f.url to the R2 URL. Used as the de-dup /
+        // reuse-cooldown key so it matches the source URLs the next block
+        // compares against. See the rehost block below for the full rationale.
+        let pickSourceUrl = "";
         for (const f of fetched) {
           if (refUrlSet.has(f.url)) continue;
           const last = imageUrlLastUsedAt.get(f.url);
@@ -3360,7 +3577,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               entityType: verifyType,
               entityName: verifyName,
               candidateUrl: f.url,
-            });
+              // Only confirmed photos of a PERSON pass — client requires the
+              // correct celebrity only. Non-person entities keep default policy.
+            }, verifyType === "person" ? { requireConfirmed: true } : {});
             if (!verdict.accept) {
               void logJob({ projectId, jobId: mediaJobId }, "match.image_block_verify.rejected", {
                 blockIndex: blockIdx, entity_type: verifyType, entity_name: verifyName,
@@ -3398,12 +3617,46 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               // verify outage — keep the candidate.
             }
           }
+          // Re-host the accepted image onto our R2 CDN before committing it.
+          // This is the chokepoint that guarantees every timeline image lives
+          // on our own CDN — so it loads in the editor AND renders in the final
+          // video. Publisher CDNs that block server fetches (people.com etc.)
+          // return null here; we reject the candidate and keep looking, exactly
+          // like a failed verification gate, rather than committing an image
+          // that would 403 in both the editor and the render.
+          //
+          // IMPORTANT: we keep the ORIGINAL publisher URL as `pickSourceUrl`
+          // and rehost into a SEPARATE field. The de-dup / reuse-cooldown maps
+          // (refUrlSet, imageUrlLastUsedAt) MUST be keyed on the source URL —
+          // that's the identity the next block's `fetched[]` candidates are
+          // compared against. Every OTHER assignment path (person-fallback,
+          // secondary-person, entity-pool) keys on the source URL too; the
+          // final rehost sweep converts item.image_url to R2 at the end. The
+          // old code keyed these maps on the rehosted R2 URL, so the check
+          // `refUrlSet.has(f.url)` (a publisher URL) never matched and the
+          // reuse-cooldown was silently dead — the top-ranked result for an
+          // identical query (e.g. celebrity-only "Prince William") was picked
+          // for EVERY block, reappearing dozens of times instead of rotating
+          // through the pool. Keying on the source URL revives the spacing.
+          pickSourceUrl = f.url;
+          {
+            const rehosted = await rehostImageToR2(f.url, projectId);
+            if (!rehosted) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.image_block_rehost.failed", {
+                blockIndex: blockIdx, url: f.url, query: q.query,
+              });
+              continue;
+            }
+            f.url = rehosted;
+          }
           pick = f;
           break;
         }
         if (!pick) continue;
-        refUrlSet.add(pick.url);
-        imageUrlLastUsedAt.set(pick.url, nowSec);
+        // De-dup/cooldown keyed on the SOURCE url (see note above), display
+        // url committed as the rehosted R2 url.
+        refUrlSet.add(pickSourceUrl);
+        imageUrlLastUsedAt.set(pickSourceUrl, nowSec);
         item.image_url = pick.url;
         item.image_query = q.query;
         item.image_source = pick.source;
@@ -3530,8 +3783,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // entities (celebrity + 2-3 related people + a show/company) can fill the
   // ~90 image blocks of a 30-minute timeline on their own. Image search APIs
   // happily return 10-15 results per query at no extra cost vs 5, and the
-  // dedup + anti-clustering steps downstream keep variety high.
-  const IMAGES_PER_ENTITY = 12;
+  // dedup + anti-clustering steps downstream keep variety high. Tunable via
+  // IMAGES_PER_ENTITY (default 12).
+  const IMAGES_PER_ENTITY = getEnv().IMAGES_PER_ENTITY;
 
   const imageBlockCount = items.filter((it) => it.type === "image").length;
 
@@ -3638,7 +3892,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // Country / state / region / continent places produce flags and maps,
       // never on-topic photographs. Drop them at the pool stage even when
       // the extraction prompt let them through.
-      !(e.type === "place" && isGenericPlace(e.value))
+      !(e.type === "place" && isGenericPlace(e.value)) &&
+      // CELEBRITY-ONLY image mode: drop every non-celebrity entity so the
+      // image pool never fetches buildings / places / company or show logos /
+      // posters / related people. The main celebrity's images come from the
+      // person-floor prefetch; blocks about non-person entities fall back to
+      // celebrity footage instead of an off-person image. Client requirement.
+      (!getEnv().IMAGE_CELEBRITY_ONLY || e.type === "celebrity")
     )
     .sort((a, b) => {
       const pa = ENTITY_TYPE_PRIORITY.indexOf(a.type);
@@ -3851,27 +4111,51 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // don't. Doubling the query count keeps the pool floor reachable for
     // a 10-min video while every kept image is a clearly-identified
     // headshot or portrait of the celebrity.
+    //
+    // The facet list mixes MODERN press-circuit terms (red carpet, premiere,
+    // BAFTA, recent years) with ARCHIVAL terms (vintage, old photo, decade
+    // anchors, career framing). Modern terms return almost nothing for an
+    // older / deceased / pre-internet actor, while archival terms return
+    // almost nothing for a contemporary star — so we ship both and let the
+    // dead queries fall through cheaply (each is skipped once the floor is
+    // reached). This is the lever for the "same image repeats" symptom on
+    // vintage subjects: more DISTINCT surfacing angles → a larger unique
+    // pool → less Tier-3 reuse downstream.
     const celebrityQueries: string[] = [
       `"${mainCelebrity}"`,
       `${mainCelebrity} interview`,
       `${mainCelebrity} portrait`,
-      `${mainCelebrity} red carpet`,
-      `${mainCelebrity} premiere`,
-      `${mainCelebrity} press conference`,
-      `${mainCelebrity} photoshoot`,
-      `${mainCelebrity} BAFTA`,
       `${mainCelebrity} headshot`,
-      `${mainCelebrity} talk show`,
+      `${mainCelebrity} photo`,
       `${mainCelebrity} smiling`,
-      `${mainCelebrity} suit`,
-      `${mainCelebrity} 2023`,
-      `${mainCelebrity} 2022`,
-      `${mainCelebrity} 2021`,
-      `${mainCelebrity} event`,
-      `${mainCelebrity} award`,
-      `${mainCelebrity} stage`,
       `${mainCelebrity} close up`,
       `${mainCelebrity} face`,
+      // Career / role framing — works for any era; surfaces publicity stills
+      // and on-set photos distinct from the press-circuit shots above.
+      `${mainCelebrity} actor`,
+      `${mainCelebrity} young`,
+      `${mainCelebrity} old`,
+      `${mainCelebrity} career`,
+      `${mainCelebrity} movie still`,
+      `${mainCelebrity} publicity photo`,
+      `${mainCelebrity} headshot black and white`,
+      // Archival / vintage anchors — the high-yield facets for older actors
+      // (Western, classic-Hollywood, pre-internet) whose press archive is
+      // black-and-white studio stills and decade-tagged photos rather than
+      // red-carpet shots.
+      `${mainCelebrity} vintage`,
+      `${mainCelebrity} 1950s`,
+      `${mainCelebrity} 1960s`,
+      `${mainCelebrity} 1970s`,
+      `${mainCelebrity} 1980s`,
+      // Modern press-circuit anchors — high-yield for contemporary subjects,
+      // cheaply dead for vintage ones.
+      `${mainCelebrity} red carpet`,
+      `${mainCelebrity} premiere`,
+      `${mainCelebrity} event`,
+      `${mainCelebrity} award`,
+      `${mainCelebrity} 2023`,
+      `${mainCelebrity} 2022`,
     ];
     // Face-verify rejection counter so we can see how many fetched URLs
     // didn't survive the gate. High rejection rate means CSE is returning
@@ -3890,48 +4174,64 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           poolFetchStats.entitiesFailed++;
           continue;
         }
-        for (const f of fetched) {
-          if (poolUrlSet.has(f.url)) continue;
-          // Face-verify EVERY candidate image against the celebrity
-          // reference before adding to the pool. Catches the failure
-          // mode where image search returns a related photo (red-carpet
-          // crowd, event guest list page) whose visible subject is
-          // someone OTHER than the celebrity. verifyPoolAsset is the
-          // same helper used in analyze and clipProcessor; verdicts
-          // are cached per-URL so re-fetches of the same image don't
-          // re-charge Gemini.
-          try {
-            // Lenient mode: accept "uncertain" verdicts. We tried strict
-            // mode but it gutted the pool whenever the reference photo
-            // fetch failed (Wikipedia transient errors) — every candidate
-            // returned "uncertain reason: reference fetch failed" and the
-            // pool ended up empty. Collage filtering happens at a
-            // different layer (see filterMultiSubjectCollages below).
-            const verdict = await verifyPoolAsset({
-              projectId,
-              entityType: "person",
-              entityName: mainCelebrity,
-              candidateUrl: f.url,
-            });
-            if (!verdict.accept) {
-              personPoolVerifyRejected++;
-              void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_rejected", {
-                query: cq, url: f.url,
-                verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+        // Dedup-and-reserve each unique URL into poolUrlSet up front so the
+        // concurrent verify batch below never double-verifies the same image
+        // (and the same URL appearing twice in fetched[] is collapsed).
+        const personCandidates = fetched.filter((f) => {
+          if (poolUrlSet.has(f.url)) return false;
+          poolUrlSet.add(f.url);
+          return true;
+        });
+        // Face-verify EVERY candidate against the celebrity reference before
+        // adding to the pool — same gate as before, but the candidates of a
+        // single query are verified CONCURRENTLY (bounded batches) instead of
+        // one Gemini round-trip at a time. This is the dominant cost of the
+        // match step on image-heavy projects; the verifies are independent
+        // per URL and verifyPoolAsset caches per-URL, so concurrency only
+        // changes wall-time, not which images survive. Survivors are appended
+        // in the original fetch order so the pool stays deterministic.
+        //
+        // STRICT mode (requireConfirmed): only images Gemini POSITIVELY
+        // confirms are the celebrity enter the pool — "uncertain", "no", and
+        // "skipped" (no reference) are all rejected. Per the client's "only
+        // the correct celebrity image" requirement, an unverifiable image
+        // must never ship as the celebrity. Verify failure (Gemini outage) is
+        // fail-open: keep the candidate rather than gut the pool.
+        const personVerifyConcurrency = getEnv().MATCH_POOL_VERIFY_CONCURRENCY;
+        for (let i = 0; i < personCandidates.length && pool.length < personFloor; i += personVerifyConcurrency) {
+          const batch = personCandidates.slice(i, i + personVerifyConcurrency);
+          const verdicts = await Promise.all(batch.map(async (f) => {
+            try {
+              const verdict = await verifyPoolAsset({
+                projectId,
+                entityType: "person",
+                entityName: mainCelebrity,
+                candidateUrl: f.url,
+              }, { requireConfirmed: true });
+              if (!verdict.accept) {
+                void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_rejected", {
+                  query: cq, url: f.url,
+                  verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+                });
+                return { f, keep: false };
+              }
+              return { f, keep: true };
+            } catch (e) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_failed", {
+                query: cq, url: f.url, err: (e as Error).message?.slice(0, 120),
               });
+              return { f, keep: true }; // fail-open
+            }
+          }));
+          for (const { f, keep } of verdicts) {
+            if (!keep) {
+              personPoolVerifyRejected++;
               continue;
             }
-          } catch (e) {
-            // Verify failure is fail-open — we keep the candidate so a
-            // Gemini outage doesn't gut the pool. Log it for visibility.
-            void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_failed", {
-              query: cq, url: f.url, err: (e as Error).message?.slice(0, 120),
-            });
+            if (pool.length >= personFloor) break;
+            pool.push({ url: f.url, source: f.source, query: cq, entityType: "celebrity" });
+            poolFetchStats.personImagesPrefetched++;
           }
-          pool.push({ url: f.url, source: f.source, query: cq, entityType: "celebrity" });
-          poolUrlSet.add(f.url);
-          poolFetchStats.personImagesPrefetched++;
-          if (pool.length >= personFloor) break;
         }
       } catch (e) {
         poolFetchStats.entitiesFailed++;
@@ -3997,11 +4297,30 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             entityType: mapped,
             entityName: ent.value,
             candidateUrl: f.url,
-          });
+            // Strict confirmation for PEOPLE — the client requires only the
+            // correct celebrity/person to appear. Non-person entities (logos,
+            // places, shows) stay on the default policy since their verify path
+            // has no reference photo and would over-reject.
+          }, mapped === "person" ? { requireConfirmed: true } : {});
           if (!verdict.accept) {
             void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
               entity_type: mapped, entity_name: ent.value, url: f.url,
               verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+            });
+            continue;
+          }
+        } else if (mapped === "celebrity_default") {
+          // The project celebrity's OWN pool. Image search for "Katherine
+          // Heigl" can return a MISLABELLED photo of a different woman; the
+          // pool builder isolating the query does not guarantee the photo is
+          // actually her. Face-gate every candidate against the celebrity
+          // reference so only the correct person enters — same hard rule as a
+          // named secondary person.
+          const gate = await gatePersonImage({ projectId, personName: mainCelebrity, candidateUrl: f.url });
+          if (!gate.accept) {
+            void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+              entity_type: "celebrity_default", entity_name: mainCelebrity, url: f.url,
+              verdict: gate.verdict, reason: gate.reason.slice(0, 120),
             });
             continue;
           }
@@ -4084,11 +4403,27 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               entityType: mappedRelaxed,
               entityName: ent.value,
               candidateUrl: f.url,
-            });
+              // requireConfirmed for PEOPLE here too — the relaxed pass widens
+              // the query and is MORE likely to surface a similar-looking wrong
+              // person, so an "uncertain" person image must NOT pass.
+            }, mappedRelaxed === "person" ? { requireConfirmed: true } : {});
             if (!verdict.accept) {
               void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
                 entity_type: mappedRelaxed, entity_name: ent.value, url: f.url,
                 verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
+                relaxed: true,
+              });
+              continue;
+            }
+          } else if (mappedRelaxed === "celebrity_default") {
+            // Celebrity's own pool, relaxed pass — same hard face-gate as the
+            // strict pass. The relaxed query is even more likely to surface a
+            // mislabelled photo of the wrong person.
+            const gate = await gatePersonImage({ projectId, personName: mainCelebrity, candidateUrl: f.url });
+            if (!gate.accept) {
+              void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+                entity_type: "celebrity_default", entity_name: mainCelebrity, url: f.url,
+                verdict: gate.verdict, reason: gate.reason.slice(0, 120),
                 relaxed: true,
               });
               continue;
@@ -4761,15 +5096,35 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     for (let k = 0; k < adjustable.length; k++) {
       const cur = adjustable[k];
       const meta = (cur.row.metadata ?? {}) as Record<string, unknown>;
-      // Title cards always keep their typewriter+hold duration. The hold
-      // tail is a visual beat, not audio time, so the next row's vo_start
-      // is naturally less than (this.vo_start + this.duration) — and
-      // that's correct.
-      if (cur.row.type === "title_card") continue;
       const next = adjustable[k + 1];
       const targetEnd = next ? next.voStart : voiceoverSeconds;
       const audioInterval = targetEnd - cur.voStart;
       const oldDuration = Number(cur.row.duration ?? 0);
+      // Title cards keep their typewriter+hold duration ONLY when that
+      // duration already covers (or exceeds) the audio interval the card
+      // sits over — then the trailing hold is a pure visual beat and the
+      // next row's vo_start is naturally <= (this.vo_start + this.duration).
+      //
+      // But when the interval is LONGER than the card (narrator keeps
+      // talking for seconds after the typewriter+hold finishes), the leftover
+      // narration is owned by no row: cumulative video falls behind the audio
+      // by (interval - duration) and never recovers, dragging every later row
+      // — including the next title card and all lower-thirds — earlier than
+      // its spoken moment (the 2026-06-10 −3.40s-per-card step bug, confirmed
+      // in DB: card at vo 607.15 held 2.08s over a 5.48s interval). Extend the
+      // card to fill the interval so its trailing hold absorbs the gap; the
+      // typewriter sub-timing is unchanged (it's driven by typewriter_seconds
+      // in the render filter, not by the row duration), only the hold grows.
+      if (cur.row.type === "title_card") {
+        if (audioInterval > oldDuration + 0.05) {
+          const newDuration = Math.round(audioInterval * 100) / 100;
+          cur.row.duration = newDuration;
+          meta.vo_end_seconds = cur.voStart + newDuration;
+          cur.row.metadata = meta;
+          adjustedCount++;
+        }
+        continue;
+      }
       totalDriftBefore += Math.abs(oldDuration - audioInterval);
       // Forced YouTube clips AND title-card-padded rows carry
       // duration_clamped: true. In BOTH cases the correct visual hold
@@ -5196,9 +5551,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // snap onto a single non-clamped row at the section tail.
   {
     type Row = (typeof items)[number];
-    const nonIntroRows = items.filter((it: Row) => it.type !== "intro");
 
-    // Sort by vo_start. Items without vo_start metadata fall through to
+    // vo_start of a row. Items without vo_start metadata fall through to
     // the end (defensive — every non-intro row in the transcript-driven
     // builder has vo_start_seconds, but legacy projects may not).
     function voOf(row: Row): number {
@@ -5206,7 +5560,52 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       const vs = m.vo_start_seconds;
       return typeof vs === "number" ? Number(vs) : Number.POSITIVE_INFINITY;
     }
-    nonIntroRows.sort((a: Row, b: Row) => voOf(a) - voOf(b));
+
+    // CRITICAL: reorder items[] itself into audio (vo_start) order and
+    // re-number position, so array order == audio order == RENDER order.
+    //
+    // The renderer loads timeline_items `ORDER BY position` and plays them
+    // back-to-back, accumulating each row's duration — so a row's video-time
+    // start is the sum of all PRIOR rows' durations in position order. But
+    // applyScriptMarkers (markers.ts) splices title-card + forced-footage
+    // rows in REVERSE doc order (to keep splice indices stable) and its
+    // dedup pass deletes rows, so after it runs items[] (and therefore
+    // position) is NO LONGER in audio-time order.
+    //
+    // The old anchor pass measured drift over a vo_start-SORTED *copy*
+    // (nonIntroRows) while the renderer played the *unsorted* array. When
+    // the two orders diverged, the pass pinned each title card perfectly in
+    // a layout the renderer never reproduced — leaving the card 5-6s off its
+    // narrated moment in the actual video. Reordering the real items[] here
+    // makes the pass measure in the exact coordinate system the renderer
+    // uses, and keeps the downstream image-merge pass (which coalesces
+    // array-adjacent rows) merging rows that are genuinely adjacent in time.
+    //
+    // Intro rows live on a different time axis (pre-roll, before the
+    // voiceover) and must stay pinned at the head in their existing order —
+    // they're not sorted into the voiceover timeline. We use a stable sort
+    // by a key that keeps intros first (in original order) and orders every
+    // other row by vo_start.
+    {
+      const introOrder = new Map<Row, number>();
+      let introSeq = 0;
+      for (const it of items) {
+        if (it.type === "intro") introOrder.set(it, introSeq++);
+      }
+      items.sort((a: Row, b: Row) => {
+        const aIntro = a.type === "intro";
+        const bIntro = b.type === "intro";
+        if (aIntro && bIntro) {
+          return (introOrder.get(a) ?? 0) - (introOrder.get(b) ?? 0);
+        }
+        if (aIntro) return -1; // intros always precede voiceover rows
+        if (bIntro) return 1;
+        return voOf(a) - voOf(b);
+      });
+      for (let i = 0; i < items.length; i++) items[i].position = i;
+    }
+
+    const nonIntroRows = items.filter((it: Row) => it.type !== "intro");
 
     function isAdjustable(row: Row): boolean {
       if (row.type === "title_card") return false;
@@ -5278,9 +5677,26 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       vo_start: number; before: number; after: number; section_rows: number;
     }> = [];
 
+    // A row is an anchor point when its start MUST equal its vo_start in the
+    // final video — the client requires both title cards AND lower-thirds to
+    // appear at the exact narrated moment (other clips/images may drift a
+    // little). A title card IS its own anchored row (we pin the video time at
+    // its start). A lower-third overlay is stamped on a footage/image host
+    // row; that host row's start must equal the lower-third's vo_start so the
+    // chyron burns in exactly when the narrator says it. In both cases the
+    // fix is identical: force cumulativeVideo at index k to equal voOf(cur).
+    function isAnchorRow(row: Row): boolean {
+      if (row.type === "title_card") return true;
+      const m = (row.metadata ?? {}) as Record<string, unknown>;
+      const lt = m.lower_third;
+      return !!lt && typeof lt === "object";
+    }
+
+    let lowerThirdsAnchored = 0;
     for (let k = 0; k < nonIntroRows.length; k++) {
       const cur = nonIntroRows[k];
-      if (cur.type === "title_card") {
+      if (isAnchorRow(cur)) {
+        const isTitle = cur.type === "title_card";
         const target = voOf(cur);
         if (Number.isFinite(target) && k > 0) {
           const driftBefore = target - cumulativeVideo;
@@ -5308,13 +5724,28 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             }
             const residual = target - cumAtCard;
             if (Math.abs(residual) > 0.005) {
-              const snapTarget = nonIntroRows[k - 1];
+              // Snap the residual onto the row immediately before this
+              // anchor — unless that row is ITSELF an anchor we already
+              // pinned (two anchors back-to-back, e.g. a lower-third whose
+              // host sits right after a title card). Re-stretching an
+              // already-pinned row would shift it and everything after off
+              // their narrated moments, so in that case snap onto the last
+              // adjustable row in this section instead. Falls back to k-1
+              // when the section has no adjustable row (then the tiny
+              // sub-0.1s rounding residual is left for the final-section
+              // distribution to absorb).
+              let snapTarget = nonIntroRows[k - 1];
+              if (isAnchorRow(snapTarget)) {
+                const sectionRows = nonIntroRows.slice(sectionStart, k).filter(isAdjustable);
+                snapTarget = sectionRows[sectionRows.length - 1] ?? nonIntroRows[k - 1];
+              }
               const snapped = hardSnap(snapTarget, residual);
               if (Math.abs(snapped) > 0.005) hardSnaps++;
               cumAtCard += snapped;
             }
             cumulativeVideo = cumAtCard;
-            titleCardsAnchored++;
+            if (isTitle) titleCardsAnchored++;
+            else lowerThirdsAnchored++;
             titleCardsResidualDrift += Math.abs(target - cumAtCard);
             anchorAudit.push({
               vo_start: Math.round(target * 100) / 100,
@@ -5324,6 +5755,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             });
           }
         }
+        // Next section begins after this anchor. For a title_card that's
+        // k+1 (the card is non-adjustable and fully placed). For a lower-
+        // third host row, the row itself is adjustable content the NEXT
+        // anchor may scale — but its START is now pinned, so we still begin
+        // the next section at k+1 and let that section distribute drift over
+        // rows AFTER the host. This keeps each anchor's start exact while
+        // never re-stretching a row that sits before an already-pinned point.
         sectionStart = k + 1;
       }
       cumulativeVideo += Number(cur.duration ?? 0);
@@ -5349,6 +5787,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
     await logJob({ projectId, jobId: mediaJobId }, "match.title_card_anchor_pass", {
       titleCardsAnchored,
+      lowerThirdsAnchored,
       finalSectionAnchored,
       rowsTouched,
       hardSnaps,
@@ -5380,6 +5819,171 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     });
   }
 
+  // ---- Merge directly-adjacent identical image slots --------------------
+  // Even with the reuse-cooldown working, the SAME celebrity photo can land
+  // in two image blocks that end up back-to-back in the timeline (e.g. two
+  // consecutive sentences both routed to the person fallback, no footage
+  // between them). Rendered, that reads as the same picture "restarting" —
+  // a visible blink — instead of one calm hold. Coalesce a run of adjacent
+  // image items that share the same image_url into a SINGLE item whose
+  // duration is the sum, so the photo simply stays on screen longer.
+  //
+  // Constraints that keep this safe:
+  //   • Only plain `image` items merge. Split-screen items (right_image_url
+  //     present) are left untouched — their left/right pairing is meaningful.
+  //   • Total duration is preserved (we sum), so the pre-render duration
+  //     validation above still holds and audio stays in sync (timeline_items
+  //     carry no start_time; the renderer plays them in `position` order for
+  //     their `duration`).
+  //   • Script text is concatenated so the merged hold still carries the
+  //     narration of every sentence it now spans (caption/overlay continuity).
+  //   • Positions are re-sequenced afterwards so they stay 0..N-1 contiguous.
+  {
+    const isPlainImage = (it: (typeof items)[number]): boolean => {
+      if (it.type !== "image") return false;
+      const url = typeof it.image_url === "string" ? it.image_url : null;
+      if (!url) return false;
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      // Split-screen halves carry a right_image_url — never coalesce those.
+      if (typeof meta.right_image_url === "string" && meta.right_image_url) return false;
+      // Never coalesce a row carrying a lower_third overlay. Merging would
+      // either drop the overlay (when this row is folded into a neighbour)
+      // or widen its on-screen window (when the neighbour folds into it),
+      // both of which break the exact-narrated-moment placement the anchor
+      // pass just pinned for that lower-third. These rows are rare; keeping
+      // them distinct preserves the chyron and its pinned start.
+      if (meta.lower_third && typeof meta.lower_third === "object") return false;
+      return true;
+    };
+    const merged: typeof items = [];
+    let mergedRuns = 0;   // number of distinct runs that absorbed ≥1 slot
+    let mergedSlots = 0;  // total slots folded away
+    for (const it of items) {
+      const prev = merged[merged.length - 1];
+      if (
+        prev &&
+        isPlainImage(prev) &&
+        isPlainImage(it) &&
+        prev.image_url === it.image_url
+      ) {
+        // Fold `it` into `prev`: extend the hold and append its narration.
+        prev.duration = Number(prev.duration ?? 0) + Number(it.duration ?? 0);
+        const prevText = typeof prev.script_text === "string" ? prev.script_text : "";
+        const curText = typeof it.script_text === "string" ? it.script_text : "";
+        if (curText && curText !== prevText) {
+          prev.script_text = prevText ? `${prevText} ${curText}` : curText;
+        }
+        const prevMeta = (prev.metadata ?? {}) as Record<string, unknown>;
+        if (!prevMeta.merged_image_run) {
+          prevMeta.merged_image_run = true;
+          prev.metadata = prevMeta;
+          mergedRuns++;
+        }
+        mergedSlots++;
+        continue;
+      }
+      merged.push(it);
+    }
+    if (mergedSlots > 0) {
+      // Re-sequence positions to stay contiguous after the merge.
+      for (let i = 0; i < merged.length; i++) merged[i].position = i;
+      items.length = 0;
+      items.push(...merged);
+      await logJob({ projectId, jobId: mediaJobId }, "match.image_merge_adjacent", {
+        mergedRuns,
+        mergedSlots,
+        finalItemCount: items.length,
+      });
+    }
+  }
+
+  // Re-host safety net. The main image-block path already re-hosts to R2 at
+  // pick time (with candidate fallback). This pass catches every OTHER image
+  // commit site (secondary-person photos, Wikipedia portraits, split-screen
+  // left/right) so NO timeline image ships pointing at an external URL — which
+  // would 403 in the editor preview and be silently dropped from the render.
+  // Wikipedia/Google-hosted URLs re-host fine; a publisher CDN that blocks the
+  // fetch returns null. Already-R2 URLs are returned as-is, so this is cheap
+  // for the common case.
+  //
+  // POOL FALLBACK (the no-URL-image fix): when a rehost returns null we DON'T
+  // clear the field to null — that would drop the slot from the render and
+  // shrink the final video by its duration. Instead we substitute an
+  // already-validated image from the project's entity pool (every pool URL was
+  // re-hosted to R2 at pool-build time, so it's known-good). We prefer a
+  // pool entry RELEVANT to the block's narration (same gate the entity-pool
+  // pass uses), falling back to any pool entry. Only when the pool is empty do
+  // we leave the field null — the upstream footage-downgrade pass and the
+  // render-time reconciliation backstop both still cover that edge.
+  {
+    const env = getEnv();
+    const r2Base = env.R2_PUBLIC_BASE_URL ?? "";
+    let rehostedCount = 0;
+    let pooledCount = 0;
+    let clearedCount = 0;
+
+    // Pick a validated pool URL to fill a slot whose own image failed rehost.
+    // Relevant-first (blockRelevantToPoolEntry), else any pool entry. Returns
+    // null only when the pool is genuinely empty. `avoidUrl` lets the
+    // split-screen RIGHT side skip the URL just chosen for the LEFT side so a
+    // split doesn't show the same image on both halves.
+    function pickPoolFallbackUrl(blockIdx: number | undefined, avoidUrl?: string): string | null {
+      if (pool.length === 0) return null;
+      if (blockIdx != null) {
+        for (let j = 0; j < pool.length; j++) {
+          if (avoidUrl && pool[j].url === avoidUrl) continue;
+          if (blockRelevantToPoolEntry(blockIdx, j)) return pool[j].url;
+        }
+      }
+      for (let j = 0; j < pool.length; j++) {
+        if (avoidUrl && pool[j].url === avoidUrl) continue;
+        return pool[j].url;
+      }
+      return null;
+    }
+
+    for (const it of items) {
+      if (it.type !== "image") continue;
+      const blockIdx = (it.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+      const url = typeof it.image_url === "string" ? it.image_url : null;
+      if (url && !(r2Base && url.startsWith(r2Base))) {
+        const r = await rehostImageToR2(url, projectId);
+        if (r) { it.image_url = r; rehostedCount++; }
+        else {
+          const sub = pickPoolFallbackUrl(blockIdx);
+          if (sub) {
+            it.image_url = sub;
+            const m = (it.metadata ?? {}) as Record<string, unknown>;
+            m.image_reason = "pool_fallback_after_rehost_fail";
+            m.image_pick_source = "pool_fallback";
+            it.metadata = m;
+            pooledCount++;
+          } else {
+            it.image_url = null;
+            clearedCount++;
+          }
+        }
+      }
+      const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      const rightUrl = typeof meta.right_image_url === "string" ? meta.right_image_url : null;
+      if (rightUrl && !(r2Base && rightUrl.startsWith(r2Base))) {
+        const r = await rehostImageToR2(rightUrl, projectId);
+        if (r) { meta.right_image_url = r; it.metadata = meta; rehostedCount++; }
+        else {
+          const leftUrl = typeof it.image_url === "string" ? it.image_url : undefined;
+          const sub = pickPoolFallbackUrl(blockIdx, leftUrl);
+          if (sub) { meta.right_image_url = sub; it.metadata = meta; pooledCount++; }
+          else { meta.right_image_url = null; it.metadata = meta; clearedCount++; }
+        }
+      }
+    }
+    if (rehostedCount > 0 || pooledCount > 0 || clearedCount > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.image_rehost.summary", {
+        rehosted: rehostedCount, pooled: pooledCount, cleared: clearedCount,
+      });
+    }
+  }
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
@@ -5403,6 +6007,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     },
   });
   await setProjectStatus(projectId, "ready_for_review");
+
+  } finally {
+    // Stop the heartbeat on EVERY exit path — success, early-return failure,
+    // or a thrown error that BullMQ will retry. A terminal media_jobs row is
+    // ignored by the sweeper anyway, but leaving an interval running across a
+    // retry would double up timers, so we always clear it here.
+    stopHeartbeat();
+  }
 }
 
 // Strip punctuation, lowercase, collapse whitespace. Used to compare a

@@ -7,7 +7,9 @@ import {
   estimateDurationSeconds,
   analyzeSegment,
   findPersonRunsAcrossSegments,
-  SECONDARY_PERSON_CLIP_THRESHOLD,
+  mergeDuplicatePersonRuns,
+  sameNamedPerson,
+  qualifiesForVideoClips,
   type SegmentUnderstanding,
 } from "@/lib/ai/segments";
 import { planTimeline } from "@/lib/ai/timeline-plan";
@@ -39,7 +41,10 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 const UuidSchema = z.string().uuid();
-const PER_INTENT_RESULTS = 6;
+// How many results each open-YouTube query pulls before ranking. Raised from 6
+// so the fallback surfaces a deeper pool per query — when reference channels
+// are thin, the main celebrity needs a wide open-YouTube net to reach target.
+const PER_INTENT_RESULTS = 12;
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -196,6 +201,19 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   // Reset prior preview state — re-running analyze should produce a clean view.
   await sb.from("youtube_search_results").delete().eq("project_id", id);
   await sb.from("project_entities").delete().eq("project_id", id);
+  // Also clear previously-cut clips. The clip processor SKIPS re-cutting a
+  // source whose per-source quota is already met (it counts existing
+  // video_clips for the project), so without this an old clip — e.g. a
+  // disclaimer card cut BEFORE the clean-footage/face gate existed — would
+  // survive a re-analyze and reappear in the render. Deleting the clips makes
+  // existingForThisSource = 0, forcing a fresh re-cut so the current
+  // clip-stage gates run on every clip.
+  //
+  // We do NOT delete video_sources: those rows are one-per-YouTube-video and
+  // SHARED across projects (downloadProcessor re-associates project_id rather
+  // than duplicating). Deleting them could strip a source another project
+  // relies on. Clearing clips alone is sufficient to force the re-cut.
+  await sb.from("video_clips").delete().eq("project_id", id);
 
   const mediaJobId = await createMediaJob({ projectId: id, type: "analyze" });
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
@@ -386,32 +404,61 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       entities_in: rosterEntities.length,
       rows_persisted: rosterRows.length,
       with_reference: rosterRows.filter((r) => !!r.reference_url).length,
+      // Per-PERSON resolution trail so an ambiguous name ("Williams" →
+      // wrong Wikipedia page) is visible in the logs. Shows the name we
+      // searched, the Wikipedia title it resolved to, and the page URL.
+      // If `name` and `resolved_title` disagree (e.g. name "Williams" →
+      // resolved "Brandon Williams (footballer)"), the reference photo is
+      // the wrong person and every downstream face/image verify is poisoned.
+      person_references: rosterRows
+        .filter((r) => r.entity_type === "person")
+        .map((r) => ({
+          name: r.entity_name,
+          resolved_title: (r.metadata as { wikipedia_title?: string } | null)?.wikipedia_title ?? null,
+          page_url: r.source_page_url ?? null,
+          has_image: !!r.reference_url,
+        })),
     });
 
-    // 1d) Compute secondary-person runs (hybrid clip-vs-photo policy).
-    // For every secondary person (anyone other than the project celebrity)
-    // we count the max consecutive run of blocks bound to them. Persons
-    // with run < SECONDARY_PERSON_CLIP_THRESHOLD will be rendered via
-    // their Wikipedia photo at match time — no YouTube clip search and no
-    // face verification budget is spent on them here, because the matcher
-    // never asks the search pipeline for those clips anyway. Persons with
-    // run >= threshold get the full clip-search + verification path.
+    // 1d) Compute secondary-person appearance counts (hybrid clip-vs-photo
+    // policy). For every secondary person (anyone other than the project
+    // celebrity) we count totalBlocks = the number of narration blocks they are
+    // the resolved subject of. Persons below SECONDARY_PERSON_VIDEO_THRESHOLD
+    // are rendered from their still image at match time — no YouTube clip search
+    // and no face-verification budget is spent on them, because the matcher
+    // never asks the search pipeline for those clips. Persons at or above the
+    // threshold get the full source-video + clip-search + verification path.
     //
-    // The verification gate later in this loop reads this map to decide
-    // WHICH person each candidate's thumbnail should be face-matched
-    // against (the named person in the query, when they crossed the
-    // threshold) vs the fallback (project celebrity). Short-mention
-    // persons whose queries Gemini still emitted are skipped: their
-    // queries waste YouTube quota without contributing clips the matcher
-    // will use.
-    const personRuns = findPersonRunsAcrossSegments(understandings, mainCelebrity ?? "");
+    // Gemini emits each person's name verbatim from the script, so the SAME
+    // real person can surface under two surface forms ("Camilla" + "Queen
+    // Camilla", "Charles" + "King Charles III"). Collapse those into one
+    // entry (keeping the fuller name) BEFORE they become separate search
+    // entities / picker cards / candidate pools below.
+    const personRuns = mergeDuplicatePersonRuns(
+      findPersonRunsAcrossSegments(understandings, mainCelebrity ?? ""),
+    );
+    // Appearance-count gate: a secondary person earns the SOURCE-VIDEO + CLIP
+    // path only when they are the resolved subject of at least
+    // SECONDARY_PERSON_VIDEO_THRESHOLD narration segments (totalBlocks). Below
+    // the threshold they get STILL IMAGES only — the Wikipedia/Brave/CSE pulls
+    // below run for everyone regardless. We gate on totalBlocks (whole-script
+    // footprint) rather than a consecutive run so a scattered-but-dominant
+    // figure (e.g. David Walliams in a "Simon Cowell speaks out about David
+    // Walliams" piece) still earns footage. The main celebrity is never in this
+    // map and always qualifies.
+    const videoThreshold = getEnv().SECONDARY_PERSON_VIDEO_THRESHOLD;
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.person_runs", {
-      threshold: SECONDARY_PERSON_CLIP_THRESHOLD,
+      videoThreshold,
+      // totalBlocks drives BOTH the gate (>= threshold → clip_search) and the
+      // proportional per-person selection target downstream.
       persons: Array.from(personRuns.entries()).map(([key, v]) => ({
         name: v.displayName,
         key,
         maxRun: v.maxRun,
-        path: v.maxRun >= SECONDARY_PERSON_CLIP_THRESHOLD ? "clip_search" : "wikipedia_photo",
+        totalBlocks: v.totalBlocks,
+        path: qualifiesForVideoClips(personRuns, v.displayName, videoThreshold)
+          ? "clip_search"
+          : "photo_only",
       })),
     });
 
@@ -451,14 +498,37 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       searchEntities.push({ value: value.trim(), type });
     }
     if (mainCelebrity) pushSearchEntity(mainCelebrity, "celebrity");
-    // Secondary people only get their own pool when their narration footprint
-    // crosses the clip threshold — otherwise the matcher fills them from a
-    // Wikipedia photo and a YouTube pool would be wasted quota.
+    // A secondary person gets their own source-video pool (and picker card)
+    // ONLY when their appearance count clears SECONDARY_PERSON_VIDEO_THRESHOLD
+    // (gated on totalBlocks via qualifiesForVideoClips). Frequently-appearing
+    // supporting cast (Camilla, Catherine, Harry… when the script is genuinely
+    // about them) earn footage, with the number of selected sources per person
+    // scaled below in entityTarget(); rarely-appearing people are NOT searched
+    // here and fall through to the still-image path (Wikipedia/Brave/CSE
+    // references built above, which cover everyone). The main celebrity always
+    // qualifies (skipped below — it was pushed as "celebrity" already).
+    const photoOnlyPeople: string[] = [];
     for (const [key, info] of personRuns.entries()) {
+      // Skip the main celebrity — including title variants of them, e.g. a
+      // block that named the celebrity "Charles" as "King Charles III". Without
+      // the subset check, a regnal/honorific variant of the main subject would
+      // get a duplicate related_person card alongside the celebrity card.
       if (key === (mainCelebrity ?? "").toLowerCase()) continue;
-      if (info.maxRun >= SECONDARY_PERSON_CLIP_THRESHOLD) {
-        pushSearchEntity(info.displayName, "related_person");
+      if (mainCelebrity && sameNamedPerson(info.displayName, mainCelebrity)) continue;
+      // Appearance-count gate: below the threshold → still images only.
+      if (!qualifiesForVideoClips(personRuns, info.displayName, videoThreshold)) {
+        photoOnlyPeople.push(info.displayName);
+        continue;
       }
+      pushSearchEntity(info.displayName, "related_person");
+    }
+    if (photoOnlyPeople.length > 0) {
+      await logJob({ projectId: id, jobId: mediaJobId }, "analyze.video_gate.photo_only", {
+        videoThreshold,
+        // People below the threshold: no source-video search/download/clips;
+        // they render from their still-image reference instead.
+        people: photoOnlyPeople,
+      });
     }
     await logJob({ projectId: id, jobId: mediaJobId }, "analyze.discovery.entities", {
       entities: searchEntities.map((e) => `${e.type}:${e.value}`),
@@ -467,9 +537,18 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
 
     // The candidate shape, with the entity it was discovered under so the
     // payload can group by entity for review.
-    type EntityCandidate = PreviewCandidate & { entity_value: string; entity_type: string; from_reference_channel: boolean; from_approved: boolean; footage_style: string };
+    type EntityCandidate = PreviewCandidate & { entity_value: string; entity_type: string; from_reference_channel: boolean; from_approved: boolean; footage_style: string; channel_id: string };
     const globalPool = new Map<string, EntityCandidate>();
     const seenVideo = new Set<string>();
+    // Title → videoId index for cross-ID dedup. Clickbait content is re-uploaded
+    // by many channels under the SAME title with DIFFERENT video IDs (e.g. two
+    // "Simon Cowell's Emotional Goodbye..." uploads). ID-keyed dedup can't catch
+    // those, so they both reach the pool and the user sees the same video twice.
+    // We normalise the title (lowercase, strip punctuation, collapse spaces) and
+    // keep only the higher-scoring candidate per normalised title.
+    const seenTitle = new Map<string, string>();
+    const normalizeTitle = (t: string): string =>
+      t.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 
     // Reusable per-candidate verifier (same two-stage thumb+body gate as the
     // old per-segment path, now subject-anchored to the entity being searched).
@@ -487,9 +566,20 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         footageStyle?: string;
         intentType?: IntentType;
         sourceIntent?: PreviewCandidate["source_intent"];
+        // Force the thumbnail face-check on/off, overriding the per-tier
+        // default. Open-YouTube uses this to face-check ONLY the top-N
+        // candidates by score (cost control) rather than every result.
+        faceCheck?: boolean;
       },
     ): Promise<EntityCandidate | null> {
       const isMain = entity.type === "celebrity";
+      // Per-tier subject policy:
+      //   Open YouTube → require the FULL disambiguated name (word-boundary).
+      //     This kills "William Shatner" matching a "Prince William" project at
+      //     zero Gemini cost — Shatner's title never contains "prince william".
+      //   Reference channels → do NOT require the name (a curated royal channel
+      //     may title a William clip "Harry interview" and we'd lose it). Recall
+      //     is preserved by the FACE-CHECK below instead.
       const ranked = rankCandidate({
         candidate: c,
         mainCelebrity: entity.value,
@@ -504,9 +594,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         blockedChannelIds: blocked,
         intentType: opts.intentType ?? "talking_head",
         referenceChannel: opts.referenceChannel,
-        // Subject-first discovery ALWAYS requires a real subject anchor so a
-        // many-celebrity reference channel can't leak the wrong person.
-        requireSubjectAnchor: true,
+        requireSubjectAnchor: !opts.referenceChannel,
       });
       if (ranked.rejected) {
         await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.rejected", {
@@ -514,9 +602,29 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         });
         return null;
       }
-      // Face-verify gate (only when enabled; default off — the ranker + the
-      // subject-anchored queries do the filtering, per the env comment).
-      if (envDisco.ANALYZE_FACE_VERIFY_ENABLED && entity.type !== "company") {
+
+      // THUMBNAIL FACE-CHECK. The analyze-time face comparison is now fully
+      // OPT-IN behind ANALYZE_FACE_VERIFY_ENABLED (default OFF). The user
+      // reviews source thumbnails manually in the picker, so we no longer spend
+      // per-candidate Gemini face calls just to filter the preview pool — that
+      // was the dominant cost making analyze slow, especially now that every
+      // character (not just the main subject) is searched. The deeper
+      // multi-frame face gate at CLIP-CUT time is still the safety net for the
+      // final render. When the flag is explicitly turned back on, the previous
+      // behaviour returns: reference-channel + open-YT-top-N + show-lane person
+      // candidates get the thumbnail (and optional body-frame) check.
+      const isPersonEntity =
+        entity.type === "person" || entity.type === "related_person" || entity.type === "celebrity";
+      // Master switch: with the env flag off, NO analyze-time face Gemini calls
+      // happen regardless of the per-tier opts.faceCheck request. With it on,
+      // the per-tier policy decides which candidates get checked.
+      const doFaceCheck =
+        envDisco.ANALYZE_FACE_VERIFY_ENABLED &&
+        (opts.faceCheck !== undefined
+          ? (opts.faceCheck && isPersonEntity)
+          : (opts.referenceChannel && isPersonEntity) ||
+            entity.type !== "company");
+      if (doFaceCheck) {
         const thumb = `https://i.ytimg.com/vi/${c.videoId}/mqdefault.jpg`;
         let thumbVerdict;
         try {
@@ -526,7 +634,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         } catch { thumbVerdict = null; }
         if (thumbVerdict?.verdict === "no") {
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.verify_rejected", {
-            entity: entity.value, videoId: c.videoId, reason: thumbVerdict.reason?.slice(0, 120),
+            entity: entity.value, videoId: c.videoId,
+            from_reference_channel: opts.referenceChannel,
+            reason: thumbVerdict.reason?.slice(0, 120),
           });
           return null;
         }
@@ -576,6 +686,7 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
         from_reference_channel: opts.referenceChannel,
         from_approved: opts.fromApproved,
         footage_style: opts.footageStyle ?? "interview",
+        channel_id: c.channelId ?? "",
       };
     }
 
@@ -585,25 +696,88 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     function foldIn(cand: EntityCandidate | null) {
       if (!cand) return;
       seenVideo.add(cand.videoId);
+
+      // Cross-ID title dedup: if another video with the SAME normalised title is
+      // already pooled under a different ID (a clickbait re-upload), keep only
+      // the higher-scoring one so the user doesn't see the same video twice.
+      const tkey = normalizeTitle(cand.title);
+      if (tkey) {
+        const existingId = seenTitle.get(tkey);
+        if (existingId && existingId !== cand.videoId) {
+          const existing = globalPool.get(existingId);
+          if (existing && existing.score >= cand.score) return; // keep existing
+          // New one wins — drop the older duplicate from the pool.
+          if (existing) globalPool.delete(existingId);
+        }
+        seenTitle.set(tkey, cand.videoId);
+      }
+
       const prev = globalPool.get(cand.videoId);
       if (!prev || cand.score > prev.score) globalPool.set(cand.videoId, cand);
+    }
+
+    // Bounded-concurrency map. rankAndVerify does a per-candidate Gemini
+    // face-check (~1-3s each) for reference-channel candidates; running those
+    // serially across (channels × 25 candidates) made discovery take minutes.
+    // We run them CONCURRENTLY with a small cap (Gemini-friendly) and fold the
+    // results serially afterward so the shared pool isn't mutated under a race.
+    const VERIFY_CONCURRENCY = 6;
+    async function mapWithConcurrency<T, R>(
+      items: T[],
+      fn: (item: T) => Promise<R>,
+      cap = VERIFY_CONCURRENCY,
+    ): Promise<R[]> {
+      const out: R[] = new Array(items.length);
+      let next = 0;
+      async function worker(): Promise<void> {
+        while (next < items.length) {
+          const i = next++;
+          out[i] = await fn(items[i]);
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(cap, items.length) }, worker));
+      return out;
     }
 
     // Per-entity discovery. We run the three tiers until we have enough
     // candidates for this entity's share of the review pool (yield-based cap on
     // open YouTube to bound quota).
-    const perEntityTarget = Math.max(
-      reviewPoolSize,
-      Math.ceil(reviewPoolSize / Math.max(1, searchEntities.length)) * searchEntities.length,
-    );
-    const perEntityShare = Math.ceil(perEntityTarget / Math.max(1, searchEntities.length));
+    //
+    // The open-YouTube yield cap is NOT an even split across entities. An even
+    // split starves the MAIN celebrity: with 5 people, each entity got only
+    // ~reviewPoolSize/5 open-YouTube slots, so when the reference channels were
+    // thin the main subject's pool never grew enough to cover the audio. The
+    // main subject is the one that needs the deepest pool (most of the
+    // narration is about them), so it gets the FULL reviewPoolSize as its open
+    // budget while secondaries keep the smaller even share. `openShareFor`
+    // returns the per-entity open-YouTube yield cap.
+    const evenShare = Math.ceil(reviewPoolSize / Math.max(1, searchEntities.length));
+    const openShareFor = (entity: SearchEntity): number =>
+      entity.type === "celebrity" ? reviewPoolSize : evenShare;
 
     for (let ei = 0; ei < searchEntities.length; ei++) {
       const entity = searchEntities[ei];
       const entityEntities = [{ type: entity.type, value: entity.value } as ExtractedEntity];
-      // Reuse buildSearchQueries for footage-style expansion; cap to ~10 to
-      // bound quota, ordered highest-signal first.
-      const openQueries = buildSearchQueries(entityEntities as ExtractedEntity[], { maxQueries: 10 });
+      // Disambiguating context anchor — ONE strong term tied to the subject so
+      // bare-name queries can't return the wrong person. For the main celebrity
+      // we use the strongest extracted context term (a recurring proper noun
+      // like another royal, the show, the company); if the entity name itself
+      // is already multi-word (e.g. "Prince William") it's self-disambiguating
+      // and we skip the anchor. Single-token names (the risky case) always get
+      // an anchor when one is available. Secondary people reuse the project
+      // context too (they share the same world as the celebrity).
+      const isSingleTokenName = !entity.value.trim().includes(" ");
+      const contextAnchor =
+        isSingleTokenName && contextTerms.length > 0 ? contextTerms[0] : "";
+      // Reuse buildSearchQueries for footage-style expansion, ordered
+      // highest-signal first. The MAIN celebrity gets a wider query set (more
+      // footage-style suffixes) so the open-YouTube fallback can actually fill
+      // its larger pool when reference channels are thin; secondaries keep the
+      // tighter cap for quota control.
+      const openQueries = buildSearchQueries(entityEntities as ExtractedEntity[], {
+        maxQueries: entity.type === "celebrity" ? 18 : 10,
+        contextAnchor,
+      });
       // Reference channels are searched with a SINGLE bare-subject query, not
       // the footage-suffix set. Reference search lists the channel's uploads and
       // filters by query tokens against title+description — so a suffixed query
@@ -613,6 +787,12 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       // description) and let the style-diversifier surface the variety (red
       // carpet / event / talk show …) from whatever that channel actually
       // posted. One query per channel also keeps quota minimal.
+      // Reference-channel query keeps the bare name (the channel filter +
+      // thumbnail face-check already narrow to the right person). We do NOT
+      // append the context anchor here because the playlist token-filter would
+      // then require the anchor word in every upload's title/description and
+      // drop most of the channel's footage. Disambiguation for reference
+      // channels is handled by the face-check, not the query text.
       const channelQuery = entity.value;
       const acceptedForEntity = () =>
         Array.from(globalPool.values()).filter((c) => c.entity_value === entity.value).length;
@@ -662,7 +842,11 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
           const hydrated = await hydrateVideoIds(approvedVids.map((v) => v.youtubeVideoId)).catch(() => []);
           for (const c of hydrated) {
             if (seenVideo.has(c.videoId)) continue;
-            foldIn(await rankAndVerify(c, entity, `${entity.value} (approved)`, { referenceChannel: false, fromApproved: true, footageStyle: "approved" }));
+            // Approved sources were human-confirmed for SOME past project, not
+            // necessarily for THIS entity — a thumbnail of the wrong person (or
+            // clickbait) can carry over. Force the face-check here too; it only
+            // rejects a confident "no", so a missing reference still passes.
+            foldIn(await rankAndVerify(c, entity, `${entity.value} (approved)`, { referenceChannel: false, fromApproved: true, footageStyle: "approved", faceCheck: true }));
           }
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.approved", {
             entity: entity.value, found: approvedVids.length, hydrated: hydrated.length,
@@ -677,43 +861,100 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       // ----- Tier 2: reference channels (~1 unit each via playlistItems) -----
       // One bare-subject query per channel; pull a generous slice of the
       // channel's subject uploads so the diversifier has variety to work with.
-      for (const ch of referenceChannels) {
-        if (acceptedForEntity() >= perEntityShare) break;
+      // We search EVERY reference channel (no early-stop cap) — reference search
+      // is cheap (~1 quota unit each) and stopping early caused all sources to
+      // come from the single highest-priority channel, killing scene variety.
+      // The per-channel round-robin in the grouping step below ensures the final
+      // pool is spread across all channels rather than dominated by one.
+      //
+      // The channels are searched CONCURRENTLY (bounded by mapWithConcurrency):
+      // each is an independent network call + verify pass, and on a long script
+      // with many reference channels × many entities the old serial loop was the
+      // dominant analyze-time cost. We collect each channel's verified results
+      // and fold them serially AFTERWARD, in channel order, so the shared pool
+      // (globalPool / seenVideo / seenTitle) is never mutated under a race and
+      // the deterministic dedup ordering is preserved.
+      const refResults = await mapWithConcurrency(referenceChannels, async (ch) => {
         try {
           const cands = await searchYoutubeCached({ query: channelQuery, channelId: ch.channelId, maxResults: 25 });
-          for (const c of cands) {
-            if (seenVideo.has(c.videoId)) continue;
-            // Footage style is derived from the upload's OWN title (e.g. a
-            // "… red carpet …" upload → "red carpet") rather than the query,
-            // so the diversifier can still bucket reference-channel results by
-            // style even though we searched with a bare name.
-            foldIn(await rankAndVerify(c, entity, channelQuery, {
+          // Pre-filter dupes, then verify the rest CONCURRENTLY (the face-check
+          // per candidate is the slow part). Footage style is derived from each
+          // upload's OWN title since we searched with a bare name.
+          const fresh = cands.filter((c) => !seenVideo.has(c.videoId));
+          return await mapWithConcurrency(fresh, (c) =>
+            rankAndVerify(c, entity, channelQuery, {
               referenceChannel: true, fromApproved: false,
               footageStyle: footageStyleFromTitle(c.title),
-            }));
-          }
+            }),
+          );
         } catch (e) {
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.ref_failed", {
             entity: entity.value, channel: ch.channelId, err: (e as Error).message?.slice(0, 160),
           });
+          return [] as Array<EntityCandidate | null>;
         }
+      });
+      // Fold serially in channel order — single-threaded mutation of the pool.
+      for (const verified of refResults) {
+        for (const v of verified) foldIn(v);
       }
 
       // ----- Tier 3: open YouTube (yield-capped) -----
+      // TWO-PASS to control Gemini cost: (1) rank ALL candidates WITHOUT the
+      // face-check (cheap, deterministic), then (2) face-check ONLY the top-N by
+      // ranker score — the ones likely to be shown/selected. The long tail of
+      // lower-scored open-YouTube results is skipped, so we don't spend a Gemini
+      // call on every result. Reference channels are checked in full (cheap
+      // quota, user-curated); only open YouTube gets this top-N cap.
+      const OPEN_FACECHECK_TOP_N = 10;
+      // Per-entity open-YouTube yield cap — the main celebrity gets the full
+      // review pool, secondaries the even share (see openShareFor above).
+      const openShare = openShareFor(entity);
+      // Pass 1: rank-only (faceCheck:false) across all open queries. Keep the
+      // RAW YoutubeCandidate alongside its ranked result so pass 2 can re-run
+      // the face-check from the raw candidate (rankAndVerify needs the raw shape,
+      // not the reshaped EntityCandidate).
+      type RawCand = Awaited<ReturnType<typeof searchYoutubeCached>>[number];
+      const openPairs: Array<{ raw: RawCand; q: string; ranked: EntityCandidate }> = [];
       for (const q of openQueries) {
-        if (acceptedForEntity() >= perEntityShare) break;
+        if (acceptedForEntity() + openPairs.length >= openShare) break;
         try {
           const cands = await searchYoutubeCached({ query: q, maxResults: PER_INTENT_RESULTS });
-          for (const c of cands) {
-            if (seenVideo.has(c.videoId)) continue;
-            foldIn(await rankAndVerify(c, entity, q, { referenceChannel: false, fromApproved: false, footageStyle: footageStyleFor(q) }));
-          }
+          const fresh = cands.filter((c) => !seenVideo.has(c.videoId));
+          const ranked = await mapWithConcurrency(fresh, async (c) => ({
+            raw: c,
+            ranked: await rankAndVerify(c, entity, q, {
+              referenceChannel: false, fromApproved: false,
+              footageStyle: footageStyleFor(q), faceCheck: false,
+            }),
+          }));
+          for (const r of ranked) if (r.ranked) openPairs.push({ raw: r.raw, q, ranked: r.ranked });
         } catch (e) {
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.open_failed", {
             entity: entity.value, q, err: (e as Error).message?.slice(0, 160),
           });
         }
       }
+      // Sort by ranker score, dedupe by videoId, then face-check only the top-N.
+      openPairs.sort((a, b) => b.ranked.score - a.ranked.score);
+      const openSeen = new Set<string>();
+      const openUnique = openPairs.filter((p) => {
+        if (openSeen.has(p.raw.videoId)) return false;
+        openSeen.add(p.raw.videoId);
+        return true;
+      });
+      const toCheck = openUnique.slice(0, OPEN_FACECHECK_TOP_N);
+      const tail = openUnique.slice(OPEN_FACECHECK_TOP_N);
+      // Top-N: re-run WITH face-check (from raw candidate); only survivors fold.
+      const checked = await mapWithConcurrency(toCheck, (p) =>
+        rankAndVerify(p.raw, entity, p.q, {
+          referenceChannel: false, fromApproved: false,
+          footageStyle: footageStyleFor(p.q), faceCheck: true,
+        }),
+      );
+      for (const v of checked) foldIn(v);
+      // Tail: lower-priority, ranked-only (no face-check spend) — fold as-is.
+      for (const p of tail) foldIn(p.ranked);
 
       // ----- Show / event lane (reserved-slot footage) -----
       // Always run regardless of the yield cap so the pool gets at least a
@@ -721,13 +962,21 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       for (const q of showQueries) {
         try {
           const cands = await searchYoutubeCached({ query: q, maxResults: PER_INTENT_RESULTS });
-          for (const c of cands) {
-            if (seenVideo.has(c.videoId)) continue;
-            foldIn(await rankAndVerify(c, entity, q, {
+          const fresh = cands.filter((c) => !seenVideo.has(c.videoId));
+          const verified = await mapWithConcurrency(fresh, (c) =>
+            rankAndVerify(c, entity, q, {
               referenceChannel: false, fromApproved: false,
               footageStyle: "show", intentType: "broll", sourceIntent: "broll",
-            }));
-          }
+              // Show/event queries match on TITLE only ("<subject> <show>"), so
+              // without a face-check a thumbnail that names the subject but does
+              // NOT show them (a co-presenter + a dance group) sails through on
+              // text rank alone. Force the thumbnail face-check here regardless
+              // of ANALYZE_FACE_VERIFY_ENABLED so wrong-person show footage is
+              // rejected. (The open-YouTube top-N lane already forces this.)
+              faceCheck: true,
+            }),
+          );
+          for (const v of verified) foldIn(v);
         } catch (e) {
           await logJob({ projectId: id, jobId: mediaJobId }, "analyze.disco.show_failed", {
             entity: entity.value, q, err: (e as Error).message?.slice(0, 160),
@@ -758,12 +1007,62 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       candidates: EntityCandidate[];
     }
     const entityGroups: EntityGroup[] = [];
-    // Split the project-wide source target across entities (main celebrity gets
-    // the lion's share; secondaries get at least 1 each).
+    // Split the project-wide source target across entities BY HOW MUCH OF THE
+    // SCRIPT IS ABOUT EACH PERSON. The selection count should track the audio
+    // content: a co-lead the narration spends half its time on (e.g. David
+    // Walliams in a "Simon Cowell speaks out about Walliams" piece) deserves
+    // several selected videos, not the hardcoded 1 that secondaries used to get.
+    //
+    // Weight per person = their narration footprint:
+    //   - secondary person → totalBlocks bound to them (from personRuns,
+    //     computed off the block_entity bindings = the audio script).
+    //   - main celebrity   → every remaining block (all narration NOT attributed
+    //     to a clip-path secondary), so they keep the lion's share by default.
+    // We then hand out sourceTarget slots in proportion to those weights, with a
+    // floor of 1 per searched entity (every card group selects at least one).
+    const footprintWeight = (e: SearchEntity, idx: number): number => {
+      if (idx === 0) {
+        // Main celebrity: total narration minus what secondaries claimed.
+        const secondaryBlocks = searchEntities
+          .slice(1)
+          .reduce((sum, se) => sum + (personRuns.get(se.value.toLowerCase())?.totalBlocks ?? 0), 0);
+        const total = Array.from(personRuns.values()).reduce((s, v) => s + v.totalBlocks, 0);
+        // Celebrity weight = max(secondaries' max, leftover). Falls back to a
+        // strong default so a celebrity with no recorded blocks still leads.
+        const leftover = Math.max(secondaryBlocks, total) - secondaryBlocks;
+        return Math.max(leftover, secondaryBlocks + 1, 1);
+      }
+      return Math.max(1, personRuns.get(e.value.toLowerCase())?.totalBlocks ?? 1);
+    };
+    const totalWeight = searchEntities.reduce((s, e, i) => s + footprintWeight(e, i), 0);
+    // Guaranteed MAIN-celebrity floor. The proportional split alone let
+    // secondaries skim too many slots — a project genuinely about Chuck
+    // Connors was selecting only ~7-8 of him while three related people took
+    // the rest, so the dominant subject ended up under-covered. We reserve a
+    // majority of the project source target for the main celebrity (≥60%, and
+    // at least the FLOOR count), then split the remainder across secondaries by
+    // footprint. This keeps the main subject's footage front-and-centre, which
+    // is what the audio is mostly about, while still giving co-leads real
+    // coverage.
+    const MAIN_CELEBRITY_SHARE = 0.6;
+    const mainTargetFloor =
+      searchEntities.length > 1
+        ? Math.max(getEnv().SOURCE_TARGET_FLOOR, Math.round(sourceTarget * MAIN_CELEBRITY_SHARE))
+        : sourceTarget;
+    const secondaryPool = Math.max(0, sourceTarget - mainTargetFloor);
+    const secondaryWeight = searchEntities
+      .slice(1)
+      .reduce((s, e, i) => s + footprintWeight(e, i + 1), 0);
     const entityTarget = (e: SearchEntity, idx: number): number => {
       if (searchEntities.length === 1) return sourceTarget;
-      if (idx === 0) return Math.max(1, sourceTarget - (searchEntities.length - 1));
-      return 1;
+      // Main celebrity (idx 0): the reserved majority floor.
+      if (idx === 0) return mainTargetFloor;
+      // Secondaries split the remaining pool proportionally by footprint,
+      // floored at 1 so every searched person's card group has at least one.
+      const share = Math.round(
+        (footprintWeight(e, idx) / Math.max(1, secondaryWeight)) * secondaryPool,
+      );
+      return Math.max(1, share);
     };
     // Reserve a small number of show/event ("clear footage within the show")
     // slots so interviews can't crowd them out, per client direction (keep
@@ -778,43 +1077,63 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
       const showIds = new Set(showPicks.map((c) => c.videoId));
       const rest = all.filter((c) => !showIds.has(c.videoId));
 
-      // 2) Diversify the remaining slots ACROSS footage styles via round-robin
-      //    so the pool isn't 8 interviews. Bucket by style, then take one from
-      //    each style in turn (each bucket already score-sorted). A news cap
+      // 2) Diversify the remaining slots ACROSS CHANNELS via round-robin so the
+      //    pool is spread over all reference (and YouTube) channels rather than
+      //    dominated by one — the variety problem the user reported. Each
+      //    channel's bucket is internally ordered to also spread footage STYLES
+      //    (so a single channel doesn't contribute 8 interviews). A news cap
       //    still applies so a scandal entity doesn't render as all-news.
       const remainingSlots = Math.max(0, reviewPoolSize - showPicks.length);
       const newsCap = Math.ceil(reviewPoolSize / 2);
-      const byStyle = new Map<string, EntityCandidate[]>();
+
+      // Bucket the remaining candidates by channel.
+      const byChannel = new Map<string, EntityCandidate[]>();
       for (const c of rest) {
-        const arr = byStyle.get(c.footage_style) ?? [];
+        const key = c.channel_id || c.channelTitle || "unknown";
+        const arr = byChannel.get(key) ?? [];
         arr.push(c);
-        byStyle.set(c.footage_style, arr);
+        byChannel.set(key, arr);
       }
-      // Style order: highest-scoring style first, but then round-robin.
-      const styleOrder = Array.from(byStyle.keys()).sort(
-        (a, b) => (byStyle.get(b)![0]?.score ?? 0) - (byStyle.get(a)![0]?.score ?? 0),
+      // Within each channel, order by style-spread then score: interleave styles
+      // so the first picks from a channel are diverse, not all one format.
+      for (const [, arr] of byChannel) {
+        arr.sort((a, b) => b.score - a.score);
+        const seenStyle = new Set<string>();
+        const firstOfStyle: EntityCandidate[] = [];
+        const remainder: EntityCandidate[] = [];
+        for (const c of arr) {
+          if (!seenStyle.has(c.footage_style)) { seenStyle.add(c.footage_style); firstOfStyle.push(c); }
+          else remainder.push(c);
+        }
+        arr.length = 0;
+        arr.push(...firstOfStyle, ...remainder);
+      }
+      // Channel order: highest top-score channel first, then round-robin.
+      const channelOrder = Array.from(byChannel.keys()).sort(
+        (a, b) => (byChannel.get(b)![0]?.score ?? 0) - (byChannel.get(a)![0]?.score ?? 0),
       );
       const diversified: EntityCandidate[] = [];
       let newsCount = 0;
       let added = true;
       while (diversified.length < remainingSlots && added) {
         added = false;
-        for (const style of styleOrder) {
+        for (const chKey of channelOrder) {
           if (diversified.length >= remainingSlots) break;
-          const bucket = byStyle.get(style)!;
-          // Pull the next unused candidate of this style, respecting news cap.
+          const bucket = byChannel.get(chKey)!;
           while (bucket.length) {
             const cand = bucket.shift()!;
             if (cand.source_type === "news" && newsCount >= newsCap) continue;
             diversified.push(cand);
             if (cand.source_type === "news") newsCount++;
             added = true;
-            break;
+            break; // one per channel per round → round-robin across channels
           }
         }
       }
-      // Show picks lead the list so they're visible; rest sorted by score.
-      const candidates = [...showPicks, ...diversified.sort((a, b) => b.score - a.score)];
+      // Show picks lead the list so they're visible; rest keeps the round-robin
+      // ORDER (do NOT re-sort by score — that would re-cluster one channel's
+      // high-scoring videos at the top and undo the channel spread).
+      const candidates = [...showPicks, ...diversified];
       entityGroups.push({ value: entity.value, type: entity.type, target: entityTarget(entity, ei), candidates });
     }
 

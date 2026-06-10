@@ -14,6 +14,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { proxiedImageUrl } from "@/lib/image-proxy";
 import { fmtClock, fmtMinutes, type ClipRow, type TimelineRow } from "../_shared";
 import { SceneBlock } from "./blocks/scene-block";
 
@@ -46,17 +47,47 @@ export function BlockEditorScreen({
   const clips = useMemo(() => clipsQ.data?.clips ?? [], [clipsQ.data?.clips]);
   const clipById = useMemo(() => new Map(clips.map((c) => [c.id, c])), [clips]);
 
+  // The project's person/celebrity images — the safe last-resort fallback.
+  // The matcher already resolves a celebrity photo for blocks it can't match
+  // to an entity (image_pick_source === "person_fallback") and stamps the URL
+  // into the row's metadata. We harvest those here so that when ANY block's
+  // own image is missing/dead, it falls back to the video's main subject
+  // rather than the grey placeholder. This is topically safe everywhere (it's
+  // the same person the whole video is about) — unlike borrowing an arbitrary
+  // image_url from another scene, which we deliberately do NOT do (that showed
+  // a "The Conversation" poster under courtroom narration; see below).
+  const personFallbackUrls = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const it of items) {
+      const meta = it.metadata as Record<string, unknown> | null | undefined;
+      const pickSource = typeof meta?.image_pick_source === "string" ? meta.image_pick_source : null;
+      const isPerson = pickSource === "person_fallback";
+      const url =
+        isPerson && typeof meta?.image_source_url === "string"
+          ? meta.image_source_url
+          : isPerson && it.image_url
+            ? it.image_url
+            : null;
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      out.push(url);
+    }
+    return out;
+  }, [items]);
+
   // Per-block fallback URLs. When a scene's saved image_url fails to load
   // in the browser (hotlink-block, CORS, expired CDN URL, transient 404),
   // we walk THIS block's own matcher-considered candidates from
   // metadata.image_candidates — i.e. other URLs the matcher found for this
-  // specific sentence. We DO NOT borrow image_urls from other scenes
-  // anymore: that produced misleading cards showing a topically-unrelated
-  // image from a different block (e.g. "The Conversation" poster appearing
-  // under courtroom narration because another block had been matched to
-  // the word "conversation"). When all of this block's candidates fail
-  // too, the SceneBlock falls back to a typed placeholder — the user can
-  // see the row's image is broken and click Replace.
+  // specific sentence — and then, as a final safe tier, the project's person
+  // images. We DO NOT borrow arbitrary image_urls from other scenes: that
+  // produced misleading cards showing a topically-unrelated image from a
+  // different block (e.g. "The Conversation" poster appearing under courtroom
+  // narration because another block had been matched to the word
+  // "conversation"). Person images are the exception because they're the
+  // video's subject and never editorially wrong. Only if every candidate AND
+  // the person images fail does the SceneBlock show a typed placeholder.
   const fallbackUrlsByItemId = useMemo(() => {
     const map = new Map<string, string[]>();
     for (const it of items) {
@@ -72,10 +103,16 @@ export function BlockEditorScreen({
         seen.add(url);
         urls.push(url);
       }
+      // Append the project's person images as the final fallback tier.
+      for (const url of personFallbackUrls) {
+        if (seen.has(url) || url === it.image_url) continue;
+        seen.add(url);
+        urls.push(url);
+      }
       map.set(it.id, urls);
     }
     return map;
-  }, [items]);
+  }, [items, personFallbackUrls]);
 
   // The block whose media is being replaced. When non-null, the replace
   // modal opens. We track the whole row so the modal can decide what tab
@@ -374,7 +411,7 @@ function ImagePreviewDialog({
         <div className="bg-black aspect-video grid place-items-center">
           {url ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={url} alt="" className="max-h-full max-w-full object-contain" />
+            <img src={proxiedImageUrl(url) ?? undefined} alt="" className="max-h-full max-w-full object-contain" />
           ) : null}
         </div>
       </DialogContent>
@@ -575,7 +612,7 @@ function MediaTile({
         {thumbnail ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
-            src={thumbnail}
+            src={proxiedImageUrl(thumbnail) ?? undefined}
             alt=""
             className={cn(
               "h-full w-full object-cover transition-opacity",

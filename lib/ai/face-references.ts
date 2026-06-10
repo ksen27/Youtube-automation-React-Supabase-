@@ -19,6 +19,7 @@
 // lazily on first match) and lookupReference() at clip/image fetch time.
 
 import { fetchWikipediaImage } from "@/lib/images/wikipedia";
+import { verifyImageIsPerson } from "@/lib/ai/verify";
 import { getServerSupabase } from "@/lib/supabase/server";
 import type { BlockEntityType } from "@/lib/ai/segments";
 
@@ -84,9 +85,21 @@ export async function fetchEntityReference(
   const queries = wikipediaCandidatesFor(entity);
   for (const q of queries) {
     const hit = await fetchWikipediaImage(q);
-    if (hit) {
-      return { url: hit.url, pageUrl: hit.pageUrl, pageTitle: hit.pageTitle };
+    if (!hit) continue;
+    // CONTENT-BASED person guard (person only, no hardcoded word lists). A bare
+    // ambiguous name resolves to a non-person Wikipedia page whose image is a
+    // tapestry / calligraphy / map / logo — NOT the person. We look at the
+    // IMAGE and confirm it depicts a single real human before accepting it as a
+    // reference. This generalizes to ANY wrong page type and any name. A
+    // confident "no" is rejected (try the next candidate query); "yes" and
+    // "uncertain" pass so a Gemini hiccup doesn't strip a valid reference.
+    if (entity.type === "person") {
+      const verdict = await verifyImageIsPerson(hit.url).catch(
+        () => ({ verdict: "uncertain" as const, reason: "check failed", confidence: 0 }),
+      );
+      if (verdict.verdict === "no") continue;
     }
+    return { url: hit.url, pageUrl: hit.pageUrl, pageTitle: hit.pageTitle };
   }
   return null;
 }

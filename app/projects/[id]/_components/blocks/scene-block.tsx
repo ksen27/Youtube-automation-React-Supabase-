@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { proxiedImageUrl } from "@/lib/image-proxy";
 
 export interface SceneBlockProps {
   index: number;
@@ -53,12 +54,18 @@ export function SceneBlock(p: SceneBlockProps) {
       ),
     [p.fallbackThumbnails, p.thumbnail],
   );
-  const exhausted = fallbackIdx >= fallbacks.length;
+  // When the row has no primary thumbnail at all (image_url never resolved),
+  // there's no <img> to fire onError, so skip straight to the first fallback
+  // rather than showing the placeholder. With a primary present, idx -1 shows
+  // it and we only advance into the fallbacks once it actually errors.
+  const startIdx = p.thumbnail ? -1 : 0;
+  const effectiveIdx = Math.max(fallbackIdx, startIdx);
+  const exhausted = effectiveIdx >= fallbacks.length;
   const displayedThumb = exhausted
     ? null
-    : fallbackIdx < 0
+    : effectiveIdx < 0
       ? p.thumbnail
-      : fallbacks[fallbackIdx];
+      : fallbacks[effectiveIdx];
 
   return (
     <div
@@ -95,11 +102,19 @@ export function SceneBlock(p: SceneBlockProps) {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               key={displayedThumb}
-              src={displayedThumb}
+              // External image-search URLs are loaded via the same-origin proxy
+              // so referer/hotlink-protected hosts (Brave/Google CSE/CDNs) that
+              // block a direct browser <img> still render in the editor. The
+              // render worker fetches these server-side already, so the final
+              // video was never affected — this fixes the preview only.
+              src={proxiedImageUrl(displayedThumb) ?? undefined}
               alt=""
               className="h-full w-full object-cover"
               loading="lazy"
-              onError={() => setFallbackIdx((i) => i + 1)}
+              // Advance past whatever is currently shown. effectiveIdx (not
+              // the raw fallbackIdx) is the source of truth, since a null
+              // primary starts us at fallback 0 with fallbackIdx still -1.
+              onError={() => setFallbackIdx(() => effectiveIdx + 1)}
             />
             {p.onPlay && (
               <button

@@ -178,6 +178,7 @@ PROPER-NOUN RULE — applies to: celebrity, related_person, movie, tv_show, song
 Type-specific rules:
 - "celebrity" = the main subject(s). Full name. e.g. "Drew Pritchard".
 - "related_person" = co-stars, spouses, family, friends, rivals. Full name. e.g. "Rebecca Pritchard".
+- DISAMBIGUATED full names for ALL people (celebrity AND related_person): never emit a bare first name on its own. A bare first name resolves to a generic name page in image/reference lookup, not the person, which pulls WRONG-PERSON images. Using the surrounding context of the script, expand every person to the specific, unambiguous public figure they refer to (their full name, plus any title/qualifier that identifies them uniquely). When the script only ever uses a bare first name, infer the full disambiguated name from context and emit THAT as the value, never the bare first name.
 - "movie" / "tv_show" / "song" = the titled work. e.g. "Salvage Hunters", "Match Game", "Bohemian Rhapsody".
 - "company" = a registered company / brand name, capitalized. e.g. "Kindig It Design", "Apple".
   REJECT: "charity", "restoration", "the company", "the project", "the firm".
@@ -299,6 +300,7 @@ Return STRICT JSON ONLY in this shape:
 
 Rules:
 - "global_main_subject" must be a person OR a tightly-named company/show, NOT a topic ("lawsuits", "custom cars" are NOT subjects).
+- CRITICAL — full DISAMBIGUATED name: global_main_subject must be a name that uniquely identifies the person on Wikipedia, NOT a bare first name. A bare first name resolves to a generic name-origin page, not the person. Using the script's context, expand the subject to the full, Wikipedia-canonical name (their full name plus any title/qualifier that uniquely identifies them). When the script only uses a bare first name, infer the full disambiguated name from context and use THAT. Put the bare forms the script actually uses in global_subject_aliases.
 - "global_subject_aliases" should be lowercase-equivalent variants the script actually uses. Always include the canonical name.
 - "global_context_terms" should be proper nouns (capitalized), not topics. "lawsuit" is NOT a context term. "Kindig It Design" IS.
 - If you cannot find a single clear subject, return empty values rather than guessing.
@@ -376,7 +378,7 @@ export const SUBJECT_FOOTAGE_SUFFIXES = [
 // search.list calls cost the same ~100 quota units each.
 export function buildSearchQueries(
   entities: ExtractedEntity[],
-  opts?: { forChannel?: boolean; maxQueries?: number },
+  opts?: { forChannel?: boolean; maxQueries?: number; contextAnchor?: string },
 ): string[] {
   const celebs = entities.filter((e) => e.type === "celebrity").map((e) => e.value);
   const people = entities.filter((e) => e.type === "related_person").map((e) => e.value);
@@ -399,13 +401,29 @@ export function buildSearchQueries(
     return Array.from(queries).slice(0, 6);
   }
 
+  // Disambiguating context anchor. A bare-name query ("William interview")
+  // returns the WRONG person when the name is ambiguous (William Shatner). The
+  // caller passes one strong context term tied to the subject (e.g. "royal",
+  // "Camilla") so every subject-anchored query carries enough context for the
+  // search engine to return the RIGHT person. We only append it to bare-subject
+  // queries — queries already paired with a secondary entity (movie/show/event)
+  // are self-disambiguating. Normalised + deduped against the name so we don't
+  // produce "William William".
+  const anchor = (opts?.contextAnchor ?? "").trim();
+  const withAnchor = (q: string): string => {
+    if (!anchor) return q;
+    if (q.toLowerCase().includes(anchor.toLowerCase())) return q;
+    return `${q} ${anchor}`;
+  };
+
   // Open-YouTube fallback: subject name + footage-style suffixes for the
-  // primary subject, plus bare names for secondary people.
+  // primary subject, plus bare names for secondary people. Each subject query
+  // gets the context anchor appended (when provided) for disambiguation.
   if (main) {
-    queries.add(main);
-    for (const suffix of SUBJECT_FOOTAGE_SUFFIXES) queries.add(`${main} ${suffix}`);
+    queries.add(withAnchor(main));
+    for (const suffix of SUBJECT_FOOTAGE_SUFFIXES) queries.add(withAnchor(`${main} ${suffix}`));
   }
-  for (const c of celebs) queries.add(`${c} interview`);
+  for (const c of celebs) queries.add(withAnchor(`${c} interview`));
   // Pair the primary subject with secondary entities — never standalone — so
   // the footage still centres on the person, just in a specific context.
   for (const m of movies) if (main) queries.add(`${main} ${m}`);
@@ -561,7 +579,7 @@ How to choose visualCategory:
 - "subscribe_screen" — YouTube end-card "subscribe" / "more videos" / "click here" overlay, often with circular avatars or video thumbnails arranged in a grid.
 - "credits" — a list of names/roles scrolling or static at the end of a video.
 - "blank" — solid black, white, or near-uniform color frame; no recognizable subject.
-- "text_only" — a frame whose primary content is words (a quote card, a chyron-only shot with no visible subject behind it). NOT for normal lower-third overlays where a subject is also visible.
+- "text_only" — a frame whose primary content is words. This includes quote cards, a chyron-only shot with no visible subject behind it, AND full-screen DISCLAIMER / "viewer discretion advised" / legal-notice / warning cards — even when the words sit over a decorative or textured background image (the background does NOT make it "content" if the frame is dominated by a block of text). NOT for normal lower-third overlays where a real subject is also visible.
 
 When visualCategory is anything other than "content", labels can be a single short item like ["title card"] or ["channel logo"] — we won't use the clip.
 

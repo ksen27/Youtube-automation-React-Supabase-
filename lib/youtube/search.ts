@@ -637,11 +637,12 @@ export interface RankedCandidate extends YoutubeCandidate {
 //   +60 reference channel (user-curated subject footage source)
 //   +25 approved channel (legacy global allowlist)
 //   +10 sweet-spot duration
+//   +15 long-source bonus (talking-head, graduated up to ~20 min)
 //   +20 keyword token cap (down-weighted from +40 — keywords are now a weak
 //        tie-breaker, not a discovery driver)
-// Total = 260. The UI bar normalises through MAX_RANK_SCORE so a reference-
+// Total = 275. The UI bar normalises through MAX_RANK_SCORE so a reference-
 // channel subject hit renders strong without every result saturating at 100.
-export const MAX_RANK_SCORE = 260;
+export const MAX_RANK_SCORE = 275;
 
 // Duration windows per intent. b-roll and archival often surface as short
 // clips (30–120s) on YouTube — applying the talking-head floor would reject
@@ -734,16 +735,34 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   const channelLower = c.channelTitle.toLowerCase();
   const matchedQueryLower = (input.matchedQuery ?? "").toLowerCase();
 
-  // Subject + alias hit (+50). An alias hitting the title counts as a subject
-  // anchor — "Kindig" in a title is just as strong a signal as "Dave Kindig"
-  // for a project anchored on Dave Kindig.
+  // Subject hit (+50), matched on a WORD BOUNDARY (not raw substring).
+  //
+  // GENERAL rule (no hardcoded name lists): only a MULTI-WORD full name is a
+  // safe standalone anchor. A bare single-token name is never trusted as an
+  // anchor by itself, because a single token collides with everyone who shares
+  // it — "william" matches "William Shatner", "dave" matches any Dave. This
+  // holds for ANY project, not just specific names. The full name ("Prince
+  // William", "Dave Kindig") is required for the title/desc anchor; single-word
+  // sources are caught instead by the thumbnail/clip face-check, which judges
+  // by the actual person rather than the name string.
+  //
+  // Word-boundary matching additionally prevents substring collisions
+  // ("williamsburg" never matches "william").
   const subjectLower = input.mainCelebrity?.toLowerCase().trim() ?? "";
   const aliasLowers = (input.aliases ?? [])
     .map((a) => a.toLowerCase().trim())
     .filter((a) => a && a !== subjectLower);
-  const subjectVariants = subjectLower ? [subjectLower, ...aliasLowers] : aliasLowers;
+  const allVariants = subjectLower ? [subjectLower, ...aliasLowers] : aliasLowers;
+  // Multi-word variants only — single bare tokens are not safe anchors.
+  const subjectVariants = allVariants.filter((v) => v.includes(" "));
+  // Word-boundary matcher: the variant must appear as whole word(s).
+  function hitsAsWord(hay: string, needle: string): boolean {
+    if (!needle) return false;
+    const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|\\W)${esc}(\\W|$)`, "i").test(hay);
+  }
   const subjectHit = subjectVariants.find((v) =>
-    titleLower.includes(v) || descLower.includes(v) || channelLower.includes(v)
+    hitsAsWord(titleLower, v) || hitsAsWord(descLower, v) || hitsAsWord(channelLower, v)
   );
   if (subjectHit) {
     score += 50;
@@ -843,6 +862,25 @@ export function rankCandidate(input: RankInput): RankedCandidate {
   if (c.durationSeconds >= window.sweetMin && c.durationSeconds <= window.sweetMax) {
     score += 10;
     reasons.push(`sweet-spot duration (${intentType})`);
+  }
+
+  // Longer-source preference (talking-head only). The client's reference
+  // channels are full of 15-25 min interviews/episodes — exactly the footage
+  // we want, because one long source yields MANY distinct clips and keeps the
+  // per-source duration high. The old flat +10 sweet-spot (capped at 15 min)
+  // gave a 4-minute clip the same credit as a 22-minute interview, so short
+  // clips were winning selection slots and the total selected duration came
+  // out small. Reward duration above the sweet-spot floor on a graduated
+  // curve (up to +15 at ~20 min) so a substantial source outranks a sliver of
+  // the same subject. b-roll / archival are intentionally excluded — those
+  // intents legitimately surface as short cutaways.
+  if (intentType === "talking_head" && c.durationSeconds > window.sweetMin) {
+    const overMinutes = (c.durationSeconds - window.sweetMin) / 60;
+    const lengthBonus = Math.min(15, Math.round(overMinutes * 1.0));
+    if (lengthBonus > 0) {
+      score += lengthBonus;
+      reasons.push(`long-source +${lengthBonus} (${Math.round(c.durationSeconds / 60)}min)`);
+    }
   }
 
   // Penalize obvious junk. (#shorts handled earlier as a hard reject; this

@@ -7,16 +7,16 @@ $videoId = "k5ps2f7UM8I"
 $videoUrl = "https://www.youtube.com/watch?v=$videoId"
 
 $proxies = @(
-  "45.56.149.184:6571:ttremosg:mhzaruqkenoa"
-  "9.142.38.25:7695:ttremosg:mhzaruqkenoa"
-  "168.158.187.29:6808:ttremosg:mhzaruqkenoa"
-  "9.142.49.22:7184:ttremosg:mhzaruqkenoa"
-  "9.142.58.58:5721:ttremosg:mhzaruqkenoa"
-  "69.30.75.166:6223:ttremosg:mhzaruqkenoa"
-  "9.142.28.55:6713:ttremosg:mhzaruqkenoa"
-  "207.135.197.210:6151:ttremosg:mhzaruqkenoa"
-  "78.31.205.139:5325:ttremosg:mhzaruqkenoa"
-  "45.56.140.97:5331:ttremosg:mhzaruqkenoa"
+  "72.1.159.153:6543:ttremosg:mhzaruqkenoa"
+  "63.246.158.234:6482:ttremosg:mhzaruqkenoa"
+  "203.160.124.95:5294:ttremosg:mhzaruqkenoa"
+  "69.30.79.183:5236:ttremosg:mhzaruqkenoa"
+  "45.56.153.80:5945:ttremosg:mhzaruqkenoa"
+  "138.226.92.174:5862:ttremosg:mhzaruqkenoa"
+  "185.205.204.147:5833:ttremosg:mhzaruqkenoa"
+  "45.45.202.54:7055:ttremosg:mhzaruqkenoa"
+  "9.142.6.10:7668:ttremosg:mhzaruqkenoa"
+  "45.56.168.83:5984:ttremosg:mhzaruqkenoa"
 )
 
 $results = @()

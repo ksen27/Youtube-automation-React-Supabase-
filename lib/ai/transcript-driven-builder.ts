@@ -67,6 +67,15 @@ export interface TranscriptBuildArgs {
   // keeps the image on screen for the full sentence; "fixed_5s" splits
   // long image sentences into N back-to-back ~5s slots.
   imageHoldPolicy: ImageHoldPolicy;
+  // Upper bound on the fraction of CONTENT blocks (image + footage; title
+  // cards and intro excluded) that may be images. Gemini's per-sentence
+  // recommended_visual_type tends to land ~50% images, which (a) over-uses
+  // the verified image pool — forcing the same celebrity photo to repeat
+  // across many slots — and (b) reads as a slideshow. The clip pool is
+  // plentiful, so we cap images at this ratio and convert the LOWEST
+  // visual_priority image blocks to footage until the cap is met. Default
+  // 0.40 → a 40:60 image:footage split. Set 0.30 for 30:70.
+  maxImageRatio?: number;
 }
 
 export interface TranscriptBuildResult {
@@ -91,6 +100,10 @@ export interface TranscriptBuildResult {
   // row by the pre-pass that folds rhythmic narration beats. Higher =
   // fewer 1-2s flash blocks in the final editor view.
   shortSentencesMerged: number;
+  // Number of image blocks converted to footage by the image:footage ratio
+  // cap (lowest visual_priority first). 0 when Gemini's split was already
+  // within the cap.
+  imagesConvertedToFootage: number;
 }
 
 // Decide which neighbor a short sentence groups with.
@@ -530,6 +543,57 @@ export function buildBlockSequenceFromTranscript(
     blockIsTitleCard.push(false);
   }
 
+  // ---- image:footage ratio cap ----------------------------------------
+  // Gemini's per-sentence recommended_visual_type lands ~50% images on a
+  // typical biography script. That over-draws the verified image pool (the
+  // same celebrity photo repeats across many slots) and reads as a slideshow.
+  // Footage supply is plentiful, so cap images at maxImageRatio of all
+  // CONTENT blocks (image + footage; title cards / intro excluded) and
+  // convert the surplus — the LOWEST visual_priority image blocks first, so
+  // the images that genuinely matter (high-priority portraits, logos,
+  // posters) stay images while generic descriptive sentences become footage.
+  const maxImageRatio = typeof args.maxImageRatio === "number"
+    && args.maxImageRatio > 0 && args.maxImageRatio < 1
+    ? args.maxImageRatio
+    : 0.40;
+  let imagesConvertedToFootage = 0;
+  {
+    // Content blocks only — title cards (overlays) and intro don't count
+    // toward the visual-style ratio.
+    const isContent = (b: (typeof blocks)[number], idx: number): boolean =>
+      !blockIsTitleCard[idx] && b.type !== "intro";
+    const contentIdxs: number[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (isContent(blocks[i], i)) contentIdxs.push(i);
+    }
+    const imageIdxs = contentIdxs.filter(
+      (i) => blocks[i].type === "image" || blocks[i].type === "split_2",
+    );
+    const contentTotal = contentIdxs.length;
+    const maxImages = Math.floor(contentTotal * maxImageRatio);
+    const surplus = imageIdxs.length - maxImages;
+    if (surplus > 0) {
+      // Convert the surplus lowest-priority image blocks to footage. Sort by
+      // visual_priority ascending (lowest first); ties broken by longer
+      // duration first (a long generic image hold is the most slideshow-like,
+      // best replaced by motion). split_2 blocks are left alone — they're a
+      // deliberate side-by-side composition, not a generic still.
+      const convertible = imageIdxs
+        .filter((i) => blocks[i].type === "image")
+        .sort((a, b) => {
+          const pa = Number(blocks[a].visual_priority ?? 0);
+          const pb = Number(blocks[b].visual_priority ?? 0);
+          if (pa !== pb) return pa - pb;
+          return Number(blocks[b].duration ?? 0) - Number(blocks[a].duration ?? 0);
+        });
+      const toConvert = convertible.slice(0, surplus);
+      for (const idx of toConvert) {
+        blocks[idx] = { ...blocks[idx], type: "footage" };
+        imagesConvertedToFootage++;
+      }
+    }
+  }
+
   return {
     blocks,
     blockSentenceIndex,
@@ -539,5 +603,6 @@ export function buildBlockSequenceFromTranscript(
     titleCardsInserted,
     imageSplitCount,
     shortSentencesMerged,
+    imagesConvertedToFootage,
   };
 }

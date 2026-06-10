@@ -18,6 +18,8 @@ import { fetchWikipediaImage } from "./wikipedia";
 import { fetchBraveImage, fetchBraveImages } from "./brave";
 import { fetchGoogleImage, fetchGoogleImages } from "./google-cse";
 import { getEnv } from "@/lib/env";
+import { uploadBuffer } from "@/lib/storage";
+import { createHash } from "node:crypto";
 
 export type ImageSource = "wikipedia" | "brave" | "google_cse";
 
@@ -91,6 +93,118 @@ export async function validateImageUrl(url: string): Promise<boolean> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Download an external image server-side and re-host it on our own R2 CDN,
+// returning the R2 public URL. Returns null when the source can't be fetched
+// (e.g. people.com and other publisher CDNs with Akamai-grade bot protection
+// that 403 every server fetch) or isn't a usable image.
+//
+// WHY: an image_url that points at a hotlink-protected publisher CDN fails in
+// BOTH the editor preview (browser <img> blocked) AND the final render (the
+// worker's server-side downloadHttp gets 403 → the block is silently dropped
+// from the video — no fallback image). Re-hosting at match time means every
+// image committed to the timeline lives on OUR CDN, so it always loads in the
+// editor and always renders. A source that blocks this fetch is rejected here,
+// before it reaches the timeline, so the matcher falls through to a different
+// working image instead of shipping a gap.
+//
+// Idempotent by content address: the R2 key is derived from the source URL, so
+// re-hosting the same image twice (across blocks / re-matches) overwrites the
+// same object rather than piling up duplicates.
+export async function rehostImageToR2(
+  sourceUrl: string,
+  projectId: string,
+): Promise<string | null> {
+  // Already on our CDN — nothing to do. Avoids a pointless round-trip when a
+  // re-match re-processes an image that was rehosted on a previous run.
+  const env = getEnv();
+  if (env.R2_PUBLIC_BASE_URL && sourceUrl.startsWith(env.R2_PUBLIC_BASE_URL)) {
+    return sourceUrl;
+  }
+  try {
+    new URL(sourceUrl);
+  } catch {
+    return null;
+  }
+
+  const timeoutMs = Math.min(15_000, env.HTTP_DOWNLOAD_TIMEOUT_SECONDS * 1000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(sourceUrl, {
+      signal: ctrl.signal,
+      redirect: "follow",
+      // Browser-like UA: many CDNs reject the default fetch UA but allow this.
+      // (Doesn't defeat Akamai-grade protection like people.com — those simply
+      // return null below and get dropped, which is the intended behaviour.)
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept: "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+      },
+    });
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) return null;
+
+  let buf: Buffer;
+  try {
+    buf = Buffer.from(await res.arrayBuffer());
+  } catch {
+    return null;
+  }
+  if (buf.length === 0) return null;
+
+  // Determine the real image type. The Content-Type header is NOT trusted on
+  // its own: CDNs commonly serve valid images as binary/octet-stream
+  // (purewow.com does this) or with a wrong type, which would wrongly drop a
+  // perfectly good image. We sniff the magic bytes and fall back to the header.
+  // If NEITHER says image, the body isn't an image (an HTML challenge page) →
+  // reject so it doesn't get stored as a broken asset.
+  const headerType = (res.headers.get("content-type") || "").split(";")[0].trim();
+  const sniffed = sniffImageMime(buf);
+  if (!sniffed && !headerType.startsWith("image/")) return null;
+  const storeType = sniffed ?? headerType;
+
+  // Pick an extension from the resolved type so the R2 object has a sensible
+  // name; default to .jpg.
+  const ext =
+    storeType.includes("png") ? "png" :
+    storeType.includes("webp") ? "webp" :
+    storeType.includes("gif") ? "gif" :
+    storeType.includes("avif") ? "avif" :
+    "jpg";
+  const hash = createHash("sha1").update(sourceUrl).digest("hex").slice(0, 24);
+  const key = `projects/${projectId}/images/${hash}.${ext}`;
+
+  try {
+    const up = await uploadBuffer(buf, key, storeType);
+    return up.publicUrl;
+  } catch {
+    return null;
+  }
+}
+
+// Sniff an image's real MIME from leading magic bytes — CDNs frequently serve
+// images with a generic/wrong Content-Type, so the header can't be trusted.
+// Returns null when the bytes aren't a recognised image.
+function sniffImageMime(buf: Buffer): string | null {
+  if (buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return "image/gif";
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return "image/webp";
+  if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return "image/avif";
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return "image/bmp";
+  return null;
 }
 
 export interface FetchedImage {

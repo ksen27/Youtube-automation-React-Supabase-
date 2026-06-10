@@ -63,37 +63,101 @@ function getModel() {
   return genai.getGenerativeModel({ model: env.GEMINI_MODEL });
 }
 
+type FetchedImage = { data: string; mimeType: string };
+
+// Per-process cache of successfully fetched images, keyed by URL. The matcher
+// verifies a whole person-pool against ONE reference photo — without this it
+// re-downloaded that identical reference URL once PER CANDIDATE (60+ times in a
+// tight, concurrent loop). Wikimedia throttles/times-out that burst, the
+// reference fetch returns null, and EVERY verification then returns
+// "uncertain" → the matcher drops the candidates ("reference fetch failed",
+// dozens of clips lost). Caching the bytes means each distinct image is pulled
+// exactly once. Cap is generous; entries are a few hundred KB of base64.
+const IMAGE_CACHE_MAX = 512;
+const imageCache = new Map<string, FetchedImage>();
+// In-flight dedup: concurrent verifications for the same person all request the
+// same reference at once. Share a single download promise so the first call
+// fetches and the rest await it, instead of all firing parallel requests (which
+// is the burst that triggers throttling in the first place).
+const inFlight = new Map<string, Promise<FetchedImage | null>>();
+
+async function doFetchImage(url: string): Promise<FetchedImage | null> {
+  // One retry on transient failure (timeout / 429 / 5xx) with a short backoff —
+  // cheap insurance against a single throttled response killing a verdict.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          signal: ctrl.signal,
+          // Descriptive UA per Wikimedia's API etiquette — a generic UA on a
+          // burst of identical requests is exactly what gets rate-limited.
+          headers: { "User-Agent": "video-automation/1.0 (image-verify; +https://github.com/video-automation)" },
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) {
+        // Retry only transient statuses; a 404 won't fix itself.
+        if (attempt === 0 && (res.status === 429 || res.status >= 500)) {
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        return null;
+      }
+      const ct = res.headers.get("content-type") || "image/jpeg";
+      const mimeType = ct.startsWith("image/") ? ct.split(";")[0].trim() : "image/jpeg";
+      const buf = Buffer.from(await res.arrayBuffer());
+      // Sanity cap — Gemini accepts large images but we don't gain anything
+      // by sending 20MB hero shots. 4MB is well above what a face/logo gate
+      // needs and keeps the request quick.
+      if (buf.length > 4 * 1024 * 1024) return null;
+      return { data: buf.toString("base64"), mimeType };
+    } catch {
+      // Network error / abort — retry once, then give up.
+      if (attempt === 0) { await new Promise((r) => setTimeout(r, 500)); continue; }
+      return null;
+    }
+  }
+  return null;
+}
+
 // Fetch an image URL and return it as a base64-encoded payload Gemini can
 // accept as inlineData. Returns null on any failure (404, timeout, non-
 // image content-type). The caller treats a null candidate or reference as
-// "uncertain" — we cannot verify what we cannot fetch.
+// "uncertain" — we cannot verify what we cannot fetch. Results are cached per
+// process and concurrent calls for the same URL are de-duplicated.
 async function fetchImageAsBase64(
   url: string,
-): Promise<{ data: string; mimeType: string } | null> {
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        signal: ctrl.signal,
-        headers: { "User-Agent": "video-automation/1.0 (verify)" },
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!res.ok) return null;
-    const ct = res.headers.get("content-type") || "image/jpeg";
-    const mimeType = ct.startsWith("image/") ? ct.split(";")[0].trim() : "image/jpeg";
-    const buf = Buffer.from(await res.arrayBuffer());
-    // Sanity cap — Gemini accepts large images but we don't gain anything
-    // by sending 20MB hero shots. 4MB is well above what a face/logo gate
-    // needs and keeps the request quick.
-    if (buf.length > 4 * 1024 * 1024) return null;
-    return { data: buf.toString("base64"), mimeType };
-  } catch {
-    return null;
+): Promise<FetchedImage | null> {
+  const cached = imageCache.get(url);
+  if (cached) {
+    // Refresh LRU position.
+    imageCache.delete(url);
+    imageCache.set(url, cached);
+    return cached;
   }
+  const pending = inFlight.get(url);
+  if (pending) return pending;
+
+  const p = doFetchImage(url).then((img) => {
+    inFlight.delete(url);
+    if (img) {
+      imageCache.set(url, img);
+      if (imageCache.size > IMAGE_CACHE_MAX) {
+        const firstKey = imageCache.keys().next().value;
+        if (firstKey !== undefined) imageCache.delete(firstKey);
+      }
+    }
+    return img;
+  }).catch(() => {
+    inFlight.delete(url);
+    return null;
+  });
+  inFlight.set(url, p);
+  return p;
 }
 
 // Single Gemini call → tri-state verdict. Centralised so both verify
@@ -201,6 +265,371 @@ export async function verifyPersonImage(input: PersonVerifyInput): Promise<Verif
     PERSON_VERIFY_PROMPT(input.personName),
     [reference, candidate],
   );
+}
+
+// =========================================================================
+// verifyPersonImageClean — identity + overlay cleanliness for a PERSON
+// image, in ONE Gemini call.
+//
+// Person photos sourced from the web are frequently article/clickbait
+// thumbnails: a real photo of the right person but stamped with a news-
+// channel logo and a big headline banner ("WILLIAM & KATE'S GLAM
+// COMEBACK", a "TOI" bug, etc.). The plain verifyPersonImage gate only
+// answers "is this the right person?" — so those overlay-laden thumbnails
+// passed straight into the image pool. This mirrors the clip-stage clean-
+// frame gate (verifyClipFrameCombined) for the IMAGE pool: it returns BOTH
+// the identity verdict AND an overlay verdict so the caller can reject a
+// correct-person-but-dirty image. Lenient by design about tiny photo
+// credits; strict about added headline/logo/caption graphics.
+//
+// Fails OPEN: on any error/missing image, verdict and overlay are
+// "uncertain" so a Gemini hiccup doesn't gut the pool.
+// =========================================================================
+export interface PersonImageCleanResult extends VerifyResult {
+  // "clean"  — a plain photograph with no added graphics.
+  // "dirty"  — carries a channel/network logo or watermark, a headline /
+  //            news banner, a caption / lower-third, or other added text.
+  // "uncertain" — cannot tell.
+  overlay: "clean" | "dirty" | "uncertain";
+  overlayArtifact: string;
+}
+
+const PERSON_IMAGE_CLEAN_PROMPT = (personName: string) => `You are vetting a candidate image an editor wants to use to represent ${personName} in a documentary video.
+
+Two images are attached. The FIRST is a known reference photo of ${personName}. The SECOND is the candidate image. Answer TWO independent questions about the SECOND image and return BOTH in one JSON object.
+
+(1) "verdict" — is the SECOND image the SAME PERSON as the reference?
+- "yes" — clearly the same person (alone or in a group). Different age/hair/lighting is fine; judge by facial structure.
+- "no" — a different person, or no recognisable person at all (a logo, map, chart, text graphic, building).
+- "uncertain" — any doubt (faces too small/blurry/from behind). DEFAULT to "uncertain" over a guessed "yes".
+
+(2) "overlay" — is the image a CLEAN photograph, free of ADDED graphics?
+- "dirty" — the image has ANY of: a news-channel / network / website logo or watermark (e.g. a corner station bug); a headline or news banner / title bar (large added caption text like "WILLIAM & KATE'S GLAM COMEBACK"); a lower-third name strip, subtitle, or quote card; a "breaking news" banner; a collage/split-screen of multiple framed photos; or any prominent added text laid over the photo.
+- "clean" — a plain photograph of the person with NONE of the above. A tiny unobtrusive photographer credit in a corner is still "clean".
+- "uncertain" — you genuinely cannot tell.
+Be strict on (2): a clickbait article thumbnail with a logo and a headline banner is "dirty" even when it shows the correct person.
+
+Return STRICT JSON ONLY:
+{ "verdict": "yes" | "no" | "uncertain", "overlay": "clean" | "dirty" | "uncertain", "overlayArtifact": "short description of any overlay, else empty", "reason": "one short sentence", "confidence": 0.0 to 1.0 }`;
+
+const PersonImageCleanSchema = z.object({
+  verdict: VerifyVerdict.default("uncertain"),
+  overlay: z.enum(["clean", "dirty", "uncertain"]).default("uncertain"),
+  overlayArtifact: z.string().optional().default(""),
+  reason: z.string().default(""),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+export async function verifyPersonImageClean(input: PersonVerifyInput): Promise<PersonImageCleanResult> {
+  const fail = (reason: string): PersonImageCleanResult => ({
+    verdict: "uncertain", overlay: "uncertain", overlayArtifact: "", reason, confidence: 0,
+  });
+  const [reference, candidate] = await Promise.all([
+    fetchImageAsBase64(input.referenceUrl),
+    fetchImageAsBase64(input.candidateUrl),
+  ]);
+  if (!reference || !candidate) {
+    return fail(reference ? "candidate fetch failed" : "reference fetch failed");
+  }
+  const model = getModel();
+  let txt: string;
+  try {
+    const res = await withGeminiRetry(
+      `verifyPersonImageClean[${input.personName}]`,
+      () => model.generateContent({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: PERSON_IMAGE_CLEAN_PROMPT(input.personName) },
+            { inlineData: { mimeType: reference.mimeType, data: reference.data } },
+            { inlineData: { mimeType: candidate.mimeType, data: candidate.data } },
+          ],
+        }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      }),
+      { attempts: 2, baseMs: 400 },
+    );
+    txt = res.response.text();
+  } catch {
+    return fail("gemini error");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch { return fail("parse error"); }
+  const safe = PersonImageCleanSchema.safeParse(parsed);
+  if (!safe.success) return fail("schema error");
+  return {
+    verdict: safe.data.verdict,
+    overlay: safe.data.overlay,
+    overlayArtifact: safe.data.overlayArtifact,
+    reason: safe.data.reason,
+    confidence: safe.data.confidence,
+  };
+}
+
+// =========================================================================
+// verifyImageIsPerson — is this image a single real human portrait?
+//
+// Content-based replacement for the old description-word-list guard. A bare
+// ambiguous name ("William", "Salam") resolves on Wikipedia to a non-person
+// page whose image is a tapestry, calligraphy, a map, or a logo. Rather than
+// trying to enumerate every bad description string (which always misses some —
+// "Arabic greeting" slipped past the word list), we look at the IMAGE itself
+// and ask whether it depicts a single recognizable human. Works for ANY wrong
+// page type without hardcoding. Fails OPEN ("uncertain"→accept) so a Gemini
+// hiccup doesn't strip a legitimate reference.
+// =========================================================================
+export async function verifyImageIsPerson(imageUrl: string): Promise<VerifyResult> {
+  const img = await fetchImageAsBase64(imageUrl);
+  if (!img) return { verdict: "uncertain", reason: "image fetch failed", confidence: 0 };
+  const prompt = `You are checking whether an image is usable as a REFERENCE PHOTO of a real person.
+
+Return STRICT JSON ONLY: { "verdict": "yes" | "no" | "uncertain", "reason": "short", "confidence": 0.0-1.0 }
+
+- "yes" — the image clearly shows a single real human being (a photograph or portrait of a person; a face is visible).
+- "no" — the image is NOT a usable person photo: it is text / calligraphy / a word graphic, a logo or wordmark, a map or flag, a building or landscape with no person, an illustration/painting of an object, a coat of arms, a chart, or a crowd with no single clear subject.
+- "uncertain" — you genuinely cannot tell.
+
+Be strict: a graphic of a written word, a tapestry, or a logo is "no", even if it is historically associated with a name.`;
+  return askGemini("verifyImageIsPerson", prompt, [img]);
+}
+
+// =========================================================================
+// verifyClipFrameCombined — ONE Gemini call answering BOTH clip-quality
+// questions for a single frame: (1) is the footage clean (no logo / watermark
+// / text / title card)? and (2) is the target person present?
+//
+// This merges what used to be two separate calls per frame
+// (classifyFrameCleanliness + verifyPoolAsset/verifyPersonImage), halving the
+// Gemini Vision spend on the clip hot path. The frame and the person's
+// reference photo are sent together; the model returns both verdicts in one
+// JSON object.
+//
+// Fails OPEN: on any error / missing image the result is clean:"uncertain"
+// and face:"uncertain" — the caller's policy (clipProcessor) decides.
+// =========================================================================
+
+export const FrameCleanVerdict = z.enum(["clean", "dirty", "uncertain"]);
+export type FrameCleanVerdict = z.infer<typeof FrameCleanVerdict>;
+
+export interface CombinedFrameResult {
+  clean: FrameCleanVerdict;
+  face: VerifyVerdict;          // yes | no | uncertain — person present?
+  cleanArtifact: string;        // short description of any overlay seen
+  reason: string;
+}
+
+const CombinedFrameSchema = z.object({
+  clean: FrameCleanVerdict.default("uncertain"),
+  cleanArtifact: z.string().optional().default(""),
+  face: VerifyVerdict.default("uncertain"),
+  reason: z.string().optional().default(""),
+});
+
+export interface CombinedFrameInput {
+  // A single sampled frame of the cut clip (uploaded thumbnail URL).
+  frameUrl: string;
+  // The person we want present. Optional — when absent (or no reference is
+  // available) the face question is skipped and face = "uncertain".
+  personName?: string;
+  // The person's reference photo (Wikipedia). Required for the face check;
+  // when missing, only the cleanliness question is asked.
+  referenceUrl?: string | null;
+}
+
+function combinedPrompt(personName?: string): string {
+  const faceBlock = personName
+    ? `\n\nThe FIRST image is a known reference photo of ${personName}. The SECOND image is the video frame. For the "face" field, decide whether ${personName} (the person in the reference) is visibly present in the SECOND image:
+- "yes" — the same person as the reference is clearly visible (alone or among others).
+- "no" — a different person, or no recognisable person at all.
+- "uncertain" — faces too small / blurry / from behind, or you cannot be sure. Default to "uncertain" over a guessed "yes".`
+    : `\n\nOnly ONE image is attached (the video frame). There is no person to check, so always return "uncertain" for the "face" field.`;
+
+  const frameRef = personName ? "the SECOND image (the video frame)" : "the attached video frame";
+
+  return `You are a broadcast-quality gate for a documentary editor. Judge ${frameRef} on TWO independent questions and return BOTH in one JSON object.
+
+(1) "clean" — is this clean, usable footage with NO graphic overlays?
+FIRST, scan all FOUR CORNERS and the bottom edge of the frame for small persistent branding before judging the center — burned-in channel logos and site watermarks live there and are easy to overlook when the center of the frame is a face or action.
+Mark "dirty" if the frame shows ANY of: a channel/network logo, brand mark, or watermark (even a SMALL corner station bug, a semi-transparent logo, or a website/URL strip such as "somesite.com" / "somesite.tv" burned into a corner or along an edge); on-screen text of ANY kind — captions, subtitles, burned-in auto-captions or "word pop" caption text (a single emphasised word like "GREAT" / "WOW" synced to speech, often centered or near the bottom), lower-third name strips, chyrons, headlines, quote cards, breaking-news banners; a title card; an end screen / subscribe / "more videos" overlay; scrolling or static credits; or a near-blank solid frame with no real subject.
+Mark "clean" ONLY if it is plain photographed footage with NONE of the above — including no corner logo, no URL/site watermark, and no caption/subtitle text anywhere in the frame.
+Mark "uncertain" only if you genuinely cannot tell. Be strict: any visible logo, watermark, URL, or text → "dirty", however small. When you mark dirty, name the artifact precisely in "cleanArtifact" using the most specific word — e.g. "corner channel logo", "werewolftvseries.com watermark bottom-right", "lower-third name strip", or "burned-in caption text 'GREAT'" / "subtitle" for spoken-word captions.${faceBlock}
+
+Return STRICT JSON ONLY:
+{ "clean": "clean" | "dirty" | "uncertain", "cleanArtifact": "short description of any overlay, else empty", "face": "yes" | "no" | "uncertain", "reason": "one short sentence" }`;
+}
+
+export async function verifyClipFrameCombined(
+  input: CombinedFrameInput,
+): Promise<CombinedFrameResult> {
+  const fail = (reason: string): CombinedFrameResult => ({
+    clean: "uncertain", face: "uncertain", cleanArtifact: "", reason,
+  });
+
+  const wantFace = !!(input.personName && input.referenceUrl);
+  const [reference, candidate] = await Promise.all([
+    wantFace ? fetchImageAsBase64(input.referenceUrl!) : Promise.resolve(null),
+    fetchImageAsBase64(input.frameUrl),
+  ]);
+  if (!candidate) return fail("frame fetch failed");
+
+  // Image order matters: when a reference exists it is FIRST (the prompt refers
+  // to "FIRST image" = reference, "SECOND image" = frame). Without a reference,
+  // only the frame is sent and the face question is forced "uncertain".
+  const images = reference ? [reference, candidate] : [candidate];
+
+  const model = getModel();
+  let txt: string;
+  try {
+    const res = await withGeminiRetry(
+      `verifyClipFrame[${input.personName ?? "no-person"}]`,
+      () => model.generateContent({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: combinedPrompt(reference ? input.personName : undefined) },
+            ...images.map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+          ],
+        }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.1 },
+      }),
+      { attempts: 2, baseMs: 400 },
+    );
+    txt = res.response.text();
+  } catch {
+    return fail("gemini error");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch { return fail("parse error"); }
+  const safe = CombinedFrameSchema.safeParse(parsed);
+  if (!safe.success) return fail("schema error");
+  // When no reference was available, never report a positive face verdict.
+  const face = reference ? safe.data.face : "uncertain";
+  return {
+    clean: safe.data.clean,
+    face,
+    cleanArtifact: safe.data.cleanArtifact,
+    reason: safe.data.reason,
+  };
+}
+
+// =========================================================================
+// detectSourceWatermark — does a WHOLE source video carry PERSISTENT burned-in
+// on-screen graphics: a logo / channel bug / site watermark, OR baked-in
+// captions / subtitles that run throughout the video?
+//
+// Per-clip cleanliness checks are unreliable for these. For a small corner
+// logo, Gemini notices the bug on some sampled frames and misses it on others
+// (returning "uncertain"), slipping a branded clip past the per-clip majority
+// gate. For word-by-word auto-captions (a single word like "GREAT" synced to
+// speech), the TEXT CHANGES every frame — so within one short clip's 3 sampled
+// frames the caption lands on maybe one of them, and the majority rule (built
+// to TOLERATE a transient lower-third) keeps the clip. Both artifacts are
+// burned into the WHOLE source, so we decide ONCE per source: sample frames
+// spread across the whole runtime and ask whether such a graphic is present.
+// A graphic on MOST sampled frames is PERSISTENT — a channel bug or baked-in
+// subtitle track — not a one-off chyron, and the whole source should skip.
+//
+// Two artifact classes count toward the vote, tracked separately for logging:
+//   - logo/watermark (a fixed brand mark)
+//   - caption/subtitle (recurring on-screen speech text)
+// A SINGLE transient chyron lands on ~1 of N frames spread across the video,
+// so it never reaches the majority — that's the guard against discarding a
+// source for occasional text. Fails CLOSED-to-keep: any error / no usable
+// frames → not flagged (we don't drop a source on a Gemini hiccup).
+// =========================================================================
+
+// Artifact phrases for a persistent brand mark. Mirrors the clipProcessor
+// logo override so the two stay consistent.
+const LOGO_WATERMARK_ARTIFACT_RE =
+  /\b(logo|watermark|wordmark|station bug|channel bug|brand(?:ing|ed)?|url|website|\.com|\.tv|\.net)\b/i;
+
+// Artifact phrases for recurring on-screen speech text — burned-in captions,
+// subtitles, karaoke-style word pop-ups. These read like normal "text" so we
+// match the words Gemini uses to describe them. Kept separate from a one-off
+// "headline" / "title" so the source-level vote is about SPOKEN-WORD captions
+// that run the whole video, the thing word-by-word auto-subs produce.
+const CAPTION_ARTIFACT_RE =
+  /\b(caption|subtitle|closed[- ]?caption|cc\b|on[- ]?screen text|burned[- ]?in text|word pop|auto[- ]?caption|lyric)\b/i;
+
+export interface SourceWatermarkInput {
+  // Frame image URLs sampled evenly across the source (already uploaded so
+  // Gemini can fetch them). 4–6 is plenty; more just costs more.
+  frameUrls: string[];
+}
+
+export interface SourceWatermarkResult {
+  // True when a persistent logo/watermark OR persistent caption track appears
+  // on a majority of sampled frames.
+  watermarked: boolean;
+  // How many sampled frames were checkable, and the per-class hit counts.
+  framesChecked: number;
+  logoFrames: number;
+  captionFrames: number;
+  // Which class triggered the decision ("logo" | "caption" | ""), and a
+  // representative artifact description for logging.
+  reasonClass: "logo" | "caption" | "";
+  artifact: string;
+}
+
+export async function detectSourceWatermark(
+  input: SourceWatermarkInput,
+): Promise<SourceWatermarkResult> {
+  const empty: SourceWatermarkResult = {
+    watermarked: false, framesChecked: 0, logoFrames: 0, captionFrames: 0,
+    reasonClass: "", artifact: "",
+  };
+  const urls = input.frameUrls.filter((u) => typeof u === "string" && u.length > 0);
+  if (urls.length === 0) return empty;
+
+  // No reference person — we only want the cleanliness verdict here.
+  const results = await Promise.all(
+    urls.map((url) => verifyClipFrameCombined({ frameUrl: url }).catch(() => null)),
+  );
+
+  let framesChecked = 0;
+  let logoFrames = 0;
+  let captionFrames = 0;
+  let logoArtifact = "";
+  let captionArtifact = "";
+  for (const r of results) {
+    if (!r) continue;                 // fetch / gemini failure → ignore this frame
+    framesChecked++;
+    if (r.clean !== "dirty") continue;
+    const art = r.cleanArtifact ?? "";
+    if (LOGO_WATERMARK_ARTIFACT_RE.test(art)) {
+      logoFrames++;
+      if (!logoArtifact) logoArtifact = art;
+    }
+    if (CAPTION_ARTIFACT_RE.test(art)) {
+      captionFrames++;
+      if (!captionArtifact) captionArtifact = art;
+    }
+  }
+
+  // Persistent = a strict majority of CHECKABLE frames show the same class of
+  // graphic. Require at least 2 hits in a class so a single mis-read can't
+  // condemn a whole source. With <2 checkable frames we can't establish
+  // persistence → keep the source. Logo and caption are evaluated
+  // independently; either one persisting is enough to skip the source.
+  const majority = Math.ceil(framesChecked / 2);
+  const logoPersistent = framesChecked >= 2 && logoFrames >= 2 && logoFrames >= majority;
+  const captionPersistent = framesChecked >= 2 && captionFrames >= 2 && captionFrames >= majority;
+
+  if (logoPersistent || captionPersistent) {
+    // Prefer reporting whichever class had more hits as the trigger.
+    const reasonClass: "logo" | "caption" =
+      captionPersistent && captionFrames >= logoFrames ? "caption" : "logo";
+    return {
+      watermarked: true,
+      framesChecked,
+      logoFrames,
+      captionFrames,
+      reasonClass,
+      artifact: reasonClass === "caption" ? captionArtifact : logoArtifact,
+    };
+  }
+
+  return { watermarked: false, framesChecked, logoFrames, captionFrames, reasonClass: "", artifact: "" };
 }
 
 // =========================================================================

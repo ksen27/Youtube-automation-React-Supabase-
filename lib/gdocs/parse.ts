@@ -213,6 +213,22 @@ function isTitleParagraph(p: ParsedParagraph): boolean {
   return p.runs.some((r) => r.bold && r.blue && r.text.trim().length > 0);
 }
 
+// Stricter than isTitleParagraph: every visible run in the paragraph must
+// be blue-bold (the whole line is a heading), not merely "contains a
+// blue-bold run". Used to decide whether a heading WITHOUT a following
+// force clip should be DROPPED from the transcript entirely — we only drop
+// pure standalone headings ("The Full Man, Finally"), never a normal
+// narration sentence that happens to carry a stray blue-bold word.
+function isPureTitleParagraph(p: ParsedParagraph): boolean {
+  let sawHeadingRun = false;
+  for (const r of p.runs) {
+    if (r.text.trim().length === 0) continue; // ignore whitespace-only runs
+    if (!(r.bold && r.blue)) return false;     // a non-heading visible run → not pure
+    sawHeadingRun = true;
+  }
+  return sawHeadingRun;
+}
+
 // Pull the title text out of a title paragraph: concatenate the blue-bold
 // runs and strip surrounding whitespace.
 function titleParagraphText(p: ParsedParagraph): string {
@@ -434,9 +450,34 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
           continue;
         }
       }
-      // Title-looking paragraph without a following timestamp+URL — treat
-      // as regular prose so we don't lose its text. Falls through to the
-      // generic paragraph branch below.
+      // Title-looking paragraph without a following timestamp+URL. If the
+      // WHOLE line is a blue-bold heading (a chapter heading the doc author
+      // wrote with no force clip under it), it STILL becomes an on-screen
+      // title card — just a clipless one. The renderer shows the title text
+      // as a standalone card (no forced footage); the narration underneath
+      // continues over the project's normal visuals. We emit a title_card
+      // marker with no youtubeUrl / start / end so downstream code knows
+      // there's no clip to download. The heading text is NOT added to the
+      // transcript (it's a card, not spoken narration).
+      //
+      // We require the STRICT pure-heading test so a normal narration
+      // sentence carrying a stray blue-bold word isn't turned into a card —
+      // those fall through to the generic prose branch below unchanged.
+      if (isPureTitleParagraph(p)) {
+        titleCards.push({
+          kind: "title_card",
+          text: titleParagraphText(p),
+          // No youtubeUrl / startSeconds / endSeconds — this is a clipless
+          // card. The match/render pipeline renders the text over a black
+          // (or default-visual) background instead of a forced YouTube clip.
+          paragraphIndex: contentParagraphCount,
+          ordinal: titleOrdinal++,
+        });
+        i++;
+        continue;
+      }
+      // Otherwise (a mixed paragraph with some blue-bold runs) fall through
+      // to the generic paragraph branch below so we don't lose its prose.
     }
 
     // Regular paragraph. Pull any red runs out as lower-third markers

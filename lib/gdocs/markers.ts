@@ -302,6 +302,42 @@ function findItemIndexAtTime(starts: number[], items: TimelineItemDraft[], t: nu
   return items.length;
 }
 
+// Find the index of the item that is PLAYING at voiceover time `t` — i.e. the
+// host item a lower-third overlay should be stamped on so the chyron burns in
+// over whatever is on screen when the narrator says the marked word.
+//
+// This is DIFFERENT from findItemIndexAtTime (which returns the first item
+// whose start is at-or-AFTER t, the correct rule for SPLICING a new row
+// between items). For an overlay we need CONTAINMENT: the last item whose
+// start is at-or-before t. Using the splice rule stamped the overlay on the
+// NEXT block instead of the playing one — so a word spoken at t=95.4s landed
+// on a block starting at 103.4s, showing e.g. "Marcella" a whole block late
+// (the 2026-06-10 wrong-clip lower-third bug).
+//
+// Narration has short gaps between sentences, so t can fall AFTER one item's
+// window ends and BEFORE the next begins. In that gap the previous item is
+// still the one on screen (its visual holds until the next cut), so the
+// last-start-<=-t rule is still correct: it returns that previous item.
+//
+// intro rows live on the pre-roll axis and never host a voiceover-time
+// overlay, so they're skipped.
+function findHostItemIndexAtTime(starts: number[], items: TimelineItemDraft[], t: number): number {
+  // The host is the item with the LATEST start that is still at-or-before t.
+  // Scan fully (no early break) so we don't depend on starts[] being perfectly
+  // monotonic at this pre-splice stage — pick the closest start <= t.
+  let host = -1;
+  let bestStart = -Infinity;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type === "intro") continue;
+    const s = starts[i];
+    if (s <= t + 0.01 && s > bestStart) {
+      bestStart = s;
+      host = i;
+    }
+  }
+  return host;
+}
+
 export interface ApplyMarkersResult {
   titleCardsInserted: number;
   titleCardsSkipped: number;
@@ -410,6 +446,41 @@ export function applyScriptMarkers(
   // Local non-null alias so TS narrows inside nested closures (the
   // `words` parameter is typed as nullable for the public API).
   const wordsNN: WordTiming[] = words;
+
+  // Drop any title_card rows the upstream planner already prepended for the
+  // doc's blue-bold headings. The transcript-driven builder
+  // (transcript-driven-builder.ts) prepends a "section start" title_card row
+  // at every paragraph that carries a title_card marker — including clipless
+  // headings. THIS pass is the authoritative title-card inserter: it rebuilds
+  // each heading's card (with the typewriter animation + spoken-audio anchor)
+  // and, for clip-bearing headings, its forced footage. So every pre-existing
+  // planner title_card is a duplicate of a card we're about to insert.
+  //
+  // For CLIP-BEARING headings the dedup pass below happened to absorb the
+  // planner card (it falls in the overlay window). For CLIPLESS headings it
+  // does NOT reliably absorb it: this pass anchors the card to the spoken
+  // heading PHRASE, which can be a later word index than the section-first
+  // sentence the builder anchored to — so the planner card sits BEFORE our
+  // insertion index and the dedup scan (which only looks forward from the
+  // inserted rows) never sees it. The result was two near-identical title
+  // cards back-to-back (one with the spoken sentence as script_text, one with
+  // the heading text). Removing planner title cards up-front makes THIS pass
+  // the single source of truth for every doc title card and kills the
+  // duplicate at the root for both kinds.
+  //
+  // Identifying a planner title_card: type === "title_card" with no
+  // doc_marker_id (this pass stamps doc_marker_id on every card it inserts).
+  // Removing the row shrinks the picture timeline by its slice duration, but
+  // it carries no unique narration (the sentence's full audio stays on its
+  // content block) and the downstream proportional-fit / title-card anchor
+  // passes rebalance the picture sum back to voiceoverSeconds.
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.type !== "title_card") continue;
+    const meta = (it.metadata ?? {}) as Record<string, unknown>;
+    if (meta.doc_marker_id != null) continue;
+    items.splice(i, 1);
+  }
 
   // Build a word-index → transcript-char-offset map. The transcript is
   // the SAME text the narrator reads, so Deepgram's word stream and the
@@ -804,7 +875,11 @@ export function applyScriptMarkers(
     // tEnd is only used by title cards; ignore here.
     if (marker.kind !== "lower_third") continue;
     if (t == null) { result.lowerThirdsSkipped++; continue; }
-    const k = findItemIndexAtTime(starts, items, t);
+    // Stamp the overlay on the item PLAYING at t (containment), not the next
+    // item that starts at-or-after t. findItemIndexAtTime is a splice rule and
+    // would land the chyron one block late (the wrong-clip bug). See
+    // findHostItemIndexAtTime.
+    const k = findHostItemIndexAtTime(starts, items, t);
     if (k < 0) { result.lowerThirdsSkipped++; continue; }
     const meta = (items[k].metadata ?? {}) as Record<string, unknown>;
     // Don't overwrite an existing lower_third stamped by the entity-name
@@ -814,7 +889,19 @@ export function applyScriptMarkers(
       result.lowerThirdsSkipped++;
       continue;
     }
-    meta.lower_third = { text: marker.text, type: "doc_marker", marker_id: marker.id };
+    // Persist the EXACT spoken time of the red-marked word (t = words[idx]
+    // .start, resolved above). The renderer offsets the chyron's slide-in to
+    // this moment WITHIN its host block so the lower-third appears when the
+    // narrator says the word — not at the block's start, which can be several
+    // seconds earlier on a long footage/image host (the client's "lower third
+    // appears too early" note). Downstream falls back to the block start when
+    // this is absent (entity-name LTs stamped elsewhere have no word time).
+    meta.lower_third = {
+      text: marker.text,
+      type: "doc_marker",
+      marker_id: marker.id,
+      vo_start_seconds: t,
+    };
     items[k].metadata = meta;
     applyLowerThirdVisualOverride(items[k], marker.text, resolverCtx);
     result.lowerThirdsApplied++;
@@ -843,12 +930,88 @@ export function applyScriptMarkers(
     // the fully-typed text on screen until parentDuration elapses.
     typewriterDuration: number;
     extras: ScriptMarkerRow[];
+    // Clipless ("overlay-only") title card: a blue-bold heading in the doc
+    // with NO force clip under it (no youtube_url / start_seconds /
+    // end_seconds). It renders as a standalone typed title card with NO
+    // forced footage following it — the project's normal visuals keep
+    // playing underneath while the narration continues. We branch on this in
+    // the insertion loop to (a) skip building any forcedFootageFromMarker
+    // rows for the parent, and (b) absorb NOTHING in dedup when the title's
+    // text wasn't actually spoken (anchor came from interpolation).
+    clipless: boolean;
+    // True only when the clipless card's anchor is a GENUINE spoken match
+    // (r.t != null — the title text was found in the Deepgram word stream).
+    // When the anchor was interpolated from neighboring title positions
+    // (titleAnchors fallback, text not spoken), this is false and the dedup
+    // pass must absorb nothing — the narrator never paused to "say the
+    // title", so the typewriter window overlaps a real sentence's narration
+    // that must NOT be deleted. Always true for clip-bearing cards (their
+    // grouping requires r.t != null upstream).
+    spokenAnchor: boolean;
   }
   const groups: TitleCardGroup[] = [];
   for (let g = 0; g < orderedResolutions.length; g++) {
     const r = orderedResolutions[g];
     if (r.marker.kind !== "title_card") continue;
-    if (r.t == null || !r.marker.youtube_url) {
+    // CLIPLESS TITLE CARD path. A blue-bold heading with NO force clip
+    // (youtube_url == null) is a standalone typed title card: it must appear
+    // ON SCREEN as a typewriter title with NO forced footage after it, while
+    // the project's normal visuals + narration continue underneath. The
+    // parser emits these with no youtube_url / start_seconds / end_seconds.
+    //
+    // Anchoring: the heading text is OFTEN editorial (not spoken by the
+    // narrator), so r.t is frequently null. Fall back to the interpolated
+    // paragraph anchor in titleAnchors (built in Pass 1, which holds a `t`
+    // for every title-card paragraph_index INCLUDING anchored:false
+    // interpolated entries). We also remember whether the anchor was a
+    // genuine spoken match (spokenAnchor) so the dedup pass below can decide
+    // whether to claim narration time (spoken) or absorb nothing (overlay).
+    if (!r.marker.youtube_url) {
+      let cliplessT: number | null = r.t;
+      let cliplessSpoken = r.t != null;
+      if (cliplessT == null && r.marker.paragraph_index != null) {
+        // Fallback: the title's own paragraph anchor (spoken or interpolated).
+        for (const a of titleAnchors) {
+          if (a.pIdx === r.marker.paragraph_index) { cliplessT = a.t; break; }
+        }
+        // An interpolated anchor means the text wasn't spoken — treat as an
+        // overlay laid on top of continuing narration (absorb nothing).
+        cliplessSpoken = false;
+      }
+      if (cliplessT == null) {
+        // No spoken anchor AND no interpolated paragraph anchor — we have no
+        // real video-time to place it at, so skip rather than guess.
+        result.titleCardsSkipped++;
+        continue;
+      }
+      // Duration: same typewriter logic. For a clipless card r.tEnd is
+      // usually null (text not spoken / no measured span), so spokenDuration
+      // is null and we fall through to the TITLE_CARD_FALLBACK_DURATION path
+      // — keeping the overlay card SMALL (~3s) so it doesn't bloat the
+      // timeline (title_card rows are non-adjustable downstream).
+      const spokenDuration = r.tEnd != null && r.tEnd > cliplessT ? r.tEnd - cliplessT : null;
+      const typewriterDuration = spokenDuration != null
+        ? Math.max(TITLE_CARD_MIN_DURATION, spokenDuration)
+        : TITLE_CARD_FALLBACK_DURATION;
+      const parentDuration = spokenDuration != null
+        ? typewriterDuration + TITLE_CARD_HOLD_TAIL
+        : TITLE_CARD_FALLBACK_DURATION;
+      // No sibling walk: a clipless card has no force clip and therefore no
+      // stacked title_card_clip extras (those only follow a clip-bearing
+      // title). Leave the outer loop cursor untouched so any following
+      // markers are processed normally.
+      groups.push({
+        parent: r.marker,
+        parentT: cliplessT,
+        parentDuration,
+        typewriterDuration,
+        extras: [],
+        clipless: true,
+        spokenAnchor: cliplessSpoken,
+      });
+      continue;
+    }
+    if (r.t == null) {
       result.titleCardsSkipped++;
       continue;
     }
@@ -899,7 +1062,18 @@ export function applyScriptMarkers(
       }
       break;
     }
-    groups.push({ parent: r.marker, parentT: r.t, parentDuration, typewriterDuration, extras });
+    groups.push({
+      parent: r.marker,
+      parentT: r.t,
+      parentDuration,
+      typewriterDuration,
+      extras,
+      // Clip-bearing card: it always carries a youtube_url and is grouped
+      // only when r.t != null (genuine spoken anchor), so the dedup pass
+      // claims its typewriter audio share exactly as before.
+      clipless: false,
+      spokenAnchor: true,
+    });
     // Skip the absorbed siblings so the outer loop doesn't re-process them
     // (the inner `if (r.marker.kind !== "title_card") continue;` would
     // skip title_card_clip extras anyway, but unaligned title_card extras
@@ -1059,7 +1233,18 @@ export function applyScriptMarkers(
       clip_id: null,
       type: "title_card",
       position: 0, // re-numbered below
-      duration: group.parentDuration,
+      // Card occupies EXACTLY its narration (typewriter) span on the
+      // timeline — NOT typewriterDuration + HOLD_TAIL. The narrator keeps
+      // talking under the card (it's an overlay-style beat, not a pause), so
+      // adding the ~0.8s visual hold tail as extra timeline length pushed
+      // every following row — and therefore every later title card and
+      // lower-third — ~0.8s later than its spoken moment. Across a handful of
+      // cards that compounded into the multi-second "cards appear late" drift.
+      // Using the typewriter span keeps the card's video length equal to its
+      // audio window, so cumulative video-time tracks the voiceover and the
+      // next clip cuts in exactly when the narrator moves on. The typewriter
+      // animation still fits because typewriterDuration IS the typing time.
+      duration: group.typewriterDuration,
       script_text: titleSpokenText,
       overlay_text: group.parent.text,
       metadata: {
@@ -1096,13 +1281,21 @@ export function applyScriptMarkers(
     // clips to audioWindowEnd keeps each row's vo_start metadata aligned
     // with what's actually being narrated under it.
     let forcedVoCursor = audioWindowEnd;
-    const parentForced = forcedFootageFromMarker(group.parent, forcedVoCursor);
-    forcedVoCursor += Number(parentForced.duration);
-    const rows: TimelineItemDraft[] = [titleCardRow, parentForced];
-    for (const extra of group.extras) {
-      const extraForced = forcedFootageFromMarker(extra, forcedVoCursor);
-      forcedVoCursor += Number(extraForced.duration);
-      rows.push(extraForced);
+    // CLIPLESS card: build ONLY the title-card row, no forced footage. The
+    // parent marker has no youtube_url / start_seconds / end_seconds, so
+    // calling forcedFootageFromMarker on it would synthesize a bogus 6s clip
+    // (end = start + 6 fallback) — guard against that by skipping it
+    // entirely. A clipless card also never has extras (no sibling clips).
+    const rows: TimelineItemDraft[] = [titleCardRow];
+    if (!group.clipless) {
+      const parentForced = forcedFootageFromMarker(group.parent, forcedVoCursor);
+      forcedVoCursor += Number(parentForced.duration);
+      rows.push(parentForced);
+      for (const extra of group.extras) {
+        const extraForced = forcedFootageFromMarker(extra, forcedVoCursor);
+        forcedVoCursor += Number(extraForced.duration);
+        rows.push(extraForced);
+      }
     }
 
     // Compute the overlay window in voiceover-time before we mutate
@@ -1121,8 +1314,23 @@ export function applyScriptMarkers(
     // pass only needs to absorb the TITLE CARD's narration share (the
     // forced clips already account for theirs by being rows). See the
     // dedup target below.
+    // For clip-bearing AND spoken clipless cards, the overlay window runs to
+    // forcedVoCursor (clipless: == audioWindowEnd, since there are no forced
+    // rows — so it covers just the title card's own typewriter audio share).
+    //
+    // OVERLAY-ONLY clipless cards (spokenAnchor == false — the title text was
+    // NOT found in the audio and the anchor came from interpolation) must
+    // absorb NOTHING: the narrator never paused to "say the title", so the
+    // typewriter window overlaps narration that belongs to a REAL sentence.
+    // Deleting that sentence would lose script content. Collapse the window
+    // to zero width (start == end) so Stage 1's removal loop deletes no rows
+    // — we just splice the visual title-card row in on top of the continuing
+    // narration. (Its duration is the small TITLE_CARD_FALLBACK_DURATION,
+    // since overlay-only cards have r.tEnd == null → spokenDuration == null,
+    // so it doesn't bloat the non-adjustable timeline.)
+    const overlayOnly = group.clipless && !group.spokenAnchor;
     const overlayWindowStart = group.parentT;
-    const overlayWindowEnd = forcedVoCursor;
+    const overlayWindowEnd = overlayOnly ? overlayWindowStart : forcedVoCursor;
 
     // Align the title card's video-time position with the narrator's
     // title-start moment.
@@ -1254,6 +1462,16 @@ export function applyScriptMarkers(
       const it = items[r];
       if (it.type === "intro") { r++; continue; }
       const meta = (it.metadata ?? {}) as Record<string, unknown>;
+      // Never delete a row this pass itself inserted from a doc marker — a
+      // title_card or forced-footage row belonging to ANOTHER group (groups
+      // are inserted in reverse spoken-time order, so a neighboring group may
+      // already sit inside this group's overlay window). Deleting it would
+      // make that title card silently vanish. This is the case for two
+      // clipless headings anchored close together: the earlier-spoken one's
+      // dedup window covers the later one's card, which must survive. Only
+      // script-driven rows (the planner's footage/image blocks) are eligible
+      // for absorption here.
+      if (meta.doc_marker_id != null) { r++; continue; }
       const itStart = meta.vo_start_seconds;
       if (typeof itStart !== "number") { r++; continue; }
       if (itStart >= overlayWindowEnd - 0.05) break;

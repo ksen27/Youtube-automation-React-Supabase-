@@ -283,6 +283,10 @@ export function AnalysisScreen({
           const next = { ...cur, entities: cur.entities.map((e) => ({ ...e })) };
           const ent = next.entities!.find((e) => e.value === vars.entityValue);
           if (!ent) return cur;
+          // Don't append a videoId already in the pool — a duplicate inflates
+          // the selected count (filter().length) without rendering a second
+          // card (collapsed by React's videoId key), causing a count mismatch.
+          if (ent.candidates.some((c) => c.videoId === j.candidate!.videoId)) return cur;
           ent.candidates = [...ent.candidates, j.candidate!];
           return next;
         }
@@ -1004,7 +1008,13 @@ function EntityPanel({
   onAddSource: (videoUrl: string) => Promise<{ accepted: boolean; reason?: string }>;
   addingSource: boolean;
 }) {
-  const visible = entity.candidates.filter((c) => !removedIds.has(c.videoId));
+  // De-dup by videoId so the count and the rendered cards agree. Without this,
+  // a duplicate videoId is counted twice by filter().length but collapses to a
+  // single card under React's videoId key — producing a count > cards shown.
+  const seenIds = new Set<string>();
+  const visible = entity.candidates.filter(
+    (c) => !removedIds.has(c.videoId) && !seenIds.has(c.videoId) && seenIds.add(c.videoId) !== null,
+  );
   const selectedCount = visible.filter((c) => selectedIds.has(c.videoId)).length;
   // Manual add-source state — one input per entity pool.
   const [addUrl, setAddUrl] = useState("");

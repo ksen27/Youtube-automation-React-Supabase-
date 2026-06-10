@@ -6,6 +6,23 @@
 app = 'video-automation-worker'
 primary_region = 'lhr'
 
+# Non-secret pipeline tuning, version-controlled here so the deployed worker
+# uses the intended value instead of silently falling back to the code default
+# in lib/env.ts. (.env.local is git-ignored AND excluded by .dockerignore, so
+# it never reaches the Fly image — only Fly secrets and this [env] block
+# populate the worker's process.env.)
+#
+# IMPORTANT: Fly SECRETS override [env]. The other pipeline tunings
+# (WORKER_CONCURRENCY, CLIP_PIPELINE_CONCURRENCY, FFMPEG_THREADS,
+# FFMPEG_TIMEOUT_SECONDS, DOWNLOAD_CONCURRENCY, RENDER_PIPELINE_CONCURRENCY,
+# NICE_LEVEL) are already set as Fly secrets, so they are intentionally NOT
+# listed here — putting them in both places would be confusing and the secret
+# would win anyway. Only MAX_SOURCE_DURATION_SECONDS lives here because it was
+# never set as a secret and was the one value diverging from the default (the
+# 25-min limit that rejected sub-40-min sources as "source_too_long").
+[env]
+  MAX_SOURCE_DURATION_SECONDS = "2400"
+
 [build]
   dockerfile = 'Dockerfile.worker'
 

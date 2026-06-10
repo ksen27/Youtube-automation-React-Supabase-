@@ -669,11 +669,21 @@ The six matchable types and what each one means:
                  ("London Palladium", "Buckingham Palace", "Wembley Stadium").
                  NOT countries, regions, or vague locations.
 - "celebrity_default" — EVERYTHING ELSE. Use this when the block is about
-                 the project celebrity, abstract narration, transitions,
-                 recaps, dates without a named event, generic concepts, or
-                 anything that doesn't have a clean proper-noun match for
-                 one of the six types above. "name" = "" (the code fills in
-                 the project celebrity's name automatically).
+                 the PROJECT CELEBRITY specifically, or for abstract
+                 narration, transitions, recaps, dates without a named event,
+                 generic concepts, or anything that doesn't have a clean
+                 proper-noun match for one of the six types above. "name" = ""
+                 (the code fills in the project celebrity's name automatically).
+                 CRITICAL: "celebrity_default" is ONLY for the project celebrity
+                 (the PROJECT SUBJECT named above) or for genuinely subject-less
+                 narration. If the
+                 block is about a DIFFERENT named real person — even if that
+                 person is a major figure in the story — use "person" with
+                 their exact name, NOT "celebrity_default". Demoting a named
+                 non-celebrity to "celebrity_default" makes the matcher show the
+                 WRONG person's footage. When in doubt between "person" and
+                 "celebrity_default", and a non-celebrity person is named and
+                 is what the block is about, choose "person".
 
 Decision procedure (apply IN ORDER, stop at the first match):
 1. Does the block PROMINENTLY name a non-celebrity person? → "person"
@@ -691,21 +701,33 @@ just mentioned in passing. "He spoke at the London Palladium" → "place"
 can't decide, pick "celebrity_default" — it is the safe default.
 
 When multiple entities fit, pick the ONE that most carries the block's
-visual meaning. A block that says "David Walliams left BGT after The
-Guardian published the transcript" should be "celebrity_default" (it's
-about Walliams), NOT "company" (Guardian is just where it was published).
-A block that says "The Guardian published the transcript in December 2022"
-should be "company" (the publication IS the subject of the sentence).
+visual meaning. A block whose subject is a NAMED PERSON other than the
+project celebrity is "person" with that person's exact name — even if a
+company or venue is also mentioned in passing (e.g. where something was
+published, or where it happened). The publication/venue only wins when it
+is itself the subject of the sentence.
 
-Examples:
-- "Bruno Tonioli was brought in as his replacement" → person, "Bruno Tonioli"
-- "The Guardian published the transcript"           → company, "The Guardian"
-- "He had been a BGT judge since 2012"              → tv_show, "Britain's Got Talent"
-- "The recordings were captured at the London Palladium" → place, "London Palladium"
-- "Private conversations between friends"            → celebrity_default
-- "What he didn't say was louder"                    → celebrity_default
-- "Three years on the show"                          → celebrity_default
-- "He called an elderly contestant an expletive"     → celebrity_default
+KEY DISTINCTION (applies to EVERY project, whoever the celebrity is):
+- A block about a NAMED non-celebrity person → "person" (their exact name),
+  NOT "celebrity_default". This holds even when that person is a major
+  figure in the story — "celebrity_default" is reserved for the project
+  celebrity and subject-less narration only.
+- A block about the PROJECT CELEBRITY themselves → "celebrity_default".
+- A block with no clear named subject (abstract narration, transitions,
+  recaps, generic concepts) → "celebrity_default".
+
+Examples (the placeholder "[CELEBRITY]" is whoever the project celebrity is;
+"[OTHER PERSON]" is any different named person in the script):
+- "[OTHER PERSON] made a crude remark"        → person, "[OTHER PERSON]"
+- "[OTHER PERSON] issued an apology"          → person, "[OTHER PERSON]"
+- "[OTHER PERSON] was brought in to replace him" → person, "[OTHER PERSON]"
+- "The Guardian published the transcript"     → company, "The Guardian"
+- "He had been a judge on Britain's Got Talent" → tv_show, "Britain's Got Talent"
+- "The recording was captured at the London Palladium" → place, "London Palladium"
+- "[CELEBRITY] called the comments unacceptable" → celebrity_default (it's the celebrity)
+- "Private conversations between friends"      → celebrity_default
+- "What he didn't say was louder"              → celebrity_default
+- "Three years on the show"                    → celebrity_default
 
 visual_priority axis (REQUIRED — drives matcher fallback chain):
 - "person_default"  → person footage / person image. Always the safe default.
@@ -1142,18 +1164,51 @@ export function normalizeBlockEntities(blocks: BlockPlan[], projectCelebrity: st
     text: string;
     geminiType: string;
     geminiName: string;
-    decision: "kept_celebrity_default" | "demoted_empty_name" | "kept_grounded" | "kept_continuity" | "demoted_not_grounded";
+    decision: "kept_celebrity_default" | "demoted_empty_name" | "kept_grounded" | "kept_continuity" | "inherited_person_pronoun" | "demoted_not_grounded";
     primaryToken?: string;
     firstCharOfMatch?: string;
   }> = [];
+  const celebrityLower = celebrity.toLowerCase();
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
     const raw = b.block_entity ?? { type: "celebrity_default" as const, name: "" };
     const type = raw.type;
     const name = (raw.name ?? "").trim();
 
-    // Branch 1 — celebrity_default: always fill in the project celebrity.
+    // Branch 1 — celebrity_default. Normally this snaps to the project
+    // celebrity. BUT a pronoun-continuation block about a SECONDARY person
+    // ("She has stood beside him for decades", continuing a Camilla
+    // paragraph) is emitted by Gemini as celebrity_default too — it names no
+    // proper noun — and would wrongly fall to the project celebrity, draining
+    // every co-lead's footage into the main subject's pool. This is the
+    // "script is about William AND Camilla but everything shows William" bug.
+    //
+    // applySubjectContinuity already ran before us and filled this block's
+    // resolved_subject with the running subject (e.g. "Camilla") for pronoun
+    // blocks. So: when the PREVIOUS accepted binding was a non-celebrity
+    // PERSON, and this block carries no new named entity, and its inherited
+    // resolved_subject still points at that same person, treat it as a
+    // pronoun-continuation and INHERIT the person binding instead of snapping
+    // to the celebrity. This mirrors resolved_subject's inheritance so the
+    // block_entity track (which the matcher actually uses to pick the pool)
+    // stays on the right person across pronoun sentences.
     if (type === "celebrity_default") {
+      const resolved = (b.resolved_subject ?? "").trim().toLowerCase();
+      const prevIsSecondaryPerson =
+        prevBinding != null &&
+        prevBinding.type === "person" &&
+        prevBinding.name.toLowerCase() !== celebrityLower;
+      const continuesPrevPerson =
+        prevIsSecondaryPerson &&
+        resolved.length > 0 &&
+        resolved === prevBinding!.name.toLowerCase();
+      if (continuesPrevPerson) {
+        const inherited: { type: BlockEntityType; name: string } = { type: "person", name: prevBinding!.name };
+        out.push({ ...b, block_entity: inherited });
+        prevBinding = inherited;
+        trace.push({ blockIdx: i, text: (b.text ?? "").slice(0, 80), geminiType: type, geminiName: name, decision: "inherited_person_pronoun", primaryToken: inherited.name });
+        continue;
+      }
       const binding = { type: "celebrity_default" as const, name: celebrity };
       out.push({ ...b, block_entity: binding });
       prevBinding = binding;
@@ -1219,6 +1274,7 @@ export function normalizeBlockEntities(blocks: BlockPlan[], projectCelebrity: st
   const matchableTraces = trace.filter((t) =>
     t.decision === "kept_grounded" ||
     t.decision === "kept_continuity" ||
+    t.decision === "inherited_person_pronoun" ||
     t.decision === "demoted_not_grounded" ||
     t.decision === "demoted_empty_name"
   );
@@ -1232,33 +1288,29 @@ export function normalizeBlockEntities(blocks: BlockPlan[], projectCelebrity: st
   return out;
 }
 
-// Walk every block across every segment in narration order and count the
-// MAX CONSECUTIVE RUN of blocks bound to each secondary person (anyone
-// who is NOT the project celebrity). The result drives the hybrid
-// secondary-character policy:
+// Walk every block across every segment in narration order and tally, per
+// secondary person (anyone who is NOT the project celebrity), BOTH:
+//   - maxRun:      longest consecutive run of blocks bound to them, and
+//   - totalBlocks: total blocks bound to them across the whole script.
 //
-//   - run < SECONDARY_PERSON_CLIP_THRESHOLD (default 4 blocks ≈ 28s):
-//       show a Wikipedia photo for that person, no YouTube fetch.
-//       Cheap and reliable for brief mentions.
-//   - run >= threshold:
-//       fall back to clip search + face verification, same as the
-//       project celebrity. Longer paragraphs deserve motion.
-//
-// We report MAX consecutive (not total) because two isolated 1-block
-// mentions feel like two separate photos, not a 2-block run. The viewer
-// experiences runs locally, not cumulatively.
+// totalBlocks is the appearance count that drives the hybrid
+// secondary-character policy (see qualifiesForVideoClips): a person at or
+// above SECONDARY_PERSON_VIDEO_THRESHOLD blocks earns the source-video + clip
+// path; below it they get still images only. We gate on totalBlocks rather
+// than maxRun so a scattered-but-dominant figure ("Simon Cowell speaks out
+// about David Walliams" — half the script is Walliams, but his blocks are
+// split up so no single run is long) still earns footage. maxRun is retained
+// because the matcher's photo-cache sizer weighs both signals.
 //
 // The map key is the person's name, lower-cased so analyze/match callers
 // can do case-insensitive lookups without re-implementing the matching
 // each time.
-export const SECONDARY_PERSON_CLIP_THRESHOLD = 4;
-
 export function findPersonRunsAcrossSegments(
   understandings: Array<{ blocks: BlockPlan[] }>,
   projectCelebrity: string,
-): Map<string, { displayName: string; maxRun: number }> {
+): Map<string, { displayName: string; maxRun: number; totalBlocks: number }> {
   const celebrityLower = projectCelebrity.trim().toLowerCase();
-  const result = new Map<string, { displayName: string; maxRun: number }>();
+  const result = new Map<string, { displayName: string; maxRun: number; totalBlocks: number }>();
 
   // Flatten all blocks across segments in narration order. Runs cross
   // segment boundaries when consecutive segments happen to both name the
@@ -1278,7 +1330,16 @@ export function findPersonRunsAcrossSegments(
     }
   }
 
-  // Sweep flat list counting runs.
+  // First pass: total block count per person (footprint across the WHOLE
+  // script, scattered or not). This is the new signal that catches a major
+  // figure whose mentions never cluster into a 4-block run.
+  const totals = new Map<string, number>();
+  for (const m of flat) {
+    if (!m.lower) continue;
+    totals.set(m.lower, (totals.get(m.lower) ?? 0) + 1);
+  }
+
+  // Second pass: sweep the flat list counting MAX CONSECUTIVE runs.
   let i = 0;
   while (i < flat.length) {
     const cur = flat[i];
@@ -1288,25 +1349,174 @@ export function findPersonRunsAcrossSegments(
     const run = j - i;
     const prev = result.get(cur.lower);
     if (!prev || run > prev.maxRun) {
-      result.set(cur.lower, { displayName: cur.name, maxRun: run });
+      result.set(cur.lower, {
+        displayName: cur.name,
+        maxRun: Math.max(run, prev?.maxRun ?? 0),
+        totalBlocks: totals.get(cur.lower) ?? run,
+      });
     }
     i = j;
   }
   return result;
 }
 
-// Convenience predicate for callers. Returns true when the named
-// secondary person's max run is BELOW the threshold (Wikipedia-photo
-// path); false when at-or-above (clip-fetch path). Unknown people
-// (no run recorded) default to BELOW — they were never mentioned, so
-// the matcher should never reach this code path for them; if it does,
-// the photo path is the safe default.
-export function shouldUsePhotoForSecondaryPerson(
-  runs: Map<string, { maxRun: number }>,
+// Appearance-count gate for the SOURCE-VIDEO / CLIP path of a secondary
+// person. A secondary person earns downloaded source videos + clips only when
+// they are the resolved subject of at least `threshold` narration segments
+// (totalBlocks from findPersonRunsAcrossSegments). Below the threshold they
+// get STILL IMAGES only — the Wikipedia / Brave / Google CSE pulls that run
+// for everyone regardless of this gate.
+//
+// Gate on totalBlocks (footprint across the whole script), NOT maxRun: a major
+// figure whose mentions are scattered (e.g. David Walliams in a "Simon Cowell
+// speaks out about David Walliams" piece) never forms a long consecutive run
+// but still dominates the audio and deserves footage. The threshold is the
+// env knob SECONDARY_PERSON_VIDEO_THRESHOLD so it can be tuned without a code
+// change; callers pass it in (this module stays env-agnostic).
+//
+// The main celebrity is NOT in this map (findPersonRunsAcrossSegments skips
+// them) and always qualifies for video — callers gate only the secondary
+// people through here. A person with no entry (never the resolved subject of
+// any block) returns false: stills only.
+export function qualifiesForVideoClips(
+  runs: Map<string, { totalBlocks?: number }>,
   personName: string,
+  threshold: number,
 ): boolean {
-  const run = runs.get(personName.trim().toLowerCase())?.maxRun ?? 0;
-  return run < SECONDARY_PERSON_CLIP_THRESHOLD;
+  const info = runs.get(personName.trim().toLowerCase());
+  const total = info?.totalBlocks ?? 0;
+  return total >= threshold;
+}
+
+// Honorific / title prefixes that Gemini emits verbatim from the script,
+// causing the SAME real person to surface under two names ("Camilla" vs
+// "Queen Camilla", "Charles" vs "King Charles III"). We strip these before
+// comparing person names so the title-only variant collapses into the bare
+// name. Order-insensitive; we strip ALL leading title tokens, not just one
+// (e.g. "His Majesty King Charles" → "charles").
+const HONORIFIC_PREFIXES = new Set([
+  "queen", "king", "prince", "princess", "duke", "duchess", "lord", "lady",
+  "sir", "dame", "dr", "doctor", "mr", "mrs", "ms", "miss", "president",
+  "senator", "governor", "mayor", "judge", "captain", "general", "professor",
+  "prof", "rev", "reverend", "saint", "st", "his", "her", "majesty",
+  "royal", "highness", "the", "honorable", "hon",
+]);
+
+// Reduce a person name to its comparable token set: lowercase, strip
+// punctuation, drop honorific prefixes and trailing regnal numerals
+// ("iii", "ii"). Returns the remaining name tokens (e.g. "King Charles III"
+// → ["charles"], "Queen Camilla" → ["camilla"]).
+export function nameTokens(name: string): string[] {
+  const raw = name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  // Drop leading honorific tokens.
+  let start = 0;
+  while (start < raw.length && HONORIFIC_PREFIXES.has(raw[start])) start++;
+  // Drop trailing regnal numerals (roman numerals or plain digits).
+  let end = raw.length;
+  const isRegnal = (t: string) => /^(?:[ivxlc]+|\d+)$/.test(t);
+  while (end > start && isRegnal(raw[end - 1])) end--;
+  return raw.slice(start, end);
+}
+
+// Merge person-run entries that refer to the SAME person under different
+// surface forms. Two entries merge when, after stripping honorifics/titles
+// and regnal numerals, one name's tokens are a (non-empty) subset of the
+// other's — e.g. "Camilla" ⊂ "Queen Camilla", "Charles" ⊂ "King Charles III".
+// The merged entry keeps the FULLER display name (more remaining tokens, ties
+// broken by longer raw string), sums totalBlocks, and takes the max maxRun.
+// This collapses the duplicate picker cards and duplicate search pools.
+export function mergeDuplicatePersonRuns(
+  runs: Map<string, { displayName: string; maxRun: number; totalBlocks: number }>,
+): Map<string, { displayName: string; maxRun: number; totalBlocks: number }> {
+  type Entry = {
+    key: string;
+    displayName: string;
+    maxRun: number;
+    totalBlocks: number;
+    tokens: string[];
+  };
+  const entries: Entry[] = Array.from(runs.entries()).map(([key, v]) => ({
+    key,
+    displayName: v.displayName,
+    maxRun: v.maxRun,
+    totalBlocks: v.totalBlocks,
+    tokens: nameTokens(v.displayName),
+  }));
+
+  const isSubset = (a: string[], b: string[]) =>
+    a.length > 0 && a.every((t) => b.includes(t));
+
+  // Union-find over entries; union when one token set is a subset of another.
+  const parent = entries.map((_, i) => i);
+  const find = (x: number): number => {
+    while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+    return x;
+  };
+  const union = (a: number, b: number) => { parent[find(a)] = find(b); };
+  for (let a = 0; a < entries.length; a++) {
+    for (let b = a + 1; b < entries.length; b++) {
+      const ta = entries[a].tokens;
+      const tb = entries[b].tokens;
+      if (isSubset(ta, tb) || isSubset(tb, ta)) union(a, b);
+    }
+  }
+
+  // Collapse each union group into one entry, keeping the fuller display name.
+  const groups = new Map<number, Entry[]>();
+  for (let i = 0; i < entries.length; i++) {
+    const root = find(i);
+    const g = groups.get(root) ?? [];
+    g.push(entries[i]);
+    groups.set(root, g);
+  }
+
+  const merged = new Map<string, { displayName: string; maxRun: number; totalBlocks: number }>();
+  for (const group of groups.values()) {
+    // Canonical = fuller name: most remaining tokens, then longest raw string.
+    const canonical = group.reduce((best, e) => {
+      if (e.tokens.length !== best.tokens.length) {
+        return e.tokens.length > best.tokens.length ? e : best;
+      }
+      return e.displayName.length > best.displayName.length ? e : best;
+    });
+    merged.set(canonical.key, {
+      displayName: canonical.displayName,
+      maxRun: Math.max(...group.map((e) => e.maxRun)),
+      totalBlocks: group.reduce((sum, e) => sum + e.totalBlocks, 0),
+    });
+  }
+  return merged;
+}
+
+// True when two names refer to the same person under the same subset rule used
+// by mergeDuplicatePersonRuns (honorific/numeral-stripped token subset, either
+// direction). Used to skip the main celebrity even when a block named them with
+// a title variant ("King Charles III" vs celebrity "Charles").
+export function sameNamedPerson(a: string, b: string): boolean {
+  const ta = nameTokens(a);
+  const tb = nameTokens(b);
+  if (ta.length === 0 || tb.length === 0) return false;
+  const subset = (x: string[], y: string[]) => x.every((t) => y.includes(t));
+  return subset(ta, tb) || subset(tb, ta);
+}
+
+// Convenience predicate for callers — the exact inverse of
+// qualifiesForVideoClips. Returns true when the named secondary person should
+// be rendered from a still image (no clip search), false when they earned the
+// source-video + clip path. MUST stay the inverse of the analyze-time gate so
+// the matcher renders clips for exactly the people analyze searched clips for.
+// Unknown people (no entry) default to the photo path — they were never the
+// resolved subject of a block, so the matcher should never reach this for them.
+export function shouldUsePhotoForSecondaryPerson(
+  runs: Map<string, { totalBlocks?: number }>,
+  personName: string,
+  threshold: number,
+): boolean {
+  return !qualifiesForVideoClips(runs, personName, threshold);
 }
 
 // Split a section's text into sentences using the same regex as the

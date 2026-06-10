@@ -30,7 +30,7 @@ import {
   type ReferenceEntityType,
 } from "@/lib/ai/face-references";
 import {
-  verifyPersonImage,
+  verifyPersonImageClean,
   verifyEntityImage,
   type EntityVerifyType,
 } from "@/lib/ai/verify";
@@ -65,6 +65,14 @@ export interface VerifyAssetOptions {
   // false — we keep uncertain candidates because rejecting them gut the
   // pool every time Gemini is rate-limited.
   rejectUncertain?: boolean;
+  // When true, ONLY a confirmed "yes" is accepted — "uncertain", "no", AND
+  // "skipped" are all rejected. This is the strictest mode: an asset enters
+  // the pool only when Gemini POSITIVELY confirmed it depicts the entity.
+  // Use for the client's "only the correct celebrity" image requirement.
+  // Note: "skipped" means no reference photo was available, so we could not
+  // confirm identity — under requireConfirmed that is a reject, which is the
+  // whole point (an unverifiable image must not ship as the celebrity).
+  requireConfirmed?: boolean;
 }
 
 // In-process LRU cache. Keyed by
@@ -93,6 +101,8 @@ function cacheSet(key: string, val: PoolVerifyResult): void {
 }
 
 function policyAccept(verdict: PoolVerdict, opts: VerifyAssetOptions): boolean {
+  // Strictest mode: only a positive "yes" passes.
+  if (opts.requireConfirmed) return verdict === "yes";
   if (verdict === "no") return false;
   if (verdict === "uncertain" && opts.rejectUncertain) return false;
   return true; // "yes", "skipped", and "uncertain" (when not strict)
@@ -174,7 +184,11 @@ export async function verifyPoolAsset(
   if (input.entityType === "person") {
     if (!ref?.reference_url) {
       const out: PoolVerifyResult = {
-        accept: true,
+        // Without a reference we can't confirm identity. Normally we fail
+        // open (accept) so a missing reference doesn't gut the pool — but
+        // requireConfirmed callers ("only the correct celebrity") must reject
+        // anything we couldn't positively confirm, including this case.
+        accept: opts.requireConfirmed ? false : true,
         verdict: "skipped",
         reason: "no reference image for person",
         confidence: 0,
@@ -183,16 +197,27 @@ export async function verifyPoolAsset(
       cacheSet(cacheKey, out);
       return out;
     }
-    const result = await verifyPersonImage({
+    const result = await verifyPersonImageClean({
       candidateUrl: input.candidateUrl,
       referenceUrl: ref.reference_url,
       personName: entityName,
     });
-    const verdict: PoolVerdict = result.verdict;
+    // Overlay gate (person images only, per the client's "strict for people,
+    // lenient for logos" policy): a CORRECT-person image that is plastered with
+    // a news-channel logo + a headline banner (the clickbait-thumbnail look) is
+    // rejected just like the clip-stage clean-frame gate rejects dirty frames.
+    // A confident "dirty" collapses the verdict to "no" so policyAccept drops
+    // it; "uncertain" overlay fails open (keeps the candidate) so a Gemini
+    // hiccup doesn't gut the pool. Entity/logo pools never reach this branch.
+    const verdict: PoolVerdict = result.overlay === "dirty" ? "no" : result.verdict;
+    const reason =
+      result.overlay === "dirty"
+        ? `overlay/text on person image: ${result.overlayArtifact || "added graphics"}`
+        : result.reason;
     const out: PoolVerifyResult = {
       accept: policyAccept(verdict, opts),
       verdict,
-      reason: result.reason,
+      reason,
       confidence: result.confidence,
       geminiCalled: true,
     };
