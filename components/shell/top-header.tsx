@@ -1,8 +1,24 @@
 "use client";
 
-import { Bell, Search } from "lucide-react";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Bell, LogOut, Search } from "lucide-react";
 
 export function TopHeader() {
+  const router = useRouter();
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  async function onLogout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } finally {
+      router.replace("/login");
+      router.refresh();
+    }
+  }
+
   return (
     <header className="h-14 shrink-0 border-b border-border bg-bg-elevated/60 backdrop-blur supports-[backdrop-filter]:bg-bg-elevated/40">
       <div className="flex h-full items-center gap-3 px-6">
@@ -18,6 +34,15 @@ export function TopHeader() {
           className="grid place-items-center h-8 w-8 rounded-md text-fg-muted hover:bg-surface-hover hover:text-fg transition-colors"
         >
           <Bell className="h-4 w-4" />
+        </button>
+        <button
+          onClick={onLogout}
+          disabled={loggingOut}
+          aria-label="Sign out"
+          title="Sign out"
+          className="grid place-items-center h-8 w-8 rounded-md text-fg-muted hover:bg-surface-hover hover:text-fg transition-colors disabled:opacity-50"
+        >
+          <LogOut className="h-4 w-4" />
         </button>
       </div>
     </header>

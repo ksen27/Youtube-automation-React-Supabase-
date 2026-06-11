@@ -562,12 +562,16 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       //     brief lower-third, a momentary station bug) no longer disqualifies
       //     an otherwise-clean clip — that any-frame rule was dropping most
       //     usable clips on perfectly good sources.
-      //   - FACE (majority): yes/no/uncertain aggregated across frames. A
-      //     majority "no" → hard drop (confirmed wrong person). Otherwise the
-      //     face_verify label feeds the matcher's person-first bonus.
+      //   - FACE (majority): yes/no/no_person/uncertain aggregated across
+      //     frames. A majority "no" (a DIFFERENT person is the subject) →
+      //     hard drop. A majority "no_person" (clean B-roll: scenery, venue,
+      //     object — nobody in frame) is KEPT and labeled; the matcher's
+      //     subject_present gating already keeps it out of person-anchored
+      //     blocks. Otherwise the face_verify label feeds the matcher's
+      //     person-first bonus.
       //
       // The intro candidate is exempt (its own dedicated verifier in the matcher).
-      let dropForNoPerson = false;   // majority "no" → wrong person
+      let dropForNoPerson = false;   // majority "no" → a different person
       let dropForDirty = false;      // any frame dirty → unclean footage
       // The clean-footage gate runs on the intro-head clip TOO. Many YouTube
       // sources open at t=0 with a "DISCLAIMER / for entertainment purposes"
@@ -588,7 +592,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
         const thumbMidDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_mid.jpg`;
         const thumbEndDest = `projects/${projectId}/clips/${vs.youtube_video_id}_${idx}_end.jpg`;
         const tempDeleteList: string[] = [];
-        const faceVerdicts: Array<"yes" | "no" | "uncertain"> = [];
+        const faceVerdicts: Array<"yes" | "no" | "no_person" | "uncertain"> = [];
         const cleanVerdicts: Array<"clean" | "dirty" | "uncertain"> = [];
         const cleanArtifacts: string[] = [];
         const frameReasons: string[] = [];
@@ -679,8 +683,16 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
             // When ANY sampled frame is flagged dirty AND its artifact reads as
             // full-screen text (not a corner bug / transient strip), the clip
             // is a text card throughout → hard-drop regardless of the count.
+            //
+            // The regex must ONLY match phrases that unambiguously mean a
+            // full-screen card. Generic phrases like "text overlay" / "text
+            // screen" used to be in here, but Gemini routinely describes a
+            // transient lower-third or one flash of on-screen text as a "text
+            // overlay" — which made this override fire on a single frame and
+            // silently defeat the majority rule, dropping clips that were
+            // clean for most of their duration.
             const FULLSCREEN_TEXT_RE =
-              /\b(disclaimer|viewer discretion|discretion advised|title card|text card|full[- ]?screen text|text screen|text overlay|legal notice|for entertainment purposes|warning screen|notice screen|end screen|credits)\b/i;
+              /\b(disclaimer|viewer discretion|discretion advised|title card|text card|full[- ]?screen text|legal notice|for entertainment purposes|warning screen|notice screen|end screen|credits)\b/i;
             const hasTextCardFrame = cleanVerdicts.some(
               (v, i) => v === "dirty" && FULLSCREEN_TEXT_RE.test(cleanArtifacts[i] ?? ""),
             );
@@ -688,46 +700,38 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
               dropForDirty = true;
             }
 
-            // PERSISTENT LOGO / WATERMARK override — also bypasses the
-            // majority rule, on a different signal than the text-card case.
-            //
-            // A burned-in channel logo or site watermark (e.g. a "HOLLYWOOD
-            // SECRETS" corner bug, a "werewolftvseries.com" URL strip) sits in
-            // the SAME corner on EVERY frame of the clip — it is never
-            // transient. But because it is small, Gemini Vision often only
-            // notices it on one of the three sampled frames and returns
-            // clean:"uncertain" (fail-open) on the others. That yields
-            // dirty=1 / uncertain=2, which never reaches the 2-of-3 majority,
-            // so the watermarked clip leaks into scene footage.
-            //
-            // The discriminator vs. a genuinely-transient lower-third is the
-            // presence of a CONFIDENTLY CLEAN frame: a real shot with a brief
-            // overlay has clean frames elsewhere; a clip stamped with a
-            // persistent logo has none. So: if ANY frame is dirty with a
-            // logo/watermark artifact AND NO frame came back "clean", treat
-            // the bug as persistent and drop. (When a clean frame exists we
-            // fall back to the majority rule — a true transient overlay.)
-            const LOGO_WATERMARK_RE =
-              /\b(logo|watermark|wordmark|station bug|channel bug|brand(?:ing|ed)?|url|website|\.com|\.tv|\.net)\b/i;
-            const anyConfidentlyClean = cleanVerdicts.some((v) => v === "clean");
-            const hasLogoFrame = cleanVerdicts.some(
-              (v, i) => v === "dirty" && LOGO_WATERMARK_RE.test(cleanArtifacts[i] ?? ""),
-            );
-            if (hasLogoFrame && !anyConfidentlyClean) {
-              dropForDirty = true;
-            }
+            // NOTE: there is deliberately NO per-clip "persistent logo"
+            // override any more. The old rule ("any dirty logo-ish frame +
+            // zero confidently-clean frames → drop") was meant to catch a
+            // small corner bug Gemini only notices on one of three frames —
+            // but "uncertain" is also what Gemini returns on every fetch
+            // failure, parse error, or blurry frame, so one misread plus two
+            // hedges condemned a perfectly clean clip. That pattern was a
+            // major source of "clip is clear but got dropped". Truly
+            // persistent watermarks are the SOURCE-level gate's job
+            // (detectSourceWatermark samples the whole runtime and skips the
+            // source before clips are ever cut); per-clip dirt is handled by
+            // the majority rule above.
           }
 
-          // FACE gate — majority rule (same as before). 2+ "no" of 3 → drop.
+          // FACE gate — majority rule. Only a majority "no" (a DIFFERENT
+          // person is the subject) drops the clip. A majority "no_person"
+          // (clean B-roll with nobody in frame — a venue, a house, a car, an
+          // establishing shot) is kept: it used to be folded into "no" and
+          // hard-dropped as "wrong person", which threw away large amounts of
+          // perfectly usable scenery footage. The matcher's subject_present
+          // gating already keeps no-person clips out of person-anchored blocks.
           if (runFace) {
             const yesCount = faceVerdicts.filter((v) => v === "yes").length;
             const noCount = faceVerdicts.filter((v) => v === "no").length;
+            const noPersonCount = faceVerdicts.filter((v) => v === "no_person").length;
             const total = faceVerdicts.length;
             const majority = Math.ceil(total / 2);
-            const overall: "yes" | "no" | "uncertain" =
+            const overall: "yes" | "no" | "no_person" | "uncertain" =
               total === 0 ? "uncertain" :
               yesCount >= majority ? "yes" :
               noCount >= majority ? "no" :
+              noPersonCount >= majority ? "no_person" :
               "uncertain";
             labelSet.add(`face_verify: ${overall}`);
             if (overall === "no") dropForNoPerson = true;
@@ -768,9 +772,11 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
           "clip.intro_head.dirty_kept", { start });
       }
 
-      // Hard drop for confirmed wrong-person clips. The main character is
-      // absent from this clip, so it must not enter the pool (otherwise the
-      // matcher could place it as filler in a block about that character).
+      // Hard drop for confirmed DIFFERENT-person clips — someone else is the
+      // subject, so the clip must not enter the pool (otherwise the matcher
+      // could place it as filler in a block about the main character). Note:
+      // no-person B-roll does NOT take this path; it stays in the pool with a
+      // `face_verify: no_person` label.
       if (dropForNoPerson) {
         droppedJunk++;
         droppedWrongPerson++;

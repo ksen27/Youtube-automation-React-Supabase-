@@ -62,7 +62,31 @@
       "Bash(sed -i \"s|import 'dotenv/config';|import dotenv from 'dotenv'; dotenv.config\\({path:'.env.local'}\\);|\" test-pin2.mjs)",
       "Bash(node test-pin2.mjs)",
       "Bash(sed -i 's|const fontPath=\"C\\\\\\\\\\\\\\\\:/Windows/Fonts/arialbd.ttf\";|const fontPath=\"C\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\:/Windows/Fonts/arialbd.ttf\";|' test-lt.mjs)",
-      "Bash(node test-lt.mjs)"
+      "Bash(node test-lt.mjs)",
+      "Bash(node -e *)",
+      "Bash(ls middleware.ts)",
+      "Bash(ls node_modules/@supabase/ssr)",
+      "Bash(openssl rand *)",
+      "Bash(grep -q \"Ready\\\\|Local:\\\\|started server\\\\|compiled\" /tmp/dev.log)",
+      "Bash(break)",
+      "Bash(curl -s -o /dev/null -w \"status=%{http_code} location=%{redirect_url}\\\\n\" http://localhost:3000/dashboard)",
+      "Bash(curl -s -w \"\\\\nstatus=%{http_code}\\\\n\" http://localhost:3000/api/projects)",
+      "Bash(curl -s -o /dev/null -w \"status=%{http_code}\\\\n\" http://localhost:3000/login)",
+      "Bash(curl -s -w \"\\\\nstatus=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"wrong\"}')",
+      "Bash(curl -s -m 60 -o /dev/null -w \"status=%{http_code}\\\\n\" http://localhost:3000/login)",
+      "Bash(curl -s -m 60 -c /tmp/cookies.txt -w \"\\\\nstatus=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"celebforge\"}')",
+      "Bash(curl -s -m 60 -b /tmp/cookies.txt -w \"\\\\nstatus=%{http_code}\\\\n\" http://localhost:3000/api/projects)",
+      "Bash(curl -s -m 60 -b /tmp/cookies.txt -o /dev/null -w \"status=%{http_code}\\\\n\" http://localhost:3000/dashboard)",
+      "Bash(curl -s -m 90 -o /dev/null -w \"status=%{http_code}\\\\n\" http://localhost:3000/login)",
+      "Bash(curl -s -m 60 -c /tmp/cookies.txt -D - -o /dev/null -w \"status=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"celebforge\"}')",
+      "Bash(curl -s -m 60 -b /tmp/cookies.txt -o /dev/null -w \"status=%{http_code}\\\\n\" http://localhost:3000/api/projects)",
+      "Bash(curl -s -m 30 -o /dev/null -w \"status=%{http_code} loc=%{redirect_url}\\\\n\" http://localhost:3000/dashboard)",
+      "Bash(curl -s -m 30 -w \" status=%{http_code}\\\\n\" http://localhost:3000/api/projects)",
+      "Bash(curl -s -m 30 -w \" status=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/login -H \"Content-Type: application/json\" -d '{\"password\":\"nope\"}')",
+      "Bash(curl -s -m 30 -o /dev/null -w \"status=%{http_code} loc=%{redirect_url}\\\\n\" --cookie \"cf_session=9999999999999.deadbeef\" http://localhost:3000/dashboard)",
+      "Bash(curl -s -m 30 -b /tmp/cookies.txt -c /tmp/cookies.txt -o /dev/null -w \"logout status=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/logout)",
+      "Bash(echo \"exit: $?\")",
+      "PowerShell(npm run typecheck)"
     ]
   }
 }

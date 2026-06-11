@@ -6,6 +6,14 @@ const ServerEnvSchema = z.object({
   NEXT_PUBLIC_SUPABASE_URL: z.string().url().optional(),
   NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+  // Shared-password access gate (CelebForge only). CELEBFORGE_PASSWORD is the
+  // single password the client team types to sign in; AUTH_SECRET is the random
+  // server-only key used to HMAC-sign the session cookie. See lib/auth.ts. When
+  // AUTH_SECRET is unset, the session signer falls back to
+  // SUPABASE_SERVICE_ROLE_KEY. Login is disabled (503) until CELEBFORGE_PASSWORD
+  // is set.
+  CELEBFORGE_PASSWORD: z.string().optional(),
+  AUTH_SECRET: z.string().optional(),
   // Cloudflare R2 (S3-compatible). The bucket should be public via r2.dev
   // subdomain or a custom domain. R2_PUBLIC_BASE_URL must NOT include a
   // trailing slash; uploadFile/uploadBuffer concatenate it as `${base}/${key}`.

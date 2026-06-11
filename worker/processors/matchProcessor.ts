@@ -1210,22 +1210,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
 
-  // If we have far fewer clips than footage slots, pre-downgrade the surplus
-  // footage blocks to image blocks. We leave the intro alone so the video
-  // still opens with motion when possible.
-  const footageBlockIdxs: number[] = blocks
-    .map((b, i) => (b.type === "footage" || b.type === "intro" ? i : -1))
-    .filter((i) => i >= 0);
-  const surplus = footageBlockIdxs.length - clips.length;
-  if (surplus > 0) {
-    const convertibles = footageBlockIdxs.filter((i) => blocks[i].type !== "intro");
-    const toConvert = convertibles.slice(-surplus);
-    for (const idx of toConvert) {
-      // Preserve the footage duration on conversion so we don't inflate
-      // total slideshow time when clip supply is tight.
-      blocks[idx] = { type: "image", duration: blocks[idx].duration };
-    }
-  }
+  // NOTE: we deliberately do NOT pre-downgrade footage blocks to images when
+  // the clip pool is smaller than the footage-slot count. The Tier 2.5 reuse
+  // picker fills every footage block by re-picking clips on a cooldown, so a
+  // small pool no longer forces the planned 60:40 footage:image ratio toward
+  // images. (The old surplus pass converted footage→image with the footage
+  // block's long duration intact; the oversized-image split then fragmented
+  // each one into 2-4 image scenes, which is how a 40-minute video with a
+  // 165-clip pool ended up ~61% image scenes.)
 
   // ---- Phase D: once-per-video shown-entity dedup -----------------------
   // Per the client's spec ("show the logo only the first time, then use
@@ -1299,10 +1291,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   let rhythmSwappedFootageToImage = 0;
   let rhythmRunsLeftUnbroken = 0;
   {
-    // Available clip slots = total clips minus what's already reserved as
-    // footage. We deduct one for the intro (it consumes its own clip).
-    const currentFootageCount = blocks.filter((b) => b.type === "footage" || b.type === "intro").length;
-    let footageHeadroom = Math.max(0, clips.length - currentFootageCount);
+    // Footage supply is no longer a hard budget: the Tier 2.5 reuse picker
+    // can fill any footage block as long as at least one clip exists. So the
+    // image→footage swap is gated only on the pool being non-empty —
+    // otherwise a small pool would leave all-image runs unbroken while still
+    // converting footage runs to images, skewing the 60:40 ratio further
+    // toward images exactly when clips are scarce.
+    let footageHeadroom = clips.length > 0 ? Number.POSITIVE_INFINITY : 0;
     let runType: string | null = null;
     let runLen = 0;
     for (let i = 0; i < blocks.length; i++) {
@@ -1350,9 +1345,60 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     runsLeftUnbroken: rhythmRunsLeftUnbroken,
   });
 
+  // ---- Final 60:40 footage:image enforcement (by screen time) ----------
+  // The builder caps images at MAX_IMAGE_RATIO of content blocks at plan
+  // time, but the passes above (split_4 downgrade, entity dedup, rhythm
+  // swaps) can shift the realized ratio. The final video's percentage is
+  // screen TIME, not block count, so re-enforce the cap here on durations —
+  // after all type-shuffling passes and before the oversized-image split
+  // (which changes counts but never durations). Convert the surplus image
+  // blocks to footage, "person_default" priority first (a person image swaps
+  // naturally to person footage; specific_event / specific_object images
+  // genuinely need a still), longest duration first within a rank. split_2
+  // and title_card blocks are deliberate beats and are left alone. Safe even
+  // on a small clip pool: the Tier 2.5 reuse picker fills every footage
+  // block as long as one clip exists.
+  let ratioEnforcedConversions = 0;
+  if (clips.length > 0) {
+    const maxImageRatio = getEnv().MAX_IMAGE_RATIO;
+    const isContent = (t: string) => t === "footage" || t === "image" || t === "split_2";
+    const contentDur = blocks.reduce(
+      (s, b) => (isContent(b.type) ? s + b.duration : s), 0);
+    let imageDur = blocks.reduce(
+      (s, b) => (b.type === "image" || b.type === "split_2" ? s + b.duration : s), 0);
+    const maxImageDur = contentDur * maxImageRatio;
+    if (imageDur > maxImageDur) {
+      const rank = (i: number) =>
+        (blockVisualPriorities[i] ?? "person_default") === "person_default" ? 0 : 1;
+      const convertible = blocks
+        .map((b, i) => (b.type === "image" ? i : -1))
+        .filter((i) => i >= 0)
+        .sort((a, b) => {
+          if (rank(a) !== rank(b)) return rank(a) - rank(b);
+          return blocks[b].duration - blocks[a].duration;
+        });
+      for (const idx of convertible) {
+        if (imageDur <= maxImageDur) break;
+        imageDur -= blocks[idx].duration;
+        blocks[idx] = { type: "footage", duration: blocks[idx].duration };
+        blockRecommendedTypes[idx] = "footage";
+        // Clear image-only refs so Phase C doesn't image-search a footage
+        // block (same convention as the rhythm-pass swap above).
+        blockSpecificRefs[idx] = [];
+        ratioEnforcedConversions++;
+      }
+    }
+    await logJob({ projectId, jobId: mediaJobId }, "match.ratio_enforce", {
+      maxImageRatio,
+      contentDurationSec: Math.round(contentDur * 10) / 10,
+      imageDurationSecAfter: Math.round(imageDur * 10) / 10,
+      imagesConvertedToFootage: ratioEnforcedConversions,
+    });
+  }
+
   // Split oversized image blocks into back-to-back 5s holds. Image blocks
   // longer than IMAGE_HOLD_SECONDS only appear after a footage→image
-  // downgrade (surplus pass, rhythm-pass swap) carried the footage block's
+  // downgrade (rhythm-pass swap) carried the footage block's
   // spoken-sentence duration over. A 13s static image is uncomfortable to
   // watch; splitting it into ~5s segments restores the documentary pacing
   // while keeping the total timeline length intact so the voiceover still
@@ -2420,6 +2466,19 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               break;
             }
           }
+          // Pass 3: reuse a clip on cooldown rather than downgrading the
+          // tail to an image — preserves the planned footage:image ratio
+          // when the unused pool is thin. pickReuseClipForBlock skips
+          // distance ≤ 0 candidates, so Clip A (just placed at this block's
+          // start) can never be picked for its own tail.
+          let clipBIsReuse = false;
+          if (!clipB) {
+            const reuse = pickReuseClipForBlock(i);
+            if (reuse) {
+              clipB = { clipId: reuse.clipId, score: 0 };
+              clipBIsReuse = true;
+            }
+          }
 
           // Push sub-row A.
           items.push({
@@ -2467,7 +2526,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               durationClampedCount++;
               subBDur = clipBDur;
             }
-            usedClipIds.add(clipB.clipId);
+            // Reuse picks update the cooldown clock only — usedClipIds is
+            // the "used once" gate for FRESH picks (same convention as the
+            // Tier 2.5 fill loop above).
+            if (clipBIsReuse) {
+              clipLastUsedAt.set(clipB.clipId, blockStartSec[i]);
+            } else {
+              usedClipIds.add(clipB.clipId);
+            }
             items.push({
               project_id: projectId,
               clip_id: clipB.clipId,
@@ -2482,8 +2548,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
                 clip_duration: clipBDur || null,
                 duration_clamped: subBDur < remainder,
                 match_score: clipB.score,
-                match_reason: "phase_b_split_secondary_clip",
-                pick_source: "split_secondary_clip",
+                match_reason: clipBIsReuse ? "phase_b_split_secondary_reuse" : "phase_b_split_secondary_clip",
+                pick_source: clipBIsReuse ? "split_secondary_reuse" : "split_secondary_clip",
                 block_index: i,
                 split_sub_row: "B",
                 split_total_sub_rows: 2,
@@ -4910,7 +4976,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     assignedFootageCount,
     downgradedCount,
     uniqueClipsUsed: usedClipIds.size,
-    totalFootageBlocks: footageBlockIdxs.length,
+    totalFootageBlocks: blocks.filter((b) => b.type === "footage" || b.type === "intro").length,
     personGateRejections,
   });
 

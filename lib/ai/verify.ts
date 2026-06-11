@@ -411,9 +411,18 @@ Be strict: a graphic of a written word, a tapestry, or a logo is "no", even if i
 export const FrameCleanVerdict = z.enum(["clean", "dirty", "uncertain"]);
 export type FrameCleanVerdict = z.infer<typeof FrameCleanVerdict>;
 
+// Face verdict for a sampled video frame. Unlike the image-pool VerifyVerdict
+// this distinguishes "a DIFFERENT person is the subject" (no — the hard-drop
+// signal) from "no people in the frame at all" (no_person — clean B-roll the
+// clip pool keeps; the matcher's subject_present gating already steers it away
+// from person-anchored blocks). Collapsing both into "no" was hard-dropping
+// perfectly clean establishing shots / scenery as "wrong person".
+export const FrameFaceVerdict = z.enum(["yes", "no", "no_person", "uncertain"]);
+export type FrameFaceVerdict = z.infer<typeof FrameFaceVerdict>;
+
 export interface CombinedFrameResult {
   clean: FrameCleanVerdict;
-  face: VerifyVerdict;          // yes | no | uncertain — person present?
+  face: FrameFaceVerdict;       // yes | no (different person) | no_person | uncertain
   cleanArtifact: string;        // short description of any overlay seen
   reason: string;
 }
@@ -421,7 +430,7 @@ export interface CombinedFrameResult {
 const CombinedFrameSchema = z.object({
   clean: FrameCleanVerdict.default("uncertain"),
   cleanArtifact: z.string().optional().default(""),
-  face: VerifyVerdict.default("uncertain"),
+  face: FrameFaceVerdict.default("uncertain"),
   reason: z.string().optional().default(""),
 });
 
@@ -440,8 +449,9 @@ function combinedPrompt(personName?: string): string {
   const faceBlock = personName
     ? `\n\nThe FIRST image is a known reference photo of ${personName}. The SECOND image is the video frame. For the "face" field, decide whether ${personName} (the person in the reference) is visibly present in the SECOND image:
 - "yes" — the same person as the reference is clearly visible (alone or among others).
-- "no" — a different person, or no recognisable person at all.
-- "uncertain" — faces too small / blurry / from behind, or you cannot be sure. Default to "uncertain" over a guessed "yes".`
+- "no" — a DIFFERENT person is clearly the subject of the frame (a recognisable face that is not the reference person).
+- "no_person" — there is no recognisable person in the frame at all (scenery, a building, an object, a vehicle, a crowd with no distinct faces).
+- "uncertain" — faces too small / blurry / from behind, or you cannot be sure. Default to "uncertain" over a guessed "yes" or "no".`
     : `\n\nOnly ONE image is attached (the video frame). There is no person to check, so always return "uncertain" for the "face" field.`;
 
   const frameRef = personName ? "the SECOND image (the video frame)" : "the attached video frame";
@@ -451,11 +461,12 @@ function combinedPrompt(personName?: string): string {
 (1) "clean" — is this clean, usable footage with NO graphic overlays?
 FIRST, scan all FOUR CORNERS and the bottom edge of the frame for small persistent branding before judging the center — burned-in channel logos and site watermarks live there and are easy to overlook when the center of the frame is a face or action.
 Mark "dirty" if the frame shows ANY of: a channel/network logo, brand mark, or watermark (even a SMALL corner station bug, a semi-transparent logo, or a website/URL strip such as "somesite.com" / "somesite.tv" burned into a corner or along an edge); on-screen text of ANY kind — captions, subtitles, burned-in auto-captions or "word pop" caption text (a single emphasised word like "GREAT" / "WOW" synced to speech, often centered or near the bottom), lower-third name strips, chyrons, headlines, quote cards, breaking-news banners; a title card; an end screen / subscribe / "more videos" overlay; scrolling or static credits; or a near-blank solid frame with no real subject.
-Mark "clean" ONLY if it is plain photographed footage with NONE of the above — including no corner logo, no URL/site watermark, and no caption/subtitle text anywhere in the frame.
-Mark "uncertain" only if you genuinely cannot tell. Be strict: any visible logo, watermark, URL, or text → "dirty", however small. When you mark dirty, name the artifact precisely in "cleanArtifact" using the most specific word — e.g. "corner channel logo", "werewolftvseries.com watermark bottom-right", "lower-third name strip", or "burned-in caption text 'GREAT'" / "subtitle" for spoken-word captions.${faceBlock}
+IMPORTANT — only graphics ADDED ON TOP of the footage count as overlays. Text, logos, and branding that are physically PART OF THE FILMED SCENE are NOT overlays and do NOT make the frame "dirty": street or storefront signs, posters, event banners, sponsor backdrops / step-and-repeat walls at red carpets and press conferences, microphone flags, product packaging, clothing prints, vehicle decals, stage screens, or text on a phone/TV being filmed. If the text sits IN the scene (subject to the scene's perspective and lighting) rather than flat ON the image, it is part of the scene.
+Mark "clean" ONLY if it is plain photographed footage with NO ADDED graphics — no corner logo, no URL/site watermark, and no caption/subtitle text laid over the frame. In-scene text per the rule above is still "clean".
+Mark "uncertain" only if you genuinely cannot tell. Be strict about ADDED graphics: any burned-in logo, watermark, URL, or caption → "dirty", however small — but do NOT penalise in-scene text. When you mark dirty, name the artifact precisely in "cleanArtifact" using the most specific word — e.g. "corner channel logo", "werewolftvseries.com watermark bottom-right", "lower-third name strip", or "burned-in caption text 'GREAT'" / "subtitle" for spoken-word captions.${faceBlock}
 
 Return STRICT JSON ONLY:
-{ "clean": "clean" | "dirty" | "uncertain", "cleanArtifact": "short description of any overlay, else empty", "face": "yes" | "no" | "uncertain", "reason": "one short sentence" }`;
+{ "clean": "clean" | "dirty" | "uncertain", "cleanArtifact": "short description of any overlay, else empty", "face": "yes" | "no" | "no_person" | "uncertain", "reason": "one short sentence" }`;
 }
 
 export async function verifyClipFrameCombined(
@@ -538,10 +549,14 @@ export async function verifyClipFrameCombined(
 // frames → not flagged (we don't drop a source on a Gemini hiccup).
 // =========================================================================
 
-// Artifact phrases for a persistent brand mark. Mirrors the clipProcessor
-// logo override so the two stay consistent.
+// Artifact phrases for a persistent brand mark. Deliberately NARROW: it only
+// matches words Gemini uses for burned-in marks (logo / watermark / station
+// bug / a domain in a URL strip). Generic words like "brand(ing)", "url", or
+// "website" are excluded — Gemini also uses those to describe things that are
+// physically IN the scene (a sponsor backdrop, a mic flag, a storefront), and
+// counting them here skipped whole sources that had no watermark at all.
 const LOGO_WATERMARK_ARTIFACT_RE =
-  /\b(logo|watermark|wordmark|station bug|channel bug|brand(?:ing|ed)?|url|website|\.com|\.tv|\.net)\b/i;
+  /\b(logo|watermark|wordmark|station bug|channel bug|\.com|\.tv|\.net)\b/i;
 
 // Artifact phrases for recurring on-screen speech text — burned-in captions,
 // subtitles, karaoke-style word pop-ups. These read like normal "text" so we

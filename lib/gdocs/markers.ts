@@ -905,6 +905,27 @@ export function applyScriptMarkers(
     items[k].metadata = meta;
     applyLowerThirdVisualOverride(items[k], marker.text, resolverCtx);
     result.lowerThirdsApplied++;
+    // Diagnostic: prove (in logs) that the chosen host actually CONTAINS the
+    // word time at stamp-time. If hostContainsWord is false here, the host
+    // finder picked the wrong block; if it's true here but the final video
+    // shows the LT one block off, the discrepancy is a LATER pass moving the
+    // item's window (vo_start_duration_pass / anchor reorder), not this finder.
+    {
+      const hostStart = starts[k];
+      const hostDur = Number(items[k].duration ?? 0);
+      const hostEnd = hostStart + hostDur;
+      // eslint-disable-next-line no-console
+      console.log(JSON.stringify({
+        msg: "markers.lower_third.host_pick",
+        text: marker.text,
+        wordT: Math.round(t * 100) / 100,
+        hostIndex: k,
+        hostType: items[k].type,
+        hostStart: Math.round(hostStart * 100) / 100,
+        hostEnd: Math.round(hostEnd * 100) / 100,
+        hostContainsWord: t >= hostStart - 0.05 && t <= hostEnd + 0.05,
+      }));
+    }
   }
 
   // Group title_card + its following title_card_clip rows together. The
