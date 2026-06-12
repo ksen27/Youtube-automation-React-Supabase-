@@ -557,9 +557,60 @@ export function applyScriptMarkers(
           hops++;
         }
         if (!matched) {
-          // Leave wordToTranscriptOffset[wi] = -1; this Deepgram word has
-          // no clean transcript anchor (rare — heavy filler/noise word).
-          // The next Deepgram word will try from the same tCursor.
+          // Hard resync: the 5-word probe assumes small drift, but the
+          // narrator can skip (or reword) a WHOLE sentence relative to the
+          // doc — e.g. the 2026-06-12 Diana project, where the audio jumps
+          // from "...Nothing at all." straight to "When people talk..."
+          // and the doc's intervening 9-word sentence stalls the cursor
+          // forever. Every later word then has no mapping, killing every
+          // offset-anchored marker (lower-thirds AND inline clips) for the
+          // remaining 70% of the video.
+          //
+          // Recovery: scan up to 80 transcript words ahead for a position
+          // where THIS Deepgram word and the NEXT one match two consecutive
+          // transcript words. A single common word ("the") could false-jump
+          // the cursor; a consecutive pair is strong evidence of genuine
+          // realignment. When a third Deepgram token exists we verify it
+          // too, rejecting candidates whose third word disagrees.
+          let tok2 = "";
+          let tok3 = "";
+          for (let wj = wi + 1; wj < wordsNN.length && !tok3; wj++) {
+            const t = normalizeToken(wordsNN[wj].word);
+            if (!t) continue;
+            if (!tok2) tok2 = t;
+            else tok3 = t;
+          }
+          if (tok2) {
+            const isWordChar = (ch: string) => /[\p{L}\p{N}']/u.test(ch);
+            const readWordAt = (from: number): { start: number; end: number; word: string } | null => {
+              let s = from;
+              while (s < normalizedTranscript.length && !isWordChar(normalizedTranscript[s])) s++;
+              if (s >= normalizedTranscript.length) return null;
+              let e = s;
+              while (e < normalizedTranscript.length && isWordChar(normalizedTranscript[e])) e++;
+              return { start: s, end: e, word: normalizeToken(normalizedTranscript.slice(s, e)) };
+            };
+            let scanFrom = tCursor;
+            for (let hops = 0; hops < 80; hops++) {
+              const w1 = readWordAt(scanFrom);
+              if (!w1) break;
+              if (w1.word === tok) {
+                const w2 = readWordAt(w1.end);
+                if (w2 && w2.word === tok2) {
+                  const w3 = tok3 ? readWordAt(w2.end) : null;
+                  if (!tok3 || (w3 && w3.word === tok3)) {
+                    wordToTranscriptOffset[wi] = w1.start;
+                    tCursor = w1.end;
+                    break;
+                  }
+                }
+              }
+              scanFrom = w1.end;
+            }
+          }
+          // Still unmatched: leave wordToTranscriptOffset[wi] = -1 (heavy
+          // filler/noise word). The next Deepgram word retries from the
+          // same tCursor.
         }
       }
     }
@@ -616,6 +667,24 @@ export function applyScriptMarkers(
       const off = wordToTranscriptOffset[wi];
       if (off < 0) continue;
       if (off >= absOffset) return wordsNN[wi].start;
+    }
+    // Offset-map fallback: the transcript↔word walk can still die when the
+    // voiceover diverges from the doc beyond what the resync above bridges,
+    // leaving every word past the divergence unmapped. Anchor by the
+    // paragraph's OPENING PHRASE instead — match its first tokens
+    // contiguously in the word stream, the same way title cards anchor.
+    // Try progressively shorter prefixes; require at least 3 tokens so a
+    // common two-word opener ("She was") can't false-anchor on an earlier
+    // sentence.
+    const paraEnd = pIdx + 1 < paragraphStart.length
+      ? paragraphStart[pIdx + 1]
+      : transcript.length;
+    const opening = tokenize(
+      transcript.slice(absOffset, Math.min(paraEnd, absOffset + 240)),
+    );
+    for (let n = Math.min(6, opening.length); n >= 3; n--) {
+      const idx = findPhraseIndex(wordsNN, opening.slice(0, n), 0);
+      if (idx >= 0) return wordsNN[idx].start;
     }
     return null;
   }
