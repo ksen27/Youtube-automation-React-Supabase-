@@ -20,7 +20,12 @@ import {
 import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages, rehostImageToR2 } from "@/lib/images/fetch";
 import { getEnv } from "@/lib/env";
-import { verifyPoolAsset } from "@/lib/ai/pool-verification";
+import {
+  verifyPoolAssetWithRetry,
+  verifyPoolAssetsBatch,
+  resetVerifyOutageTracking,
+  getVerifyOutageStats,
+} from "@/lib/ai/pool-verification";
 import { verifyImageMatchesScript } from "@/lib/ai/verify";
 import { lookupReference } from "@/lib/ai/face-references";
 import { splitTranscriptIntoSentences } from "@/lib/ai/sentences";
@@ -87,7 +92,9 @@ async function gatePersonImage(args: {
 }): Promise<{ accept: boolean; verdict: string; reason: string }> {
   const name = (args.personName ?? "").trim();
   if (!name) return { accept: true, verdict: "skipped", reason: "no person to verify against" };
-  const verdict = await verifyPoolAsset(
+  // Retry-aware verify: a Gemini 503 is retried with backoff (bounded by the
+  // shared per-job budget) instead of instantly counting as "unconfirmed".
+  const verdict = await verifyPoolAssetWithRetry(
     {
       projectId: args.projectId,
       entityType: "person",
@@ -367,6 +374,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
   await setProjectStatus(projectId, "matching");
+
+  // Fresh outage accounting + retry-wait budget for this run. The stats feed
+  // the circuit breaker at the end of the job: a run whose verifications
+  // mostly ERRORED (sustained Gemini outage) must fail and re-run later —
+  // never complete with an all-fallback video that merely looks successful.
+  resetVerifyOutageTracking();
 
   // Heartbeat. The match step does its heavy work — LLM block scoring plus
   // per-entity image-pool building (fetchImages + verifyPoolAsset, hundreds
@@ -3150,31 +3163,35 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       `${personName} headshot`,
       `${personName} talk show`,
     ];
-    // Face-verify one candidate. Returns the entry to keep, or null to drop.
-    // Fail-open on Gemini outage (keep the candidate) — same policy as the
-    // original serial gate; gutting the cache on a 503 blip is worse than a
-    // rare wrong-person photo. verifyPoolAsset has a per-process LRU cache,
-    // so running these concurrently for distinct URLs is safe.
-    async function verifyCandidate(
-      f: { url: string; source: string },
-      q: string,
-    ): Promise<PersonPhotoCacheEntry | null> {
-      try {
-        const verdict = await verifyPoolAsset({
+    // Face-verify a query's candidates in BATCHED Gemini calls (up to 8
+    // candidates per call, one shared reference upload) instead of one call
+    // per candidate — this loop was the dominant Gemini volume of the match
+    // step (~120 calls/person) and the thing that tripped 503 "high demand".
+    //
+    // STRICT mode: only POSITIVELY confirmed photos enter the cache. INFRA
+    // FAILURES (Gemini 503 / fetch timeout — verdict.errored) are PARKED:
+    // never accepted unverified, never counted as a rejection. Parked
+    // candidates are re-verified in bounded rounds below, after a wait that
+    // lets the typical 503 spike pass. Still-errored after that → dropped
+    // (the job-level circuit breaker decides whether the run is shippable).
+    const parked: PersonPhotoCacheEntry[] = [];
+    async function verifyBatch(cands: PersonPhotoCacheEntry[]): Promise<void> {
+      if (cands.length === 0) return;
+      const verdicts = await verifyPoolAssetsBatch(
+        cands.map((f) => ({
           projectId,
-          entityType: "person",
+          entityType: "person" as const,
           entityName: personName,
           candidateUrl: f.url,
-        }, { requireConfirmed: true });
-        if (!verdict.accept) return null;
-      } catch {
-        // verify failed (Gemini outage etc.) — keep the candidate
-        // rather than gut the cache.
-      }
-      return { url: f.url, source: f.source, query: q };
+        })),
+        { requireConfirmed: true },
+      );
+      verdicts.forEach((v, k) => {
+        if (v.errored) { parked.push(cands[k]); return; }
+        if (v.accept && result.length < target) result.push(cands[k]);
+      });
     }
 
-    const verifyConcurrency = getEnv().MATCH_POOL_VERIFY_CONCURRENCY;
     for (const q of queries) {
       if (result.length >= target) break;
       try {
@@ -3188,23 +3205,22 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           seen.add(f.url);
           return true;
         });
-        // Face-verify the query's candidates concurrently in bounded
-        // batches. Results are reassembled in the original fetch order so
-        // the cache is deterministic regardless of which verify finishes
-        // first — only timing changes vs. the old serial loop, not which
-        // images win. We stop launching batches once `target` is reached.
-        for (let i = 0; i < candidates.length && result.length < target; i += verifyConcurrency) {
-          const batch = candidates.slice(i, i + verifyConcurrency);
-          const verified = await Promise.all(batch.map((f) => verifyCandidate(f, q)));
-          for (const entry of verified) {
-            if (!entry) continue;
-            if (result.length >= target) break;
-            result.push(entry);
-          }
-        }
+        await verifyBatch(candidates.map((f) => ({ url: f.url, source: f.source, query: q })));
       } catch {
         // Image search failed for one query — continue with the rest.
       }
+    }
+
+    // Parked-retry rounds. Each round re-verifies everything that errored so
+    // far; re-erroring entries land back in `parked` for the next round.
+    for (const delayMs of [20_000, 40_000]) {
+      if (result.length >= target || parked.length === 0) break;
+      await new Promise((r) => setTimeout(r, delayMs));
+      const retry = parked.splice(0, parked.length);
+      void logJob({ projectId, jobId: mediaJobId }, "match.person_photo_cache.retry_parked", {
+        person: personName, parked: retry.length, have: result.length, target,
+      });
+      await verifyBatch(retry);
     }
     personPhotoCache.set(rawPersonName.toLowerCase(), result);
     void logJob({ projectId, jobId: mediaJobId }, "match.person_photo_cache.built", {
@@ -3212,6 +3228,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       rawPerson: rawPersonName,
       target,
       cached: result.length,
+      // Candidates whose verification still ERRORED after the retry rounds —
+      // dropped unverified. Non-zero here means Gemini was down for the whole
+      // build window; the circuit breaker evaluates the run-level impact.
+      unverifiedDropped: parked.length,
     });
     return result;
   }
@@ -3711,7 +3731,13 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           const last = imageUrlLastUsedAt.get(f.url);
           if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
           if (verifyType && verifyName) {
-            const verdict = await verifyPoolAsset({
+            // Retry-aware verify: a Gemini 503 gets backoff retries (bounded
+            // by the shared per-job budget) before this candidate is given up
+            // on. A still-errored result is logged as UNAVAILABLE, not
+            // "rejected" — nobody ever looked at the image, and during the
+            // 2026-06 outage these fake rejections were what collapsed whole
+            // jobs to celebrity_default fallback (refImagesFailed:188).
+            const verdict = await verifyPoolAssetWithRetry({
               projectId,
               entityType: verifyType,
               entityName: verifyName,
@@ -3720,7 +3746,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               // correct celebrity only. Non-person entities keep default policy.
             }, verifyType === "person" ? { requireConfirmed: true } : {});
             if (!verdict.accept) {
-              void logJob({ projectId, jobId: mediaJobId }, "match.image_block_verify.rejected", {
+              void logJob({ projectId, jobId: mediaJobId },
+                verdict.errored ? "match.image_block_verify.unavailable" : "match.image_block_verify.rejected", {
                 blockIndex: blockIdx, entity_type: verifyType, entity_name: verifyName,
                 url: f.url, verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
               });
@@ -3743,7 +3770,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
                 topic: projectTopic,
                 scriptText,
               });
-              if (scriptVerdict.verdict !== "yes") {
+              // Infra failure (errored) fails OPEN — same policy as the
+              // thrown-exception path below. The script gate is a topical
+              // filter; identity was already enforced by the entity gate
+              // above, so an unjudged candidate is kept rather than lost
+              // to a 503 blip.
+              if (!scriptVerdict.errored && scriptVerdict.verdict !== "yes") {
                 void logJob({ projectId, jobId: mediaJobId }, "match.image_block_script_verify.rejected", {
                   blockIndex: blockIdx, topic: projectTopic,
                   url: f.url, verdict: scriptVerdict.verdict,
@@ -4302,6 +4334,52 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // where the celebrity is in the background and the foreground person
     // dominates the frame — the "woman in yellow" failure mode).
     let personPoolVerifyRejected = 0;
+    // Candidates whose verification ERRORED (Gemini 503 / fetch timeout) —
+    // parked for bounded retry rounds after the query loop. Never accepted
+    // unverified, never counted as a rejection: during the 2026-06 outage
+    // these fake "uncertain" rejections gutted the entire pool.
+    const poolParked: Array<{ url: string; source: string; query: string }> = [];
+    // Face-verify candidates in BATCHED Gemini calls (up to 8 per call, the
+    // celebrity reference uploaded once per call instead of once per
+    // candidate). This was the dominant cost of the match step on image-
+    // heavy projects. Survivors are appended in the original fetch order so
+    // the pool stays deterministic.
+    //
+    // STRICT mode (requireConfirmed): only images Gemini POSITIVELY
+    // confirms are the celebrity enter the pool — "uncertain", "no", and
+    // "skipped" (no reference) are all rejected. Per the client's "only
+    // the correct celebrity image" requirement, an unverifiable image
+    // must never ship as the celebrity.
+    const verifyIntoPool = async (
+      cands: Array<{ url: string; source: string; query: string }>,
+    ): Promise<void> => {
+      if (cands.length === 0) return;
+      const verdicts = await verifyPoolAssetsBatch(
+        cands.map((f) => ({
+          projectId,
+          entityType: "person" as const,
+          entityName: mainCelebrity,
+          candidateUrl: f.url,
+        })),
+        { requireConfirmed: true },
+      );
+      verdicts.forEach((v, k) => {
+        const f = cands[k];
+        if (v.errored) { poolParked.push(f); return; }
+        if (!v.accept) {
+          personPoolVerifyRejected++;
+          void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_rejected", {
+            query: f.query, url: f.url,
+            verdict: v.verdict, reason: v.reason.slice(0, 120),
+          });
+          return;
+        }
+        if (pool.length >= personFloor) return;
+        pool.push({ url: f.url, source: f.source, query: f.query, entityType: "celebrity" });
+        poolFetchStats.personImagesPrefetched++;
+      });
+    };
+
     for (const cq of celebrityQueries) {
       if (pool.length >= personFloor) break;
       poolFetchStats.entitiesQueried++;
@@ -4314,75 +4392,40 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           continue;
         }
         // Dedup-and-reserve each unique URL into poolUrlSet up front so the
-        // concurrent verify batch below never double-verifies the same image
-        // (and the same URL appearing twice in fetched[] is collapsed).
+        // verify batch below never double-verifies the same image (and the
+        // same URL appearing twice in fetched[] is collapsed).
         const personCandidates = fetched.filter((f) => {
           if (poolUrlSet.has(f.url)) return false;
           poolUrlSet.add(f.url);
           return true;
         });
-        // Face-verify EVERY candidate against the celebrity reference before
-        // adding to the pool — same gate as before, but the candidates of a
-        // single query are verified CONCURRENTLY (bounded batches) instead of
-        // one Gemini round-trip at a time. This is the dominant cost of the
-        // match step on image-heavy projects; the verifies are independent
-        // per URL and verifyPoolAsset caches per-URL, so concurrency only
-        // changes wall-time, not which images survive. Survivors are appended
-        // in the original fetch order so the pool stays deterministic.
-        //
-        // STRICT mode (requireConfirmed): only images Gemini POSITIVELY
-        // confirms are the celebrity enter the pool — "uncertain", "no", and
-        // "skipped" (no reference) are all rejected. Per the client's "only
-        // the correct celebrity image" requirement, an unverifiable image
-        // must never ship as the celebrity. Verify failure (Gemini outage) is
-        // fail-open: keep the candidate rather than gut the pool.
-        const personVerifyConcurrency = getEnv().MATCH_POOL_VERIFY_CONCURRENCY;
-        for (let i = 0; i < personCandidates.length && pool.length < personFloor; i += personVerifyConcurrency) {
-          const batch = personCandidates.slice(i, i + personVerifyConcurrency);
-          const verdicts = await Promise.all(batch.map(async (f) => {
-            try {
-              const verdict = await verifyPoolAsset({
-                projectId,
-                entityType: "person",
-                entityName: mainCelebrity,
-                candidateUrl: f.url,
-              }, { requireConfirmed: true });
-              if (!verdict.accept) {
-                void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_rejected", {
-                  query: cq, url: f.url,
-                  verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
-                });
-                return { f, keep: false };
-              }
-              return { f, keep: true };
-            } catch (e) {
-              void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_failed", {
-                query: cq, url: f.url, err: (e as Error).message?.slice(0, 120),
-              });
-              return { f, keep: true }; // fail-open
-            }
-          }));
-          for (const { f, keep } of verdicts) {
-            if (!keep) {
-              personPoolVerifyRejected++;
-              continue;
-            }
-            if (pool.length >= personFloor) break;
-            pool.push({ url: f.url, source: f.source, query: cq, entityType: "celebrity" });
-            poolFetchStats.personImagesPrefetched++;
-          }
-        }
+        await verifyIntoPool(personCandidates.map((f) => ({ url: f.url, source: f.source, query: cq })));
       } catch (e) {
         poolFetchStats.entitiesFailed++;
         void logJob({ projectId, jobId: mediaJobId },
           "match.image_fetch.failed", { query: cq, personFloor: true, err: (e as Error).message });
       }
     }
-    if (personPoolVerifyRejected > 0) {
+
+    // Parked-retry rounds: re-verify everything that errored once the 503
+    // spike has had time to pass. Re-erroring entries land back in
+    // poolParked for the next round; whatever still errors after the final
+    // round is dropped (the circuit breaker judges the run overall).
+    for (const delayMs of [20_000, 40_000]) {
+      if (pool.length >= personFloor || poolParked.length === 0) break;
+      await new Promise((r) => setTimeout(r, delayMs));
+      const retry = poolParked.splice(0, poolParked.length);
+      void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.retry_parked", {
+        parked: retry.length, have: pool.length, target: personFloor,
+      });
+      await verifyIntoPool(retry);
+    }
+    if (personPoolVerifyRejected > 0 || poolParked.length > 0) {
       void logJob({ projectId, jobId: mediaJobId }, "match.person_pool.verify_summary", {
         celebrity: mainCelebrity,
         rejected: personPoolVerifyRejected,
         kept: poolFetchStats.personImagesPrefetched,
+        unverifiedDropped: poolParked.length,
       });
     }
   }
@@ -4431,7 +4474,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       for (const f of fetched) {
         if (poolUrlSet.has(f.url)) continue;          // dedupe across entities
         if (mapped && mapped !== "celebrity_default") {
-          const verdict = await verifyPoolAsset({
+          const verdict = await verifyPoolAssetWithRetry({
             projectId,
             entityType: mapped,
             entityName: ent.value,
@@ -4442,7 +4485,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
             // has no reference photo and would over-reject.
           }, mapped === "person" ? { requireConfirmed: true } : {});
           if (!verdict.accept) {
-            void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+            void logJob({ projectId, jobId: mediaJobId },
+              verdict.errored ? "match.image_verify.unavailable" : "match.image_verify.rejected", {
               entity_type: mapped, entity_name: ent.value, url: f.url,
               verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
             });
@@ -4537,7 +4581,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         for (const f of fetched) {
           if (poolUrlSet.has(f.url)) continue;
           if (mappedRelaxed && mappedRelaxed !== "celebrity_default") {
-            const verdict = await verifyPoolAsset({
+            const verdict = await verifyPoolAssetWithRetry({
               projectId,
               entityType: mappedRelaxed,
               entityName: ent.value,
@@ -4547,7 +4591,8 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
               // person, so an "uncertain" person image must NOT pass.
             }, mappedRelaxed === "person" ? { requireConfirmed: true } : {});
             if (!verdict.accept) {
-              void logJob({ projectId, jobId: mediaJobId }, "match.image_verify.rejected", {
+              void logJob({ projectId, jobId: mediaJobId },
+                verdict.errored ? "match.image_verify.unavailable" : "match.image_verify.rejected", {
                 entity_type: mappedRelaxed, entity_name: ent.value, url: f.url,
                 verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
                 relaxed: true,
@@ -4978,14 +5023,18 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
           const last = imageUrlLastUsedAt.get(f.url);
           if (last !== undefined && nowSec - last < IMAGE_REUSE_COOLDOWN_SEC) continue;
           try {
-            const verdict = await verifyPoolAsset({
+            // Retry-aware so a 503 spike recovers; a still-errored verdict
+            // stays rejected here (rejectUncertain) — split entities fail
+            // CLOSED by design, see the catch below.
+            const verdict = await verifyPoolAssetWithRetry({
               projectId,
               entityType: verifyEntityType,
               entityName: q,
               candidateUrl: f.url,
             }, { rejectUncertain: true });
             if (!verdict.accept) {
-              void logJob({ projectId, jobId: mediaJobId }, "match.split.entity_verify_rejected", {
+              void logJob({ projectId, jobId: mediaJobId },
+                verdict.errored ? "match.split.entity_verify_unavailable" : "match.split.entity_verify_rejected", {
                 blockIndex: blockIdx, query: q, url: f.url,
                 verdict: verdict.verdict, reason: verdict.reason.slice(0, 120),
               });
@@ -6196,6 +6245,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       await logJob({ projectId, jobId: mediaJobId }, "match.image_rehost.summary", {
         rehosted: rehostedCount, pooled: pooledCount, cleared: clearedCount,
       });
+    }
+  }
+
+  // Gemini-outage circuit breaker. When MOST verification attempts in this
+  // run were infra failures (sustained 503 outage), the pools and gates
+  // above degraded to fallback everywhere — completing now would ship a
+  // video that LOOKS successful but silently violates the "correct celebrity
+  // only" requirement (the refImagesFailed:188 incident). Fail the job
+  // instead: BullMQ retries it, and the persistent image_verifications cache
+  // makes the re-run skip everything that was already verified, so retrying
+  // is cheap. Thresholds: enough attempts to be meaningful (≥20) and a
+  // majority errored — a brief spike that the parked-retry rounds absorbed
+  // never trips this.
+  {
+    const vs = getVerifyOutageStats();
+    if (vs.checked >= 20 && vs.errored / vs.checked > 0.5) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.gemini_outage_abort", {
+        checked: vs.checked, errored: vs.errored,
+      });
+      throw new Error(
+        `gemini verification unavailable: ${vs.errored}/${vs.checked} verify attempts errored — ` +
+        `failing the job so it retries instead of shipping unverified fallback images`,
+      );
     }
   }
 

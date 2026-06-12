@@ -48,6 +48,14 @@ export interface VerifyResult {
   // 0..1 confidence. Logged for tuning; the matcher's gate is binary
   // (yes/no) so it doesn't read this directly.
   confidence: number;
+  // True when the verdict is NOT a judgement at all — Gemini 503'd, the
+  // image fetch failed, or the response didn't parse. An errored "uncertain"
+  // means "nobody looked at this image", which is fundamentally different
+  // from "Gemini looked and could not tell": errored results must never be
+  // cached/persisted and callers should retry them later instead of treating
+  // them as a rejection. This distinction is what stops a transient Gemini
+  // outage from permanently rejecting a whole pool of correct images.
+  errored?: boolean;
 }
 
 const VerifyResponseSchema = z.object({
@@ -199,11 +207,11 @@ async function askGemini(
       op: label,
       err: (e as Error).message?.slice(0, 200),
     }));
-    return { verdict: "uncertain", reason: "gemini error", confidence: 0 };
+    return { verdict: "uncertain", reason: "gemini error", confidence: 0, errored: true };
   }
   let parsed: unknown;
   try { parsed = JSON.parse(txt); } catch {
-    return { verdict: "uncertain", reason: "parse error", confidence: 0 };
+    return { verdict: "uncertain", reason: "parse error", confidence: 0, errored: true };
   }
   const safe = VerifyResponseSchema.safeParse(parsed);
   if (!safe.success) {
@@ -212,7 +220,7 @@ async function askGemini(
       op: label,
       raw: txt.slice(0, 200),
     }));
-    return { verdict: "uncertain", reason: "schema error", confidence: 0 };
+    return { verdict: "uncertain", reason: "schema error", confidence: 0, errored: true };
   }
   return safe.data;
 }
@@ -254,10 +262,13 @@ export async function verifyPersonImage(input: PersonVerifyInput): Promise<Verif
   // decides whether to keep or drop based on context (an unverified person
   // block should typically be dropped; an unverified non-person should keep).
   if (!reference || !candidate) {
+    // Fetch failures are infra failures, not judgements — a Wikimedia
+    // throttle burst or CDN timeout must not become a persisted rejection.
     return {
       verdict: "uncertain",
       reason: reference ? "candidate fetch failed" : "reference fetch failed",
       confidence: 0,
+      errored: true,
     };
   }
   return askGemini(
@@ -328,8 +339,10 @@ const PersonImageCleanSchema = z.object({
 });
 
 export async function verifyPersonImageClean(input: PersonVerifyInput): Promise<PersonImageCleanResult> {
+  // Every fail() path here is an infra failure (fetch / 503 / parse), never a
+  // judgement — mark errored so callers retry instead of rejecting + caching.
   const fail = (reason: string): PersonImageCleanResult => ({
-    verdict: "uncertain", overlay: "uncertain", overlayArtifact: "", reason, confidence: 0,
+    verdict: "uncertain", overlay: "uncertain", overlayArtifact: "", reason, confidence: 0, errored: true,
   });
   const [reference, candidate] = await Promise.all([
     fetchImageAsBase64(input.referenceUrl),
@@ -371,6 +384,151 @@ export async function verifyPersonImageClean(input: PersonVerifyInput): Promise<
     reason: safe.data.reason,
     confidence: safe.data.confidence,
   };
+}
+
+// =========================================================================
+// verifyPersonImagesCleanBatch — verifyPersonImageClean for MANY candidates
+// in ONE Gemini call.
+//
+// The matcher's person-photo pools verify dozens of candidates against the
+// SAME reference photo. One call per candidate meant ~120 round-trips per
+// person, re-uploading the identical reference image every time — that
+// volume was both the dominant wall-time cost of the match step AND the
+// thing that tripped Gemini's 503 "high demand" limiter. Batching sends the
+// reference once plus up to PERSON_VERIFY_BATCH_MAX candidates and asks for
+// one verdict per candidate, cutting calls (and 503 exposure) ~8x.
+//
+// Failure semantics per candidate:
+//   - candidate fetch failed   → errored result for THAT candidate only;
+//                                the rest still go to Gemini.
+//   - Gemini call failed       → errored result for every candidate that
+//                                was in the call (caller parks + retries).
+//   - model omitted an index   → errored result for that candidate (never
+//                                guess a verdict the model didn't give).
+// Results are returned aligned 1:1 with input.candidateUrls.
+// =========================================================================
+
+export const PERSON_VERIFY_BATCH_MAX = 8;
+
+const PersonImageCleanBatchSchema = z.object({
+  results: z.array(PersonImageCleanSchema.extend({
+    index: z.number().int().min(1),
+  })),
+});
+
+const PERSON_IMAGE_CLEAN_BATCH_PROMPT = (personName: string, count: number) => `You are vetting ${count} candidate images an editor wants to use to represent ${personName} in a documentary video.
+
+${count + 1} images are attached. The FIRST is a known reference photo of ${personName}. The following ${count} images are CANDIDATES, numbered 1 to ${count} in attachment order. For EACH candidate, answer TWO independent questions.
+
+(1) "verdict" — is the candidate the SAME PERSON as the reference?
+- "yes" — clearly the same person (alone or in a group). Different age/hair/lighting is fine; judge by facial structure.
+- "no" — a different person, or no recognisable person at all (a logo, map, chart, text graphic, building).
+- "uncertain" — any doubt (faces too small/blurry/from behind). DEFAULT to "uncertain" over a guessed "yes".
+
+(2) "overlay" — grade how much ADDED graphics sit on the photo. Pick the ONE that fits:
+- "clean" — a plain photograph of the person with no added graphics at all.
+- "minor" — the photo is otherwise a clean, full-frame shot of the person, but carries ONLY a SMALL, unobtrusive mark: a corner stock-photo watermark (e.g. an iStock / Getty / AP / Shutterstock bug), a small photographer or agency credit, or a faint corner logo. The person and scene are fully visible and not obscured. This is fine to use.
+- "dirty" — the image has a BIG or intrusive overlay: a headline / news banner / title bar; a lower-third name strip, subtitle, or quote card; a "breaking news" banner; a collage or split-screen of multiple framed photos; a magazine / book / product cover with title text; or any large added text laid across the photo.
+- "uncertain" — you genuinely cannot tell.
+Rule of thumb: judge by how much the added graphics INTERFERE. A tiny corner watermark on an otherwise-clean photo of the correct person is "minor" (acceptable). A clickbait thumbnail with a headline banner, or a collage, is "dirty".
+
+Judge every candidate INDEPENDENTLY — do not let one candidate's verdict influence another's.
+
+Return STRICT JSON ONLY, with EXACTLY one entry per candidate (indexes 1 to ${count}):
+{ "results": [ { "index": 1, "verdict": "yes" | "no" | "uncertain", "overlay": "clean" | "minor" | "dirty" | "uncertain", "overlayArtifact": "short description of any overlay, else empty", "reason": "one short sentence", "confidence": 0.0 to 1.0 }, ... ] }`;
+
+export interface PersonBatchVerifyInput {
+  // Candidate image URLs, verified together against ONE reference. Callers
+  // should chunk to PERSON_VERIFY_BATCH_MAX; longer lists are still handled
+  // (single call) but accuracy degrades with very large image counts.
+  candidateUrls: string[];
+  referenceUrl: string;
+  personName: string;
+}
+
+export async function verifyPersonImagesCleanBatch(
+  input: PersonBatchVerifyInput,
+): Promise<PersonImageCleanResult[]> {
+  const errResult = (reason: string): PersonImageCleanResult => ({
+    verdict: "uncertain", overlay: "uncertain", overlayArtifact: "", reason, confidence: 0, errored: true,
+  });
+  if (input.candidateUrls.length === 0) return [];
+
+  const reference = await fetchImageAsBase64(input.referenceUrl);
+  if (!reference) return input.candidateUrls.map(() => errResult("reference fetch failed"));
+
+  const fetched = await Promise.all(input.candidateUrls.map((u) => fetchImageAsBase64(u)));
+  // Candidates whose fetch failed get an errored result and are excluded
+  // from the Gemini call; `sent` maps attachment order → input position.
+  const results: Array<PersonImageCleanResult | null> = fetched.map((img) =>
+    img ? null : errResult("candidate fetch failed"),
+  );
+  const sent: Array<{ inputIdx: number; img: FetchedImage }> = [];
+  fetched.forEach((img, i) => { if (img) sent.push({ inputIdx: i, img }); });
+  if (sent.length === 0) return results as PersonImageCleanResult[];
+
+  const model = getModel();
+  let txt: string;
+  try {
+    const res = await withGeminiRetry(
+      `verifyPersonImageCleanBatch[${input.personName}x${sent.length}]`,
+      () => model.generateContent({
+        contents: [{
+          role: "user",
+          parts: [
+            { text: PERSON_IMAGE_CLEAN_BATCH_PROMPT(input.personName, sent.length) },
+            { inlineData: { mimeType: reference.mimeType, data: reference.data } },
+            ...sent.map((s) => ({ inlineData: { mimeType: s.img.mimeType, data: s.img.data } })),
+          ],
+        }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+      }),
+      // A failed batch costs up to 8 verdicts (vs 1 on the single path), so
+      // it gets one more attempt than the single verify before parking.
+      { attempts: 3, baseMs: 500 },
+    );
+    txt = res.response.text();
+  } catch {
+    for (const s of sent) results[s.inputIdx] = errResult("gemini error");
+    return results as PersonImageCleanResult[];
+  }
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch {
+    for (const s of sent) results[s.inputIdx] = errResult("parse error");
+    return results as PersonImageCleanResult[];
+  }
+  const safe = PersonImageCleanBatchSchema.safeParse(parsed);
+  if (!safe.success) {
+    console.warn(JSON.stringify({
+      msg: "verify.batch_schema_failed",
+      op: `verifyPersonImageCleanBatch[${input.personName}]`,
+      raw: txt.slice(0, 200),
+    }));
+    for (const s of sent) results[s.inputIdx] = errResult("schema error");
+    return results as PersonImageCleanResult[];
+  }
+
+  // Map the model's 1-based attachment indexes back to input positions.
+  // Duplicate indexes: first one wins. Missing indexes: errored (retry later)
+  // — never invent a verdict the model didn't actually give.
+  const byIndex = new Map<number, (typeof safe.data.results)[number]>();
+  for (const r of safe.data.results) {
+    if (!byIndex.has(r.index)) byIndex.set(r.index, r);
+  }
+  sent.forEach((s, attachPos) => {
+    const r = byIndex.get(attachPos + 1);
+    results[s.inputIdx] = r
+      ? {
+          verdict: r.verdict,
+          overlay: r.overlay,
+          overlayArtifact: r.overlayArtifact,
+          reason: r.reason,
+          confidence: r.confidence,
+        }
+      : errResult("missing batch result");
+  });
+  return results as PersonImageCleanResult[];
 }
 
 // =========================================================================
