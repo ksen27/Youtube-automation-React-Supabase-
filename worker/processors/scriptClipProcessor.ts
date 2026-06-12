@@ -5,6 +5,7 @@ import { logJob, setMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { cutAudio, cutClip, normalizeClip } from "@/lib/media/ffmpeg";
+import { probeFile } from "@/lib/media/probe";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
 import type { JobAttemptInfo } from "../index";
@@ -129,16 +130,25 @@ export async function processScriptClipJob(
       keepAudio: true,
     });
     normalizedTmp = path.join(tmp, "norm.mp4");
+    // Pin to the requested window. cutClip above stream-copies (-c:v copy),
+    // which can only start the cut on a keyframe AT OR BEFORE `start` — on
+    // YouTube footage (4-10s GOPs) the trimmed file carries up to a whole
+    // GOP of pre-window footage at its HEAD, with the requested window as
+    // its tail (the "8s intro plays for 12s" bug). Probe the cut and skip
+    // the head excess during the normalize re-encode, then cap at
+    // `duration`, so the stored clip is exactly [start, end] of the source
+    // and lines up with the separately (accurately) cut audio.
+    let headTrim = 0;
+    try {
+      const trimmedProbe = await probeFile(trimmedTmp);
+      headTrim = Math.max(0, trimmedProbe.durationSeconds - duration);
+    } catch { /* pin-only fallback below */ }
     await normalizeClip({
       inputPath: trimmedTmp,
       outputPath: normalizedTmp,
       width: 1280, height: 720, fps: 30,
       keepAudio: true,
-      // Pin to the requested window length. cutClip above stream-copies
-      // (-c:v copy), which can only cut on keyframe boundaries, so an 8s
-      // request on YouTube footage (4-10s GOPs) overshoots to ~12s. Without
-      // this pin the overshoot survives the normalize re-encode and the stored
-      // intro clip is longer than asked (the "8s intro plays for 12s" bug).
+      startOffsetSeconds: headTrim > 0 ? headTrim : undefined,
       pinDurationSeconds: duration,
     });
     await setMediaJob(mediaJobId, { progress: 75 });

@@ -19,6 +19,10 @@ import type {
 //   • Red text runs INSIDE regular paragraphs are lower-thirds — drawn as
 //     a drawtext overlay while the narrator says those words.
 //
+//   • Bare hyperlinked timestamp lines mid-doc (no blue-bold heading above)
+//     are inline forced clips — the YouTube window plays over the following
+//     paragraph's narration, with no title card.
+//
 // Everything else flows into the plain transcript text.
 //
 // Why this lives apart from the fetcher: parsing is pure (input = parsed
@@ -37,6 +41,14 @@ export type ScriptMarkerKind =
   // adjacency: title_card_clip rows always immediately follow their
   // title_card row in the ordinal stream.
   | "title_card_clip"
+  // Bare hyperlinked timestamp line sitting in the MIDDLE of the prose with
+  // no blue-bold heading above it. The doc author wants the YouTube window
+  // to play as forced footage while the narration of the FOLLOWING paragraph
+  // runs underneath — no title card is shown. paragraphIndex points at that
+  // following content paragraph; the matcher anchors the clip to the start
+  // of its spoken audio. The timestamp text itself is NOT added to the
+  // transcript (it's an instruction, not narration).
+  | "inline_clip"
   | "lower_third"
   // Standalone OVERALL-VIDEO title rendered as a 5s black title-card
   // BEFORE the intro clips play. Set when the doc starts with a blue-bold
@@ -75,6 +87,9 @@ export interface ParsedScript {
   // original audio. Multiple intros = multiple clips concatenated as the
   // pre-roll, in doc order.
   introCards: ScriptMarker[];
+  // title_card, title_card_clip AND inline_clip markers, in doc order —
+  // they share one ordinal counter so the matcher can reconstruct their
+  // relative positions.
   titleCards: ScriptMarker[];
   lowerThirds: ScriptMarker[];
   // Optional standalone overall-video title. Set when the doc starts with
@@ -386,6 +401,33 @@ export function parseScriptDoc(doc: GoogleDocsDocument): ParsedScript {
       continue;
     }
     const p = rawParagraphs[i];
+
+    // Inline forced clip: a bare hyperlinked timestamp line in the middle
+    // of the prose with NO blue-bold heading above it. (A timestamp that
+    // belongs to a title card never reaches this branch — the title branch
+    // below consumes its stacked timestamp lines via `i = k`.) The clip
+    // plays as forced footage anchored to the start of the next paragraph's
+    // narration; no card is rendered. Consuming the line here also keeps
+    // the timestamp text OUT of the transcript — previously it leaked in as
+    // prose and the matcher built a bogus footage block whose script text
+    // was a fragment of the timestamp (e.g. "46").
+    const inlineBare = bareTimestampInfo(p);
+    if (inlineBare) {
+      titleCards.push({
+        kind: "inline_clip",
+        text: "",
+        youtubeUrl: inlineBare.url,
+        startSeconds: inlineBare.range.start,
+        endSeconds: inlineBare.range.end,
+        // Index of the first content paragraph BELOW the timestamp — the
+        // one whose narration the clip plays over. Consecutive stacked
+        // timestamp lines share this index and play back-to-back.
+        paragraphIndex: contentParagraphCount,
+        ordinal: titleOrdinal++,
+      });
+      i++;
+      continue;
+    }
 
     // Title card detection: blue-bold paragraph followed (after blanks) by
     // ONE OR MORE consecutive bare-timestamp lines. The first timestamp

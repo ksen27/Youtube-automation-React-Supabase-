@@ -1309,6 +1309,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               // starts under leftover intro footage and every block after
               // it lags the narration. Probe and re-pin to `dur` so the
               // file matches what we account for.
+              //
+              // The excess sits at the HEAD, not the tail: cutClip's copy
+              // seek starts at the keyframe at or before the marker start,
+              // so the requested window is the LAST `dur` seconds of the
+              // stored file. Trim the head excess and keep the tail — a
+              // tail trim keeps pre-marker footage and plays it under the
+              // (exactly-cut) intro audio, several seconds out of sync.
               let introClipPath = localClip;
               try {
                 const probed = await probeFile(localClip);
@@ -1318,6 +1325,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                   await normalizeClip({
                     inputPath: localClip, outputPath: pinned,
                     width: 1280, height: 720, fps: 30,
+                    startOffsetSeconds: overshoot,
                     pinDurationSeconds: dur,
                   });
                   await safeUnlink(localClip);
@@ -1327,6 +1335,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                       ordinal: row.ordinal,
                       storedDuration: Math.round(probed.durationSeconds * 100) / 100,
                       pinnedDuration: dur,
+                      headTrimSeconds: Math.round(overshoot * 100) / 100,
                     });
                 }
               } catch (e) {
@@ -1361,13 +1370,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               startSeconds: start, durationSeconds: dur,
             });
             const normalizedCard = path.join(introTmp, `norm_${row.ordinal}.mp4`);
+            // Pin to the requested window. cutClip stream-copies, so the cut
+            // starts at the keyframe at or before `start` — the wanted
+            // window is the TAIL of the trimmed file, behind up to a GOP of
+            // earlier footage. Probe the cut and skip that head excess, then
+            // cap at `dur`, so the output matches the separately-cut intro
+            // audio frame-accurately.
+            let cardHeadTrim = 0;
+            try {
+              const trimmedProbe = await probeFile(trimmed);
+              cardHeadTrim = Math.max(0, trimmedProbe.durationSeconds - dur);
+            } catch { /* pin-only fallback below */ }
             await normalizeClip({
               inputPath: trimmed, outputPath: normalizedCard,
               width: 1280, height: 720, fps: 30,
-              // Pin to the requested window. cutClip stream-copies and rounds
-              // up to the next keyframe, so an 8s intro card overshoots to
-              // ~12s; pinning the normalize re-encode caps it back to exactly
-              // `dur` (matches what scene blocks already do via renderDur).
+              startOffsetSeconds: cardHeadTrim > 0 ? cardHeadTrim : undefined,
               pinDurationSeconds: dur,
             });
             builtVideos.push(normalizedCard);

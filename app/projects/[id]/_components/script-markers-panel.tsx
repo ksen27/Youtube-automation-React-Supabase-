@@ -13,7 +13,7 @@ import { Button } from "@/components/ui/button";
 
 export interface ScriptMarker {
   id: string;
-  kind: "intro_card" | "title_card" | "title_card_clip" | "lower_third";
+  kind: "intro_card" | "title_card" | "title_card_clip" | "inline_clip" | "lower_third";
   text: string;
   ordinal: number;
   paragraph_index: number | null;
@@ -121,7 +121,10 @@ export function ScriptMarkersPanel({ projectId }: { projectId: string }) {
     return {
       intro: markers.filter((m) => m.kind === "intro_card"),
       titleCards: markers.filter(
-        (m) => m.kind === "title_card" || m.kind === "title_card_clip",
+        (m) =>
+          m.kind === "title_card"
+          || m.kind === "title_card_clip"
+          || m.kind === "inline_clip",
       ),
       lowerThirds: markers.filter((m) => m.kind === "lower_third"),
     };
@@ -189,7 +192,9 @@ export function ScriptMarkersPanel({ projectId }: { projectId: string }) {
                 label={
                   m.kind === "title_card"
                     ? m.text || "(no title text)"
-                    : `↳ extra clip ${m.ordinal}`
+                    : m.kind === "inline_clip"
+                      ? "Inline clip (no title)"
+                      : `↳ extra clip ${m.ordinal}`
                 }
                 detail={fmtRange(m.start_seconds, m.end_seconds)}
                 marker={m}

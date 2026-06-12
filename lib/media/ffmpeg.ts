@@ -975,6 +975,16 @@ export interface NormalizeOptions {
   // copy-cut's over-included GOP. Leave undefined for image/title builders;
   // they're CFR-clean from frame 0 and need no pin.
   pinDurationSeconds?: number;
+  // Skip this many seconds at the head of the input before encoding.
+  // cutClip's input-side -ss with -c:v copy starts the cut at the nearest
+  // keyframe AT OR BEFORE the requested start, so the requested window sits
+  // at the TAIL of the cut file with up to a whole GOP of earlier footage in
+  // front of it. Callers that need the window frame-accurate (doc-marker
+  // clips, whose separately-cut audio is exact) probe the cut file and pass
+  // the excess (probed − requested) here; the seek decodes-and-discards, so
+  // it is frame-accurate, and combined with pinDurationSeconds the output is
+  // exactly the requested source window.
+  startOffsetSeconds?: number;
   signal?: AbortSignal;
 }
 
@@ -1176,6 +1186,11 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
+    // Input-side seek past the copy-cut's keyframe head excess. Accurate
+    // here (unlike in cutClip) because this pass decodes anyway.
+    ...(typeof opts.startOffsetSeconds === "number" && opts.startOffsetSeconds > 0
+      ? ["-ss", String(opts.startOffsetSeconds)]
+      : []),
     "-i", opts.inputPath,
     ...(opts.keepAudio ? ["-c:a", "aac"] : ["-an"]),
     "-vf", vf,

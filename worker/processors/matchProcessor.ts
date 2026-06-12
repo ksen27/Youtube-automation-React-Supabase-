@@ -5311,7 +5311,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .from("project_script_markers")
     .select("id, kind, text, ordinal, paragraph_index, char_offset, youtube_url, start_seconds, end_seconds")
     .eq("project_id", projectId)
-    .in("kind", ["title_card", "title_card_clip", "lower_third"])
+    .in("kind", ["title_card", "title_card_clip", "inline_clip", "lower_third"])
     .order("ordinal");
   if (allMarkerRows && allMarkerRows.length > 0) {
     // Lower-third → canonical visual override (per client spec).

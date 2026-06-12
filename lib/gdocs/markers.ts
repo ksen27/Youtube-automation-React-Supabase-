@@ -53,7 +53,13 @@ export interface ScriptMarkerRow {
   // to align them independently — there's no text to align). The matcher
   // appends them as forced-footage rows immediately after the title_card's
   // own forced-footage row, with no second card flash between them.
-  kind: "title_card" | "title_card_clip" | "lower_third";
+  //
+  // inline_clip rows are bare hyperlinked timestamp lines mid-doc with no
+  // blue-bold heading above them. They have no text to align either —
+  // they're anchored to the START of their paragraph_index's spoken audio
+  // (the paragraph directly below the timestamp in the doc) and inserted as
+  // cardless forced-footage rows.
+  kind: "title_card" | "title_card_clip" | "inline_clip" | "lower_third";
   text: string;
   ordinal: number;
   paragraph_index: number | null;
@@ -345,6 +351,11 @@ export interface ApplyMarkersResult {
   // parent title_card. Reported separately from titleCardsInserted so logs
   // can show how many doc-stacked clips actually got into the timeline.
   titleCardExtraClipsInserted: number;
+  // Cardless mid-doc clips (kind=inline_clip) that made it into the
+  // timeline as forced-footage rows, and ones that couldn't be anchored to
+  // their paragraph's spoken audio.
+  inlineClipsInserted: number;
+  inlineClipsSkipped: number;
   lowerThirdsApplied: number;
   lowerThirdsSkipped: number;
   // Forced YouTube clips that were trimmed because their requested duration
@@ -438,6 +449,8 @@ export function applyScriptMarkers(
     titleCardsInserted: 0,
     titleCardsSkipped: 0,
     titleCardExtraClipsInserted: 0,
+    inlineClipsInserted: 0,
+    inlineClipsSkipped: 0,
     lowerThirdsApplied: 0,
     lowerThirdsSkipped: 0,
     forcedClipTrimmings: [],
@@ -589,6 +602,24 @@ export function applyScriptMarkers(
     return bestWi;
   }
 
+  // Spoken-audio start of a content paragraph: the first Deepgram word
+  // whose mapped transcript offset is at-or-after the paragraph's starting
+  // offset. Used to anchor inline_clip markers, which carry no text to
+  // align — the doc puts the timestamp line ABOVE the paragraph it covers,
+  // so the clip starts exactly when the narrator begins that paragraph.
+  // Returns null when the paragraph is out of range or no word maps past
+  // its offset (e.g. a trailing paragraph Deepgram never matched).
+  function paragraphAudioStart(pIdx: number | null): number | null {
+    if (pIdx == null || pIdx < 0 || pIdx >= paragraphStart.length) return null;
+    const absOffset = paragraphStart[pIdx];
+    for (let wi = 0; wi < wordToTranscriptOffset.length; wi++) {
+      const off = wordToTranscriptOffset[wi];
+      if (off < 0) continue;
+      if (off >= absOffset) return wordsNN[wi].start;
+    }
+    return null;
+  }
+
   // Resolve each marker's spoken-time window by finding its text in the
   // Deepgram word stream.
   //
@@ -722,11 +753,14 @@ export function applyScriptMarkers(
   let cursorSectionOrdinal = -1;
   const debugRows: Array<Record<string, unknown>> = [];
   for (const m of ordered) {
-    if (m.kind === "title_card_clip") {
+    // title_card_clip rows anchor via their parent title_card; inline_clip
+    // rows anchor via paragraphAudioStart at group-build time. Neither has
+    // text to phrase-search here.
+    if (m.kind === "title_card_clip" || m.kind === "inline_clip") {
       resolved.push({ marker: m, t: null, tEnd: null });
       debugRows.push({
         ord: m.ordinal, kind: m.kind, pIdx: m.paragraph_index,
-        text: m.text.slice(0, 40), skipped: "title_card_clip",
+        text: m.text.slice(0, 40), skipped: m.kind,
       });
       continue;
     }
@@ -969,10 +1003,60 @@ export function applyScriptMarkers(
     // that must NOT be deleted. Always true for clip-bearing cards (their
     // grouping requires r.t != null upstream).
     spokenAnchor: boolean;
+    // Cardless group (kind=inline_clip): forced footage only, NO title-card
+    // row is inserted and no typewriter audio share is claimed. parentT is
+    // the start of the anchor paragraph's narration; typewriterDuration and
+    // parentDuration are both 0.
+    cardless: boolean;
   }
   const groups: TitleCardGroup[] = [];
   for (let g = 0; g < orderedResolutions.length; g++) {
     const r = orderedResolutions[g];
+    // INLINE CLIP path: a bare hyperlinked timestamp mid-doc. No card, no
+    // text to align — anchor to the start of its paragraph's spoken audio
+    // (the paragraph directly below the timestamp line in the doc) and
+    // play the forced window over that narration. Consecutive timestamp
+    // lines stacked above the SAME paragraph share one group and play
+    // back-to-back.
+    if (r.marker.kind === "inline_clip") {
+      const anchorT = paragraphAudioStart(r.marker.paragraph_index);
+      if (anchorT == null || !r.marker.youtube_url) {
+        result.inlineClipsSkipped++;
+        continue;
+      }
+      const extras: ScriptMarkerRow[] = [];
+      let h = g + 1;
+      while (h < orderedResolutions.length) {
+        const sib = orderedResolutions[h];
+        // lower_third markers use an independent ordinal counter and can
+        // interleave — skip without ending the stack walk.
+        if (sib.marker.kind === "lower_third") { h++; continue; }
+        if (
+          sib.marker.kind === "inline_clip"
+          && sib.marker.paragraph_index === r.marker.paragraph_index
+          && sib.marker.youtube_url
+        ) {
+          extras.push(sib.marker);
+          h++;
+          continue;
+        }
+        break;
+      }
+      groups.push({
+        parent: r.marker,
+        parentT: anchorT,
+        // No card: nothing types in and no audio share is claimed beyond
+        // what the forced rows themselves hold.
+        parentDuration: 0,
+        typewriterDuration: 0,
+        extras,
+        clipless: false,
+        spokenAnchor: false,
+        cardless: true,
+      });
+      g = h - 1;
+      continue;
+    }
     if (r.marker.kind !== "title_card") continue;
     // CLIPLESS TITLE CARD path. A blue-bold heading with NO force clip
     // (youtube_url == null) is a standalone typed title card: it must appear
@@ -1029,6 +1113,7 @@ export function applyScriptMarkers(
         extras: [],
         clipless: true,
         spokenAnchor: cliplessSpoken,
+        cardless: false,
       });
       continue;
     }
@@ -1094,6 +1179,7 @@ export function applyScriptMarkers(
       // claims its typewriter audio share exactly as before.
       clipless: false,
       spokenAnchor: true,
+      cardless: false,
     });
     // Skip the absorbed siblings so the outer loop doesn't re-process them
     // (the inner `if (r.marker.kind !== "title_card") continue;` would
@@ -1125,7 +1211,11 @@ export function applyScriptMarkers(
   for (const group of groupsByTimeDesc) {
     const currentStarts = computeStarts(items);
     const k = findItemIndexAtTime(currentStarts, items, group.parentT);
-    if (k < 0) { result.titleCardsSkipped++; continue; }
+    if (k < 0) {
+      if (group.cardless) result.inlineClipsSkipped += 1 + group.extras.length;
+      else result.titleCardsSkipped++;
+      continue;
+    }
 
     // How much audio narration sits between this title's audio-end and the
     // NEXT title's start. Forced YouTube clips must collectively play for
@@ -1307,7 +1397,12 @@ export function applyScriptMarkers(
     // calling forcedFootageFromMarker on it would synthesize a bogus 6s clip
     // (end = start + 6 fallback) — guard against that by skipping it
     // entirely. A clipless card also never has extras (no sibling clips).
-    const rows: TimelineItemDraft[] = [titleCardRow];
+    //
+    // CARDLESS group (inline_clip): the inverse — forced footage ONLY, no
+    // title-card row. audioWindowEnd == parentT (typewriterDuration is 0)
+    // so the forced rows' voiceover windows start right at the anchor
+    // paragraph's first spoken word.
+    const rows: TimelineItemDraft[] = group.cardless ? [] : [titleCardRow];
     if (!group.clipless) {
       const parentForced = forcedFootageFromMarker(group.parent, forcedVoCursor);
       forcedVoCursor += Number(parentForced.duration);
@@ -1406,8 +1501,13 @@ export function applyScriptMarkers(
     // appear at exactly the right narration beat, with the surrounding
     // script items unchanged on either side of it.
     items.splice(k, 0, ...rows);
-    result.titleCardsInserted++;
-    result.titleCardExtraClipsInserted += group.extras.length;
+    if (group.cardless) {
+      // Every row in a cardless group is a forced-footage clip.
+      result.inlineClipsInserted += rows.length;
+    } else {
+      result.titleCardsInserted++;
+      result.titleCardExtraClipsInserted += group.extras.length;
+    }
     if (forcedClipTrimmings.length > 0) {
       result.forcedClipTrimmings.push(...forcedClipTrimmings);
     }
@@ -1444,8 +1544,10 @@ export function applyScriptMarkers(
     // (audioWindowEnd = parentT + typewriterDuration), the dedup target
     // is the simple sum of (title card audio share) + (forced clip durs).
     const titleCardAudioShare = audioWindowEnd - group.parentT; // == typewriterDuration
+    // Filter by type rather than slicing past the card: cardless groups
+    // have no title-card row, so rows[0] is already forced footage.
     const forcedClipsDuration = rows
-      .slice(1)
+      .filter((r) => r.type === "footage")
       .reduce((s, r) => s + Number(r.duration ?? 0), 0);
     const insertedDuration = titleCardAudioShare + forcedClipsDuration;
     let absorbedDuration = 0;
@@ -1551,7 +1653,9 @@ export function applyScriptMarkers(
       // to shift the rescue window by TITLE_CARD_HOLD_TAIL (0.8s),
       // dropping lower-thirds whose spoken word fell in that 0.8s gap.
       let cursor = audioWindowEnd;
-      for (let r = 1; r < rows.length; r++) {
+      // Start at 0, not 1: cardless groups have no title-card row at index
+      // 0. The type check below skips the card when one is present.
+      for (let r = 0; r < rows.length; r++) {
         const fr = rows[r];
         if (fr.type !== "footage") continue;
         const dur = Number(fr.duration ?? 0);
