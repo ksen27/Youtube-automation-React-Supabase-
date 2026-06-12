@@ -27,7 +27,7 @@ import {
   getVerifyOutageStats,
 } from "@/lib/ai/pool-verification";
 import { verifyImageMatchesScript } from "@/lib/ai/verify";
-import { lookupReference } from "@/lib/ai/face-references";
+import { lookupReference, upsertReference } from "@/lib/ai/face-references";
 import { splitTranscriptIntoSentences } from "@/lib/ai/sentences";
 import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
 import { buildEnrichmentLookup } from "@/lib/ai/gemini-enrichment";
@@ -2771,7 +2771,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // precision when the script genuinely calls it out.
   const refUrlSet = new Set<string>();      // URLs claimed by reference pass
   let refImagesAssigned = 0;
+  // GENUINE failures only: the block had references/entities, the search +
+  // verify pipeline ran, and no candidate survived.
   let refImagesFailed = 0;
+  // BY-DESIGN person fallbacks: celebrity_default blocks skip the reference
+  // search entirely per the closed-world spec ("abstract narration → show the
+  // project celebrity"). Counted separately so this log line stops reading
+  // like a mass failure when most blocks are simply abstract narration.
+  let refImagesShortCircuited = 0;
 
   // Lowercase tokens that indicate "fetch a logo, not a photo" — feeds the
   // existing fetchImages imgType plumbing.
@@ -3121,18 +3128,98 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     return 0;
   }
 
+  // Resolve the NAME a person can actually be face-VERIFIED under. The pool
+  // verifier looks up face_references by entity_name; block subjects are
+  // often bare ("Catherine") and disambiguatePersonName produces a
+  // search-qualified phrase ("Catherine British royal family") — but the
+  // roster row from analyze was created under the script's full proper noun
+  // ("Catherine, Princess of Wales"). That exact-string mismatch made every
+  // secondary person UNVERIFIABLE: lookupReference missed, all their fetched
+  // candidates came back "skipped", requireConfirmed rejected them, and the
+  // pool was cached EMPTY — so Catherine/Camilla blocks all fell back to the
+  // main celebrity. Resolution order:
+  //   1. the disambiguated name   (exact roster hit)
+  //   2. the raw name             (roster row under the bare form)
+  //   3. roster prefix match      ("Catherine" → "Catherine, Princess of Wales")
+  //   4. lazily CREATE a roster row for the disambiguated name (Wikipedia
+  //      fetch + is-a-person guard) so even people the analyze-time roster
+  //      missed become verifiable.
+  // Returns the name used for BOTH search queries and verification. When
+  // nothing resolves, returns the disambiguated name — verification then
+  // "skips" and strict mode rejects, exactly the old behaviour.
+  const personVerifyNameCache = new Map<string, string>();
+  async function resolvePersonVerifyName(rawPersonName: string): Promise<string> {
+    const raw = rawPersonName.trim();
+    const cacheKey = raw.toLowerCase();
+    const hit = personVerifyNameCache.get(cacheKey);
+    if (hit) return hit;
+    const disambiguated = disambiguatePersonName(raw);
+    const bare = isBareFirstName(raw);
+    let resolved: string | null = null;
+    // Exact candidates. For a BARE first name we deliberately do NOT accept
+    // an exact roster row under the bare name itself here — bare-name rows
+    // are the known-poisoned class: Wikipedia resolves a bare given name to
+    // its "given name" article, whose infobox photo is a FAMOUS NAMESAKE
+    // (the Katherine-Heigl-as-"Catherine" bug), and the is-a-person guard
+    // can't catch that because the namesake IS a person. The bare row stays
+    // reachable below as a prefix match — but only when no longer, more
+    // specific roster name exists for the same first name.
+    for (const cand of bare ? [disambiguated] : [disambiguated, raw]) {
+      if (await lookupReference(projectId, "person", cand)) { resolved = cand; break; }
+    }
+    if (!resolved) {
+      // Prefix match against the project roster, preferring the LONGEST
+      // entity_name — "Catherine" → "Catherine, Princess of Wales" wins over
+      // a bare (possibly poisoned) "Catherine" row. Project-scoped, so a
+      // bare first name resolving to the wrong namesake would require TWO
+      // people with the same first name in one script — acceptable residual
+      // risk.
+      const prefix = raw.replace(/[%_]/g, "");
+      if (prefix) {
+        const { data } = await sb
+          .from("face_references")
+          .select("entity_name")
+          .eq("project_id", projectId)
+          .eq("entity_type", "person")
+          .ilike("entity_name", `${prefix}%`)
+          .not("reference_url", "is", null)
+          .limit(10);
+        const rows = (data ?? []) as Array<{ entity_name: string }>;
+        if (rows.length > 0) {
+          rows.sort((a, b) => b.entity_name.length - a.entity_name.length);
+          resolved = rows[0].entity_name;
+        }
+      }
+    }
+    if (!resolved) {
+      try {
+        const row = await upsertReference(projectId, { type: "person", name: disambiguated });
+        if (row.reference_url) resolved = disambiguated;
+      } catch {
+        // Lazy roster build failed (Wikipedia miss / DB blip) — verification
+        // will skip for this person, same as before this resolver existed.
+      }
+    }
+    const finalName = resolved ?? disambiguated;
+    personVerifyNameCache.set(cacheKey, finalName);
+    void logJob({ projectId, jobId: mediaJobId }, "match.person_ref_resolved", {
+      raw, disambiguated, resolved: finalName, referenceFound: resolved !== null,
+    });
+    return finalName;
+  }
+
   async function buildPersonPhotoCache(
     rawPersonName: string,
     sizeOverride?: number,
   ): Promise<PersonPhotoCacheEntry[]> {
     // Cache key stays on the ORIGINAL name (callers pass the bare subject), but
-    // every search query AND the face-verify reference below use the
-    // disambiguated name so a bare first name ("Catherine") can't pull/confirm
-    // the wrong namesake (the actress). Project-wide fix — see
-    // disambiguatePersonName.
+    // every search query AND the face-verify reference below use the RESOLVED
+    // name: disambiguated so a bare first name ("Catherine") can't pull/confirm
+    // the wrong namesake (the actress), and roster-resolved so verification
+    // finds the person's reference photo — see resolvePersonVerifyName.
     const cached = personPhotoCache.get(rawPersonName.toLowerCase());
     if (cached) return cached;
-    const personName = disambiguatePersonName(rawPersonName);
+    const personName = await resolvePersonVerifyName(rawPersonName);
     // Caller-provided size override (used by secondary-person path to
     // scale by maxRun); falls back to the main-celebrity target.
     const target = sizeOverride ?? personPhotoTarget;
@@ -3443,7 +3530,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       void logJob({ projectId, jobId: mediaJobId }, "match.image_block_celebrity_default", {
         blockIndex: blockIdx, name: blockEntity.name || mainCelebrity || null,
       });
-      refImagesFailed++;
+      refImagesShortCircuited++;
       const personPick = await tryPersonImageFallback(blockIdx);
       if (personPick) {
         refUrlSet.add(personPick.url);
@@ -3569,13 +3656,20 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       //   - cache build returned 0 verified photos
       //   - all cache photos already consumed by refUrlSet (rare)
       try {
-        const ref = await lookupReference(projectId, "person", resolvedSubject);
+        // Resolve the roster name FIRST — looking up the bare subject
+        // ("Catherine") directly is how a poisoned bare-name reference row
+        // (the Wikipedia given-name article whose photo is Katherine Heigl,
+        // not the princess) shipped straight into approved blocks stamped
+        // image_verified:"yes". The resolver prefers the longest, most
+        // specific roster row ("Catherine, Princess of Wales").
+        const refName = await resolvePersonVerifyName(resolvedSubject);
+        const ref = await lookupReference(projectId, "person", refName);
         if (ref?.reference_url) {
           item.image_url = ref.reference_url;
           item.image_source = "wikipedia";
-          item.image_query = `face_reference:${resolvedSubject}`;
+          item.image_query = `face_reference:${refName}`;
           const meta = (item.metadata ?? {}) as Record<string, unknown>;
-          meta.image_query_used = `face_reference:${resolvedSubject}`;
+          meta.image_query_used = `face_reference:${refName}`;
           meta.image_source_url = ref.reference_url;
           meta.image_source_provider = "wikipedia";
           meta.image_entity = resolvedSubject;
@@ -3704,7 +3798,14 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // common nouns like "transcript", "announcement", "private"
         // which produce pages of nonsensical Gemini verify rejections
         // (`entity_type: "company", entity_name: "transcript"`).
-        const verifyName = celebOnly ? mainCelebrity! : (blockEntity?.name || refs[0] || ents[0] || "").trim();
+        const rawVerifyName = celebOnly ? mainCelebrity! : (blockEntity?.name || refs[0] || ents[0] || "").trim();
+        // For PEOPLE, resolve to the roster name the reference photo is
+        // actually filed under. Block entities are often bare first names
+        // ("Catherine"); verifying against the bare-name row risks the
+        // poisoned given-name reference (see resolvePersonVerifyName).
+        const verifyName = verifyType === "person" && rawVerifyName
+          ? await resolvePersonVerifyName(rawVerifyName)
+          : rawVerifyName;
         // Take the first non-duplicate, verification-passing image. The
         // verification call runs inside the find predicate so we stop at
         // the first acceptable URL instead of paying for every candidate
@@ -3921,6 +4022,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   await logJob({ projectId, jobId: mediaJobId }, "match.image_ref", {
     refImagesAssigned,
     refImagesFailed,
+    refImagesShortCircuited,
     refBlocksWithHints: blockSpecificRefs.filter((r) => r.length > 0).length,
     personFallbackCount,
   });

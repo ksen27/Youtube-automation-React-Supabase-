@@ -24,6 +24,13 @@ import {
 // visible chip instead of one that slides in as the clip cuts away.
 const MIN_LT_VISIBLE_SECONDS = 1.0;
 
+// Max seconds a pre-downloaded intro-card clip may exceed its marker window
+// before the renderer re-pins it. Assets cut before the pinDurationSeconds
+// fix in scriptClipProcessor were keyframe-cut and overshoot by whole
+// seconds; post-fix assets land within frame-rounding of the window, so a
+// quarter second cleanly splits "stale asset" from "fine, skip the re-encode".
+const INTRO_CARD_PIN_TOLERANCE_SECONDS = 0.25;
+
 // Compute the in-clip offset (seconds) at which a lower-third chyron should
 // begin its slide-in, so it appears exactly when the narrator says the
 // red-marked word rather than at the host clip's start. Returns 0 (chip at
@@ -99,6 +106,46 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     await sb.from("render_jobs").update({ status: "failed", error: "no renderable timeline items" }).eq("id", renderJobId);
     await setProjectStatus(projectId, "failed");
     throw new Error("no renderable timeline items");
+  }
+
+  // Planned render durations, floored at 0.5s with neighbor repayment.
+  // Fades/xfades need at least ~0.5s of frames, so sub-0.5s narration blocks
+  // must render longer than their audio interval — but flooring each block
+  // independently never gives the borrowed time back, so every floored block
+  // pushes all later visuals 100–200ms further behind the voiceover. Across a
+  // 40-minute timeline that compounded to ~2.3s of lag at the end (the
+  // 2026-06-12 driftMs 2339 post_validation failure). Here the floor's
+  // overshoot becomes a debt repaid by trimming the next blocks that have
+  // headroom, capped per block so a run of tiny blocks can't gut one
+  // neighbor, keeping cumulative video time pinned to the voiceover.
+  const FLOOR_SECONDS = 0.5;
+  const REPAY_MAX_PER_BLOCK_SECONDS = 0.3;
+  const plannedDurations: number[] = new Array(renderable.length).fill(FLOOR_SECONDS);
+  {
+    let floorDebt = 0;
+    let flooredBlocks = 0;
+    let totalFloorAdded = 0;
+    for (let i = 0; i < renderable.length; i++) {
+      let d = Number(renderable[i].duration) || 0;
+      if (d < FLOOR_SECONDS) {
+        floorDebt += FLOOR_SECONDS - d;
+        totalFloorAdded += FLOOR_SECONDS - d;
+        flooredBlocks++;
+        d = FLOOR_SECONDS;
+      } else if (floorDebt > 0) {
+        const repay = Math.min(floorDebt, d - FLOOR_SECONDS, REPAY_MAX_PER_BLOCK_SECONDS);
+        d -= repay;
+        floorDebt -= repay;
+      }
+      plannedDurations[i] = d;
+    }
+    if (flooredBlocks > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "render.duration_floor", {
+        flooredBlocks,
+        totalFloorAddedMs: Math.round(totalFloorAdded * 1000),
+        unrepaidMs: Math.round(floorDebt * 1000),
+      });
+    }
   }
 
   // Diagnostic: count how many renderable items carry a lower_third overlay
@@ -268,7 +315,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         signature: {
           image_url: it.image_url ?? null,
           clip_id: (it as Record<string, unknown>).clip_id ?? null,
-          duration: it.duration ?? null,
+          // The repayment-adjusted duration, not the raw row value — a block
+          // trimmed to repay floor debt must not hit a cache entry rendered
+          // at its untrimmed length.
+          duration: plannedDurations[i],
           metadata: it.metadata ?? null,
         },
       });
@@ -305,7 +355,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
 
     async function renderItem(i: number, out: string): Promise<void> {
       const it = renderable[i];
-      const plannedDur = Math.max(0.5, Number(it.duration) || 0);
+      const plannedDur = plannedDurations[i];
       const idx = String(i).padStart(3, "0");
 
       if (it.type === "split_2") {
@@ -838,7 +888,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         if (slots[i] !== null) continue;
         const it = renderable[i];
         if (it.type === "intro") continue;
-        const plannedDur = Math.max(0.5, Number(it.duration) || 0);
+        const plannedDur = plannedDurations[i];
         const out = path.join(tmp, `filler_${String(i).padStart(3, "0")}.mp4`);
         try {
           await buildBlackVideo({
@@ -1253,7 +1303,39 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                 downloadHttp(preClipUrl, localClip),
                 downloadHttp(preAudioUrl, localAudio),
               ]);
-              builtVideos.push(localClip);
+              // Assets pre-downloaded before the pin fix were keyframe-cut
+              // and can run seconds past the marker window, while
+              // accumulatedDuration only counts `dur` — the voiceover then
+              // starts under leftover intro footage and every block after
+              // it lags the narration. Probe and re-pin to `dur` so the
+              // file matches what we account for.
+              let introClipPath = localClip;
+              try {
+                const probed = await probeFile(localClip);
+                const overshoot = probed.durationSeconds - dur;
+                if (overshoot > INTRO_CARD_PIN_TOLERANCE_SECONDS) {
+                  const pinned = path.join(introTmp, `pre_card_${row.ordinal}_pinned.mp4`);
+                  await normalizeClip({
+                    inputPath: localClip, outputPath: pinned,
+                    width: 1280, height: 720, fps: 30,
+                    pinDurationSeconds: dur,
+                  });
+                  await safeUnlink(localClip);
+                  introClipPath = pinned;
+                  await logJob({ projectId, jobId: mediaJobId },
+                    "render.intro_card.repinned", {
+                      ordinal: row.ordinal,
+                      storedDuration: Math.round(probed.durationSeconds * 100) / 100,
+                      pinnedDuration: dur,
+                    });
+                }
+              } catch (e) {
+                await logJob({ projectId, jobId: mediaJobId },
+                  "render.intro_card.pin_check_failed", {
+                    ordinal: row.ordinal, err: (e as Error).message,
+                  });
+              }
+              builtVideos.push(introClipPath);
               builtAudios.push(localAudio);
               accumulatedDuration += dur;
               continue;
