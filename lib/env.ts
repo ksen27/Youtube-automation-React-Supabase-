@@ -191,15 +191,16 @@ const ServerEnvSchema = z.object({
   // backfill (cut exactly the target, no reserve — the old behaviour).
   CLIP_BACKFILL_BUFFER_FACTOR: z.coerce.number().nonnegative().default(0.5),
   // Hard ceiling on the candidate-window pool, expressed as a multiple of the
-  // per-source survivor target (`cappedCount`). The backfill reserve
-  // (CLIP_BACKFILL_BUFFER_FACTOR) sizes the pool proportionally, but on a
-  // long source that proportional reserve — and the old "use the whole
-  // source" behaviour — generated hundreds of candidate windows, each costing
-  // an ffmpeg cut + up to 4 Gemini Vision calls. That made the clip step
-  // crawl and showed a huge "totalClips" on the job. This factor caps the
-  // pool at `cappedCount × CLIP_MAX_POOL_FACTOR` so even a heavy-drop source
-  // attempts at most this many windows per target clip. Default 3 = attempt
-  // up to 3× the target before giving up (absorbs a ~66% drop rate).
+  // per-source survivor target (`cappedCount`). The clip processor first cuts
+  // the proportional reserve pool (CLIP_BACKFILL_BUFFER_FACTOR, ~1.5× the
+  // target); only when that pool exhausts with the target unmet does it
+  // ESCALATE — generating a second batch of windows up to
+  // `cappedCount × CLIP_MAX_POOL_FACTOR` total attempts. Default 3 = a
+  // heavy-drop source attempts up to 3× the target before giving up (absorbs
+  // a ~66% drop rate), while clean sources early-stop at the target and never
+  // pay for the escalation. The ceiling exists because each window costs an
+  // ffmpeg cut + up to 4 Gemini Vision calls — the old "use the whole source"
+  // behaviour ground through hundreds of windows on long sources.
   CLIP_MAX_POOL_FACTOR: z.coerce.number().positive().default(3),
   // Lower bound on the project clip cap — prevents under-clipping for very
   // short voiceovers or when voiceover duration isn't known yet.

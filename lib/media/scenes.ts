@@ -28,7 +28,35 @@ import { getEnv } from "@/lib/env";
 export interface DetectScenesOptions {
   inputPath: string;
   threshold?: number;          // default 0.35
+  // Source runtime in seconds, when the caller knows it. Used to scale the
+  // scene-detect timeout — see sceneDetectTimeoutSeconds. Omitted → the flat
+  // SCENE_DETECT_TIMEOUT_SECONDS applies.
+  durationSeconds?: number;
   signal?: AbortSignal;
+}
+
+// Scene-detect wall-time budget. The flat SCENE_DETECT_TIMEOUT_SECONDS
+// (default 90s) is sized for ~10-minute sources; with the full-source scan
+// (SCENE_DETECT_MAX_INPUT_SECONDS=0) every 30-minute source blew through it
+// on shared-CPU hosts, so long sources NEVER got scene-boundary cuts — they
+// always fell back to blind uniform sampling, which lands mid-overlay on
+// news-style footage and tanks the clean-gate survival rate.
+//
+// Scale with runtime instead: assume the 320p downscaled decode runs at
+// worst ~8× realtime on a busy shared host, plus a flat startup buffer.
+// The env value stays as the FLOOR (short sources keep failing fast), and a
+// hard cap keeps a pathological source from stalling the clip job — the
+// uniform fallback is still a fine outcome.
+const SCENE_DETECT_ASSUMED_DECODE_SPEED = 8;   // × realtime, worst case at 320p
+const SCENE_DETECT_STARTUP_BUFFER_SECONDS = 30;
+const SCENE_DETECT_TIMEOUT_CAP_SECONDS = 360;
+
+export function sceneDetectTimeoutSeconds(durationSeconds?: number): number {
+  const floor = getEnv().SCENE_DETECT_TIMEOUT_SECONDS;
+  if (!durationSeconds || durationSeconds <= 0) return floor;
+  const scaled = Math.ceil(durationSeconds / SCENE_DETECT_ASSUMED_DECODE_SPEED)
+    + SCENE_DETECT_STARTUP_BUFFER_SECONDS;
+  return Math.min(SCENE_DETECT_TIMEOUT_CAP_SECONDS, Math.max(floor, scaled));
 }
 
 export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<number[]> {
@@ -59,7 +87,12 @@ export async function detectSceneTimestamps(opts: DetectScenesOptions): Promise<
     "-",
   ];
 
-  const stderr = await runCapturingStderr(env.FFMPEG_PATH, args, opts.signal);
+  const stderr = await runCapturingStderr(
+    env.FFMPEG_PATH,
+    args,
+    sceneDetectTimeoutSeconds(opts.durationSeconds),
+    opts.signal,
+  );
   return parsePtsTimes(stderr);
 }
 
@@ -80,13 +113,12 @@ export function parsePtsTimes(stderr: string): number[] {
   return Array.from(new Set(out)).sort((a, b) => a - b);
 }
 
-function runCapturingStderr(bin: string, args: string[], signal?: AbortSignal): Promise<string> {
-  // Use a dedicated, shorter timeout for scene-detect rather than the global
-  // FFMPEG_TIMEOUT_SECONDS. Scene-detect failing means we fall back to
-  // uniform sampling — a perfectly fine outcome that costs nothing to retry.
-  // The longer ffmpeg timeout exists for clip cuts and the final concat,
-  // where a timeout means a real failure.
-  const timeoutSeconds = getEnv().SCENE_DETECT_TIMEOUT_SECONDS;
+function runCapturingStderr(bin: string, args: string[], timeoutSeconds: number, signal?: AbortSignal): Promise<string> {
+  // Dedicated, duration-scaled timeout for scene-detect rather than the
+  // global FFMPEG_TIMEOUT_SECONDS — see sceneDetectTimeoutSeconds. Scene-
+  // detect failing means we fall back to uniform sampling, a usable (if
+  // worse) outcome; the longer ffmpeg timeout exists for clip cuts and the
+  // final concat, where a timeout means a real failure.
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";

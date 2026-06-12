@@ -233,6 +233,12 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // early-stop at `succeeded >= cappedCount`, so clean sources never cut the
   // full reserve) but stops a long source from exploding into hundreds of
   // candidate windows.
+  //
+  // When this initial pool exhausts with the target still unmet (a heavy-drop
+  // source), the ESCALATION BACKFILL below the lane loop widens once more —
+  // a second batch of windows up to CLIP_MAX_POOL_FACTOR × cappedCount — so
+  // a high dirty-rate source still gets a fair number of attempts without
+  // unbounding the pool.
   const reserveTarget = Math.max(
     cappedCount + 2,
     Math.ceil(cappedCount * (1 + env.CLIP_BACKFILL_BUFFER_FACTOR)),
@@ -351,7 +357,10 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   let timestampSource: "scene_detect" | "uniform" | "scene_detect_then_uniform" = "uniform";
   let sceneCount = 0;
   try {
-    const scenes = await detectSceneTimestamps({ inputPath: sourceLocal });
+    const scenes = await detectSceneTimestamps({
+      inputPath: sourceLocal,
+      durationSeconds: vs.duration_seconds,
+    });
     sceneCount = scenes.length;
     // Generate `poolCount` (target + reserve) candidate windows, not just the
     // target — the surplus is the backfill reserve consumed below when clips
@@ -741,6 +750,11 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
             "clip.frame_check.done", {
               start, frames: frameReasons.join(","),
               clean: cleanVerdicts.join(","), face: faceVerdicts.join(","),
+              // WHAT Gemini saw on each dirty frame (e.g. "lower-third name
+              // strip", "burned-in caption"). Without this, a high dirty-drop
+              // source is undiagnosable from logs — the frames themselves are
+              // deleted on drop.
+              artifacts: cleanArtifacts.map((a) => a || "-"),
             });
         } catch (e) {
           void logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
@@ -835,7 +849,7 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   // reserve, so a clean source doesn't over-produce.
   const concurrency = Math.max(1, Math.min(env.CLIP_PIPELINE_CONCURRENCY, windows.length));
   let cursor = 0;
-  await Promise.all(
+  const runLanes = () => Promise.all(
     Array.from({ length: concurrency }, async () => {
       while (true) {
         // Stop pulling new windows once the surviving-clip target is met.
@@ -848,6 +862,66 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
       }
     }),
   );
+  await runLanes();
+
+  // ---- ESCALATION BACKFILL -----------------------------------------------
+  // The initial pool is sized for a normal drop rate (reserve ≈ +50%). On
+  // heavy-drop sources — news-style footage where most frames carry burned-in
+  // lower-thirds / captions — that pool exhausts long before the target
+  // survives, even though the source physically holds hundreds of untried
+  // windows (physicalMax). Rather than giving up at ~1.5× the target, widen
+  // ONCE: generate a second batch of uniform windows up to the
+  // CLIP_MAX_POOL_FACTOR ceiling, skipping anything near an already-attempted
+  // start, and run the lanes again. Clean sources never reach this branch
+  // (the lanes early-stop at the target), so the extra ffmpeg/Gemini spend is
+  // paid only where it actually buys clips.
+  if (succeeded < cappedCount) {
+    const escalationCeiling = Math.min(
+      physicalMax,
+      Math.ceil(cappedCount * env.CLIP_MAX_POOL_FACTOR),
+    );
+    const extraNeeded = escalationCeiling - windows.length;
+    if (extraNeeded > 0) {
+      // Dense uniform sweep (2× the ceiling so enough candidates survive the
+      // collision filter), drop anything whose window would intersect an
+      // already-attempted window's span (scene windows can run to max
+      // duration — comparing starts alone would let an escalation window
+      // half-overlap a SURVIVING clip and produce a near-duplicate), then
+      // subsample evenly to preserve whole-source coverage.
+      const fresh = pickClipTimestamps(vs.duration_seconds, escalationCeiling * 2)
+        .filter((t) => windows.every((w) =>
+          t + CLIP_DURATION_DEFAULT_SECONDS <= w.start || t >= w.start + w.duration));
+      let picked: number[];
+      if (fresh.length <= extraNeeded) {
+        picked = fresh;
+      } else {
+        const stride = fresh.length / extraNeeded;
+        const out = new Set<number>();
+        for (let i = 0; i < extraNeeded; i++) {
+          out.add(fresh[Math.min(fresh.length - 1, Math.floor(i * stride))]);
+        }
+        picked = Array.from(out).sort((a, b) => a - b);
+      }
+      if (picked.length > 0) {
+        await logJob({ projectId, jobId: mediaJobId, sourceId: videoSourceId },
+          "clip.backfill_escalation", {
+            succeededSoFar: succeeded,
+            target: cappedCount,
+            initialPool: windows.length,
+            added: picked.length,
+            escalationCeiling,
+          });
+        // The drained lanes over-advanced the cursor past windows.length while
+        // exiting; rewind it to the first new index BEFORE pushing so every
+        // escalation window gets processed exactly once.
+        cursor = windows.length;
+        for (const t of picked) {
+          windows.push({ start: t, duration: CLIP_DURATION_DEFAULT_SECONDS });
+        }
+        await runLanes();
+      }
+    }
+  }
 
   if (succeeded === 0 && failed > 0) {
     await sb.from("video_sources").update({ status: "failed", error: "all clip cuts failed" }).eq("id", videoSourceId);
@@ -899,11 +973,13 @@ export async function processClipJob(data: ClipJobData): Promise<void> {
   //   - droppedDirty / droppedWrongPerson → which gate dominated the loss, so a
   //                                          short source is diagnosable (logo/
   //                                          text vs face) at a glance
-  //   - poolExhausted                     → true when we tried every window and
-  //                                          STILL came up short — i.e. the
-  //                                          source physically can't yield more
-  //                                          clean clips, not a reserve-too-small
-  //                                          problem.
+  //   - poolExhausted                     → true when every window — including
+  //                                          the escalation batch up to
+  //                                          CLIP_MAX_POOL_FACTOR × target —
+  //                                          was tried and we STILL came up
+  //                                          short. The next lever is the gate
+  //                                          policy or the source choice, not
+  //                                          the pool size.
   const attempted = processed;
   const dropRate = attempted > 0
     ? Math.round((droppedJunk / attempted) * 1000) / 1000
