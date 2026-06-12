@@ -134,6 +134,12 @@ export async function processScriptClipJob(
       outputPath: normalizedTmp,
       width: 1280, height: 720, fps: 30,
       keepAudio: true,
+      // Pin to the requested window length. cutClip above stream-copies
+      // (-c:v copy), which can only cut on keyframe boundaries, so an 8s
+      // request on YouTube footage (4-10s GOPs) overshoots to ~12s. Without
+      // this pin the overshoot survives the normalize re-encode and the stored
+      // intro clip is longer than asked (the "8s intro plays for 12s" bug).
+      pinDurationSeconds: duration,
     });
     await setMediaJob(mediaJobId, { progress: 75 });
 

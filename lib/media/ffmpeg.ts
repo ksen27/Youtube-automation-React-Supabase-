@@ -688,7 +688,10 @@ export async function buildTitleCardVideo(opts: {
           const partialLines = partialLinesForChars(k);
           const tStart = ((k - CHAR_STEP) * dt).toFixed(3);
           const tEnd = (k * dt).toFixed(3);
-          const enableExpr = `between(t,${tStart},${tEnd})`;
+          // Escape the commas inside between() — see the lower-third xExpr
+          // note: a bare comma here is read as the drawtext-chain separator
+          // and the expression gets chopped ("No such filter: '<num>)'").
+          const enableExpr = `between(t\\,${tStart}\\,${tEnd})`;
           for (let li = 0; li < partialLines.length; li++) {
             const t = partialLines[li];
             if (!t) continue;
@@ -701,7 +704,7 @@ export async function buildTitleCardVideo(opts: {
         const lastIntermediateK = Math.floor((totalChars - 1) / CHAR_STEP) * CHAR_STEP;
         const tailStart = (lastIntermediateK * dt).toFixed(3);
         const tailEnd = opts.durationSeconds.toFixed(3);
-        const tailEnable = `between(t,${tailStart},${tailEnd})`;
+        const tailEnable = `between(t\\,${tailStart}\\,${tailEnd})`;
         for (let li = 0; li < lines.length; li++) {
           const t = lines[li];
           if (!t) continue;
@@ -1039,11 +1042,22 @@ async function buildLowerThirdFilter(
   // red-marked word within this host clip so the chip appears exactly when the
   // narrator says it. Every gate/interp expression below is already written
   // relative to `start`, so shifting it is sufficient — no other change.
-  const start = Math.max(0, startOffsetSeconds);
+  // Round to millisecond precision BEFORE building any expression. The slide
+  // interpolation math below subtracts/adds these values and interpolates them
+  // straight into the ffmpeg filter string. Raw binary floats (startOffset =
+  // word_vo_start − clip_vo_start) produce 16-digit tails like
+  // `2.840019999999993`, and a long unrounded token inside the drawtext `x`
+  // expression has been observed to trip the filtergraph lexer ("No such
+  // filter: '2.840019999999993)'") and fail the whole render. ms precision is
+  // far finer than any chyron timing needs.
+  const r3 = (n: number) => Number(n.toFixed(3));
+  const start = r3(Math.max(0, startOffsetSeconds));
   const slideIn = 0.4;
   const hold = 2.6;
   const slideOut = 0.4;
-  const end = start + slideIn + hold + slideOut;
+  const end = r3(start + slideIn + hold + slideOut);
+  const slideInEnd = r3(start + slideIn);
+  const holdEnd = r3(start + slideIn + hold);
   const fontPath = font.replace(/\\/g, "/").replace(/'/g, "\\'").replace(/:/g, "\\:");
   // Upper-case the text to match the broadcast chyron convention
   // ("PANG BOURNE IN BERKSHIRE"). Doing it here rather than in drawtext's
@@ -1086,12 +1100,22 @@ async function buildLowerThirdFilter(
   // (rest - off) * progress  +  off  → linear interpolation from off → rest
   const slideInExpr = `((${restX})-(${offX}))*((t-${start})/${slideIn})+(${offX})`;
   // (off - rest) * progress + rest  → linear interpolation from rest → off
-  const slideOutExpr = `((${offX})-(${restX}))*((t-${start + slideIn + hold})/${slideOut})+(${restX})`;
+  const slideOutExpr = `((${offX})-(${restX}))*((t-${holdEnd})/${slideOut})+(${restX})`;
+  // Every comma INSIDE the expression must be escaped as `\,`. ffmpeg's
+  // filtergraph parser treats a bare comma as the filter separator (the same
+  // role as the comma in `scale=...,crop=...`), so an unescaped `lt(t,2.84)`
+  // gets chopped at its comma and the orphaned `2.84)` is read as a (missing)
+  // filter name — "No such filter: '2.84)'". The surrounding single quotes are
+  // NOT reliable protection here because this string is also embedded into a
+  // `-filter_complex` graph (the image/Ken Burns path), where the graph lexer
+  // runs before option-level quote handling. Escaping the commas works in both
+  // the `-vf` and `-filter_complex` paths — same fix already used for `tRamp`.
+  const c = "\\,"; // escaped comma for use inside the expression
   const xExpr =
-    `'if(lt(t,${start}),${offX},` +
-    `if(lt(t,${start + slideIn}),${slideInExpr},` +
-    `if(lt(t,${start + slideIn + hold}),${restX},` +
-    `if(lt(t,${end}),${slideOutExpr},${offX}))))'`;
+    `'if(lt(t${c}${start})${c}${offX}${c}` +
+    `if(lt(t${c}${slideInEnd})${c}${slideInExpr}${c}` +
+    `if(lt(t${c}${holdEnd})${c}${restX}${c}` +
+    `if(lt(t${c}${end})${c}${slideOutExpr}${c}${offX}))))'`;
 
   // Blue (#1E5BC9) matches the reference screenshot; white bold text inside.
   // No alpha ramp — the chip is fully opaque whenever it's on-screen. The
@@ -1398,6 +1422,9 @@ export interface ConcatOptions {
   // of narration off the final file.
   totalVideoDurationSeconds?: number;
   signal?: AbortSignal;
+  // Fired on each ffmpeg stderr status line so the caller can heartbeat job
+  // liveness during this (long) re-encode pass. See runFFmpeg's onProgress.
+  onProgress?: () => void;
 }
 
 export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> {
@@ -1729,7 +1756,7 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   args.push("-movflags", "+faststart", opts.outputPath);
 
   try {
-    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal, undefined, opts.onProgress);
   } finally {
     try { await fs.unlink(listPath); } catch { /* ignore */ }
   }
@@ -1743,6 +1770,13 @@ function runFFmpeg(
   // image transcode) where the global FFMPEG_TIMEOUT_SECONDS would let a
   // hung input burn the whole render budget before failing.
   timeoutOverrideSeconds?: number,
+  // Optional liveness callback, fired on each stderr chunk from ffmpeg (which
+  // emits a `frame=/time=` status line ~once a second during encoding). The
+  // render processor uses this to heartbeat the job's updated_at DURING a long
+  // pass (the final whole-video concat re-encode can run 10-20 min), so the
+  // stall sweeper never mistakes an actively-encoding job for a dead one.
+  // Best-effort and throttled by the caller — must not throw.
+  onProgress?: () => void,
 ): Promise<void> {
   const env = getEnv();
   const timeoutSeconds = timeoutOverrideSeconds ?? env.FFMPEG_TIMEOUT_SECONDS;
@@ -1778,6 +1812,12 @@ function runFFmpeg(
       stderrTail += c.toString();
       if (stderrTail.length > STDERR_KEEP) {
         stderrTail = stderrTail.slice(-STDERR_KEEP);
+      }
+      // Liveness signal — ffmpeg writes a status line here roughly every
+      // second while encoding. Guard so a throwing callback can't crash the
+      // ffmpeg wrapper.
+      if (onProgress) {
+        try { onProgress(); } catch { /* ignore */ }
       }
     });
     child.on("error", (err) => {

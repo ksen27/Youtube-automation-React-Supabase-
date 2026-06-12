@@ -5,6 +5,8 @@ import { isSupabaseConfigured, getServerSupabase } from "@/lib/supabase/server";
 import { newRedisClient } from "@/lib/jobs/queue";
 import { checkR2Health } from "@/lib/storage";
 import { ReferenceChannels, type ReferenceChannel } from "./reference-channels";
+import { ChangePassword } from "./change-password";
+import { hasCustomPassword } from "@/lib/auth-store";
 
 export const dynamic = "force-dynamic";
 
@@ -49,7 +51,12 @@ async function getStatus() {
     } catch { /* ignore */ }
   }
 
-  return { youtube, gemini, supabase, storage, redis, env, referenceChannels, blocked };
+  let customPassword = false;
+  try {
+    customPassword = await hasCustomPassword();
+  } catch { /* default password still in use */ }
+
+  return { youtube, gemini, supabase, storage, redis, env, referenceChannels, blocked, customPassword };
 }
 
 function StatusBadge({ ok }: { ok: boolean }) {
@@ -64,6 +71,8 @@ export default async function SettingsPage() {
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">Connection health for the services this MVP needs.</p>
       </header>
+
+      <ChangePassword hasCustomPassword={s.customPassword} />
 
       <div className="grid gap-4 sm:grid-cols-2">
         <Card>

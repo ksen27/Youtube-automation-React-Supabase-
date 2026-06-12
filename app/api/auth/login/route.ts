@@ -6,6 +6,7 @@ import {
   isAuthConfigured,
   verifyPassword,
 } from "@/lib/auth";
+import { getStoredPasswordHash } from "@/lib/auth-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,7 +16,7 @@ const Body = z.object({ password: z.string().min(1) });
 export async function POST(req: NextRequest) {
   if (!isAuthConfigured()) {
     return NextResponse.json(
-      { error: "Login is not configured on the server. Set CELEBFORGE_PASSWORD and AUTH_SECRET." },
+      { error: "Login is not configured on the server. Set AUTH_SECRET." },
       { status: 503 },
     );
   }
@@ -25,7 +26,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Enter your password." }, { status: 400 });
   }
 
-  const ok = await verifyPassword(parsed.data.password);
+  const ok = await verifyPassword(parsed.data.password, getStoredPasswordHash);
   if (!ok) {
     // Deliberately vague — don't confirm anything about the password to an
     // outsider who's guessing.

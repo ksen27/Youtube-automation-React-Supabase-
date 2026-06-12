@@ -202,13 +202,20 @@ export async function verifyPoolAsset(
       referenceUrl: ref.reference_url,
       personName: entityName,
     });
-    // Overlay gate (person images only, per the client's "strict for people,
-    // lenient for logos" policy): a CORRECT-person image that is plastered with
-    // a news-channel logo + a headline banner (the clickbait-thumbnail look) is
-    // rejected just like the clip-stage clean-frame gate rejects dirty frames.
-    // A confident "dirty" collapses the verdict to "no" so policyAccept drops
-    // it; "uncertain" overlay fails open (keeps the candidate) so a Gemini
-    // hiccup doesn't gut the pool. Entity/logo pools never reach this branch.
+    // Overlay gate (person images only). Three-tier severity:
+    //   "dirty"  — BIG/intrusive overlay (headline banner, lower-third,
+    //              collage, magazine/book/product cover). Collapses the verdict
+    //              to "no" so policyAccept drops it — same as the clickbait
+    //              thumbnail look we never want.
+    //   "minor"  — only a small corner stock watermark / credit on an
+    //              otherwise-clean photo of the correct person. ACCEPTED: real
+    //              archival photos of historical figures almost always carry a
+    //              Getty/iStock corner bug, and rejecting them starved the pool
+    //              (e.g. Diana, where nearly every clean photo is watermarked).
+    //   "clean" / "uncertain" — pass through to the identity verdict; an
+    //              "uncertain" overlay fails open so a Gemini hiccup doesn't
+    //              gut the pool.
+    // Entity/logo pools never reach this branch.
     const verdict: PoolVerdict = result.overlay === "dirty" ? "no" : result.verdict;
     const reason =
       result.overlay === "dirty"

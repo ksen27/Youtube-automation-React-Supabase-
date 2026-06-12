@@ -52,6 +52,30 @@ export async function setMediaJob(
   if (error) throw new Error(`setMediaJob: ${error.message}`);
 }
 
+// Lightweight liveness heartbeat. Bumps the row's updated_at (via the
+// media_jobs_touch trigger) WITHOUT a read-modify-write, so it's cheap enough
+// to call frequently from inside long-running phases (the render merge/concat
+// stage) that otherwise go many minutes between setMediaJob() progress writes.
+// Without this, sweepStalledJobs() can mistake a slow-but-alive job for a
+// dead one and mark it failed mid-render. Best-effort: a transient DB blip
+// here must never crash the job, so errors are swallowed (the next heartbeat
+// or progress write will refresh updated_at anyway).
+export async function touchMediaJob(id: string): Promise<void> {
+  try {
+    const sb = getServerSupabase();
+    // Re-assert status='running' to fire the touch trigger. The .eq on status
+    // makes this a no-op for rows that already reached a terminal state, so a
+    // late heartbeat can't resurrect a completed/failed job.
+    await sb
+      .from("media_jobs")
+      .update({ status: "running" })
+      .eq("id", id)
+      .eq("status", "running");
+  } catch {
+    /* best-effort heartbeat — ignore */
+  }
+}
+
 export async function setProjectStatus(projectId: string, status: ProjectStatus): Promise<void> {
   const sb = getServerSupabase();
   const { error } = await sb.from("projects").update({ status }).eq("id", projectId);

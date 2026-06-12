@@ -568,6 +568,60 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     .filter((e) => e.type === "celebrity")
     .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))[0]?.value as string | undefined;
 
+  // ---- Person-name disambiguation (project-wide) -----------------------
+  // A SECONDARY person is often referred to by bare FIRST NAME in the script
+  // ("Catherine", "William", "Charles"). Searching image providers for a bare
+  // first name returns the most famous unrelated namesake — e.g. "Catherine"
+  // returned the actress Catherine Zeta-Jones instead of Catherine, Princess of
+  // Wales — and because the face-verify REFERENCE is built from the SAME bare
+  // query, the wrong person self-verifies as "yes". To stop this for EVERY
+  // ambiguous name in the project, we append a context phrase derived from the
+  // project's main subject so the query/reference target the right person.
+  //
+  // Context source: derive a NEUTRAL domain phrase from the main celebrity's
+  // descriptor — NOT the literal title. "Diana, Princess of Wales" implies the
+  // British royal family, so bare royal first names ("Catherine", "William",
+  // "Charles") get "British royal family" appended. Using the literal title
+  // would be wrong across genders/roles (appending "Princess of Wales" to
+  // "William" or "Charles" pulls bad images). A "Firstname Lastname" main
+  // celebrity with no royal/known descriptor (e.g. "Simon Cowell") yields no
+  // context, so we append nothing rather than guess.
+  const projectContextPhrase = (() => {
+    const mc = (mainCelebrity ?? "").trim();
+    if (!mc) return "";
+    const qualifier = mc.includes(",") ? mc.split(",").slice(1).join(",") : mc;
+    // Royal cue anywhere in the descriptor → neutral royal-family context.
+    if (/\b(Prince|Princess|King|Queen|Duke|Duchess|Earl|Countess|Royal|Crown)\b/i.test(qualifier)) {
+      return "British royal family";
+    }
+    // No recognized domain cue — don't guess a context.
+    return "";
+  })();
+
+  // True when `name` is a bare single token (one word, no comma/title/surname)
+  // — exactly the ambiguous case that needs project context appended.
+  function isBareFirstName(name: string): boolean {
+    const n = name.trim();
+    if (!n || n.includes(",")) return false;
+    if (/\b(Prince|Princess|King|Queen|Duke|Duchess|Sir|Dame|Lord|Lady|Markle|Windsor)\b/i.test(n)) {
+      return false;
+    }
+    return n.split(/\s+/).length === 1;
+  }
+
+  // Qualify a person name for image search/verify. Bare first names get the
+  // project context appended ("Catherine" → "Catherine Princess of Wales");
+  // already-qualified names pass through unchanged. Applied project-wide at the
+  // single choke point that builds person photo pools.
+  function disambiguatePersonName(name: string): string {
+    const n = (name ?? "").trim();
+    if (!n) return n;
+    if (projectContextPhrase && isBareFirstName(n)) {
+      return `${n} ${projectContextPhrase}`;
+    }
+    return n;
+  }
+
   const INTERVIEW_SETTING_RE = /interview|sit[- ]?down|talk show|podcast|conversation|host/i;
   const INTERVIEW_LABEL_RE = /interview|talking|speaking|microphone|host/i;
   const STAGED_SETTING_RE = /studio|stage|set\b/i;
@@ -3055,18 +3109,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   }
 
   async function buildPersonPhotoCache(
-    personName: string,
+    rawPersonName: string,
     sizeOverride?: number,
   ): Promise<PersonPhotoCacheEntry[]> {
-    const cached = personPhotoCache.get(personName.toLowerCase());
+    // Cache key stays on the ORIGINAL name (callers pass the bare subject), but
+    // every search query AND the face-verify reference below use the
+    // disambiguated name so a bare first name ("Catherine") can't pull/confirm
+    // the wrong namesake (the actress). Project-wide fix — see
+    // disambiguatePersonName.
+    const cached = personPhotoCache.get(rawPersonName.toLowerCase());
     if (cached) return cached;
+    const personName = disambiguatePersonName(rawPersonName);
     // Caller-provided size override (used by secondary-person path to
     // scale by maxRun); falls back to the main-celebrity target.
     const target = sizeOverride ?? personPhotoTarget;
     if (target <= 0) {
       // Caller asked for an empty pool (maxRun 1 secondary). Return [] —
-      // they'll fall back to the Wikipedia portrait.
-      personPhotoCache.set(personName.toLowerCase(), []);
+      // they'll fall back to the Wikipedia portrait. Cache under the RAW name
+      // so the lookup at the top (also raw) hits.
+      personPhotoCache.set(rawPersonName.toLowerCase(), []);
       return [];
     }
     const result: PersonPhotoCacheEntry[] = [];
@@ -3145,9 +3206,10 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         // Image search failed for one query — continue with the rest.
       }
     }
-    personPhotoCache.set(personName.toLowerCase(), result);
+    personPhotoCache.set(rawPersonName.toLowerCase(), result);
     void logJob({ projectId, jobId: mediaJobId }, "match.person_photo_cache.built", {
       person: personName,
+      rawPerson: rawPersonName,
       target,
       cached: result.length,
     });
@@ -3178,67 +3240,78 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // visuals.") actually shows the project celebrity.
     const resolvedSubjectType = blockSubjectTypes[blockIdx] ?? null;
     const resolvedSubject = blockResolvedSubjects[blockIdx];
-    const subj = (
-      (resolvedSubjectType === "person" && resolvedSubject)
-        ? resolvedSubject
-        : (mainCelebrity || "")
-    ).trim();
-    if (!subj) return null;
     const nowSec = blockStartSec[blockIdx];
-    const fetched = await buildPersonPhotoCache(subj);
-    if (fetched.length === 0) return null;
-    // Three-tier pick. Per client spec: "If an exact image/visual cannot
-    // be found → fallback to the person image. NEVER use random unrelated
-    // visuals." So we MUST return a person image when any exist — even
-    // when they're already used elsewhere in the timeline. Re-showing the
-    // same celebrity photo twice is strictly better than dropping through
-    // to the entity pool and rendering a random brand logo.
-    //
+
+    // Subjects to try, in order. When the block resolves to a SECONDARY person
+    // (e.g. "Charles" on a Diana project), try them first — but if their photo
+    // pool comes back empty (a thin secondary pool, or every candidate rejected
+    // by the verify gate), FALL BACK TO THE MAIN CELEBRITY rather than giving
+    // up. The narration on these blocks is almost always still about the main
+    // subject ("…Diana chose it herself."), so the project celebrity is an
+    // on-topic visual — and a real celebrity photo beats leaving the block
+    // empty (which collapses the timeline). De-duplicated so we never fetch the
+    // same person twice.
+    const subjectCandidates: string[] = [];
+    if (resolvedSubjectType === "person" && resolvedSubject) {
+      subjectCandidates.push(resolvedSubject.trim());
+    }
+    if (mainCelebrity && mainCelebrity.trim()) {
+      subjectCandidates.push(mainCelebrity.trim());
+    }
+    const seenSubjects = new Set<string>();
+
+    // Three-tier pick over one subject's fetched photo pool. Per client spec:
+    // "If an exact image/visual cannot be found → fallback to the person image.
+    // NEVER use random unrelated visuals." So we MUST return a person image
+    // when any exist — even one already used elsewhere; re-showing a celebrity
+    // photo beats dropping through to a random brand logo (or empty).
     //   Tier A — fresh URL outside the reuse cooldown (or never used).
-    //   Tier B — fresh URL ignoring the cooldown but unused by reference
-    //            pass (refUrlSet) — i.e. seen earlier in the timeline as
-    //            another person-fallback, fine to repeat.
-    //   Tier C — any fetched URL, including ones reference-claimed. This
-    //            is the "we'd rather repeat than ship junk" tier.
-    let bestA: PersonPhotoCacheEntry | null = null;
-    let bestB: PersonPhotoCacheEntry | null = null;
-    let bestBDistance = -Infinity;
-    for (const f of fetched) {
-      if (refUrlSet.has(f.url)) continue;
-      const last = imageUrlLastUsedAt.get(f.url);
-      if (last === undefined) {
-        bestA = f;
-        break;
-      }
-      const dist = nowSec - last;
-      if (dist >= IMAGE_REUSE_COOLDOWN_SEC) {
-        bestA = f;
-        break;
-      }
-      if (dist > bestBDistance) {
-        bestB = f;
-        bestBDistance = dist;
-      }
-    }
-    let pick = bestA ?? bestB;
-    if (!pick) {
-      // Tier C — every fetched image was already in refUrlSet. Pick the
-      // one used longest ago, ignoring refUrlSet. Better to re-show a
-      // person photo than to leave the block for the entity pool.
-      let bestC: PersonPhotoCacheEntry | null = null;
-      let bestCDistance = -Infinity;
+    //   Tier B — fresh URL ignoring the cooldown but unused by the reference
+    //            pass (refUrlSet) — seen earlier as another fallback, fine to repeat.
+    //   Tier C — any fetched URL, including reference-claimed ones.
+    const pickFromPool = (fetched: PersonPhotoCacheEntry[]): PersonPhotoCacheEntry | null => {
+      let bestA: PersonPhotoCacheEntry | null = null;
+      let bestB: PersonPhotoCacheEntry | null = null;
+      let bestBDistance = -Infinity;
       for (const f of fetched) {
+        if (refUrlSet.has(f.url)) continue;
         const last = imageUrlLastUsedAt.get(f.url);
-        const dist = last === undefined ? Infinity : nowSec - last;
-        if (dist > bestCDistance) {
-          bestCDistance = dist;
-          bestC = f;
-        }
+        if (last === undefined) { bestA = f; break; }
+        const dist = nowSec - last;
+        if (dist >= IMAGE_REUSE_COOLDOWN_SEC) { bestA = f; break; }
+        if (dist > bestBDistance) { bestB = f; bestBDistance = dist; }
       }
-      pick = bestC;
+      let pick = bestA ?? bestB;
+      if (!pick) {
+        let bestC: PersonPhotoCacheEntry | null = null;
+        let bestCDistance = -Infinity;
+        for (const f of fetched) {
+          const last = imageUrlLastUsedAt.get(f.url);
+          const dist = last === undefined ? Infinity : nowSec - last;
+          if (dist > bestCDistance) { bestCDistance = dist; bestC = f; }
+        }
+        pick = bestC;
+      }
+      return pick;
+    };
+
+    for (const subj of subjectCandidates) {
+      const key = subj.toLowerCase();
+      if (seenSubjects.has(key)) continue;
+      seenSubjects.add(key);
+      const fetched = await buildPersonPhotoCache(subj);
+      if (fetched.length === 0) continue;
+      const pick = pickFromPool(fetched);
+      if (pick) {
+        if (subj !== resolvedSubject) {
+          void logJob({ projectId, jobId: mediaJobId }, "match.person_fallback_to_main_celebrity", {
+            blockIndex: blockIdx, triedSubject: resolvedSubject ?? null, usedSubject: subj,
+          });
+        }
+        return { url: pick.url, source: pick.source, query: pick.query };
+      }
     }
-    if (!pick) return null;
-    return { url: pick.url, source: pick.source, query: pick.query };
+    return null;
   }
 
   // First pass: walk image blocks in order, try to fill from references.
@@ -4736,27 +4809,104 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // black-background fallback then masks the missing url. This is the
   // last-resort case the renderer was always able to handle; we just
   // prefer footage when one exists.
+  // Shared "never leave a block empty" fill ladder, tried in order until the
+  // block has a visual:
+  //   1. FRESH clip             — pickFillerForBlock (unused-only)
+  //   2. REUSED celebrity image — tryPersonImageFallback (re-shows a person
+  //                               photo; its Tier C repeats one if needed)
+  //   3. REUSED clip            — pickReuseClipForBlock (already-placed clip,
+  //                               spread by the reuse cooldown)
+  // Returns the outcome so callers can tally it; returns "blank" only when ALL
+  // of the above are exhausted, in which case the render-side filler holds the
+  // slot so timing never desyncs. Reuse is explicitly allowed by the spec; the
+  // reuse pickers enforce the cooldown / spread rules.
+  //
+  // This is shared by BOTH the empty-image pass below AND the split-downgrade
+  // branch (resolveSplitSide's caller). That matters: the split pass runs
+  // AFTER this point, so a split block that resolves to nothing there has no
+  // later pass to catch it — it must run the ladder itself. (That ordering gap
+  // is exactly how abstract split blocks reached render empty before.)
+  async function fillEmptyBlock(
+    item: typeof items[number],
+    blockIdx: number,
+    downgradedFrom: string,
+  ): Promise<"fresh_clip" | "reused_image" | "reused_clip" | "blank"> {
+    const meta = (item.metadata ?? {}) as Record<string, unknown>;
+
+    const filler = pickFillerForBlock(blockIdx);
+    if (filler && !usedClipIds.has(filler.clipId)) {
+      item.type = "footage";
+      item.clip_id = filler.clipId;
+      item.image_url = null;
+      usedClipIds.add(filler.clipId);
+      clipLastUsedAt.set(filler.clipId, blockStartSec[blockIdx]);
+      meta.downgraded_from = downgradedFrom;
+      meta.downgrade_reason = "no image resolved; fresh clip";
+      meta.pick_source = "image_downgrade_to_footage";
+      item.metadata = meta;
+      return "fresh_clip";
+    }
+
+    // Reused celebrity image — preferred over a reused clip per the spec's
+    // "fallback to the PERSON image" direction.
+    const personPick = await tryPersonImageFallback(blockIdx);
+    if (personPick) {
+      item.type = "image";
+      item.clip_id = null;
+      item.image_url = personPick.url;
+      item.image_query = personPick.query;
+      item.image_source = personPick.source;
+      refUrlSet.add(personPick.url);
+      imageUrlLastUsedAt.set(personPick.url, blockStartSec[blockIdx]);
+      meta.downgraded_from = downgradedFrom;
+      meta.image_query_used = personPick.query;
+      meta.image_source_url = personPick.url;
+      meta.image_source_provider = personPick.source;
+      meta.image_reason = "empty_block_reused_person_image";
+      meta.image_pick_source = "person_fallback_reuse";
+      item.metadata = meta;
+      return "reused_image";
+    }
+
+    // Reused clip (already placed elsewhere, spread by the cooldown). Do NOT
+    // add to usedClipIds — that set is the used-once gate; reuse only updates
+    // the cooldown clock.
+    const reuse = pickReuseClipForBlock(blockIdx);
+    if (reuse) {
+      item.type = "footage";
+      item.clip_id = reuse.clipId;
+      item.image_url = null;
+      clipLastUsedAt.set(reuse.clipId, blockStartSec[blockIdx]);
+      meta.downgraded_from = downgradedFrom;
+      meta.downgrade_reason = "no image + no fresh clip; reused a prior clip";
+      meta.pick_source = "image_downgrade_to_reused_footage";
+      item.metadata = meta;
+      return "reused_clip";
+    }
+
+    return "blank";
+  }
+
   let emptyImageDowngradedCount = 0;
+  let emptyImageReusedImageCount = 0;
+  let emptyImageReusedClipCount = 0;
+  let emptyImageStillBlankCount = 0;
   for (const item of items) {
     if (item.type !== "image") continue;
     if (item.image_url && String(item.image_url).trim().length > 0) continue;
     const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
     if (blockIdx == null) continue;
-    const filler = pickFillerForBlock(blockIdx);
-    if (!filler || usedClipIds.has(filler.clipId)) continue;
-    item.type = "footage";
-    item.clip_id = filler.clipId;
-    usedClipIds.add(filler.clipId);
-    clipLastUsedAt.set(filler.clipId, blockStartSec[blockIdx]);
-    const meta = (item.metadata ?? {}) as Record<string, unknown>;
-    meta.downgraded_from = "image_no_url";
-    meta.downgrade_reason = "no image resolved (pool + person fallback failed)";
-    meta.pick_source = "image_downgrade_to_footage";
-    item.metadata = meta;
-    emptyImageDowngradedCount++;
+    const outcome = await fillEmptyBlock(item, blockIdx, "image_no_url");
+    if (outcome === "fresh_clip") emptyImageDowngradedCount++;
+    else if (outcome === "reused_image") emptyImageReusedImageCount++;
+    else if (outcome === "reused_clip") emptyImageReusedClipCount++;
+    else emptyImageStillBlankCount++;
   }
   await logJob({ projectId, jobId: mediaJobId }, "match.empty_image_downgrade", {
     downgraded: emptyImageDowngradedCount,
+    reusedImage: emptyImageReusedImageCount,
+    reusedClip: emptyImageReusedClipCount,
+    stillBlank: emptyImageStillBlankCount,
   });
 
   // ---- Split-screen image fill -----------------------------------------
@@ -4889,26 +5039,25 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     // clip is available we convert to footage; if not we fall back to
     // image (which still gets the eventual entity-pool fill below).
     if (!leftPick && !rightPick) {
-      const filler = pickFillerForBlock(blockIdx);
-      if (filler && !usedClipIds.has(filler.clipId)) {
-        item.type = "footage";
-        item.clip_id = filler.clipId;
-        usedClipIds.add(filler.clipId);
-        clipLastUsedAt.set(filler.clipId, nowSec);
-        const meta = (item.metadata ?? {}) as Record<string, unknown>;
-        meta.downgraded_from = "split_2_no_images";
-        meta.downgrade_reason = "neither split half resolved";
-        meta.pick_source = "split_downgrade_to_footage";
-        item.metadata = meta;
-      } else {
-        // No fresh clip either — leave the block as type=image with no
-        // url so the entity-pool fill / person-fallback pass below has
-        // a chance to attach something. Better than an empty split tile.
+      // Run the same never-empty ladder the image pass uses: fresh clip →
+      // reused celebrity image → reused clip. This pass runs AFTER the
+      // empty-image pass, so there's no later catch-all — the block must be
+      // filled here or it reaches render empty and desyncs the timeline (the
+      // original "leave it as a url-less image for a later pass" comment was
+      // wrong; that pass already ran above).
+      const outcome = await fillEmptyBlock(item, blockIdx, "split_2_no_images");
+      if (outcome === "blank") {
+        // Truly nothing left to reuse — leave url-less; render-side filler
+        // holds the slot so timing stays aligned.
         item.type = "image";
         const meta = (item.metadata ?? {}) as Record<string, unknown>;
         meta.downgraded_from = "split_2_no_images";
-        meta.downgrade_reason = "neither split half resolved; no fresh clip in pool";
+        meta.downgrade_reason = "neither split half resolved; no clip/image to reuse";
         item.metadata = meta;
+      } else {
+        void logJob({ projectId, jobId: mediaJobId }, "match.split_downgrade_filled", {
+          blockIndex: blockIdx, outcome,
+        });
       }
       continue;
     }

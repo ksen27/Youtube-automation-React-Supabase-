@@ -287,10 +287,16 @@ export async function verifyPersonImage(input: PersonVerifyInput): Promise<Verif
 // =========================================================================
 export interface PersonImageCleanResult extends VerifyResult {
   // "clean"  — a plain photograph with no added graphics.
-  // "dirty"  — carries a channel/network logo or watermark, a headline /
-  //            news banner, a caption / lower-third, or other added text.
+  // "minor"  — only a SMALL, unobtrusive mark: a corner stock-photo watermark
+  //            (iStock/Getty/AP bug), a photographer credit, a faint logo. The
+  //            photo itself is otherwise a clean, full-frame shot of the person.
+  //            ACCEPTABLE for B-roll — these are common on real archival photos
+  //            of historical figures and rejecting them starves the pool.
+  // "dirty"  — a BIG/intrusive overlay: a headline or news banner, a
+  //            lower-third / caption / quote card, a collage or split-screen,
+  //            a magazine/book/product cover, or large added text. REJECTED.
   // "uncertain" — cannot tell.
-  overlay: "clean" | "dirty" | "uncertain";
+  overlay: "clean" | "minor" | "dirty" | "uncertain";
   overlayArtifact: string;
 }
 
@@ -303,18 +309,19 @@ Two images are attached. The FIRST is a known reference photo of ${personName}. 
 - "no" — a different person, or no recognisable person at all (a logo, map, chart, text graphic, building).
 - "uncertain" — any doubt (faces too small/blurry/from behind). DEFAULT to "uncertain" over a guessed "yes".
 
-(2) "overlay" — is the image a CLEAN photograph, free of ADDED graphics?
-- "dirty" — the image has ANY of: a news-channel / network / website logo or watermark (e.g. a corner station bug); a headline or news banner / title bar (large added caption text like "WILLIAM & KATE'S GLAM COMEBACK"); a lower-third name strip, subtitle, or quote card; a "breaking news" banner; a collage/split-screen of multiple framed photos; or any prominent added text laid over the photo.
-- "clean" — a plain photograph of the person with NONE of the above. A tiny unobtrusive photographer credit in a corner is still "clean".
+(2) "overlay" — grade how much ADDED graphics sit on the photo. Pick the ONE that fits:
+- "clean" — a plain photograph of the person with no added graphics at all.
+- "minor" — the photo is otherwise a clean, full-frame shot of the person, but carries ONLY a SMALL, unobtrusive mark: a corner stock-photo watermark (e.g. an iStock / Getty / AP / Shutterstock bug), a small photographer or agency credit, or a faint corner logo. The person and scene are fully visible and not obscured. This is fine to use.
+- "dirty" — the image has a BIG or intrusive overlay: a headline / news banner / title bar (large caption text like "WILLIAM & KATE'S GLAM COMEBACK"); a lower-third name strip, subtitle, or quote card; a "breaking news" banner; a collage or split-screen of multiple framed photos; a magazine / book / product (t-shirt, mug) cover with title text; or any large added text laid across the photo.
 - "uncertain" — you genuinely cannot tell.
-Be strict on (2): a clickbait article thumbnail with a logo and a headline banner is "dirty" even when it shows the correct person.
+Rule of thumb: judge by how much the added graphics INTERFERE. A tiny corner watermark on an otherwise-clean photo of the correct person is "minor" (acceptable). A clickbait thumbnail with a headline banner, or a collage, is "dirty".
 
 Return STRICT JSON ONLY:
-{ "verdict": "yes" | "no" | "uncertain", "overlay": "clean" | "dirty" | "uncertain", "overlayArtifact": "short description of any overlay, else empty", "reason": "one short sentence", "confidence": 0.0 to 1.0 }`;
+{ "verdict": "yes" | "no" | "uncertain", "overlay": "clean" | "minor" | "dirty" | "uncertain", "overlayArtifact": "short description of any overlay, else empty", "reason": "one short sentence", "confidence": 0.0 to 1.0 }`;
 
 const PersonImageCleanSchema = z.object({
   verdict: VerifyVerdict.default("uncertain"),
-  overlay: z.enum(["clean", "dirty", "uncertain"]).default("uncertain"),
+  overlay: z.enum(["clean", "minor", "dirty", "uncertain"]).default("uncertain"),
   overlayArtifact: z.string().optional().default(""),
   reason: z.string().default(""),
   confidence: z.number().min(0).max(1).default(0.5),

@@ -5,11 +5,20 @@
 // password, checked at the edge by `proxy.ts`, locks the whole app (pages and
 // API) behind a single login.
 //
-// How the session works: when the right password is submitted we mint an
-// HMAC-signed cookie value `${expiry}.${signature}`. Every request re-verifies
-// the signature and expiry. The cookie carries no secret and can't be forged
-// without AUTH_SECRET, so a leaked cookie is the only exposure — hence the
-// expiry. Everything here uses Web Crypto so it runs in any Next.js runtime.
+// Two independent secrets are at play here, and keeping them separate matters:
+//
+//   1. The SESSION SIGNING secret (AUTH_SECRET) — used only to HMAC-sign the
+//      login cookie. This is read from env so the lightweight `proxy.ts` can
+//      verify cookies on every request WITHOUT touching the database.
+//
+//   2. The ACCESS PASSWORD — what the client types to log in. This is now
+//      stored (hashed) in the database so the client can CHANGE it at any time
+//      from the settings page, with no redeploy. Until a password is set in the
+//      DB, we fall back to the CELEBFORGE_PASSWORD env var so a fresh deploy is
+//      never locked out. Password verification only runs in the Node-runtime
+//      login API, so DB access there is fine.
+//
+// Everything cookie-related uses Web Crypto so it runs in any Next.js runtime.
 
 const encoder = new TextEncoder();
 
@@ -18,26 +27,24 @@ export const SESSION_COOKIE = "cf_session";
 // a reasonable floor without being annoying.
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-function getAuthConfig(): { password: string; secret: string } {
-  const password = process.env.CELEBFORGE_PASSWORD;
-  // Fall back to the service-role key as signing material if no dedicated
-  // secret is set — it's already a long random server-only string. A dedicated
-  // AUTH_SECRET is preferred (see .env.example) so rotating it doesn't touch
-  // the database client.
+// DB key under which the access-password hash is stored in app_settings.
+const PASSWORD_SETTING_KEY = "access_password_hash";
+
+// Session signing secret. Falls back to the service-role key (already a long
+// random server-only string) if no dedicated AUTH_SECRET is set.
+function getSessionSecret(): string {
   const secret = process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!password || !secret) {
-    throw new Error(
-      "Auth not configured. Set CELEBFORGE_PASSWORD and AUTH_SECRET (see .env.example).",
-    );
+  if (!secret) {
+    throw new Error("Auth not configured. Set AUTH_SECRET (see .env.example).");
   }
-  return { password, secret };
+  return secret;
 }
 
+// Auth is usable if we can sign cookies AND have *some* way to check a password
+// — either a stored DB hash (checked at call time) or the bootstrap env var.
+// The session-secret fallback means service-role-only deploys still work.
 export function isAuthConfigured(): boolean {
-  return Boolean(
-    process.env.CELEBFORGE_PASSWORD &&
-      (process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY),
-  );
+  return Boolean(process.env.AUTH_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY);
 }
 
 // Constant-time string compare so we don't leak the password length/prefix via
@@ -56,13 +63,102 @@ async function sha256(input: string): Promise<Uint8Array> {
   return new Uint8Array(digest);
 }
 
-export async function verifyPassword(candidate: string): Promise<boolean> {
-  const { password } = getAuthConfig();
-  return timingSafeEqual(candidate, password);
+// ---------------------------------------------------------------------------
+// Password storage (DB-backed, changeable at runtime)
+// ---------------------------------------------------------------------------
+//
+// We store a PBKDF2-SHA256 hash, never plaintext. Format is a self-describing
+// string so the parameters travel with the hash and can be upgraded later:
+//
+//   pbkdf2$<iterations>$<saltHex>$<hashHex>
+//
+// PBKDF2 is available in Web Crypto on every Next.js runtime, so this works
+// the same in dev, Node, and serverless.
+
+const PBKDF2_ITERATIONS = 100_000;
+
+async function pbkdf2Hash(password: string, salt: Uint8Array): Promise<Uint8Array> {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: salt as BufferSource, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial,
+    256,
+  );
+  return new Uint8Array(bits);
 }
 
+// Produce a storable hash string for a new password.
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2Hash(password, salt);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bufferToHex(salt)}$${bufferToHex(hash)}`;
+}
+
+// Check a candidate against a stored `pbkdf2$...` string. Returns false on any
+// malformed input rather than throwing.
+async function verifyAgainstStored(candidate: string, stored: string): Promise<boolean> {
+  const parts = stored.split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const iterations = Number(parts[1]);
+  if (!Number.isInteger(iterations) || iterations <= 0) return false;
+  const salt = hexToBuffer(parts[2]);
+  const expected = parts[3];
+  if (!salt) return false;
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(candidate),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: salt as BufferSource, iterations, hash: "SHA-256" },
+    keyMaterial,
+    256,
+  );
+  return timingSafeEqualHex(bufferToHex(new Uint8Array(bits)), expected);
+}
+
+// Read the stored password hash from the DB, if any. Returns null when no
+// password has been set in-app yet (the env bootstrap path then applies).
+//
+// `getStoredHash` is injected so this module never statically imports the
+// Supabase server client — that keeps `lib/auth.ts` importable from the
+// lightweight proxy (which only needs the cookie functions) without pulling the
+// DB client into that bundle.
+export async function verifyPassword(
+  candidate: string,
+  getStoredHash: () => Promise<string | null>,
+): Promise<boolean> {
+  let storedHash: string | null = null;
+  try {
+    storedHash = await getStoredHash();
+  } catch {
+    storedHash = null; // DB unreachable → fall through to env bootstrap
+  }
+
+  if (storedHash) {
+    return verifyAgainstStored(candidate, storedHash);
+  }
+
+  // Bootstrap: no password set in-app yet. Accept the env password if present
+  // so a fresh deploy can be logged into and then change the password.
+  const envPassword = process.env.CELEBFORGE_PASSWORD;
+  if (envPassword) return timingSafeEqual(candidate, envPassword);
+
+  return false;
+}
+
+export { PASSWORD_SETTING_KEY };
+
 async function hmac(message: string): Promise<string> {
-  const { secret } = getAuthConfig();
+  const secret = getSessionSecret();
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(secret),
@@ -78,6 +174,26 @@ function bufferToHex(buf: Uint8Array): string {
   let out = "";
   for (const byte of buf) out += byte.toString(16).padStart(2, "0");
   return out;
+}
+
+function hexToBuffer(hex: string): Uint8Array | null {
+  if (hex.length === 0 || hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
+}
+
+// Constant-time compare for two equal-purpose hex strings (already
+// fixed-width hash digests), so password verification doesn't leak via timing.
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 // Mint a signed cookie value. Shape: `${expiryMs}.${hmac(expiryMs)}`.

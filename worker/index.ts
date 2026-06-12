@@ -18,6 +18,7 @@ import { processMatchJob }      from "./processors/matchProcessor";
 import { processRenderJob }     from "./processors/renderProcessor";
 import { processScriptClipJob } from "./processors/scriptClipProcessor";
 import { markJobFailedIfExhausted, sweepStalledJobs } from "./reconcile";
+import { sweepRenderCache } from "./processors/renderCache";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -132,13 +133,30 @@ workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadC
 // legitimately mid-await on a long ffmpeg/yt-dlp call is never swept — those
 // only heartbeat updated_at between awaits.
 const SWEEP_INTERVAL_MS = 5 * 60_000;
-const SWEEP_STALE_MS = 900_000 + 5 * 60_000; // lockDuration + 5 min
+// Stall cutoff. Must exceed the longest gap a LIVE job can go without touching
+// updated_at. The render's merge/concat stage is a sequence of long single
+// ffmpeg passes (image xfades + the final whole-video concat); on a big
+// project that whole stretch can run 20-30 min. The render processor now emits
+// touchMediaJob() heartbeats around each of those passes, but we still keep a
+// generous cutoff as defence-in-depth: 45 min comfortably covers the largest
+// observed single pass while a truly-dead job is still cleaned up well before
+// the BullMQ retry/visibility windows matter. (Was lockDuration + 5 min = 20
+// min, which false-killed a slow-but-alive 430-clip render.)
+const SWEEP_STALE_MS = 45 * 60_000; // 45 min
 const sweepTimer = setInterval(() => {
   void sweepStalledJobs(SWEEP_STALE_MS)
     .then((n) => {
       if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
     })
     .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+  // Reap render-cache entries from abandoned/failed projects so the resume
+  // cache doesn't grow unbounded on the /data volume. Live renders refresh
+  // their dir mtime as they write clips, so this only removes stale orphans.
+  void sweepRenderCache()
+    .then((n) => {
+      if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "render_cache.sweep.done", removed: n }));
+    })
+    .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "render_cache.sweep.error", err: (e as Error).message })));
 }, SWEEP_INTERVAL_MS);
 // Don't keep the process alive solely for the sweep timer.
 sweepTimer.unref?.();

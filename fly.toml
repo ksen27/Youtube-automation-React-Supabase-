@@ -22,13 +22,30 @@ primary_region = 'lhr'
 # 25-min limit that rejected sub-40-min sources as "source_too_long").
 [env]
   MAX_SOURCE_DURATION_SECONDS = "2400"
+  # Resume cache for renders. MUST live on the persistent /data volume (see
+  # [[mounts]] below) so per-clip outputs survive a machine reboot/redeploy and
+  # an interrupted render resumes instead of re-encoding all ~400 clips. The
+  # code default (./tmp/render-cache) is ephemeral and only suitable for dev.
+  RENDER_CACHE_DIR = "/data/render-cache"
 
 [build]
   dockerfile = 'Dockerfile.worker'
 
+# Render throughput is CPU-bound: every footage clip is a libx264 normalize
+# pass and every image/video boundary is an xfade re-encode. The clip-normalize
+# loop runs RENDER_PIPELINE_CONCURRENCY lanes in parallel, so more vCPUs let
+# more clips encode at once. Bumped 4x -> 8x (4 -> 8 dedicated vCPUs) to roughly
+# halve the clip-loop wall-time on big (~400-clip) projects.
+#
+# IMPORTANT: the concurrency knobs that consume these cores are Fly SECRETS
+# (they override [env] here), so changing the VM size alone is NOT enough. To
+# actually use the 8 cores, set:
+#   fly secrets set RENDER_PIPELINE_CONCURRENCY=4 FFMPEG_THREADS=2 \
+#     --app video-automation-worker
+# (4 lanes x 2 threads = 8 vCPUs — the rule of thumb from lib/env.ts.)
 [[vm]]
-  size = 'performance-4x'
-  memory = '8gb'
+  size = 'performance-8x'
+  memory = '16gb'
 
 # Redis AOF lives here so queue state survives container restarts/deploys.
 # Without this, every redeploy would wipe in-flight jobs.

@@ -242,6 +242,13 @@ const ServerEnvSchema = z.object({
   // product stays at or below the host's vCPU count to avoid thrash.
   FFMPEG_THREADS: z.coerce.number().int().positive().default(2),
   HTTP_DOWNLOAD_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
+  // Number of EXTRA attempts (beyond the first) a render-path download makes
+  // when it hits a transient failure — a timeout, a 5xx/429 from the CDN, or a
+  // mid-stream network drop. A single slow clip download (e.g. media.celebforge
+  // .org stalling past the 120s timeout) used to fail its clip outright and
+  // stall the whole render until the watchdog reaped it. 4xx (except 429) is
+  // permanent and is NOT retried. 0 disables retries (legacy one-shot behavior).
+  HTTP_DOWNLOAD_RETRIES: z.coerce.number().int().nonnegative().default(2),
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
   YTDLP_PATH: z.string().default("yt-dlp"),
@@ -273,6 +280,18 @@ const ServerEnvSchema = z.object({
   // standard list export). Empty = no proxy (local/dev only).
   YTDLP_PROXIES: z.string().optional(),
   TMP_DIR: z.string().default("./tmp"),
+  // Persistent render cache. Per-clip normalized outputs are written here keyed
+  // by a content hash so a render that is interrupted (Fly machine reboot, OOM,
+  // redeploy) can RESUME on retry instead of re-encoding all ~400 clips from
+  // scratch. MUST point at a durable volume — on the worker that's the /data
+  // mount (see fly.toml [[mounts]]), which survives restarts. Defaults to a
+  // local ./tmp subdir for dev. The cache for a project is deleted after its
+  // final video uploads successfully; a stale-entry sweep also bounds growth.
+  RENDER_CACHE_DIR: z.string().default("./tmp/render-cache"),
+  // Max age (hours) for a render-cache entry before the periodic sweep deletes
+  // it. Sized so an in-progress render's clips are never reaped mid-flight but
+  // orphans from a project that was abandoned/failed don't accumulate on /data.
+  RENDER_CACHE_TTL_HOURS: z.coerce.number().positive().default(24),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

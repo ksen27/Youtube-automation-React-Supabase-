@@ -3,7 +3,7 @@ import { promises as fs, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import type { RenderJobData } from "@/lib/jobs/queue";
-import { logJob, setMediaJob, setProjectStatus } from "@/lib/jobs/db";
+import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
@@ -12,6 +12,12 @@ import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
 import { getEnv } from "@/lib/env";
+import {
+  clipCacheKey,
+  lookupCachedClip,
+  storeCachedClip,
+  clearProjectCache,
+} from "./renderCache";
 
 // Minimum seconds of host clip that must remain after a lower-third's slide-in
 // begins, so a word spoken near the very end of a clip still produces a
@@ -245,11 +251,62 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     let cursor = 0;
     let completed = 0;
 
+    // Resume cache wrapper. Before doing the (expensive) normalize work for
+    // item i, check the persistent render cache for a valid prior result; on a
+    // hit, restore the clip + its durations and skip the encode entirely. On a
+    // miss, run renderItem() and persist whatever it produced. This is what
+    // makes a render survive a mid-flight worker restart without redoing every
+    // clip. See worker/processors/renderCache.ts.
     async function processItem(i: number): Promise<void> {
+      const it = renderable[i];
+      const idx = String(i).padStart(3, "0");
+      const out = path.join(tmp, `norm_${idx}.mp4`);
+      const cacheKey = clipCacheKey({
+        itemId: (it.id as string | undefined) ?? null,
+        index: i,
+        type: String(it.type),
+        signature: {
+          image_url: it.image_url ?? null,
+          clip_id: (it as Record<string, unknown>).clip_id ?? null,
+          duration: it.duration ?? null,
+          metadata: it.metadata ?? null,
+        },
+      });
+
+      const cached = await lookupCachedClip(projectId, cacheKey);
+      if (cached) {
+        try {
+          await fs.copyFile(cached.mp4Path, out);
+          slots[i] = out;
+          slotDurations[i] = cached.meta.slotDuration;
+          slotContentDurations[i] = cached.meta.slotContentDuration;
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.clip.cache_hit", { idx: i });
+          return;
+        } catch {
+          // Copy failed (e.g. cache file vanished between probe and copy) —
+          // fall through and render fresh.
+        }
+      }
+
+      await renderItem(i, out);
+
+      // Persist on success. slots[i] is only set when renderItem produced a
+      // usable clip; a failed item leaves it null (and durations at 0), so we
+      // cache nothing and the next retry re-attempts it.
+      if (slots[i] && slotDurations[i] > 0) {
+        await storeCachedClip(projectId, cacheKey, out, {
+          slotDuration: slotDurations[i],
+          slotContentDuration: slotContentDurations[i],
+          probedDuration: slotDurations[i],
+        });
+      }
+    }
+
+    async function renderItem(i: number, out: string): Promise<void> {
       const it = renderable[i];
       const plannedDur = Math.max(0.5, Number(it.duration) || 0);
       const idx = String(i).padStart(3, "0");
-      const out = path.join(tmp, `norm_${idx}.mp4`);
 
       if (it.type === "split_2") {
         // Split-screen: matcher persisted the LEFT image URL on
@@ -888,7 +945,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }
     }
 
+    // Liveness heartbeat for the merge phase. Each boundary is a full ffmpeg
+    // xfade re-encode and there's no per-boundary progress write, so on a big
+    // project this loop can run many minutes — long enough for the stall
+    // sweeper to false-kill the job. Touch updated_at at most every ~20s so a
+    // live merge keeps signalling without hammering the DB.
+    let lastMergeHeartbeat = 0;
+    const mergeHeartbeat = async () => {
+      const now = Date.now();
+      if (now - lastMergeHeartbeat < 20_000) return;
+      lastMergeHeartbeat = now;
+      await touchMediaJob(mediaJobId);
+    };
+
     for (let i = 0; i < slots.length; i++) {
+      await mergeHeartbeat();
       const seg = slots[i];
       if (seg === null) continue;
       const itemKind: SegKind = isImageNeighbor(i) ? "image" : "video";
@@ -1211,6 +1282,11 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await normalizeClip({
               inputPath: trimmed, outputPath: normalizedCard,
               width: 1280, height: 720, fps: 30,
+              // Pin to the requested window. cutClip stream-copies and rounds
+              // up to the next keyframe, so an 8s intro card overshoots to
+              // ~12s; pinning the normalize re-encode caps it back to exactly
+              // `dur` (matches what scene blocks already do via renderDur).
+              pinDurationSeconds: dur,
             });
             builtVideos.push(normalizedCard);
             await safeUnlink(videoDl.outputPath);
@@ -1735,7 +1811,22 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }
     }
 
+    // The final concat is the single longest ffmpeg pass in the whole render
+    // (it RE-ENCODES every segment + mixes voiceover/music/SFX over the full
+    // timeline — can run 10-20 min on a long video). Heartbeat both before AND
+    // DURING the pass: onProgress fires on every ffmpeg status line, throttled
+    // to ~20s, so the stall sweeper never mistakes an actively-encoding job for
+    // a dead one no matter how long the encode takes.
+    await touchMediaJob(mediaJobId);
+    let lastConcatHeartbeat = 0;
+    const concatHeartbeat = () => {
+      const now = Date.now();
+      if (now - lastConcatHeartbeat < 20_000) return;
+      lastConcatHeartbeat = now;
+      void touchMediaJob(mediaJobId);
+    };
     await concatNormalizedClips({
+      onProgress: concatHeartbeat,
       inputPaths: normalized,
       outputPath: finalLocal,
       voiceoverPath: voiceoverForConcat,
@@ -1989,7 +2080,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         "render.post_validation.failed", { err: (e as Error).message });
     }
 
-    // 5) Upload final
+    // 5) Upload final. Pushing a multi-hundred-MB mp4 to R2 can take a while on
+    // a slow link — heartbeat first so the sweeper doesn't fire during upload.
+    await touchMediaJob(mediaJobId);
     const dest = `projects/${projectId}/final/${Date.now()}.mp4`;
     const up = await uploadFile(finalLocal, dest, "video/mp4");
 
@@ -1998,6 +2091,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     }).eq("id", renderJobId);
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { outputUrl: up.publicUrl } });
     await setProjectStatus(projectId, "completed");
+    // Render succeeded — the per-clip resume cache has served its purpose, so
+    // free the disk it holds on the /data volume.
+    await clearProjectCache(projectId);
   } catch (e) {
     const msg = (e as Error).message;
     await sb.from("render_jobs").update({ status: "failed", error: msg }).eq("id", renderJobId);
@@ -2016,14 +2112,69 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   }
 }
 
+// Render-path download error carrying enough context to decide whether a retry
+// is worthwhile. `retryable` is false for permanent failures (4xx other than
+// 429) so we don't burn the global render budget re-fetching a 404, and true
+// for timeouts, 5xx/429, and mid-stream network drops.
+class DownloadError extends Error {
+  retryable: boolean;
+  status?: number;
+  constructor(message: string, retryable: boolean, status?: number) {
+    super(message);
+    this.name = "DownloadError";
+    this.retryable = retryable;
+    this.status = status;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+// Retrying wrapper around downloadHttpOnce. A single slow/flaky CDN response
+// (e.g. media.celebforge.org stalling past the 120s timeout) previously failed
+// its clip outright and stalled the whole render until the stall-sweep watchdog
+// reaped it. We now make HTTP_DOWNLOAD_RETRIES extra attempts with exponential
+// backoff on transient failures only; permanent 4xx failures throw immediately.
+// The public signature is unchanged so all call sites benefit transparently.
 async function downloadHttp(url: string, destPath: string): Promise<void> {
+  const retries = getEnv().HTTP_DOWNLOAD_RETRIES;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      await downloadHttpOnce(url, destPath);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const retryable = e instanceof DownloadError ? e.retryable : true;
+      if (!retryable || attempt === retries) throw e;
+      // Exponential backoff: 1s, 2s, 4s, ... capped at 10s. Clean up any
+      // partial file the failed attempt left behind before retrying so the
+      // next stream write starts from an empty destination.
+      await safeUnlink(destPath);
+      const backoffMs = Math.min(10_000, 1000 * 2 ** attempt);
+      await sleep(backoffMs);
+    }
+  }
+  // Unreachable — the loop either returns or throws — but satisfies the
+  // type checker that lastErr is always thrown when retries are exhausted.
+  throw lastErr;
+}
+
+async function downloadHttpOnce(url: string, destPath: string): Promise<void> {
   const timeoutMs = getEnv().HTTP_DOWNLOAD_TIMEOUT_SECONDS * 1000;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { signal: ctrl.signal });
-    if (!r.ok) throw new Error(`download ${url}: ${r.status}`);
-    if (!r.body) throw new Error(`download ${url}: empty body`);
+    if (!r.ok) {
+      // 4xx (except 429 Too Many Requests) is a permanent client error —
+      // retrying a 404/403 just wastes the render budget. 5xx and 429 are
+      // transient and worth another attempt.
+      const retryable = r.status >= 500 || r.status === 429;
+      throw new DownloadError(`download ${url}: ${r.status}`, retryable, r.status);
+    }
+    if (!r.body) throw new DownloadError(`download ${url}: empty body`, true);
     await fs.mkdir(path.dirname(destPath), { recursive: true });
     // Stream the response straight to disk instead of buffering the entire
     // body via arrayBuffer(). For a 16-clip render this loop runs 17+ times
@@ -2042,11 +2193,19 @@ async function downloadHttp(url: string, destPath: string): Promise<void> {
       { signal: ctrl.signal },
     );
   } catch (e) {
+    // Already-classified errors (the !r.ok / empty-body cases) pass through
+    // unchanged so the wrapper sees their retryable flag.
+    if (e instanceof DownloadError) throw e;
     const err = e as Error & { code?: string };
     if (err.name === "AbortError" || err.code === "ABORT_ERR") {
-      throw new Error(`download ${url}: timed out after ${timeoutMs / 1000}s`);
+      // Timeout — transient, worth a retry against a slow/flaky CDN.
+      throw new DownloadError(
+        `download ${url}: timed out after ${timeoutMs / 1000}s`,
+        true,
+      );
     }
-    throw e;
+    // Network reset, DNS hiccup, mid-stream disconnect, etc. — also transient.
+    throw new DownloadError(`download ${url}: ${err.message}`, true);
   } finally {
     clearTimeout(timer);
   }

@@ -86,7 +86,17 @@
       "Bash(curl -s -m 30 -o /dev/null -w \"status=%{http_code} loc=%{redirect_url}\\\\n\" --cookie \"cf_session=9999999999999.deadbeef\" http://localhost:3000/dashboard)",
       "Bash(curl -s -m 30 -b /tmp/cookies.txt -c /tmp/cookies.txt -o /dev/null -w \"logout status=%{http_code}\\\\n\" -X POST http://localhost:3000/api/auth/logout)",
       "Bash(echo \"exit: $?\")",
-      "PowerShell(npm run typecheck)"
+      "PowerShell(npm run typecheck)",
+      "PowerShell($bytes = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Fill\\($bytes\\); -join \\($bytes | ForEach-Object { $_.ToString\\('x2'\\) }\\))",
+      "Bash(netstat -ano)",
+      "Bash(curl -s -m 10 -o /dev/null -w \"3000=%{http_code}\\\\n\" http://127.0.0.1:3000/login)",
+      "Bash(curl -s -m 10 -o /dev/null -w \"3001=%{http_code}\\\\n\" http://127.0.0.1:3001/login)",
+      "Bash(grep -qE \"Failed to compile|Compiled with|Route \\\\\\(app\\\\\\)|✓ Generating|Linting|error\\\\b|✓ Finalizing|build completed\" /tmp/build.log)",
+      "Bash(grep -qE \"Route \\\\\\(app\\\\\\)|Failed to compile|build error\" /tmp/build.log)",
+      "Bash(ffmpeg -y -f lavfi -i color=c=black:s=640x360:d=1 -filter_script:v \"C:/Users/HJS/AppData/Local/Temp/lt_fixed.txt\" -f null -)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\HJS\\AppData\\Local\\Temp"
     ]
   }
 }
