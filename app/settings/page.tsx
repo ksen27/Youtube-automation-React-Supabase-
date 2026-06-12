@@ -1,9 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { getEnv } from "@/lib/env";
 import { isSupabaseConfigured, getServerSupabase } from "@/lib/supabase/server";
-import { newRedisClient } from "@/lib/jobs/queue";
-import { checkR2Health } from "@/lib/storage";
 import { ReferenceChannels, type ReferenceChannel } from "./reference-channels";
 import { ChangePassword } from "./change-password";
 import { hasCustomPassword } from "@/lib/auth-store";
@@ -11,19 +7,7 @@ import { hasCustomPassword } from "@/lib/auth-store";
 export const dynamic = "force-dynamic";
 
 async function getStatus() {
-  const env = getEnv();
-  const youtube = Boolean(env.YOUTUBE_API_KEY);
-  const gemini = Boolean(env.GEMINI_API_KEY);
   const supabase = isSupabaseConfigured();
-
-  const storage = await checkR2Health();
-  let redis = false;
-  try {
-    const c = newRedisClient();
-    await c.ping();
-    await c.quit();
-    redis = true;
-  } catch { redis = false; }
 
   let referenceChannels: ReferenceChannel[] = [];
   let blocked: Array<{ channel_id: string | null; channel_title: string | null }> = [];
@@ -56,11 +40,7 @@ async function getStatus() {
     customPassword = await hasCustomPassword();
   } catch { /* default password still in use */ }
 
-  return { youtube, gemini, supabase, storage, redis, env, referenceChannels, blocked, customPassword };
-}
-
-function StatusBadge({ ok }: { ok: boolean }) {
-  return ok ? <Badge variant="success">configured</Badge> : <Badge variant="destructive">missing</Badge>;
+  return { referenceChannels, blocked, customPassword };
 }
 
 export default async function SettingsPage() {
@@ -69,64 +49,10 @@ export default async function SettingsPage() {
     <div className="p-8 max-w-5xl mx-auto space-y-6">
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-        <p className="text-sm text-muted-foreground">Connection health for the services this MVP needs.</p>
+        <p className="text-sm text-muted-foreground">Account and channel preferences.</p>
       </header>
 
       <ChangePassword hasCustomPassword={s.customPassword} />
-
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle>YouTube Data API</CardTitle></CardHeader>
-          <CardContent className="text-sm space-y-1">
-            <div className="flex items-center justify-between"><span>YOUTUBE_API_KEY</span><StatusBadge ok={s.youtube} /></div>
-            <p className="text-xs text-muted-foreground">Enable "YouTube Data API v3" in Google Cloud and set the key in <code>.env.local</code>.</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle>Gemini</CardTitle></CardHeader>
-          <CardContent className="text-sm space-y-1">
-            <div className="flex items-center justify-between"><span>GEMINI_API_KEY</span><StatusBadge ok={s.gemini} /></div>
-            <p className="text-xs text-muted-foreground">Get a key at <a className="underline" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">aistudio.google.com</a>.</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle>Supabase</CardTitle></CardHeader>
-          <CardContent className="text-sm space-y-1">
-            <div className="flex items-center justify-between"><span>Database</span><StatusBadge ok={s.supabase} /></div>
-            <p className="text-xs text-muted-foreground">Set <code>NEXT_PUBLIC_SUPABASE_URL</code>, <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>, and <code>SUPABASE_SERVICE_ROLE_KEY</code>.</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle>Cloudflare R2</CardTitle></CardHeader>
-          <CardContent className="text-sm space-y-1">
-            <div className="flex items-center justify-between"><span>Bucket "{s.env.R2_BUCKET}"</span><StatusBadge ok={s.storage} /></div>
-            <p className="text-xs text-muted-foreground">Set <code>R2_ACCOUNT_ID</code>, <code>R2_ACCESS_KEY_ID</code>, <code>R2_SECRET_ACCESS_KEY</code>, <code>R2_BUCKET</code>, and <code>R2_PUBLIC_BASE_URL</code>. Bucket must be public via r2.dev or a custom domain.</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader><CardTitle>Redis (BullMQ)</CardTitle></CardHeader>
-          <CardContent className="text-sm space-y-1">
-            <div className="flex items-center justify-between"><span>Connection</span><StatusBadge ok={s.redis} /></div>
-            <p className="text-xs text-muted-foreground">Run <code>docker compose up -d redis</code> or set <code>REDIS_URL</code>.</p>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Pipeline limits</CardTitle>
-          <CardDescription>Hard caps from environment configuration.</CardDescription>
-        </CardHeader>
-        <CardContent className="text-sm grid gap-2 sm:grid-cols-3">
-          <div>Max videos / project: <strong>{s.env.MAX_VIDEOS_PER_PROJECT}</strong></div>
-          <div>Max clips / video: <strong>{s.env.MAX_CLIPS_PER_VIDEO}</strong></div>
-          <div>Max source duration: <strong>{s.env.MAX_SOURCE_DURATION_SECONDS}s</strong></div>
-        </CardContent>
-      </Card>
 
       <ReferenceChannels initial={s.referenceChannels} />
 

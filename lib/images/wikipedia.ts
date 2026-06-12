@@ -23,6 +23,28 @@ export interface WikipediaImageResult {
   description: string;
 }
 
+// Matches an upload.wikimedia.org ORIGINAL file URL, capturing the project
+// ("commons", "en", ...) and the file name.
+const WIKIMEDIA_ORIGINAL_RE =
+  /^https:\/\/upload\.wikimedia\.org\/wikipedia\/([^/]+)\/[0-9a-f]\/[0-9a-f]{2}\/([^/?#]+)$/;
+
+/**
+ * Build a server-side resized rendition of a Wikimedia original-file URL via
+ * the Special:Redirect/file endpoint (302s to the rendered thumb). Wikipedia
+ * originals are routinely 4-20MB scans; consumers that only need a
+ * recognizable image (face verification) should fetch a bounded-width
+ * rendition instead. The /thumb/ URL path is deliberately NOT used — it
+ * returns 400 for some files; Special:Redirect is the stable resize API.
+ * Returns null for URLs that aren't Wikimedia originals.
+ */
+export function wikimediaResizedUrl(originalUrl: string, width: number): string | null {
+  const m = WIKIMEDIA_ORIGINAL_RE.exec(originalUrl);
+  if (!m) return null;
+  const [, project, file] = m;
+  const host = project === "commons" ? "commons.wikimedia.org" : `${project}.wikipedia.org`;
+  return `https://${host}/w/index.php?title=Special:Redirect/file/${file}&width=${width}`;
+}
+
 /**
  * Fetch the page summary for a query and return its main image if present.
  * Returns null when no page matches OR the page exists but has no image.

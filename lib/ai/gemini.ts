@@ -32,10 +32,27 @@ export function isRetryableGeminiError(err: unknown): boolean {
   );
 }
 
+// Parse the server-mandated retry delay from a 429 quota error. Gemini's
+// per-minute token quota errors carry RetryInfo ("Please retry in 39.6s" /
+// retryDelay:"39s") — waiting any LESS than that guarantees the next attempt
+// lands inside the same exhausted quota window and fails identically, which
+// is how the 1s→3s→9s ladder burned all attempts in ~3s against a 40s
+// window (2026-06-12 scoreClips drops). Capped so a pathological server
+// value can't stall a job.
+function serverRetryDelayMs(err: unknown): number | null {
+  const msg = (err as Error)?.message ?? String(err);
+  if (!msg.includes("429")) return null;
+  const m = /retry in (\d+(?:\.\d+)?)\s*s/i.exec(msg) ?? /retryDelay[":\\]+(\d+(?:\.\d+)?)s/.exec(msg);
+  if (!m) return null;
+  return Math.min(Math.ceil(parseFloat(m[1]) * 1000), 90_000);
+}
+
 // Exponential backoff with full jitter. 1s → 3s → 9s by default — total
 // worst-case wait is ~13s before giving up, which is acceptable inside the
 // clip job (label runs alongside upload) and the match job (one batch out
-// of many, run with bounded concurrency).
+// of many, run with bounded concurrency). EXCEPTION: a 429 with RetryInfo
+// waits what the server asked for (plus jitter so concurrent batches don't
+// all retry on the same tick) — see serverRetryDelayMs.
 export async function withGeminiRetry<T>(
   label: string,
   fn: () => Promise<T>,
@@ -50,12 +67,16 @@ export async function withGeminiRetry<T>(
     } catch (e) {
       lastErr = e;
       if (i === attempts - 1 || !isRetryableGeminiError(e)) throw e;
-      const delay = Math.round(baseMs * Math.pow(3, i) * (0.5 + Math.random()));
+      const serverMs = serverRetryDelayMs(e);
+      const delay = serverMs !== null
+        ? serverMs + Math.round(Math.random() * 3000)
+        : Math.round(baseMs * Math.pow(3, i) * (0.5 + Math.random()));
       console.warn(JSON.stringify({
         msg: "gemini.retry",
         op: label,
         attempt: i + 1,
         nextDelayMs: delay,
+        honoredServerDelay: serverMs !== null || undefined,
         err: (e as Error).message?.slice(0, 200),
       }));
       await new Promise((r) => setTimeout(r, delay));

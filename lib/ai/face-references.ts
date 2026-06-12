@@ -18,7 +18,7 @@
 // Slice 4-6 will call buildReferenceRoster() during project setup (or
 // lazily on first match) and lookupReference() at clip/image fetch time.
 
-import { fetchWikipediaImage } from "@/lib/images/wikipedia";
+import { fetchWikipediaImage, wikimediaResizedUrl } from "@/lib/images/wikipedia";
 import { verifyImageIsPerson } from "@/lib/ai/verify";
 import { getServerSupabase } from "@/lib/supabase/server";
 import type { BlockEntityType } from "@/lib/ai/segments";
@@ -86,6 +86,14 @@ export async function fetchEntityReference(
   for (const q of queries) {
     const hit = await fetchWikipediaImage(q);
     if (!hit) continue;
+    // A reference only needs a recognizable face/logo — never the full-res
+    // original. Wikipedia originals are often >4MB, which the verifier's
+    // fetch size cap rejects on EVERY verification, collapsing the whole
+    // identity gate (every verdict "reference fetch failed"). Store a
+    // bounded 1024px rendition instead.
+    const url = hit.width > 1024
+      ? (wikimediaResizedUrl(hit.url, 1024) ?? hit.url)
+      : hit.url;
     // CONTENT-BASED person guard (person only, no hardcoded word lists). A bare
     // ambiguous name resolves to a non-person Wikipedia page whose image is a
     // tapestry / calligraphy / map / logo — NOT the person. We look at the
@@ -94,12 +102,12 @@ export async function fetchEntityReference(
     // confident "no" is rejected (try the next candidate query); "yes" and
     // "uncertain" pass so a Gemini hiccup doesn't strip a valid reference.
     if (entity.type === "person") {
-      const verdict = await verifyImageIsPerson(hit.url).catch(
+      const verdict = await verifyImageIsPerson(url).catch(
         () => ({ verdict: "uncertain" as const, reason: "check failed", confidence: 0 }),
       );
       if (verdict.verdict === "no") continue;
     }
-    return { url: hit.url, pageUrl: hit.pageUrl, pageTitle: hit.pageTitle };
+    return { url, pageUrl: hit.pageUrl, pageTitle: hit.pageTitle };
   }
   return null;
 }

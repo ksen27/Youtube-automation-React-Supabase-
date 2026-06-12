@@ -151,23 +151,30 @@ async function dbGetVerdicts(
 ): Promise<Map<string, DbVerdict>> {
   const out = new Map<string, DbVerdict>();
   if (urls.length === 0) return out;
+  // PostgREST encodes .in() as a GET query-string filter. Hundreds of long
+  // image URLs (parked-retry rounds pass 250+) overflow the request line and
+  // the WHOLE read 400s ("Bad Request") — every cached verdict becomes a
+  // miss and gets re-verified. Chunk the reads to keep each request small.
+  const CHUNK = 50;
   try {
     const sb = getServerSupabase();
-    const { data, error } = await sb
-      .from("image_verifications")
-      .select("candidate_url, verdict, reason, confidence")
-      .eq("entity_type", entityType)
-      .eq("entity_name", entityName.trim().toLowerCase())
-      .in("candidate_url", urls);
-    if (error) throw new Error(error.message);
-    for (const row of (data ?? []) as Array<{
-      candidate_url: string; verdict: string; reason: string | null; confidence: number | string | null;
-    }>) {
-      out.set(row.candidate_url, {
-        verdict: row.verdict as PoolVerdict,
-        reason: row.reason ?? "",
-        confidence: Number(row.confidence ?? 0),
-      });
+    for (let i = 0; i < urls.length; i += CHUNK) {
+      const { data, error } = await sb
+        .from("image_verifications")
+        .select("candidate_url, verdict, reason, confidence")
+        .eq("entity_type", entityType)
+        .eq("entity_name", entityName.trim().toLowerCase())
+        .in("candidate_url", urls.slice(i, i + CHUNK));
+      if (error) throw new Error(error.message);
+      for (const row of (data ?? []) as Array<{
+        candidate_url: string; verdict: string; reason: string | null; confidence: number | string | null;
+      }>) {
+        out.set(row.candidate_url, {
+          verdict: row.verdict as PoolVerdict,
+          reason: row.reason ?? "",
+          confidence: Number(row.confidence ?? 0),
+        });
+      }
     }
   } catch (e) {
     console.warn(JSON.stringify({

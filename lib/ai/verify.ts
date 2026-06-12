@@ -32,6 +32,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
 import { withGeminiRetry } from "@/lib/ai/gemini";
+import { wikimediaResizedUrl } from "@/lib/images/wikipedia";
 import type { BlockEntityType } from "@/lib/ai/segments";
 
 // Tri-state verdict. "uncertain" means "the model could not tell" — the
@@ -90,6 +91,20 @@ const imageCache = new Map<string, FetchedImage>();
 const inFlight = new Map<string, Promise<FetchedImage | null>>();
 
 async function doFetchImage(url: string): Promise<FetchedImage | null> {
+  // Wikimedia ORIGINAL-file URLs are often multi-MB full-resolution scans
+  // that deterministically fail the size cap / 8s timeout below — rows in
+  // face_references written before the roster builder stored resized URLs
+  // still point at originals. Fetch a 1024px server-side rendition first;
+  // fall back to the stored URL if the resize endpoint fails.
+  const resized = wikimediaResizedUrl(url, 1024);
+  if (resized) {
+    const img = await doFetchImageOnce(resized);
+    if (img) return img;
+  }
+  return doFetchImageOnce(url);
+}
+
+async function doFetchImageOnce(url: string): Promise<FetchedImage | null> {
   // One retry on transient failure (timeout / 429 / 5xx) with a short backoff —
   // cheap insurance against a single throttled response killing a verdict.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -120,8 +135,18 @@ async function doFetchImage(url: string): Promise<FetchedImage | null> {
       const buf = Buffer.from(await res.arrayBuffer());
       // Sanity cap — Gemini accepts large images but we don't gain anything
       // by sending 20MB hero shots. 4MB is well above what a face/logo gate
-      // needs and keeps the request quick.
-      if (buf.length > 4 * 1024 * 1024) return null;
+      // needs and keeps the request quick. Logged loudly: a capped image is
+      // indistinguishable from a 404 to callers ("fetch failed"), and a
+      // capped REFERENCE photo deterministically fails every verification
+      // for that entity (the 2026-06-12 1712/1814-errored incident).
+      if (buf.length > 4 * 1024 * 1024) {
+        console.warn(JSON.stringify({
+          msg: "image_fetch.size_cap_rejected",
+          url: url.slice(0, 200),
+          bytes: buf.length,
+        }));
+        return null;
+      }
       return { data: buf.toString("base64"), mimeType };
     } catch {
       // Network error / abort — retry once, then give up.
