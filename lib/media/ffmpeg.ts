@@ -1814,8 +1814,21 @@ export async function overlayEffectVideo(opts: {
   // blend. format=yuv420p on BOTH the effect prep and the blend output keeps
   // the pipeline 8-bit 4:2:0 — matching the concat output so the re-encode is
   // a clean single-format pass.
+  //
+  // BLACK-FLOOR (lutyuv): screen blend keeps `result = 255 - (255-base)*(255-fx)/255`,
+  // so ANY non-zero effect luma lifts the base. Real-world effect exports are
+  // limited-range (TV) — their "black" background sits at luma ~16, not 0 —
+  // which under screen would add a uniform ~6% gray veil over the whole video.
+  // Map every luma at/below BLACK_FLOOR down to 0 (and pin chroma to neutral
+  // 128) so only the genuine bright specks (well above the floor) survive the
+  // blend and the background contributes nothing. BLACK_FLOOR=24 clears the
+  // ~16 TV-black floor with headroom for compression noise while staying far
+  // below particle brightness (measured YMAX ~125 on the client asset).
+  const BLACK_FLOOR = 24;
+  const fxBlackFloor =
+    `lutyuv=y='if(lte(val\\,${BLACK_FLOOR})\\,0\\,val)':u=128:v=128`;
   const filter =
-    `[1:v]scale=${w}:${h},setsar=1,fps=${fps},format=yuv420p[fx];` +
+    `[1:v]scale=${w}:${h},setsar=1,fps=${fps},${fxBlackFloor},format=yuv420p[fx];` +
     `[0:v][fx]blend=all_mode=screen:all_opacity=${opacity.toFixed(3)}:shortest=1,` +
     `format=yuv420p[v]`;
 
