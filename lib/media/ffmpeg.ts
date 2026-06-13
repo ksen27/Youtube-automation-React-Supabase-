@@ -1777,6 +1777,69 @@ export async function concatNormalizedClips(opts: ConcatOptions): Promise<void> 
   }
 }
 
+// Screen-blend a looping effect clip over an already-finished MP4. Run as a
+// post-pass on the concat output (final_<projectId>.mp4). The effect is a
+// short clip of bright particles/dust/flares on a PURE-BLACK background;
+// `blend=all_mode=screen` keeps only the bright pixels and makes the black
+// background vanish, so the particles float over the content with no dark
+// wash. Black contributes nothing under screen, so even high opacity is safe.
+//
+// Compositing two video layers is impossible with -c:v copy, so this RE-
+// ENCODES the video (one libx264 pass over the whole timeline). Audio is
+// stream-copied — the finished mix already lives in the input file.
+//
+// The effect is looped on the input side (-stream_loop -1) to cover videos
+// longer than the effect clip; `shortest=1` on the blend pins the output to
+// the base video's length so the looped (effectively infinite) effect can't
+// extend it. Scale + setsar + fps match the effect to the base stream so the
+// blend lines up frame-for-frame.
+export async function overlayEffectVideo(opts: {
+  inputPath: string;       // finished MP4 to overlay onto
+  effectPath: string;      // the effect clip (particles on black)
+  outputPath: string;
+  width?: number;          // default 1280
+  height?: number;         // default 720
+  fps?: number;            // default 30
+  opacity?: number;        // 0..1, default 0.7
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  const opacity = Math.min(1, Math.max(0, opts.opacity ?? 0.7));
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  // Normalize the effect layer to the base's geometry/timebase, then screen-
+  // blend. format=yuv420p on BOTH the effect prep and the blend output keeps
+  // the pipeline 8-bit 4:2:0 — matching the concat output so the re-encode is
+  // a clean single-format pass.
+  const filter =
+    `[1:v]scale=${w}:${h},setsar=1,fps=${fps},format=yuv420p[fx];` +
+    `[0:v][fx]blend=all_mode=screen:all_opacity=${opacity.toFixed(3)}:shortest=1,` +
+    `format=yuv420p[v]`;
+
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputPath,
+    "-stream_loop", "-1", "-i", opts.effectPath,
+    "-filter_complex", filter,
+    "-map", "[v]",
+    // Keep the finished audio mix if the input has one (silent renders won't).
+    "-map", "0:a?",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "20",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 function runFFmpeg(
   bin: string,
   args: string[],

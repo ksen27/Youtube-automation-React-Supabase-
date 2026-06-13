@@ -1050,7 +1050,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         titleCardTextByParagraph,
         mainCelebrity: mainCelebrity ?? "",
         imageHoldPolicy: "sentence_duration",
-        // Cap images at MAX_IMAGE_RATIO (default 40:60). Gemini's raw
+        // Cap images at MAX_IMAGE_RATIO (default 30:70). Gemini's raw
         // visual-type split lands ~50% images, over-using the photo pool and
         // reading as a slideshow; the builder converts the lowest-priority
         // surplus image blocks to footage (footage supply is plentiful).
@@ -6259,6 +6259,120 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         mergedRuns,
         mergedSlots,
         finalItemCount: items.length,
+      });
+    }
+  }
+
+  // ---- Hard image use-count cap (client spec: max twice per video) ------
+  // The reuse cooldown above only spreads repeats across TIME — it never caps
+  // the TOTAL number of times one photo appears. On image-heavy projects with
+  // a thin verified pool the same celebrity photo could still surface 3, 4, 5+
+  // times over a long video. Client direction (2026-06): no image may appear
+  // more than twice in a video; the 3rd+ appearance must fall back to a CLIP
+  // (footage), not another image and not a blank slot.
+  //
+  // We enforce this as a single post-assignment pass rather than gating every
+  // individual pick site: the pick loops have divergent fall-through behaviour
+  // (next-oldest image, person fallback, blank) and none of them naturally
+  // lands on a clip, which is exactly what the client asked for. Walking the
+  // committed timeline once — in position order, so the FIRST two chronological
+  // uses of each image are the ones kept — and downgrading the surplus is both
+  // simpler and a precise match for the spec.
+  //
+  // Runs AFTER the adjacent-merge pass on purpose: that pass folds a back-to-
+  // back identical photo (very common from the person fallback) into ONE slot,
+  // so two consecutive duplicates count as a single on-screen appearance — the
+  // semantic the client means by "appears in the video". Counting before the
+  // merge would over-count and downgrade images the viewer only sees twice.
+  //
+  // Scope: plain `image` items only. split_2 blocks are deliberate side-by-side
+  // compositions (a whole different visual), so we leave them intact and don't
+  // count their halves toward the cap.
+  //
+  // Downgrade target: a clip via the SAME ladder fillEmptyBlock uses, but with
+  // the person-image rung removed (steps 1 + 3 only: fresh clip, then reused
+  // clip). Re-showing a person photo here would defeat the cap. If no clip is
+  // available at all, we keep the image — a 3rd appearance beats a black slot,
+  // and footage genuinely being exhausted is the documented last resort.
+  {
+    const IMAGE_MAX_USES = 2;
+    const imageUseCount = new Map<string, number>();
+
+    // Clip-only downgrade: fresh clip first, then a reused clip on cooldown.
+    // Mirrors fillEmptyBlock steps 1 & 3 but never reintroduces an image.
+    const downgradeImageToClip = (
+      item: typeof items[number],
+      blockIdx: number,
+    ): "fresh_clip" | "reused_clip" | "no_clip" => {
+      const meta = (item.metadata ?? {}) as Record<string, unknown>;
+      const prevUrl = typeof item.image_url === "string" ? item.image_url : null;
+
+      const filler = pickFillerForBlock(blockIdx);
+      if (filler && !usedClipIds.has(filler.clipId)) {
+        item.type = "footage";
+        item.clip_id = filler.clipId;
+        item.image_url = null;
+        usedClipIds.add(filler.clipId);
+        clipLastUsedAt.set(filler.clipId, blockStartSec[blockIdx]);
+        meta.downgraded_from = "image_use_cap";
+        meta.downgrade_reason = `image used > ${IMAGE_MAX_USES}x; fresh clip`;
+        meta.pick_source = "image_cap_downgrade_to_footage";
+        if (prevUrl) meta.capped_image_url = prevUrl;
+        item.metadata = meta;
+        return "fresh_clip";
+      }
+
+      const reuse = pickReuseClipForBlock(blockIdx);
+      if (reuse) {
+        item.type = "footage";
+        item.clip_id = reuse.clipId;
+        item.image_url = null;
+        clipLastUsedAt.set(reuse.clipId, blockStartSec[blockIdx]);
+        meta.downgraded_from = "image_use_cap";
+        meta.downgrade_reason = `image used > ${IMAGE_MAX_USES}x; reused a prior clip`;
+        meta.pick_source = "image_cap_downgrade_to_reused_footage";
+        if (prevUrl) meta.capped_image_url = prevUrl;
+        item.metadata = meta;
+        return "reused_clip";
+      }
+
+      return "no_clip";
+    };
+
+    let cappedToFreshClip = 0;
+    let cappedToReusedClip = 0;
+    let cappedKeptNoClip = 0;
+    for (const item of items) {
+      if (item.type !== "image") continue;
+      const url = typeof item.image_url === "string" ? item.image_url.trim() : "";
+      if (!url) continue;
+      const prior = imageUseCount.get(url) ?? 0;
+      if (prior >= IMAGE_MAX_USES) {
+        // This would be the 3rd+ appearance — try to downgrade to a clip.
+        const blockIdx = (item.metadata as Record<string, unknown> | undefined)?.block_index as number | undefined;
+        const outcome = blockIdx == null ? "no_clip" : downgradeImageToClip(item, blockIdx);
+        if (outcome === "fresh_clip") cappedToFreshClip++;
+        else if (outcome === "reused_clip") cappedToReusedClip++;
+        else {
+          // No clip available — keep the image (last resort) and count it so
+          // the metric reflects reality.
+          cappedKeptNoClip++;
+          imageUseCount.set(url, prior + 1);
+        }
+        continue;
+      }
+      imageUseCount.set(url, prior + 1);
+    }
+    if (cappedToFreshClip + cappedToReusedClip + cappedKeptNoClip > 0) {
+      // Positions may now be non-contiguous if any items changed type? No —
+      // downgrade mutates type in place and keeps position/duration, so the
+      // 0..N-1 sequencing from the merge pass still holds.
+      await logJob({ projectId, jobId: mediaJobId }, "match.image_use_cap", {
+        maxUses: IMAGE_MAX_USES,
+        downgradedToFreshClip: cappedToFreshClip,
+        downgradedToReusedClip: cappedToReusedClip,
+        keptNoClipAvailable: cappedKeptNoClip,
+        distinctImages: imageUseCount.size,
       });
     }
   }

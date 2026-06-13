@@ -99,9 +99,10 @@ const ServerEnvSchema = z.object({
   // be images. Gemini's per-sentence visual-type call lands ~50% images,
   // which over-uses the verified image pool (same photo repeats) and reads as
   // a slideshow. The transcript-driven builder caps images at this ratio and
-  // converts the lowest visual_priority image blocks to footage. 0.40 = 40:60
-  // image:footage; set 0.30 for 30:70. Range (0,1).
-  MAX_IMAGE_RATIO: z.coerce.number().gt(0).lt(1).default(0.40),
+  // converts the lowest visual_priority image blocks to footage. 0.30 = 30:70
+  // image:footage; set 0.40 for 40:60. Range (0,1). Client direction
+  // (2026-06): shift ~10% from stills to footage, so 0.40 → 0.30.
+  MAX_IMAGE_RATIO: z.coerce.number().gt(0).lt(1).default(0.30),
   // Subject-first source-video target. The number of source videos we aim to
   // SELECT scales with voiceover duration instead of a flat constant: the
   // longer the narration, the more distinct footage sources it needs. Client
@@ -253,6 +254,31 @@ const ServerEnvSchema = z.object({
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
   YTDLP_PATH: z.string().default("yt-dlp"),
+  // Global full-video effect overlay. A single effect clip (e.g. floating
+  // dust/particle specks on a pure-black background) is screen-blended over
+  // EVERY frame of the finished video — across intro clips, the opening
+  // title card, and all body content — as a one-shot post-pass on the
+  // concat output. Client direction (2026-06): the same effect overlays the
+  // entire video for every project, so it lives in config, not per-project
+  // state (no DB column, no UI).
+  //
+  //   EFFECT_OVERLAY_ENABLED — master toggle. Off by default so a deploy
+  //     without the asset behaves exactly as before.
+  //   EFFECT_OVERLAY_PATH    — absolute or worker-relative path to the
+  //     effect video. The overlay is silently skipped (best-effort, logged)
+  //     when the file is missing, so a misconfigured path never fails a
+  //     render.
+  //   EFFECT_OVERLAY_OPACITY — 0..1 strength of the screen blend. Particles
+  //     on black wash nothing out even near 1.0, so 0.7 is a strong-but-safe
+  //     default. Lower it to make the effect subtler.
+  //
+  // The overlay forces a full re-encode of the finished MP4 (compositing two
+  // video layers is impossible with the concat's -c:v copy fast path), so it
+  // adds one libx264 pass over the whole timeline. Audio is stream-copied —
+  // the voiceover/music/SFX mix is already baked into the concat output.
+  EFFECT_OVERLAY_ENABLED: z.coerce.boolean().default(false),
+  EFFECT_OVERLAY_PATH: z.string().default("./assets/effect-overlay.mp4"),
+  EFFECT_OVERLAY_OPACITY: z.coerce.number().min(0).max(1).default(0.7),
   // Run heavy subprocesses (ffmpeg, yt-dlp) at lower scheduling priority on
   // Linux. On shared-CPU hosts, full-throttle ffmpeg can starve Redis of CPU
   // long enough for idle TCP keepalives to time out, surfacing as

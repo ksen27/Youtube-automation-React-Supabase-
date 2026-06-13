@@ -38,7 +38,41 @@ export const SHORT_SENTENCE_SECONDS = 3;
 // segment over the voiceover audio. Per client spec — section title
 // shows for exactly this long while the narrator speaks the section's
 // first sentence underneath.
+//
+// NOTE: this is the UPPER BOUND on the card's on-screen hold, NOT the
+// amount of the sentence's spoken time the card consumes. The narrator
+// says the title phrase in ~1-1.5s and then keeps talking; the card is an
+// OVERLAY over that continuing narration, not a pause. We therefore
+// consume only the title phrase's estimated SPOKEN duration (see
+// estimateTitleSpokenSeconds) from the sentence's window — capped at this
+// value — so the section's first sentence keeps the rest of its real
+// spoken time on its own content block instead of being shoved forward.
 export const TITLE_CARD_HOLD_SECONDS = 5;
+
+// Standard English voiceover narration cadence (words/sec) used to
+// estimate how long the narrator spends SAYING a title phrase. 2.5 wps
+// (150 wpm) matches the alignment fallback (sentence-alignment.ts:
+// FALLBACK_WPS). The builder doesn't have the title's measured Deepgram
+// span (markers.ts does, and re-anchors the card later), so we estimate
+// from the title's word count.
+const TITLE_SPOKEN_WPS = 2.5;
+
+// Floor on the consumed title time. A one- or two-word heading ("Now.",
+// "The End.") still needs a readable beat, and a card shorter than this
+// reads as a flash. Mirrors markers.ts TITLE_CARD_MIN_DURATION (1.5s).
+const TITLE_SPOKEN_FLOOR_SECONDS = 1.5;
+
+// Estimate how many seconds the narrator spends speaking a title phrase,
+// from its word count. Bounded to [floor, TITLE_CARD_HOLD_SECONDS]. This
+// is what the card CONSUMES from the section-first sentence — far less
+// than the old flat TITLE_CARD_HOLD_SECONDS, which over-claimed up to ~4s
+// of a short opener and pushed its content block past the real spoken
+// start.
+function estimateTitleSpokenSeconds(titleText: string): number {
+  const words = titleText.trim().split(/\s+/).filter((w) => w.length > 0).length;
+  const est = words > 0 ? words / TITLE_SPOKEN_WPS : TITLE_SPOKEN_FLOOR_SECONDS;
+  return Math.min(TITLE_CARD_HOLD_SECONDS, Math.max(TITLE_SPOKEN_FLOOR_SECONDS, est));
+}
 
 // Combined cap on a sentence group's TOTAL spoken duration. Keeps a
 // chain of 3+ tiny sentences from collapsing into one ungainly 10s
@@ -74,7 +108,7 @@ export interface TranscriptBuildArgs {
   // across many slots — and (b) reads as a slideshow. The clip pool is
   // plentiful, so we cap images at this ratio and convert the LOWEST
   // visual_priority image blocks to footage until the cap is met. Default
-  // 0.40 → a 40:60 image:footage split. Set 0.30 for 30:70.
+  // 0.30 → a 30:70 image:footage split. Set 0.40 for 40:60.
   maxImageRatio?: number;
 }
 
@@ -371,9 +405,16 @@ export function buildBlockSequenceFromTranscript(
       if (out.length > 0 && isShortStandalone) {
         const prev = out[out.length - 1];
         // Don't cross paragraph boundaries; don't absorb into a section
-        // opener (those carry title cards and must stay clean).
+        // opener (those carry title cards and must stay clean). The
+        // section-opener exclusion was previously only described in this
+        // comment but never enforced — folding a trailing short sentence
+        // INTO the opener stretched the opener's spoken window, which then
+        // let the title-card prepend consume more of it and shoved the
+        // opener's CONTENT block several seconds past its real spoken start
+        // (the "title card holds 7s, next sentence squeezed to 1s" bug).
         if (
           prev.paragraph_index === cur.paragraph_index &&
+          !prev.is_section_first_sentence &&
           (prev.vo_end - prev.vo_start) + curDur <= MERGE_TOTAL_CAP
         ) {
           prev.text = `${prev.text} ${cur.text}`;
@@ -432,15 +473,20 @@ export function buildBlockSequenceFromTranscript(
     if (s.is_section_first_sentence) {
       const titleText = (titleCardTextByParagraph.get(s.paragraph_index) ?? "").trim();
       if (titleText) {
-        // Title card duration = min(default 5s, sentence_duration − floor).
-        // We keep at least 1s of sentence-content time so the sentence row
-        // still exists in the editor for review/swap. When the sentence is
-        // shorter than the floor + 1s, skip the title card entirely — the
-        // sentence is too short to coexist with a card.
+        // Title card duration = the title phrase's estimated SPOKEN time
+        // (not a flat 5s), clamped so at least 1s of sentence-content time
+        // remains. The narrator says the title in ~1-1.5s then continues
+        // into the sentence; consuming only that spoken slice keeps the
+        // sentence's content block anchored near its REAL spoken start
+        // instead of being shoved forward by the full card hold. We keep at
+        // least 1s of sentence-content time so the sentence row still exists
+        // in the editor for review/swap. When the sentence is shorter than
+        // the floor + 1s, skip the title card entirely — the sentence is too
+        // short to coexist with a card.
         const MIN_SENTENCE_AFTER_CARD = 1.0;
         const maxCard = fullSentenceDuration - MIN_SENTENCE_AFTER_CARD;
         if (maxCard > 0.5) {
-          const cardDur = Math.min(TITLE_CARD_HOLD_SECONDS, maxCard);
+          const cardDur = Math.min(estimateTitleSpokenSeconds(titleText), maxCard);
           blocks.push({
             type: "title_card",
             duration: cardDur,
@@ -555,7 +601,7 @@ export function buildBlockSequenceFromTranscript(
   const maxImageRatio = typeof args.maxImageRatio === "number"
     && args.maxImageRatio > 0 && args.maxImageRatio < 1
     ? args.maxImageRatio
-    : 0.40;
+    : 0.30;
   let imagesConvertedToFootage = 0;
   {
     // Content blocks only — title cards (overlays) and intro don't count

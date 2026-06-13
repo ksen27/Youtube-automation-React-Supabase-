@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -1691,7 +1691,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     }
 
     // 4) Concat
-    const finalLocal = path.join(tmp, `final_${projectId}.mp4`);
+    let finalLocal = path.join(tmp, `final_${projectId}.mp4`);
     const bgMusicGain = project?.bg_music_gain != null
       ? Number(project.bg_music_gain)
       : 0.15;
@@ -1941,6 +1941,82 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     });
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
+
+    // 4a-pre) Global effect overlay (best-effort). Screen-blend the configured
+    // particle/dust effect over the ENTIRE finished video — intro, opening
+    // title, and all body content — as a one-shot post-pass. We overlay
+    // finalLocal into a new file then point finalLocal at it, so the probe,
+    // post-validation, and upload below operate on the overlaid file with no
+    // further changes. On any failure (toggle off, missing asset, ffmpeg
+    // error) we keep the un-overlaid finalLocal and ship that — the effect is
+    // polish, never a render-blocker.
+    //
+    // EFFECT_OVERLAY_PATH is resolved two ways so a single global asset can be
+    // hosted whichever way the deploy prefers:
+    //   • an http(s) URL — downloaded into tmp once per render (e.g. an R2
+    //     object alongside the project's other media), or
+    //   • a local path — baked into the worker image at build time
+    //     (./assets/... → /app/assets/... under the Dockerfile's WORKDIR).
+    // The downloaded copy lives in tmp and is reaped by the finally-block
+    // cleanup like every other render artifact.
+    if (env.EFFECT_OVERLAY_ENABLED) {
+      const effectSource = env.EFFECT_OVERLAY_PATH;
+      const isRemote = /^https?:\/\//i.test(effectSource);
+      let effectLocalPath: string | null = null;
+      let downloadedEffect = false;
+      if (isRemote) {
+        const dest = path.join(tmp, "effect_overlay.mp4");
+        try {
+          await touchMediaJob(mediaJobId);
+          await downloadHttp(effectSource, dest);
+          effectLocalPath = dest;
+          downloadedEffect = true;
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.effect_overlay.download_failed",
+            { effectSource, err: (e as Error).message });
+        }
+      } else {
+        try {
+          await fs.access(effectSource);
+          effectLocalPath = effectSource;
+        } catch {
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.effect_overlay.missing", { effectSource });
+        }
+      }
+      if (effectLocalPath) {
+        const overlaidLocal = path.join(tmp, `final_fx_${projectId}.mp4`);
+        try {
+          await touchMediaJob(mediaJobId);
+          await overlayEffectVideo({
+            inputPath: finalLocal,
+            effectPath: effectLocalPath,
+            outputPath: overlaidLocal,
+            width: 1280, height: 720, fps: 30,
+            opacity: env.EFFECT_OVERLAY_OPACITY,
+          });
+          await safeUnlink(finalLocal);
+          finalLocal = overlaidLocal;
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.effect_overlay.done", {
+              effectSource,
+              opacity: env.EFFECT_OVERLAY_OPACITY,
+            });
+        } catch (e) {
+          // Keep the un-overlaid finalLocal. Clean up the partial output.
+          await safeUnlink(overlaidLocal);
+          await logJob({ projectId, jobId: mediaJobId },
+            "render.effect_overlay.failed", {
+              effectSource, err: (e as Error).message,
+            });
+        } finally {
+          // Reap the downloaded effect copy now (the tmp sweep would too, but
+          // this keeps peak disk lower during the upload that follows).
+          if (downloadedEffect && effectLocalPath) await safeUnlink(effectLocalPath);
+        }
+      }
+    }
 
     // 4a) Per-block drift audit. Emit one log line per renderable item with
     // the four numbers needed to diagnose any future sync regression:
