@@ -1810,27 +1810,41 @@ export async function overlayEffectVideo(opts: {
   const opacity = Math.min(1, Math.max(0, opts.opacity ?? 0.7));
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
-  // Normalize the effect layer to the base's geometry/timebase, then screen-
-  // blend. format=yuv420p on BOTH the effect prep and the blend output keeps
-  // the pipeline 8-bit 4:2:0 — matching the concat output so the re-encode is
-  // a clean single-format pass.
+  // Screen-blend in RGB, NOT YUV. This is the crux of getting the color right.
   //
-  // BLACK-FLOOR (lutyuv): screen blend keeps `result = 255 - (255-base)*(255-fx)/255`,
-  // so ANY non-zero effect luma lifts the base. Real-world effect exports are
-  // limited-range (TV) — their "black" background sits at luma ~16, not 0 —
-  // which under screen would add a uniform ~6% gray veil over the whole video.
-  // Map every luma at/below BLACK_FLOOR down to 0 (and pin chroma to neutral
-  // 128) so only the genuine bright specks (well above the floor) survive the
-  // blend and the background contributes nothing. BLACK_FLOOR=24 clears the
-  // ~16 TV-black floor with headroom for compression noise while staying far
+  // `blend=all_mode=screen` operates per-plane on whatever the input format is.
+  // In YUV that means it screens the CHROMA planes (U,V) too — and screening
+  // chroma pushes U/V toward 255 wherever the effect's chroma isn't perfectly
+  // neutral, tinting the ENTIRE base video a flat color (the magenta/pink wash
+  // bug we hit). Per-plane YUV tricks don't fix it cleanly: forcing U/V to
+  // `normal` at opacity 0 doesn't pass the base chroma through — blend emits
+  // neutral 128, i.e. a GRAYSCALE video.
+  //
+  // Converting both layers to RGB (gbrp) and screening there is the correct,
+  // standard recipe. Screen on RGB is `255 - (255-base)*(255-fx)/255` per R,G,B
+  // channel: a BLACK effect pixel (0,0,0) leaves the base exactly unchanged, and
+  // a WHITE/gray particle (R=G=B) adds equal light to all channels — which is a
+  // pure brightness lift with NO hue shift. Verified on the client asset: base
+  // chroma is preserved (UAVG/VAVG within ~0.4 of the source) while luma rises
+  // where particles land. Output is converted back to yuv420p so the encode
+  // matches the rest of the pipeline.
+  //
+  // BLACK-FLOOR (lutyuv on Y, applied while still in YUV before the gbrp
+  // conversion): screen lifts the base by ANY non-zero effect value, and real
+  // exports are limited-range (TV) — their "black" sits at luma ~16, not 0 —
+  // which would add a uniform ~6% veil. Map luma at/below BLACK_FLOOR to 0 so
+  // only genuine bright specks survive; pin chroma to neutral 128 so the floored
+  // background carries no color into the RGB conversion. BLACK_FLOOR=24 clears
+  // the ~16 TV-black floor with headroom for compression noise while staying far
   // below particle brightness (measured YMAX ~125 on the client asset).
   const BLACK_FLOOR = 24;
   const fxBlackFloor =
     `lutyuv=y='if(lte(val\\,${BLACK_FLOOR})\\,0\\,val)':u=128:v=128`;
+  const op = opacity.toFixed(3);
   const filter =
-    `[1:v]scale=${w}:${h},setsar=1,fps=${fps},${fxBlackFloor},format=yuv420p[fx];` +
-    `[0:v][fx]blend=all_mode=screen:all_opacity=${opacity.toFixed(3)}:shortest=1,` +
-    `format=yuv420p[v]`;
+    `[1:v]scale=${w}:${h},setsar=1,fps=${fps},${fxBlackFloor},format=gbrp[fx];` +
+    `[0:v]format=gbrp[bg];` +
+    `[bg][fx]blend=all_mode=screen:all_opacity=${op}:shortest=1,format=yuv420p[v]`;
 
   const args = [
     "-y",
