@@ -278,7 +278,19 @@ const ServerEnvSchema = z.object({
   // the voiceover/music/SFX mix is already baked into the concat output.
   EFFECT_OVERLAY_ENABLED: z.coerce.boolean().default(false),
   EFFECT_OVERLAY_PATH: z.string().default("./assets/effect-overlay.mp4"),
-  EFFECT_OVERLAY_OPACITY: z.coerce.number().min(0).max(1).default(0.7),
+  EFFECT_OVERLAY_OPACITY: z.coerce.number().min(0).max(1).default(0.85),
+  // Pre-blend brightness gain on the effect layer. Multiplies the particle
+  // luminance BEFORE the screen blend, so specks read brighter/whiter and
+  // stay visible even on bright scenes (where plain screen blend washes out —
+  // screen vanishes as the base approaches white no matter how high opacity
+  // goes). 1.0 = no boost (original brightness). 2.0 = double. The black
+  // background is unaffected (0 × gain = 0), so boosting gain never re-adds a
+  // veil. Combine with OPACITY for overall strength: GAIN controls how bright
+  // each particle is, OPACITY controls how much of the (brightened) effect
+  // mixes in. Client direction (2026-06): effect was "too transparent" — the
+  // 0.85 opacity + 2.0 gain defaults make it clearly visible across both dark
+  // and bright content. Tune both as Fly secrets without a redeploy.
+  EFFECT_OVERLAY_GAIN: z.coerce.number().min(1).max(8).default(2.0),
   // Run heavy subprocesses (ffmpeg, yt-dlp) at lower scheduling priority on
   // Linux. On shared-CPU hosts, full-throttle ffmpeg can starve Redis of CPU
   // long enough for idle TCP keepalives to time out, surfacing as

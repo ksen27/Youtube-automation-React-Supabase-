@@ -30,7 +30,8 @@ over the content with no dark wash.
 | --- | --- | --- |
 | `EFFECT_OVERLAY_ENABLED` | `false` | Master toggle. Off → renders behave exactly as before. |
 | `EFFECT_OVERLAY_PATH` | `./assets/effect-overlay.mp4` | Local path **or** an `http(s)` URL. A URL is downloaded per-render into tmp (e.g. an R2 object); a local path is read straight from the image. |
-| `EFFECT_OVERLAY_OPACITY` | `0.7` | 0–1 screen-blend strength. Particles on black wash nothing out even near 1.0; lower for a subtler effect. |
+| `EFFECT_OVERLAY_OPACITY` | `0.85` | 0–1 screen-blend strength — how much of the (gained) effect mixes in. Raise toward 1.0 for a stronger effect overall. |
+| `EFFECT_OVERLAY_GAIN` | `2.0` | ≥1 pre-blend brightness boost on the particles. Makes specks read brighter/whiter so they stay visible even on **bright** scenes (plain screen blend washes out as the base nears white — opacity alone can't fix that). 1.0 = no boost; 2.0 = double; up to 8.0. Background stays black (0×gain=0), so higher gain never re-adds a veil. |
 
 ### Notes
 

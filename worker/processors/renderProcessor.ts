@@ -1995,6 +1995,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             outputPath: overlaidLocal,
             width: 1280, height: 720, fps: 30,
             opacity: env.EFFECT_OVERLAY_OPACITY,
+            gain: env.EFFECT_OVERLAY_GAIN,
           });
           await safeUnlink(finalLocal);
           finalLocal = overlaidLocal;
@@ -2002,6 +2003,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             "render.effect_overlay.done", {
               effectSource,
               opacity: env.EFFECT_OVERLAY_OPACITY,
+              gain: env.EFFECT_OVERLAY_GAIN,
             });
         } catch (e) {
           // Keep the un-overlaid finalLocal. Clean up the partial output.

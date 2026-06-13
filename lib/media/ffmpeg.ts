@@ -1801,6 +1801,7 @@ export async function overlayEffectVideo(opts: {
   height?: number;         // default 720
   fps?: number;            // default 30
   opacity?: number;        // 0..1, default 0.7
+  gain?: number;           // >=1 pre-blend brightness boost on particles, default 1.0
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -1808,6 +1809,7 @@ export async function overlayEffectVideo(opts: {
   const h = opts.height ?? 720;
   const fps = opts.fps ?? 30;
   const opacity = Math.min(1, Math.max(0, opts.opacity ?? 0.7));
+  const gain = Math.max(1, opts.gain ?? 1.0);
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
   // Screen-blend in RGB, NOT YUV. This is the crux of getting the color right.
@@ -1837,9 +1839,18 @@ export async function overlayEffectVideo(opts: {
   // background carries no color into the RGB conversion. BLACK_FLOOR=24 clears
   // the ~16 TV-black floor with headroom for compression noise while staying far
   // below particle brightness (measured YMAX ~125 on the client asset).
+  //
+  // GAIN: above the floor the luma is multiplied by `gain` (clamped to 255) so
+  // particles read brighter/whiter and survive even on bright scenes — plain
+  // screen vanishes as the base nears white, and opacity alone can't fix that.
+  // Background pixels are already 0 (floored), and 0 × gain = 0, so the boost
+  // never re-adds a veil. gain=1.0 is a no-op (original brightness).
   const BLACK_FLOOR = 24;
+  const g = gain.toFixed(3);
+  // min(255, val*gain) above the floor, 0 at/below it. `*` and `,` inside the
+  // expression are escaped for the filtergraph lexer.
   const fxBlackFloor =
-    `lutyuv=y='if(lte(val\\,${BLACK_FLOOR})\\,0\\,val)':u=128:v=128`;
+    `lutyuv=y='if(lte(val\\,${BLACK_FLOOR})\\,0\\,min(255\\,val*${g}))':u=128:v=128`;
   const op = opacity.toFixed(3);
   const filter =
     `[1:v]scale=${w}:${h},setsar=1,fps=${fps},${fxBlackFloor},format=gbrp[fx];` +
