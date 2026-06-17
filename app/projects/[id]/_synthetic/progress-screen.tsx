@@ -56,6 +56,18 @@ export function SyntheticProgressScreen({
     onChange();
   }
 
+  // Re-run a failed early pipeline step (voiceover or planner). Unlike Refresh
+  // (which only re-reads state), this re-enqueues the job so it actually runs
+  // again — e.g. after fixing a config/network issue.
+  async function retryStep(step: "voiceover" | "planner") {
+    await fetch(`/api/projects/${projectId}/synthetic/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step }),
+    });
+    onChange();
+  }
+
   const failedSegs = segs.filter((s) => s.status === "failed");
   const readyCount = (g: SyntheticSegmentRow[]) => g.filter((s) => s.status === "ready").length;
   const stat = (g: SyntheticSegmentRow[]) =>
@@ -63,14 +75,22 @@ export function SyntheticProgressScreen({
 
   const ttsJobs = jobsOfType(jobs, "tts");
   const planJobs = jobsOfType(jobs, "plan_synthetic");
+  // Newest job's error message for a step (jobs are ordered ascending, so last).
+  const lastError = (js: SyntheticMediaJob[]): string | null => {
+    const failed = js.filter((j) => j.status === "failed" && j.error);
+    return failed.length ? (failed[failed.length - 1].error ?? null) : null;
+  };
 
-  const steps: Array<{ label: string; hint: string; state: StepState; stat?: string; group?: SyntheticSegmentRow[] }> = [
-    { label: "Voiceover", hint: "69labs TTS / uploaded audio", state: aggregateState(ttsJobs) },
-    { label: "Alignment", hint: "Deepgram word timings", state: ttsJobs.some((j) => j.status === "completed") ? "done" : aggregateState(ttsJobs) },
-    { label: "Planner", hint: "Gemini segments the script", state: aggregateState(planJobs) },
-    { label: "Images", hint: "nano-banana stills", state: segState(byType.image), stat: stat(byType.image), group: byType.image },
-    { label: "AI Clips", hint: "fal.ai animated clips", state: segState(byType.ai_clip), stat: stat(byType.ai_clip), group: byType.ai_clip },
-    { label: "Avatars + Split", hint: "HeyGen avatar videos", state: segState([...byType.avatar, ...byType.split_2]), stat: stat([...byType.avatar, ...byType.split_2]), group: [...byType.avatar, ...byType.split_2] },
+  const steps: Array<{
+    label: string; hint: string; state: StepState; stat?: string;
+    retryStep?: "voiceover" | "planner"; error?: string | null;
+  }> = [
+    { label: "Voiceover", hint: "69labs TTS / uploaded audio", state: aggregateState(ttsJobs), retryStep: "voiceover", error: lastError(ttsJobs) },
+    { label: "Alignment", hint: "Deepgram word timings", state: ttsJobs.some((j) => j.status === "completed") ? "done" : aggregateState(ttsJobs), retryStep: "voiceover", error: lastError(ttsJobs) },
+    { label: "Planner", hint: "Gemini segments the script", state: aggregateState(planJobs), retryStep: "planner", error: lastError(planJobs) },
+    { label: "Images", hint: "nano-banana stills", state: segState(byType.image), stat: stat(byType.image) },
+    { label: "AI Clips", hint: "fal.ai animated clips", state: segState(byType.ai_clip), stat: stat(byType.ai_clip) },
+    { label: "Avatars + Split", hint: "HeyGen avatar videos", state: segState([...byType.avatar, ...byType.split_2]), stat: stat([...byType.avatar, ...byType.split_2]) },
   ];
 
   return (
@@ -84,8 +104,18 @@ export function SyntheticProgressScreen({
 
       <div className="space-y-2">
         {steps.map((s, i) => (
-          <StepCard key={s.label} index={i} label={s.label} hint={s.hint} state={s.state} stat={s.stat}
-            progress={s.state === "running" ? 50 : undefined} />
+          <div key={s.label} className="space-y-1">
+            <StepCard index={i} label={s.label} hint={s.hint} state={s.state} stat={s.stat}
+              progress={s.state === "running" ? 50 : undefined} />
+            {s.state === "failed" && s.retryStep && (
+              <div className="ml-10 flex items-center gap-2 text-xs">
+                {s.error && <span className="text-danger truncate flex-1" title={s.error}>{s.error}</span>}
+                <Button type="button" variant="soft" size="xs" className="ml-auto shrink-0" onClick={() => retryStep(s.retryStep!)}>
+                  <RefreshCw className="h-3.5 w-3.5" /> Retry step
+                </Button>
+              </div>
+            )}
+          </div>
         ))}
       </div>
 

@@ -337,11 +337,11 @@ const ServerEnvSchema = z.object({
   // synthetic generate route 503s but the sourced engine is unaffected.
   // =======================================================================
   // 69labs — TTS voiceover + nano-banana image generation.
-  // Real API (691labs.vip) is async job-based: POST /api/v1/tts/generate ->
+  // Real API (69labs.vip) is async job-based: POST /api/v1/tts/generate ->
   // poll GET /api/v1/tts/status/:jobId -> GET /api/v1/tts/download/:jobId.
   // Base URL has NO version suffix here; route paths include /api/v1/...
   SIXTYNINE_LABS_API_KEY: z.string().optional(),
-  SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://691labs.vip"),
+  SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://69labs.vip"),
   // TTS voiceProvider: elevenlabs | edgetts | minimax (wire-level value).
   SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),
   // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).

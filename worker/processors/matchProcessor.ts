@@ -6487,9 +6487,122 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
   }
 
+  // ---- Final authoritative duration pass (runs on the EXACT array that
+  //      gets inserted, after every other pass) -------------------------
+  // Bug class this closes (2026-06-16, King Charles project): the inserted
+  // timeline summed ~98s short of the voiceover even though
+  // pre_render_validation logged a perfect match. Root cause: a row whose
+  // audio window grew (because a neighbouring row was removed by the marker
+  // dedup) kept its short *planned* duration in the persisted array, while
+  // the in-memory reconciliation passes had stretched a different view. The
+  // result is "orphaned narration" — voiceover plays over a window that no
+  // timeline row's duration covers, so the picture timeline is shorter than
+  // the audio and the render-time guard blocks the project.
+  //
+  // The fix is to make the LAST thing before insert the single source of
+  // truth: every adjustable non-intro row's duration = the gap to the next
+  // row's vo_start (its audio interval). This telescopes the body of the
+  // timeline to exactly (last.vo_start - first.vo_start), and the tail row
+  // is sized to reach voiceoverSeconds. Title cards (visual hold beat) and
+  // duration_clamped rows (forced/inline YouTube windows the doc author
+  // chose, already sized by vo_start_duration_pass) are left untouched.
+  //
+  // Idempotent: a row already at its audio interval is left as-is, so a
+  // re-match writes the same values. Operates on `items` directly so it is
+  // immune to any upstream pass mutating a copy instead of the real rows.
+  {
+    type Row = (typeof items)[number];
+    const voOf = (it: Row): number => {
+      const m = (it.metadata ?? {}) as Record<string, unknown>;
+      const vs = m.vo_start_seconds;
+      return typeof vs === "number" ? Number(vs) : Number.NaN;
+    };
+    const isClampedOrCard = (it: Row): boolean => {
+      if (it.type === "title_card") return true;
+      const m = (it.metadata ?? {}) as Record<string, unknown>;
+      return m.duration_clamped === true;
+    };
+    // vo_start-ordered view of every non-intro row that has a vo_start. This
+    // is the audio-time order the renderer plays in (rows are inserted in
+    // `position` order, which the title-card-anchor pass already aligned to
+    // vo_start). Rows without vo_start (legacy/defensive) are left alone.
+    const ordered = items
+      .filter((it) => it.type !== "intro" && Number.isFinite(voOf(it)))
+      .sort((a, b) => voOf(a) - voOf(b));
+
+    let orphanedResized = 0;
+    let orphanedReclaimedSeconds = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      const cur = ordered[i];
+      if (isClampedOrCard(cur)) continue;
+      const next = ordered[i + 1];
+      const targetEnd = next ? voOf(next) : voiceoverSeconds;
+      const audioInterval = targetEnd - voOf(cur);
+      if (!(audioInterval > 0.05)) continue;
+      const newDuration = Math.round(audioInterval * 100) / 100;
+      const oldDuration = Number(cur.duration ?? 0);
+      if (Math.abs(newDuration - oldDuration) < 0.05) continue;
+      cur.duration = newDuration;
+      const m = (cur.metadata ?? {}) as Record<string, unknown>;
+      m.vo_end_seconds = voOf(cur) + newDuration;
+      cur.metadata = m;
+      orphanedResized++;
+      orphanedReclaimedSeconds += newDuration - oldDuration;
+    }
+
+    const finalNonIntroSum = items
+      .filter((it) => it.type !== "intro")
+      .reduce((s, it) => s + Number(it.duration ?? 0), 0);
+    const finalDriftSeconds = finalNonIntroSum - voiceoverSeconds;
+    const FINAL_TOLERANCE_SECONDS = 3; // mirrors the render-route guard
+    await logJob({ projectId, jobId: mediaJobId }, "match.final_duration_pass", {
+      voiceoverSeconds,
+      timelineSumSeconds: Math.round(finalNonIntroSum * 1000) / 1000,
+      driftSeconds: Math.round(finalDriftSeconds * 100) / 100,
+      orphanedResized,
+      orphanedReclaimedSeconds: Math.round(orphanedReclaimedSeconds * 10) / 10,
+      itemCount: items.filter((it) => it.type !== "intro").length,
+    });
+
+    // Hard gate: never persist a timeline that the render-route guard would
+    // reject. Failing here (instead of silently inserting a short timeline)
+    // makes BullMQ retry the match and surfaces the drift in match logs,
+    // rather than the operator discovering it at "Start render".
+    if (Math.abs(finalDriftSeconds) > FINAL_TOLERANCE_SECONDS) {
+      throw new Error(
+        `match produced a timeline ${finalDriftSeconds.toFixed(1)}s off the voiceover ` +
+          `(timeline ${finalNonIntroSum.toFixed(1)}s vs voiceover ${voiceoverSeconds.toFixed(1)}s, ` +
+          `tolerance ±${FINAL_TOLERANCE_SECONDS}s) — refusing to persist a short timeline`,
+      );
+    }
+  }
+
   await setMediaJob(mediaJobId, { progress: 80 });
   const { error: insErr } = await sb.from("timeline_items").insert(items);
   if (insErr) throw new Error(`insert timeline_items: ${insErr.message}`);
+
+  // Verify the insert actually persisted every row. A single .insert(array)
+  // is atomic in PostgREST (it cannot partially commit), but a count-back is
+  // cheap insurance against the symptom that started this investigation —
+  // the DB holding fewer rows than the matcher built — turning any future
+  // silent shortfall into a loud, retryable failure instead of a blocked
+  // render the operator has to diagnose by hand.
+  {
+    const { count, error: countErr } = await sb
+      .from("timeline_items")
+      .select("id", { count: "exact", head: true })
+      .eq("project_id", projectId);
+    if (countErr) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.insert_count_check.failed", {
+        err: countErr.message,
+      });
+    } else if ((count ?? 0) !== items.length) {
+      throw new Error(
+        `timeline_items insert persisted ${count ?? 0}/${items.length} rows — ` +
+          `partial insert detected, failing the job for retry`,
+      );
+    }
+  }
 
   const plannedSum = Math.round(sumDurations(blocks) * 10) / 10;
   await setMediaJob(mediaJobId, {

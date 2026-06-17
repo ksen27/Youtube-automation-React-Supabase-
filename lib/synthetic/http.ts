@@ -66,9 +66,30 @@ export async function fetchOrThrow(
     const res = await fetch(url, { ...rest, signal: controller?.signal ?? rest.signal });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      throw new HttpError(res.status, `${init.method ?? "GET"} ${url} -> ${res.status}`, body.slice(0, 500));
+      // Include the response body in the message so the worker's job.failed log
+      // shows WHY the API rejected us (e.g. an invalid field) — a bare status
+      // code is undiagnosable for a 400.
+      const snippet = body.slice(0, 300).replace(/\s+/g, " ").trim();
+      throw new HttpError(
+        res.status,
+        `${init.method ?? "GET"} ${url} -> ${res.status}${snippet ? ` :: ${snippet}` : ""}`,
+        body.slice(0, 500),
+      );
     }
     return res;
+  } catch (err) {
+    // Node's fetch reports a bare "fetch failed" and hides the real reason in
+    // err.cause (ENOTFOUND/ECONNREFUSED/CERT_*/ETIMEDOUT). Unwrap it so the
+    // log tells us whether it's DNS, a refused connection, or TLS — instead of
+    // an undiagnosable "fetch failed".
+    if (err instanceof HttpError) throw err;
+    const cause = (err as { cause?: { code?: string; message?: string } }).cause;
+    const detail = cause?.code || cause?.message;
+    if (detail) {
+      const e = new Error(`${init.method ?? "GET"} ${url} -> ${(err as Error).message} (${detail})`);
+      throw e;
+    }
+    throw err;
   } finally {
     if (timer) clearTimeout(timer);
   }
