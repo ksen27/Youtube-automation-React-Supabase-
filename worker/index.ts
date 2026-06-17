@@ -169,12 +169,22 @@ const SWEEP_INTERVAL_MS = 5 * 60_000;
 // the BullMQ retry/visibility windows matter. (Was lockDuration + 5 min = 20
 // min, which false-killed a slow-but-alive 430-clip render.)
 const SWEEP_STALE_MS = 45 * 60_000; // 45 min
+// Each worker sweeps ONLY the job types it processes, so an engine-scoped
+// worker can't false-kill the other engine's in-flight jobs. 'all' passes
+// undefined → sweeps everything (single-worker setup, unchanged).
+const SOURCED_TYPES = ["search", "download", "clip", "match", "render", "script_clip", "analyze"];
+const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar"];
+const sweepTypes =
+  role === "sourced" ? SOURCED_TYPES : role === "synthetic" ? SYNTHETIC_TYPES : undefined;
 const sweepTimer = setInterval(() => {
-  void sweepStalledJobs(SWEEP_STALE_MS)
+  void sweepStalledJobs(SWEEP_STALE_MS, sweepTypes)
     .then((n) => {
       if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
     })
     .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+  // Render-cache reaping only applies to the render worker (sourced/all); the
+  // avatar worker has no /data render cache.
+  if (!runSourced) return;
   // Reap render-cache entries from abandoned/failed projects so the resume
   // cache doesn't grow unbounded on the /data volume. Live renders refresh
   // their dir mtime as they write clips, so this only removes stale orphans.

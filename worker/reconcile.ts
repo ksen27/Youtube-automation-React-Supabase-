@@ -100,17 +100,24 @@ export async function markJobFailedIfExhausted(
 // staleMs MUST exceed the worker's lockDuration (currently 15 min) plus a
 // margin, or we'd kill jobs that are legitimately mid-await on a long ffmpeg /
 // yt-dlp call (those only heartbeat updated_at between awaits).
-export async function sweepStalledJobs(staleMs: number): Promise<number> {
+export async function sweepStalledJobs(staleMs: number, onlyTypes?: string[]): Promise<number> {
   const sb = getServerSupabase();
   // Compute the cutoff without Date.now() arithmetic surprises — a plain ISO
   // string comparison in the query.
   const cutoff = new Date(Date.now() - staleMs).toISOString();
 
-  const { data: stalled, error } = await sb
+  // When the worker is engine-scoped (WORKER_ROLE), only sweep its own job
+  // types — otherwise the celebrity worker could false-kill a slow-but-alive
+  // avatar job the synthetic worker is actively running (and vice versa).
+  let query = sb
     .from("media_jobs")
     .select("id, project_id, type")
     .in("status", ["running", "queued"])
     .lt("updated_at", cutoff);
+  if (onlyTypes && onlyTypes.length > 0) {
+    query = query.in("type", onlyTypes);
+  }
+  const { data: stalled, error } = await query;
   if (error) {
     await logJob({}, "reconcile.sweep.query_error", { err: error.message });
     return 0;
