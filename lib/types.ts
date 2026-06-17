@@ -10,7 +10,77 @@ export type ProjectStatus =
   | "ready_for_review"
   | "rendering"
   | "completed"
-  | "failed";
+  | "failed"
+  // --- synthetic engine statuses (additive; sourced engine never sets these) ---
+  | "created"
+  | "voiceover"
+  | "aligning"
+  | "planning"
+  // Planner finished; segments are planned but assets are NOT yet generated.
+  // The review gate — the user inspects/edits the plan then clicks Generate.
+  | "plan_ready"
+  | "generating_images"
+  | "generating_clips"
+  | "generating_avatars";
+
+// Which generation pipeline a project runs through. 'sourced' is the original
+// (and DB default) engine; 'synthetic' is the AI-generated pipeline added in
+// migration 0020. Branch on this — NEVER change behaviour for 'sourced'.
+export type Engine = "sourced" | "synthetic";
+
+export type AspectRatio = "16:9" | "9:16" | "1:1";
+
+export type VoiceoverSource = "tts" | "uploaded";
+
+// The four synthetic visual block types Gemini chooses between (see planner).
+export type SyntheticBlockType = "avatar" | "image" | "ai_clip" | "split_2";
+
+export type SyntheticSegmentStatus =
+  | "pending"
+  | "generating"
+  | "ready"
+  | "failed"
+  | "skipped";
+
+// Planner output / asset-generation working row (table synthetic_segments).
+export interface SyntheticSegment {
+  id: string;
+  project_id: string;
+  position: number;
+  block_type: SyntheticBlockType;
+  start_time: number;
+  end_time: number;
+  duration: number;
+  script: string;
+  image_prompt: string | null;
+  animation_prompt: string | null;
+  status: SyntheticSegmentStatus;
+  image_url: string | null;
+  video_url: string | null;
+  right_image_url: string | null;
+  provider: string | null;
+  error: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export type HeygenAccountStatus = "active" | "cooldown" | "disabled";
+
+export interface HeygenAccount {
+  id: string;
+  email: string;
+  password_enc: string;
+  cookies_json: string | null;
+  status: HeygenAccountStatus;
+  fail_count: number;
+  cooldown_until: string | null;
+  last_used_at: string | null;
+  proxy: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface Project {
   id: string;
@@ -22,6 +92,12 @@ export interface Project {
   bg_music_url: string | null;
   bg_music_gain: number;
   status: ProjectStatus;
+  // --- synthetic engine columns (migration 0020; null/default for sourced) ---
+  engine: Engine;
+  avatar_image_url: string | null;
+  aspect_ratio: AspectRatio;
+  voiceover_source: VoiceoverSource | null;
+  tts_voice_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -112,7 +188,10 @@ export type TimelineItemType =
   | "split_2"
   | "split_4"
   | "lower_third"
-  | "transition";
+  | "transition"
+  // --- synthetic engine block types (additive) ---
+  | "avatar"
+  | "ai_clip";
 
 export interface TimelineItem {
   id: string;
@@ -154,7 +233,13 @@ export type MediaJobType =
   // .mp4 always; .m4a audio for intro_card kinds). The script-doc API
   // enqueues one job per marker right after persisting them so the user
   // can watch download progress on the intake screen before generate.
-  | "script_clip";
+  | "script_clip"
+  // --- synthetic engine job types (migration 0020) ---
+  | "tts"             // 69labs voiceover generation (transcript -> mp3)
+  | "plan_synthetic"  // Gemini planner -> synthetic_segments[]
+  | "avatar"          // HeyGen avatar video (Playwright automation)
+  | "image_gen"       // 69labs nano-banana image (Flux fallback)
+  | "image_to_video"; // nano-banana image -> fal.ai Veo Fast (Kling fallback)
 export type MediaJobStatus = "queued" | "running" | "completed" | "failed";
 
 export interface MediaJob {

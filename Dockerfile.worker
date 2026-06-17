@@ -21,6 +21,11 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev=false
 
+# Chromium + its OS deps for the synthetic engine's HeyGen avatar automation
+# (Playwright). --with-deps installs the system libraries Chromium needs on
+# Debian slim. Browsers land under /root/.cache/ms-playwright by default.
+RUN npx playwright install --with-deps chromium
+
 COPY . .
 
 # AOF (appendonly) keeps queue state durable across restarts; noeviction is

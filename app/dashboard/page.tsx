@@ -19,6 +19,7 @@ interface ProjectRow {
   id: string;
   title: string;
   status: string;
+  engine: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -28,7 +29,8 @@ async function loadProjects(): Promise<ProjectCardData[]> {
   const sb = getServerSupabase();
   const { data, error } = await sb
     .from("projects")
-    .select("id, title, status, created_at, updated_at")
+    .select("id, title, status, engine, created_at, updated_at")
+    .or("engine.eq.sourced,engine.is.null") // Celebrity Videos only — synthetic lives under /avatar
     .order("created_at", { ascending: false })
     .limit(100);
   if (error) return [];

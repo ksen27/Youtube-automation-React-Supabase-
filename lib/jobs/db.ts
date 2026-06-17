@@ -82,6 +82,29 @@ export async function setProjectStatus(projectId: string, status: ProjectStatus)
   if (error) throw new Error(`setProjectStatus: ${error.message}`);
 }
 
+// Engine guard for route handlers. The Celebrity (sourced) and AI Avatar
+// (synthetic) products share the projects table, divided only by the `engine`
+// column. A sourced-only action (analyze/generate/script-doc) run on a
+// synthetic project — or vice-versa — would corrupt that project's pipeline,
+// so every engine-specific entry point checks the engine first.
+//
+// Returns:
+//   { ok: true }                              — project exists and matches
+//   { ok: false, status: 404 }                — project not found
+//   { ok: false, status: 400, engine: "…" }   — wrong engine for this action
+export async function checkProjectEngine(
+  projectId: string,
+  expected: "sourced" | "synthetic",
+): Promise<{ ok: true } | { ok: false; status: 404 | 400; engine?: string }> {
+  const sb = getServerSupabase();
+  const { data, error } = await sb.from("projects").select("engine").eq("id", projectId).single();
+  if (error || !data) return { ok: false, status: 404 };
+  // Legacy rows predate the engine column; treat null as 'sourced' (the default).
+  const engine = (data.engine as string | null) ?? "sourced";
+  if (engine !== expected) return { ok: false, status: 400, engine };
+  return { ok: true };
+}
+
 export async function logJob(
   scope: { projectId?: string; jobId?: string; sourceId?: string },
   msg: string,

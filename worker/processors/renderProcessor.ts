@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -91,13 +91,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // section title string in overlay_text. Keep them in the renderable
     // list so the segment appears at the right timeline position.
     if (it.type === "title_card" && typeof it.overlay_text === "string" && it.overlay_text.trim().length > 0) return true;
-    // Split-screen blocks: matcher persists the left image on image_url
-    // and the right image on metadata.right_image_url. Need BOTH to render
-    // a usable split; if either is missing the matcher downgraded the row
-    // to a plain image already.
+    // --- SYNTHETIC ENGINE blocks (migration 0020) ---
+    // avatar / ai_clip carry a generated mp4 on video_url (a degraded ai_clip
+    // may have only image_url, in which case it renders as a held still).
+    if ((it.type === "avatar" || it.type === "ai_clip") && (it.video_url || it.image_url)) return true;
+    // Split-screen blocks. Sourced split: left+right are both stills
+    // (image_url + metadata.right_image_url). Synthetic split: avatar VIDEO on
+    // video_url + still on right_image_url. Renderable when a usable pair
+    // exists for either flavor.
     if (it.type === "split_2") {
       const meta = (it.metadata ?? {}) as Record<string, unknown>;
-      return !!it.image_url && typeof meta.right_image_url === "string" && (meta.right_image_url as string).length > 0;
+      const rightFromCol = typeof it.right_image_url === "string" && it.right_image_url.length > 0;
+      const rightFromMeta = typeof meta.right_image_url === "string" && (meta.right_image_url as string).length > 0;
+      const synthetic = !!it.video_url && rightFromCol;          // avatar | still
+      const sourced = !!it.image_url && rightFromMeta;           // still | still
+      return synthetic || sourced;
     }
     return false;
   });
@@ -269,7 +277,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   };
   const isVideoNeighbor = (i: number): boolean => {
     const it = renderable[i];
-    return !!it?.clip_id;
+    if (it?.clip_id) return true;
+    // Synthetic avatar / ai_clip blocks render as full-motion video segments.
+    if ((it?.type === "avatar" || it?.type === "ai_clip") && it?.video_url) return true;
+    return false;
   };
   // SFX cues should only land on REAL photo→photo dissolves, not on
   // title-card or split-screen transitions. isImageNeighbor lumps all three
@@ -381,8 +392,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             : 0;
         const renderDur = plannedDur + headLeft + headRight;
         const meta = (it.metadata ?? {}) as Record<string, unknown>;
-        const leftUrl = it.image_url as string;
-        const rightUrl = meta.right_image_url as string;
+        // SYNTHETIC split: avatar VIDEO (video_url) left + still (right_image_url)
+        // right. SOURCED split: still (image_url) left + still (meta.right_image_url)
+        // right. Detected by the presence of video_url.
+        const isSyntheticSplit = !!it.video_url;
+        const leftUrl = isSyntheticSplit ? (it.video_url as string) : (it.image_url as string);
+        const rightUrl = isSyntheticSplit
+          ? (it.right_image_url as string)
+          : (meta.right_image_url as string);
         const leftLocal = path.join(tmp, `splitL_${idx}`);
         const rightLocal = path.join(tmp, `splitR_${idx}`);
         try {
@@ -395,16 +412,30 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             | { text?: string; vo_start_seconds?: number }
             | undefined;
           const splitLtOffset = lowerThirdStartOffset(splitLt, splitMeta, headLeft, renderDur);
-          await buildSplitScreenVideo({
-            leftImagePath: leftLocal,
-            rightImagePath: rightLocal,
-            outputPath: out,
-            durationSeconds: renderDur,
-            width: 1280, height: 720, fps: 30,
-            lowerThird: splitLt?.text
-              ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
-              : undefined,
-          });
+          if (isSyntheticSplit) {
+            // Reuse the synthetic split-screen builder: avatar video left, still right.
+            await buildSplitScreenAvatarVideo({
+              avatarVideoPath: leftLocal,
+              rightImagePath: rightLocal,
+              outputPath: out,
+              durationSeconds: renderDur,
+              width: 1280, height: 720, fps: 30,
+              lowerThird: splitLt?.text
+                ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
+                : undefined,
+            });
+          } else {
+            await buildSplitScreenVideo({
+              leftImagePath: leftLocal,
+              rightImagePath: rightLocal,
+              outputPath: out,
+              durationSeconds: renderDur,
+              width: 1280, height: 720, fps: 30,
+              lowerThird: splitLt?.text
+                ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
+                : undefined,
+            });
+          }
           slots[i] = out;
           slotDurations[i] = renderDur;
           slotContentDurations[i] = plannedDur;
@@ -416,6 +447,59 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         } finally {
           await safeUnlink(leftLocal);
           await safeUnlink(rightLocal);
+        }
+      } else if (it.type === "avatar" || it.type === "ai_clip") {
+        // SYNTHETIC full-frame video block. avatar = HeyGen talking head;
+        // ai_clip = fal.ai animated clip. Either is a no-audio mp4 on video_url
+        // (a degraded ai_clip may have only image_url -> render as a held
+        // still). The master voiceover is the single audio track, muxed at
+        // concat time, so these segments are silent like every other one.
+        const leftPartnerImage = isImageNeighbor(i - 1);
+        const leftPartnerVideo = isVideoNeighbor(i - 1);
+        const rightPartnerImage = isImageNeighbor(i + 1);
+        const rightPartnerVideo = isVideoNeighbor(i + 1);
+        const headLeft = leftPartnerImage ? IMAGE_XFADE_SECONDS / 2 : leftPartnerVideo ? MIXED_FADE_SECONDS / 2 : 0;
+        const headRight = rightPartnerImage ? IMAGE_XFADE_SECONDS / 2 : rightPartnerVideo ? MIXED_FADE_SECONDS / 2 : 0;
+        const renderDur = plannedDur + headLeft + headRight;
+
+        if (it.video_url) {
+          const localPre = path.join(tmp, `synvid_${idx}.mp4`);
+          const trimmed = path.join(tmp, `synvid_cut_${idx}.mp4`);
+          try {
+            await downloadHttp(it.video_url as string, localPre);
+            await cutClip({ inputPath: localPre, outputPath: trimmed, startSeconds: 0, durationSeconds: renderDur, keepAudio: false });
+            await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30, keepAudio: false });
+            slots[i] = out;
+            let actualDur = renderDur;
+            try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = p.durationSeconds; } catch { /* fallback */ }
+            slotDurations[i] = actualDur;
+            slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
+          } catch (e) {
+            await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_video.failed", { idx: i, type: it.type, url: it.video_url, err: (e as Error).message });
+          } finally {
+            await safeUnlink(localPre);
+            await safeUnlink(trimmed);
+          }
+        } else if (it.image_url) {
+          // Degraded ai_clip: hold the still with motion, same as an image block.
+          const MOTION_CYCLE = ["in", "pan_right", "out", "pan_left"] as const;
+          const localImg = path.join(tmp, `synimg_${idx}`);
+          try {
+            await downloadHttp(it.image_url as string, localImg);
+            await buildStillVideo({
+              inputImagePath: localImg, outputPath: out, durationSeconds: renderDur,
+              width: 1280, height: 720, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
+            });
+            slots[i] = out;
+            slotDurations[i] = renderDur;
+            slotContentDurations[i] = plannedDur;
+            imageRendered++;
+          } catch (e) {
+            imageFailed++;
+            await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_still.failed", { idx: i, url: it.image_url, err: (e as Error).message });
+          } finally {
+            await safeUnlink(localImg);
+          }
         }
       } else if (it.type === "title_card") {
         // Section-break title card: black background with the section

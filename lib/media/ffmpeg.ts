@@ -519,6 +519,88 @@ export async function buildSplitScreenVideo(opts: {
   }
 }
 
+// SYNTHETIC ENGINE: split-screen with an AVATAR VIDEO on the left and a
+// generated STILL on the right. The synthetic split_2 block pairs a HeyGen
+// talking-head (left) with an illustrative nano-banana image (right).
+//
+// Differs from buildSplitScreenVideo (image|image) only in the left input: it
+// is a VIDEO, so we scale-to-cover its half directly (no PNG pre-transcode) and
+// trim/loop it to the block duration. The right still keeps the same PNG
+// pre-transcode defense as the image path. Output flags match buildSplitScreen
+// Video BYTE-FOR-BYTE so the final concat stays on the stream-copy fast path.
+// Audio is dropped (-an): the master voiceover is the single audio track muxed
+// in at concat time, exactly like every other synthetic/sourced segment.
+export async function buildSplitScreenAvatarVideo(opts: {
+  avatarVideoPath: string;   // LEFT half — HeyGen avatar mp4
+  rightImagePath: string;    // RIGHT half — generated still
+  outputPath: string;
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  fps?: number;
+  lowerThird?: { text: string; startOffsetSeconds?: number };
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  const halfW = Math.floor(w / 2);
+  const dur = opts.durationSeconds;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  // Pre-transcode the still half to a PNG single frame (same defense as the
+  // image|image path). The avatar VIDEO is fed directly.
+  const rightPng = `${opts.rightImagePath}.normalized.png`;
+  await runFFmpeg(env.FFMPEG_PATH, [
+    "-y", "-i", opts.rightImagePath, "-frames:v", "1", rightPng,
+  ], opts.signal, 30);
+
+  // LEFT (avatar video, input 0): trim to duration, normalize fps, scale-to-
+  // cover the left cell, center-crop, setsar=1. setpts resets the PTS so a
+  // trimmed clip starts at 0.
+  // RIGHT (still, input 1): identical recipe to buildSplitScreenVideo's side.
+  const leftChain =
+    `[0:v]trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps},` +
+    `scale=${halfW}:${h}:force_original_aspect_ratio=increase,crop=${halfW}:${h},setsar=1`;
+  const rightChain =
+    `[1:v]fps=${fps},scale=${halfW}:${h}:force_original_aspect_ratio=increase,` +
+    `crop=${halfW}:${h},setsar=1`;
+  const ltFilter = opts.lowerThird?.text
+    ? await buildLowerThirdFilter(opts.lowerThird.text, h, opts.lowerThird.startOffsetSeconds ?? 0)
+    : null;
+  const ltSuffix = ltFilter ? `,${ltFilter}` : "";
+  const filter =
+    `${leftChain}[L];` +
+    `${rightChain}[R];` +
+    `[L][R]hstack=inputs=2,format=yuv420p${ltSuffix}[v]`;
+
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    // Loop the avatar video so a clip shorter than the block holds the last
+    // beat instead of cutting to black; trim above clamps the upper bound.
+    "-stream_loop", "-1", "-t", String(dur), "-i", opts.avatarVideoPath,
+    "-loop", "1", "-t", String(dur), "-i", rightPng,
+    "-an",
+    "-filter_complex", filter,
+    "-map", "[v]",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  try {
+    await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+  } finally {
+    try { await fs.unlink(rightPng); } catch { /* ignore */ }
+  }
+}
+
 // Build a black title-card segment with white text centered on the frame.
 // Used at section boundaries: Gemini's analyzeSegment emits a sectionTitle
 // (e.g. "The Cancellation", "Marriage") on the first block of every new

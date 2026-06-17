@@ -331,6 +331,68 @@ const ServerEnvSchema = z.object({
   // it. Sized so an in-progress render's clips are never reaped mid-flight but
   // orphans from a project that was abandoned/failed don't accumulate on /data.
   RENDER_CACHE_TTL_HOURS: z.coerce.number().positive().default(24),
+
+  // =======================================================================
+  // SYNTHETIC ENGINE (migration 0020). All optional — when unset, the
+  // synthetic generate route 503s but the sourced engine is unaffected.
+  // =======================================================================
+  // 69labs — TTS voiceover + nano-banana image generation.
+  // Real API (691labs.vip) is async job-based: POST /api/v1/tts/generate ->
+  // poll GET /api/v1/tts/status/:jobId -> GET /api/v1/tts/download/:jobId.
+  // Base URL has NO version suffix here; route paths include /api/v1/...
+  SIXTYNINE_LABS_API_KEY: z.string().optional(),
+  SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://691labs.vip"),
+  // TTS voiceProvider: elevenlabs | edgetts | minimax (wire-level value).
+  SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),
+  // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).
+  SIXTYNINE_LABS_TTS_MODEL: z.string().default("eleven_multilingual_v2"),
+  SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana"),
+  SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
+  // Max seconds to poll a TTS job to COMPLETED before giving up.
+  SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // Flux image fallback when nano-banana fails (Black Forest Labs or a proxy).
+  FLUX_API_KEY: z.string().optional(),
+  FLUX_BASE_URL: z.string().url().default("https://api.bfl.ai/v1"),
+  FLUX_MODEL: z.string().default("flux-pro-1.1"),
+  // fal.ai — image-to-video. Veo 3 Fast primary, Kling fallback.
+  FAL_AI_API_KEY: z.string().optional(),
+  FAL_AI_BASE_URL: z.string().url().default("https://queue.fal.run"),
+  FAL_AI_VEO_MODEL: z.string().default("fal-ai/veo3/fast/image-to-video"),
+  FAL_AI_KLING_MODEL: z.string().default("fal-ai/kling-video/v1/standard/image-to-video"),
+  // Hard timeout (seconds) for a single fal.ai image-to-video job (poll loop).
+  FAL_AI_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // HeyGen avatar automation (Playwright — NOT the API, per spec).
+  HEYGEN_BASE_URL: z.string().url().default("https://app.heygen.com"),
+  // 64-hex-char (32-byte) AES-256-GCM key encrypting heygen_accounts secrets
+  // and cookies. Generate with: openssl rand -hex 32. Without it, the HeyGen
+  // account routes 503 (encryption refuses to run with a missing/short key).
+  SECRET_BOX_KEY: z.string().optional(),
+  // Newline/comma-separated residential proxy pool (ip:port:user:pass) for
+  // HeyGen browser sessions. Per-account `proxy` column overrides this.
+  HEYGEN_PROXIES: z.string().optional(),
+  // Run the browser headful (false) for local debugging of HeyGen automation.
+  HEYGEN_HEADLESS: z.coerce.boolean().default(true),
+  // Per-attempt timeout (ms) for one HeyGen avatar generation in the browser.
+  HEYGEN_NAV_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // How long an avatar render may take inside HeyGen before we give up (ms).
+  HEYGEN_RENDER_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
+  // fail_count threshold past which an account is auto-disabled (taken out of
+  // rotation) rather than merely cooled down.
+  HEYGEN_MAX_FAIL_COUNT: z.coerce.number().int().positive().default(3),
+  // Cooldown window (minutes) applied to an account after a soft failure.
+  HEYGEN_COOLDOWN_MINUTES: z.coerce.number().int().positive().default(30),
+  // Where Playwright failure screenshots are written (R2-uploaded for audit).
+  HEYGEN_SCREENSHOT_DIR: z.string().default("./tmp/heygen-shots"),
+
+  // Per-queue concurrency for the synthetic asset-generation queues. Mirrors
+  // the spec: tts=2, planner=2, image=3, video=2, avatar=1. Avatar stays at 1
+  // because each HeyGen browser session is heavy and account-rotation is
+  // serial by design.
+  TTS_CONCURRENCY: z.coerce.number().int().positive().default(2),
+  SYNTHETIC_PLANNER_CONCURRENCY: z.coerce.number().int().positive().default(2),
+  IMAGE_GEN_CONCURRENCY: z.coerce.number().int().positive().default(3),
+  IMAGE_TO_VIDEO_CONCURRENCY: z.coerce.number().int().positive().default(2),
+  AVATAR_CONCURRENCY: z.coerce.number().int().positive().default(1),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

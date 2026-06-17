@@ -1,0 +1,40 @@
+// Shared synthetic-engine constants.
+
+// Appended to EVERY image prompt (nano-banana / Flux) so generated stills share
+// the client's required "candid documentary" look instead of a studio-render
+// aesthetic. Per spec — do not edit without client sign-off.
+export const STYLE_PROMPT =
+  "Candid video frame grab, mid-range consumer camera quality, slightly " +
+  "compressed JPEG artifact look, natural daylight or golden hour lighting, " +
+  "handheld camera feel with subtle motion softness, authentic documentary " +
+  "style, no studio lighting, real-world environment, slightly overexposed " +
+  "highlights, muted earthy color grading, shallow depth of field on subject, " +
+  "background slightly out of focus, grainy texture consistent with 1080p " +
+  "video still, no filters, unposed candid moment";
+
+/** Append the mandatory style prompt to a base image prompt. */
+export function withStylePrompt(basePrompt: string): string {
+  const base = basePrompt.trim().replace(/[.,\s]+$/, "");
+  return `${base}. ${STYLE_PROMPT}`;
+}
+
+// Output canvas for the synthetic engine (matches the sourced render).
+export const SYNTHETIC_WIDTH = 1280;
+export const SYNTHETIC_HEIGHT = 720;
+export const SYNTHETIC_FPS = 30;
+
+// R2 key prefixes for synthetic assets, kept together so storage layout is
+// easy to audit / sweep. {projectId} is substituted by callers.
+export const r2Keys = {
+  masterVoiceover: (projectId: string) => `synthetic/${projectId}/master_voiceover.mp3`,
+  segmentImage: (projectId: string, segmentId: string) =>
+    `synthetic/${projectId}/images/${segmentId}.jpg`,
+  segmentRightImage: (projectId: string, segmentId: string) =>
+    `synthetic/${projectId}/images/${segmentId}_right.jpg`,
+  segmentVideo: (projectId: string, segmentId: string) =>
+    `synthetic/${projectId}/clips/${segmentId}.mp4`,
+  avatarVideo: (projectId: string, segmentId: string) =>
+    `synthetic/${projectId}/avatars/${segmentId}.mp4`,
+  avatarShot: (projectId: string, segmentId: string, label: string) =>
+    `synthetic/${projectId}/heygen-shots/${segmentId}_${label}.png`,
+};

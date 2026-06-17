@@ -2,6 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { isSupabaseConfigured, getServerSupabase } from "@/lib/supabase/server";
 import { ReferenceChannels, type ReferenceChannel } from "./reference-channels";
 import { ChangePassword } from "./change-password";
+import { HeygenAccounts } from "./heygen-accounts";
 import { hasCustomPassword } from "@/lib/auth-store";
 
 export const dynamic = "force-dynamic";
@@ -55,6 +56,8 @@ export default async function SettingsPage() {
       <ChangePassword hasCustomPassword={s.customPassword} />
 
       <ReferenceChannels initial={s.referenceChannels} />
+
+      <HeygenAccounts />
 
       <div className="grid gap-4 sm:grid-cols-2">
         <Card>

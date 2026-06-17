@@ -13,6 +13,13 @@ function getModel() {
   return genai.getGenerativeModel({ model: env.GEMINI_MODEL });
 }
 
+// Exported accessor so other modules (e.g. the synthetic planner) can reuse the
+// same configured model + withGeminiRetry path instead of re-instantiating the
+// SDK. Internal callers keep using the private getModel() above unchanged.
+export function getGeminiModel() {
+  return getModel();
+}
+
 // ---------------------------------------------------------------------------
 // Retry helper
 // ---------------------------------------------------------------------------

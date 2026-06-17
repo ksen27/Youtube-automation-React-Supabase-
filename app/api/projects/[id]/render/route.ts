@@ -29,7 +29,15 @@ const DURATION_BEARING_TYPES = new Set([
   "split_2",
   "split_4",
   "title_card",
+  // --- synthetic engine block types (migration 0020) ---
+  "avatar",
+  "ai_clip",
 ]);
+
+// Synthetic block types render as visible segments without a clip_id (their
+// asset lives on video_url/image_url, set by the synthetic processors). They
+// count as renderable the same way footage/image do for the sourced engine.
+const SYNTHETIC_RENDERABLE_TYPES = new Set(["avatar", "ai_clip", "image", "split_2"]);
 
 const VALIDATION_FAILED_MSG =
   "Timeline duration must match voiceover.";
@@ -95,11 +103,21 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     return !!fc?.youtube_url;
   }
 
-  const renderable = items.filter((it) => !!it.clip_id || isForcedClip(it as { type: string; metadata: unknown }));
+  const renderable = items.filter(
+    (it) =>
+      !!it.clip_id ||
+      isForcedClip(it as { type: string; metadata: unknown }) ||
+      SYNTHETIC_RENDERABLE_TYPES.has(String(it.type)),
+  );
   if (renderable.length === 0) {
     return NextResponse.json({ error: "no clips on timeline" }, { status: 400 });
   }
-  if (!renderable.every((it) => it.approved)) {
+  // Synthetic blocks are reviewed (not per-row "approved") on the synthetic
+  // review screen, so the approval gate applies only to sourced timeline rows.
+  const requiresApproval = renderable.filter(
+    (it) => !SYNTHETIC_RENDERABLE_TYPES.has(String(it.type)),
+  );
+  if (!requiresApproval.every((it) => it.approved)) {
     return NextResponse.json({ error: "approve timeline before rendering" }, { status: 400 });
   }
 

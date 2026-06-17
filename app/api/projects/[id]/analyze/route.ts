@@ -179,8 +179,12 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
 
   const sb = getServerSupabase();
   const { data: project, error: projErr } = await sb
-    .from("projects").select("id, transcript, status, voiceover_duration_seconds").eq("id", id).single();
+    .from("projects").select("id, engine, transcript, status, voiceover_duration_seconds").eq("id", id).single();
   if (projErr || !project) return NextResponse.json({ error: "project not found" }, { status: 404 });
+  // Celebrity (sourced) pipeline only — AI Avatar projects never run analyze/search.
+  if (((project.engine as string | null) ?? "sourced") !== "sourced") {
+    return NextResponse.json({ error: "not a celebrity (sourced) project" }, { status: 400 });
+  }
   const transcript = (project.transcript ?? "").trim();
   if (!transcript) {
     return NextResponse.json({ error: "transcript required before analysis" }, { status: 400 });

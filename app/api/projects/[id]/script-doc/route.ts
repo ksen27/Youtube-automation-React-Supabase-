@@ -4,7 +4,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { estimateDurationSeconds } from "@/lib/ai/segments";
 import { extractDocumentId, fetchGoogleDoc, GoogleDocsFetchError } from "@/lib/gdocs/fetch";
 import { parseScriptDoc, type ScriptMarker } from "@/lib/gdocs/parse";
-import { createMediaJob, logJob } from "@/lib/jobs/db";
+import { createMediaJob, logJob, checkProjectEngine } from "@/lib/jobs/db";
 import { enqueueScriptClip } from "@/lib/jobs/queue";
 
 export const runtime = "nodejs";
@@ -20,6 +20,13 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
   if (!z.string().uuid().safeParse(id).success) {
     return NextResponse.json({ error: "invalid id" }, { status: 400 });
+  }
+  // Google-Doc script ingest is part of the Celebrity (sourced) intake only.
+  const eng = await checkProjectEngine(id, "sourced");
+  if (!eng.ok) {
+    return eng.status === 404
+      ? NextResponse.json({ error: "project not found" }, { status: 404 })
+      : NextResponse.json({ error: "not a celebrity (sourced) project" }, { status: 400 });
   }
   const body = await req.json().catch(() => ({}));
   const parsed = Body.safeParse(body);

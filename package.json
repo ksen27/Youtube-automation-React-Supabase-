@@ -8,6 +8,7 @@
     "start": "next start",
     "worker": "tsx worker/index.ts",
     "check-system": "tsx scripts/check-system.ts",
+    "test:synthetic": "tsx scripts/test-synthetic.ts",
     "db:migrate": "echo 'Run the SQL files in supabase/migrations/ via the Supabase SQL editor or `supabase db push`.'",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit"
@@ -36,6 +37,7 @@
     "ioredis": "^5.4.1",
     "lucide-react": "^0.469.0",
     "next": "16.2.4",
+    "playwright": "^1.61.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-hook-form": "^7.54.1",

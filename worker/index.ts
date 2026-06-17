@@ -17,6 +17,12 @@ import { processClipJob }       from "./processors/clipProcessor";
 import { processMatchJob }      from "./processors/matchProcessor";
 import { processRenderJob }     from "./processors/renderProcessor";
 import { processScriptClipJob } from "./processors/scriptClipProcessor";
+// --- synthetic engine processors (migration 0020) ---
+import { processTtsJob }              from "./processors/synthetic/ttsProcessor";
+import { processSyntheticPlannerJob } from "./processors/synthetic/plannerProcessor";
+import { processImageGenJob }         from "./processors/synthetic/imageGenProcessor";
+import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
+import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
 import { markJobFailedIfExhausted, sweepStalledJobs } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 
@@ -125,6 +131,16 @@ workers.push(startWorker(QUEUE_NAMES.render,     processRenderJob,     1));
 // downloadConcurrency keeps the marker batch from saturating residential
 // proxies during a heavy ingest of a script-doc with many title cards.
 workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadConcurrency));
+
+// --- synthetic engine queues (migration 0020). Separate workers + per-queue
+// concurrency so the synthetic pipeline never contends with the sourced one.
+// avatar stays at 1: each HeyGen browser session is heavy and account
+// rotation is serial. ---
+workers.push(startWorker(QUEUE_NAMES.tts,              processTtsJob,              env.TTS_CONCURRENCY));
+workers.push(startWorker(QUEUE_NAMES.syntheticPlanner, processSyntheticPlannerJob, env.SYNTHETIC_PLANNER_CONCURRENCY));
+workers.push(startWorker(QUEUE_NAMES.imageGeneration,  processImageGenJob,         env.IMAGE_GEN_CONCURRENCY));
+workers.push(startWorker(QUEUE_NAMES.imageToVideo,     processImageToVideoJob,     env.IMAGE_TO_VIDEO_CONCURRENCY));
+workers.push(startWorker(QUEUE_NAMES.avatar,           processAvatarJob,           env.AVATAR_CONCURRENCY));
 
 // Periodic stall sweeper — the safety net for the case where on("failed")
 // never fires (hard OOM kill, Fly machine eviction). Any media_jobs row stuck

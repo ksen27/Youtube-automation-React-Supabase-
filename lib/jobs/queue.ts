@@ -14,6 +14,14 @@ export const QUEUE_NAMES = {
   // bursts of script_clip jobs from a doc with many title cards don't
   // starve the source-pool downloads the matcher depends on.
   scriptClip: "video-automation-script-clip",
+  // --- synthetic engine queues (migration 0020). Separate from the sourced
+  // queues so the two engines never contend for the same workers and the
+  // sourced pipeline's behaviour is unchanged. ---
+  tts:              "video-automation-tts",
+  syntheticPlanner: "video-automation-synthetic-planner",
+  imageGeneration:  "video-automation-image-generation",
+  imageToVideo:     "video-automation-image-to-video",
+  avatar:           "video-automation-avatar",
 } as const;
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
@@ -26,6 +34,17 @@ export interface RenderJobData    { projectId: string; mediaJobId: string; rende
 // looks up the marker row by markerId to read its URL + window + kind so
 // the queued payload stays small (no need to re-pickle URLs on retry).
 export interface ScriptClipJobData { projectId: string; mediaJobId: string; markerId: string; }
+
+// --- synthetic engine job payloads ---
+// Each stays small: the processor re-reads the project / segment row by id, so
+// retries never depend on stale data pickled into the queue payload.
+export interface TtsJobData              { projectId: string; mediaJobId: string; }
+export interface SyntheticPlannerJobData { projectId: string; mediaJobId: string; }
+// One job per synthetic_segments row. segmentId is the unit of work; the
+// processor reads its block_type, prompts and timings from the row.
+export interface ImageGenerationJobData  { projectId: string; mediaJobId: string; segmentId: string; }
+export interface ImageToVideoJobData     { projectId: string; mediaJobId: string; segmentId: string; }
+export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; }
 
 // Idle BullMQ workers sit on a long blocking BRPOP. On Fly, idle TCP sockets
 // to the colocated Redis get torn down by the network layer after a few
@@ -115,4 +134,25 @@ export async function enqueueRender(data: RenderJobData) {
 }
 export async function enqueueScriptClip(data: ScriptClipJobData) {
   return getQueue<ScriptClipJobData>(QUEUE_NAMES.scriptClip).add("script_clip", data, { jobId: data.mediaJobId });
+}
+
+// --- synthetic engine enqueue helpers ---
+// jobId === mediaJobId throughout (same invariant as the sourced queues): it
+// dedupes accidental double-enqueues and lets reconcile.ts map a BullMQ job id
+// straight back to its media_jobs row. Each synthetic asset job owns its own
+// media_job, so segment-level jobs are still uniquely keyed.
+export async function enqueueTts(data: TtsJobData) {
+  return getQueue<TtsJobData>(QUEUE_NAMES.tts).add("tts", data, { jobId: data.mediaJobId });
+}
+export async function enqueueSyntheticPlanner(data: SyntheticPlannerJobData) {
+  return getQueue<SyntheticPlannerJobData>(QUEUE_NAMES.syntheticPlanner).add("plan_synthetic", data, { jobId: data.mediaJobId });
+}
+export async function enqueueImageGeneration(data: ImageGenerationJobData) {
+  return getQueue<ImageGenerationJobData>(QUEUE_NAMES.imageGeneration).add("image_gen", data, { jobId: data.mediaJobId });
+}
+export async function enqueueImageToVideo(data: ImageToVideoJobData) {
+  return getQueue<ImageToVideoJobData>(QUEUE_NAMES.imageToVideo).add("image_to_video", data, { jobId: data.mediaJobId });
+}
+export async function enqueueAvatar(data: AvatarJobData) {
+  return getQueue<AvatarJobData>(QUEUE_NAMES.avatar).add("avatar", data, { jobId: data.mediaJobId });
 }
