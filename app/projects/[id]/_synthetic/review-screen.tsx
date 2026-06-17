@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -37,6 +37,22 @@ export function SyntheticReviewScreen({
     onSuccess: onChange,
   });
 
+  // Re-run ONLY the planner against the existing voiceover — re-segments the
+  // script (e.g. after fixing avatar marks) WITHOUT regenerating the voiceover.
+  // Rebuilds the segment list, so it discards per-segment edits + any generated
+  // assets; we confirm before firing.
+  const replan = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/synthetic/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ step: "planner" }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `re-plan failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+
   const render = useMutation({
     mutationFn: async () => {
       const r = await fetch(`/api/projects/${projectId}/render`, { method: "POST" });
@@ -45,31 +61,77 @@ export function SyntheticReviewScreen({
     onSuccess: onChange,
   });
 
+  // Three states share this one screen (the user never leaves it during asset
+  // generation):
+  //   plan_ready        -> review the plan, click "Generate assets"
+  //   generating_*      -> assets in flight; per-segment status shown inline,
+  //                        with per-row Retry on any failed block
+  //   ready_for_review  -> every block ready; click "Render video"
+  const isGenerating =
+    resp.project.status === "generating_images" ||
+    resp.project.status === "generating_clips" ||
+    resp.project.status === "generating_avatars";
+  const generatingCount = segs.filter((s) => s.status === "generating" || s.status === "pending").length;
   const allReady = segs.length > 0 && segs.every((s) => s.status === "ready" || s.status === "skipped");
+
+  // Re-plan is available in ALL states (not just the plan gate) — re-segmenting
+  // is useful even after generation started (e.g. to fix avatar marks). It
+  // discards the current plan + generated assets, so it always confirms.
+  const onReplan = () => {
+    if (confirm("Re-plan re-segments the script from scratch and discards the current plan, edits, and any generated assets. The voiceover is kept. Continue?")) {
+      replan.mutate();
+    }
+  };
 
   return (
     <div className="max-w-4xl mx-auto space-y-5">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <div>
-          <h2 className="text-sm font-medium text-fg">{isPlanGate ? "Review plan" : "Review timeline"}</h2>
+          <h2 className="text-sm font-medium text-fg">
+            {isPlanGate ? "Review plan" : isGenerating ? "Generating assets" : "Review timeline"}
+          </h2>
           <p className="text-xs text-fg-subtle">
             {segs.length} blocks{isPlanGate
               ? " · edit types/prompts before generating"
-              : ` · ${resp.summary.ready} ready · ${resp.summary.failed} failed`}
+              : ` · ${resp.summary.ready} ready · ${resp.summary.failed} failed${isGenerating ? ` · ${generatingCount} generating` : ""}`}
           </p>
         </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Re-plan: always available, re-runs only the planner. */}
+          <Button type="button" variant="soft" size="sm" disabled={replan.isPending} onClick={onReplan}>
+            <RefreshCw className={`h-4 w-4 ${replan.isPending ? "animate-spin" : ""}`} /> Re-plan
+          </Button>
         {isPlanGate ? (
-          <Button type="button" variant="gradient" disabled={segs.length === 0 || generate.isPending} onClick={() => generate.mutate()}>
-            <Sparkles className="h-4 w-4" /> {generate.isPending ? "Starting…" : "Generate assets"}
+            <Button type="button" variant="gradient" disabled={segs.length === 0 || generate.isPending} onClick={() => generate.mutate()}>
+              <Sparkles className="h-4 w-4" /> {generate.isPending ? "Starting…" : "Generate assets"}
+            </Button>
+        ) : isGenerating ? (
+          // Still generating — no primary action; the per-segment rows show
+          // live status and offer Retry on failures. A Refresh keeps it live
+          // even if polling lapses.
+          <Button type="button" variant="ghost" size="sm" onClick={onChange}>
+            <RefreshCw className="h-4 w-4 animate-spin" /> Generating…
           </Button>
         ) : (
           <Button type="button" variant="gradient" disabled={!allReady || render.isPending} onClick={() => render.mutate()}>
             <Film className="h-4 w-4" /> {render.isPending ? "Starting render…" : "Render video"}
           </Button>
         )}
+        </div>
       </div>
       {generate.error && <p className="text-xs text-danger">{(generate.error as Error).message}</p>}
       {render.error && <p className="text-xs text-danger">{(render.error as Error).message}</p>}
+      {replan.error && <p className="text-xs text-danger">{(replan.error as Error).message}</p>}
+
+      {/* Master voiceover — listen before committing to asset generation/render. */}
+      {resp.project.voiceover_url && (
+        <Card>
+          <CardContent className="p-3 flex items-center gap-3">
+            <Volume2 className="h-4 w-4 text-brand-300 shrink-0" />
+            <audio src={resp.project.voiceover_url} controls preload="metadata" className="w-full h-9" />
+          </CardContent>
+        </Card>
+      )}
 
       <div className="space-y-3">
         {segs.map((s) => (
@@ -124,9 +186,11 @@ function SegmentRow({
   const thumb = thumbUrl(segment);
   const statusVariant =
     segment.status === "ready" ? "success" : segment.status === "failed" ? "destructive" : segment.status === "generating" ? "info" : "secondary";
+  const isGenerating = segment.status === "generating";
+  const isFailed = segment.status === "failed";
 
   return (
-    <Card>
+    <Card className={isFailed ? "border-danger/40" : undefined}>
       <CardContent className="flex gap-4 p-3">
         {/* Thumbnail */}
         <div className="h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center">
@@ -136,6 +200,10 @@ function SegmentRow({
           ) : thumb ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img src={thumb} alt="" className="h-full w-full object-cover" />
+          ) : isGenerating ? (
+            <Loader2 className="h-5 w-5 animate-spin text-brand-300" />
+          ) : isFailed ? (
+            <span className="text-[10px] text-danger">failed</span>
           ) : (
             <span className="text-[10px] text-fg-subtle">no preview</span>
           )}
@@ -150,8 +218,15 @@ function SegmentRow({
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
             <div className="ml-auto flex items-center gap-1">
               <Button type="button" variant="ghost" size="xs" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</Button>
-              <Button type="button" variant="soft" size="xs" disabled={regenerate.isPending} onClick={() => regenerate.mutate()}>
-                <RefreshCw className="h-3.5 w-3.5" /> Regenerate
+              <Button
+                type="button"
+                variant={isFailed ? "gradient" : "soft"}
+                size="xs"
+                disabled={regenerate.isPending || isGenerating}
+                onClick={() => regenerate.mutate()}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${regenerate.isPending ? "animate-spin" : ""}`} />
+                {isFailed ? "Retry" : "Regenerate"}
               </Button>
               <Button type="button" variant="ghost" size="xs" onClick={() => del.mutate()} disabled={del.isPending}>
                 <Trash2 className="h-3.5 w-3.5 text-danger" />

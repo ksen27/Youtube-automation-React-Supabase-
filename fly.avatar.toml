@@ -1,0 +1,55 @@
+# Fly config for the AI-AVATAR (synthetic) worker — a SEPARATE app from the
+# celebrity worker (fly.toml). Deploy with:
+#   fly deploy -c fly.avatar.toml
+#
+# Why a second app: avatar generation is bursty (occasional), and the work is
+# heavy per-job (Playwright/Chromium for HeyGen). Isolating it onto its own
+# machine means a big celebrity render can never starve it of CPU/RAM, and vice
+# versa. It connects to the EXISTING Redis hosted by the celebrity worker, so it
+# hosts no service of its own and can scale to zero when idle.
+#
+# REQUIRED secrets (set once, mirroring the celebrity worker where shared):
+#   fly secrets set -c fly.avatar.toml \
+#     REDIS_URL='redis://:<password>@video-automation-worker.fly.dev:6379' \
+#     NEXT_PUBLIC_SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
+#     R2_ACCOUNT_ID=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... R2_PUBLIC_BASE_URL=... \
+#     DEEPGRAM_API_KEY=... GEMINI_API_KEY=... \
+#     SIXTYNINE_LABS_API_KEY=... FAL_AI_API_KEY=... \
+#     SECRET_BOX_KEY=... HEYGEN_PROXIES=...
+# (REDIS_URL must point at the celebrity worker's public Redis — that's the
+#  shared queue both engines use.)
+
+app = 'video-automation-avatar-worker'
+primary_region = 'lhr'
+
+[env]
+  # Serve ONLY the synthetic queues (tts/planner/image/video/avatar).
+  WORKER_ROLE = "synthetic"
+  # Headless Chromium for HeyGen automation.
+  HEYGEN_HEADLESS = "true"
+  # Local scratch for downloads/screenshots (ephemeral is fine — no resume
+  # cache is needed for avatar jobs the way renders need /data).
+  TMP_DIR = "/tmp/work"
+
+[build]
+  dockerfile = 'Dockerfile.worker'
+
+# Avatar work is Playwright + HTTP (image/video/TTS provider calls), not heavy
+# multi-core FFmpeg, so a much smaller VM than the render worker suffices.
+# Chromium needs a couple of GB of RAM; shared-cpu-2x / 4gb is comfortable.
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '4gb'
+
+# NOTE on auto-stop: a BullMQ worker has no inbound HTTP port, so Fly cannot
+# auto-WAKE it from a queued Redis job (auto_start fires on inbound requests to
+# a service, which this app doesn't expose). Two cost options:
+#   (A) Leave this app scaled to a single always-on machine (simplest). Cost is
+#       just the small shared-cpu-2x — far cheaper than a 2nd performance-8x.
+#   (B) For true scale-to-zero, scale it to 0 between runs and start it on
+#       demand right before generating:
+#         fly scale count 1 -c fly.avatar.toml   # before a batch
+#         fly scale count 0 -c fly.avatar.toml   # when done
+#       (Or wire the generate-synthetic API route to call the Fly Machines API
+#        to start the machine — a future enhancement.)
+# No [[services]] block: this worker exposes nothing and hosts no Redis.

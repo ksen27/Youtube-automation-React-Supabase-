@@ -18,26 +18,31 @@ import type { SyntheticResp } from "./_synthetic/types";
 // status, which the backend advances through the pipeline.
 type SyntheticPhase = "intake" | "progress" | "review" | "render";
 
-const IN_PROGRESS = new Set([
-  "voiceover", "aligning", "planning",
-  "generating_images", "generating_clips", "generating_avatars",
-]);
+// Early-pipeline statuses (no segments to show yet) -> the progress screen.
+const EARLY_PROGRESS = new Set(["voiceover", "aligning", "planning"]);
+// Asset-generation statuses -> STAY on the planner/review screen, which shows
+// per-segment generation status inline. The user never navigates away to a
+// separate progress view once the plan exists.
+const ASSET_GENERATING = new Set(["generating_images", "generating_clips", "generating_avatars"]);
 
 function derivePhase(resp: SyntheticResp | undefined): SyntheticPhase {
   if (!resp?.project) return "intake";
   const s = resp.project.status;
   if (s === "created" || s === "draft") return "intake";
-  // 'plan_ready' is the REVIEW GATE — planning finished, assets not generated.
-  // 'ready_for_review' is after assets are generated (final pre-render review).
-  if (s === "plan_ready" || s === "ready_for_review") return "review";
-  if (IN_PROGRESS.has(s)) return "progress";
+  // The planner/review screen is "home" once a plan exists:
+  //   plan_ready          -> review the plan, click Generate
+  //   generating_*        -> assets generating; per-segment status shown inline
+  //   ready_for_review    -> all assets done; click Render
+  if (s === "plan_ready" || s === "ready_for_review" || ASSET_GENERATING.has(s)) return "review";
+  if (EARLY_PROGRESS.has(s)) return "progress";
   if (s === "rendering" || s === "completed" || s === "failed") return "render";
   return "intake";
 }
 
 function syntheticBusy(resp: SyntheticResp | undefined): boolean {
   if (!resp?.project) return false;
-  if (IN_PROGRESS.has(resp.project.status) || resp.project.status === "rendering") return true;
+  const s = resp.project.status;
+  if (EARLY_PROGRESS.has(s) || ASSET_GENERATING.has(s) || s === "rendering") return true;
   return (resp.media_jobs ?? []).some((j) => j.status === "queued" || j.status === "running");
 }
 

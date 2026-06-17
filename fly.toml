@@ -21,6 +21,11 @@ primary_region = 'lhr'
 # never set as a secret and was the one value diverging from the default (the
 # 25-min limit that rejected sub-40-min sources as "source_too_long").
 [env]
+  # This app serves ONLY the celebrity (sourced) queues. The AI-avatar
+  # (synthetic) queues run on the separate video-automation-avatar-worker app
+  # (see fly.avatar.toml) so a heavy render never starves avatar generation and
+  # vice versa. Set to 'all' to fold both engines back into this one worker.
+  WORKER_ROLE = "sourced"
   MAX_SOURCE_DURATION_SECONDS = "2400"
   # Resume cache for renders. MUST live on the persistent /data volume (see
   # [[mounts]] below) so per-clip outputs survive a machine reboot/redeploy and

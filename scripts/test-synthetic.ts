@@ -129,6 +129,28 @@ async function main() {
       const idx = out.transcript.indexOf("Plain intro.");
       assert.ok(!segmentIsAvatarMarked(idx, idx + 5, out.avatarRanges));
     });
+
+    // Regression: leading whitespace must not shift the avatar ranges. Before
+    // the fix, trim() shifted the transcript but not the ranges, so marks
+    // landed on the wrong sentences.
+    test("ranges stay aligned after leading-whitespace trim", () => {
+      const red2 = { color: { rgbColor: { red: 0.8, green: 0, blue: 0 } } };
+      const doc2 = {
+        documentId: "d2", title: "T2",
+        body: { content: [{ paragraph: { elements: [
+          { textRun: { content: "   \n  " } },                                   // leading whitespace
+          { textRun: { content: "AVATARLINE.", textStyle: { foregroundColor: red2 } } },
+          { textRun: { content: " plain tail." } },
+        ] } }] },
+      };
+      const o2 = extractAvatarDoc(doc2);
+      const aIdx = o2.transcript.indexOf("AVATARLINE");
+      const tIdx = o2.transcript.indexOf("plain tail");
+      assert.ok(aIdx >= 0 && tIdx >= 0);
+      // The marked range must cover AVATARLINE and NOT the plain tail.
+      assert.ok(segmentIsAvatarMarked(aIdx, aIdx + 5, o2.avatarRanges));
+      assert.ok(!segmentIsAvatarMarked(tIdx, tIdx + 5, o2.avatarRanges));
+    });
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

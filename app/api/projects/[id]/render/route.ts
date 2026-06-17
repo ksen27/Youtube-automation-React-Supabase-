@@ -72,12 +72,13 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   // the intro here for the same reason DURATION_BEARING_TYPES excludes it.
   const { data: project, error: projErr } = await sb
     .from("projects")
-    .select("transcript, voiceover_duration_seconds, intro_duration_seconds")
+    .select("engine, transcript, voiceover_duration_seconds, intro_duration_seconds")
     .eq("id", id)
     .single();
   if (projErr || !project) {
     return NextResponse.json({ error: "project not found" }, { status: 404 });
   }
+  const isSynthetic = ((project.engine as string | null) ?? "sourced") === "synthetic";
   const rawVoiceoverSeconds =
     Number(project.voiceover_duration_seconds) ||
     estimateDurationSeconds(project.transcript ?? "") ||
@@ -103,20 +104,25 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     return !!fc?.youtube_url;
   }
 
+  // Synthetic renderable types only apply to SYNTHETIC projects. For celebrity
+  // (sourced) projects the original gate is used verbatim, so celebrity render
+  // behaviour is byte-for-byte unchanged — including the approval requirement
+  // on its own image/split_2 rows (which are NOT exempted here).
   const renderable = items.filter(
     (it) =>
       !!it.clip_id ||
       isForcedClip(it as { type: string; metadata: unknown }) ||
-      SYNTHETIC_RENDERABLE_TYPES.has(String(it.type)),
+      (isSynthetic && SYNTHETIC_RENDERABLE_TYPES.has(String(it.type))),
   );
   if (renderable.length === 0) {
     return NextResponse.json({ error: "no clips on timeline" }, { status: 400 });
   }
   // Synthetic blocks are reviewed (not per-row "approved") on the synthetic
-  // review screen, so the approval gate applies only to sourced timeline rows.
-  const requiresApproval = renderable.filter(
-    (it) => !SYNTHETIC_RENDERABLE_TYPES.has(String(it.type)),
-  );
+  // review screen, so the approval gate is skipped ONLY for synthetic projects'
+  // synthetic rows. Celebrity projects keep the full approval gate.
+  const requiresApproval = isSynthetic
+    ? renderable.filter((it) => !SYNTHETIC_RENDERABLE_TYPES.has(String(it.type)))
+    : renderable;
   if (!requiresApproval.every((it) => it.approved)) {
     return NextResponse.json({ error: "approve timeline before rendering" }, { status: 400 });
   }

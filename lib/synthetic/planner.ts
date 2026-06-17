@@ -175,11 +175,19 @@ export async function buildSyntheticTimeline(input: {
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
 
   const model = getGeminiModel();
-  const res = await withGeminiRetry("buildSyntheticTimeline", () =>
-    model.generateContent({
-      contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
-    }),
+  // Gemini 2.5-flash hits intermittent 503 "high demand" spikes. The planner is
+  // a single one-shot call per project (not high-volume), so we can afford to
+  // wait it out: 6 attempts with a longer base backoff rather than the default
+  // 3. This turns a transient Google outage from a hard failure into a slightly
+  // slower success.
+  const res = await withGeminiRetry(
+    "buildSyntheticTimeline",
+    () =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
+      }),
+    { attempts: 6, baseMs: 2000 },
   );
   const txt = res.response.text();
 
@@ -198,26 +206,84 @@ export async function buildSyntheticTimeline(input: {
 
   const planned = alignSegments(safe.data.segments, words, voiceoverDuration);
 
-  // Force avatar on segments that overlap a red/orange doc mark. Locate each
-  // segment's char window by walking a cursor through the transcript and
-  // matching its script slice (Gemini returns contiguous slices). When found
-  // and the window overlaps an avatar range, override the block type — and
-  // null out the now-irrelevant image/animation prompts.
+  // Force avatar on segments that overlap a red/orange doc mark.
+  //
+  // We locate each segment's char window in the transcript so we can test it
+  // against the avatar ranges. Gemini does NOT return verbatim transcript
+  // slices (it normalizes punctuation/spacing), so an exact indexOf is
+  // unreliable and a single miss makes the cursor drift, mis-marking every
+  // following segment. Instead we map through a NORMALIZED projection: build a
+  // lowercase, punctuation-stripped copy of the transcript while keeping an
+  // index back to the original offsets, then find each segment's normalized
+  // script within it. This tolerates Gemini's rewording and never drifts.
   if (avatarRanges.length > 0) {
-    let cursor = 0;
+    // normChars[i] = original transcript offset of the i-th normalized char.
+    let normStr = "";
+    const normToOrig: number[] = [];
+    {
+      let prevSpace = true;
+      for (let i = 0; i < transcript.length; i++) {
+        const ch = transcript[i].toLowerCase();
+        const keep = /[a-z0-9]/.test(ch);
+        if (keep) {
+          normStr += ch; normToOrig.push(i); prevSpace = false;
+        } else if (!prevSpace) {
+          normStr += " "; normToOrig.push(i); prevSpace = true;
+        }
+      }
+    }
+    // Normalize the NEEDLE the SAME way normStr is built: lowercase, collapse
+    // every run of non-alphanumerics to a single space, trim. The module-level
+    // norm() strips spaces entirely, which would never match normStr (which has
+    // single spaces between words) — that mismatch silently disabled all avatar
+    // marking, so Gemini's own block-type choices leaked through unchanged.
+    const normNeedle = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    let searchFrom = 0;
+    let placed = 0;
+    let forced = 0;
+    let unplaced = 0;
     for (const seg of planned) {
-      const needle = seg.script.trim();
+      const needle = normNeedle(seg.script);
       if (!needle) continue;
-      const at = transcript.indexOf(needle, cursor);
-      const start = at >= 0 ? at : cursor;
-      const end = start + needle.length;
-      if (at >= 0) cursor = end;
-      if (segmentIsAvatarMarked(start, end, avatarRanges)) {
+      const at = normStr.indexOf(needle, searchFrom);
+      // Whether or not we can locate the segment, doc marks are AUTHORITATIVE:
+      // a segment is avatar IFF its text falls inside a marked range. So the
+      // DEFAULT for any segment is "not avatar" — we only promote to avatar on
+      // a confirmed overlap. This means a segment that can't be placed, or that
+      // Gemini wrongly chose as avatar, is corrected to a non-avatar type.
+      let marked = false;
+      if (at >= 0) {
+        placed++;
+        const origStart = normToOrig[at];
+        const origEnd = (normToOrig[at + needle.length - 1] ?? origStart) + 1;
+        // Advance the cursor only on a real match so a single miss can't strand
+        // the rest. Re-anchor search from just after this match.
+        searchFrom = at + needle.length;
+        marked = segmentIsAvatarMarked(origStart, origEnd, avatarRanges);
+      } else {
+        unplaced++;
+      }
+      if (marked) {
+        forced++;
         seg.blockType = "avatar";
         seg.imagePrompt = null;
         seg.animationPrompt = null;
+      } else if (seg.blockType === "avatar") {
+        // NOT inside a marked range (or unplaceable) but Gemini chose avatar.
+        // Marks are authoritative -> demote to image.
+        seg.blockType = "image";
+        seg.imagePrompt = seg.imagePrompt || seg.script.slice(0, 200);
       }
     }
+    await logJob({ projectId, jobId }, "synthetic.plan.avatar_marks", {
+      ranges: avatarRanges.length,
+      transcriptChars: transcript.length,
+      markedChars: avatarRanges.reduce((a, r) => a + (r.end - r.start), 0),
+      segmentsPlaced: placed,
+      segmentsUnplaced: unplaced,
+      segmentsTotal: planned.length,
+      avatarForced: forced,
+    });
   }
 
   // Persist. Clear any prior plan first so retries don't accumulate.

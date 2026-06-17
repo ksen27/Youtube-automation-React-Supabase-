@@ -36,15 +36,17 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   }
 
   const sb = getServerSupabase();
-  // Don't double-run: block if any pipeline job is already in flight.
-  const { data: open } = await sb
-    .from("media_jobs").select("id")
+
+  // Mark any in-flight TTS/planner job for THIS step as failed first, so a
+  // stuck/orphaned job (e.g. left queued from earlier debugging) can't block a
+  // legitimate retry with a 409. This makes Re-plan/Retry always actionable.
+  const jobType = body.data.step === "voiceover" ? "tts" : "plan_synthetic";
+  await sb
+    .from("media_jobs")
+    .update({ status: "failed", error: "superseded by retry" })
     .eq("project_id", id)
-    .in("type", ["tts", "plan_synthetic"])
-    .in("status", ["queued", "running"]).limit(1);
-  if ((open ?? []).length > 0) {
-    return NextResponse.json({ error: "a step is already running" }, { status: 409 });
-  }
+    .eq("type", jobType)
+    .in("status", ["queued", "running"]);
 
   if (body.data.step === "voiceover") {
     // Re-read the resolved voiceover source so the retried job behaves the same.
@@ -59,7 +61,18 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ ok: true, media_job_id: mediaJobId, step: "voiceover" }, { status: 202 });
   }
 
-  // planner retry
+  // planner retry / re-plan. Also clear any in-flight ASSET jobs + their
+  // segments, since the planner rebuilds the segment list from scratch.
+  await sb
+    .from("media_jobs")
+    .update({ status: "failed", error: "superseded by re-plan" })
+    .eq("project_id", id)
+    .in("type", ["image_gen", "image_to_video", "avatar"])
+    .in("status", ["queued", "running"]);
+  // The planner deletes + reinserts synthetic_segments, and also drops any
+  // timeline_items materialized from a prior (now-stale) plan.
+  await sb.from("timeline_items").delete().eq("project_id", id);
+
   const mediaJobId = await createMediaJob({ projectId: id, type: "plan_synthetic", metadata: { retry: true } });
   await enqueueSyntheticPlanner({ projectId: id, mediaJobId });
   await setProjectStatus(id, "planning");

@@ -87,10 +87,23 @@ export function extractAvatarDoc(doc: GoogleDocsDocument): ExtractedDoc {
     }
   }
 
+  // CRITICAL: do NOT mutate `transcript` after this point. The ranges above are
+  // character offsets INTO this exact string; trimming/replacing would shift
+  // every offset and scramble which sentences are marked as avatar. We trim
+  // only the LEADING whitespace and shift the ranges by the same amount to keep
+  // them aligned; trailing whitespace is harmless to leave (no range follows
+  // it). This was the bug that made avatar marks land on the wrong segments.
+  const leadingWs = transcript.length - transcript.replace(/^\s+/, "").length;
+  const trimmedStart = transcript.replace(/^\s+/, "").replace(/\s+$/, "");
+  const adjusted = merged
+    .map((r) => ({ start: r.start - leadingWs, end: r.end - leadingWs }))
+    .map((r) => ({ start: Math.max(0, r.start), end: Math.min(trimmedStart.length, r.end) }))
+    .filter((r) => r.end > r.start);
+
   return {
     title: doc.title ?? null,
-    transcript: transcript.replace(/\s+\n/g, "\n").trim(),
-    avatarRanges: merged,
+    transcript: trimmedStart,
+    avatarRanges: adjusted,
   };
 }
 

@@ -45,7 +45,16 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   const mediaJobs = mediaRes.data;
   const segments = segmentsRes.data;
 
-  if (!project) return NextResponse.json({ error: "project not found" }, { status: 404 });
+  if (!project) {
+    // Distinguish "row genuinely absent" from "exists but wrong engine" so the
+    // UI/logs aren't misleading. A sourced project hitting the synthetic route
+    // would also land here.
+    const { data: existing } = await sb.from("projects").select("id, engine").eq("id", id).maybeSingle();
+    const detail = !existing
+      ? "no project row with this id"
+      : `project exists but engine=${existing.engine ?? "null"} (not synthetic)`;
+    return NextResponse.json({ error: "project not found", detail }, { status: 404 });
+  }
 
   // Roll up segment counts so the UI can render completed/total per block type
   // without re-deriving it client-side.

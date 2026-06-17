@@ -121,26 +121,36 @@ function startWorker<T>(
   return w;
 }
 
-workers.push(startWorker(QUEUE_NAMES.search,     processSearchJob,     1));
-workers.push(startWorker(QUEUE_NAMES.download,   processDownloadJob,   downloadConcurrency));
-workers.push(startWorker(QUEUE_NAMES.clip,       processClipJob,       concurrency));
-workers.push(startWorker(QUEUE_NAMES.match,      processMatchJob,      1));
-workers.push(startWorker(QUEUE_NAMES.render,     processRenderJob,     1));
-// script_clip jobs share the same proxy-rotated yt-dlp pipeline as the
-// source-pool downloads, so they tolerate the same level of parallelism.
-// downloadConcurrency keeps the marker batch from saturating residential
-// proxies during a heavy ingest of a script-doc with many title cards.
-workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadConcurrency));
+// WORKER_ROLE selects which engine's queues this process serves, so the
+// celebrity and AI-avatar engines can run on SEPARATE Fly machines (the avatar
+// one can auto-stop when idle). 'all' (default) keeps the single-worker setup.
+const role = env.WORKER_ROLE;
+const runSourced = role === "all" || role === "sourced";
+const runSynthetic = role === "all" || role === "synthetic";
+console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.role", role, runSourced, runSynthetic }));
 
-// --- synthetic engine queues (migration 0020). Separate workers + per-queue
-// concurrency so the synthetic pipeline never contends with the sourced one.
-// avatar stays at 1: each HeyGen browser session is heavy and account
-// rotation is serial. ---
-workers.push(startWorker(QUEUE_NAMES.tts,              processTtsJob,              env.TTS_CONCURRENCY));
-workers.push(startWorker(QUEUE_NAMES.syntheticPlanner, processSyntheticPlannerJob, env.SYNTHETIC_PLANNER_CONCURRENCY));
-workers.push(startWorker(QUEUE_NAMES.imageGeneration,  processImageGenJob,         env.IMAGE_GEN_CONCURRENCY));
-workers.push(startWorker(QUEUE_NAMES.imageToVideo,     processImageToVideoJob,     env.IMAGE_TO_VIDEO_CONCURRENCY));
-workers.push(startWorker(QUEUE_NAMES.avatar,           processAvatarJob,           env.AVATAR_CONCURRENCY));
+if (runSourced) {
+  workers.push(startWorker(QUEUE_NAMES.search,     processSearchJob,     1));
+  workers.push(startWorker(QUEUE_NAMES.download,   processDownloadJob,   downloadConcurrency));
+  workers.push(startWorker(QUEUE_NAMES.clip,       processClipJob,       concurrency));
+  workers.push(startWorker(QUEUE_NAMES.match,      processMatchJob,      1));
+  workers.push(startWorker(QUEUE_NAMES.render,     processRenderJob,     1));
+  // script_clip jobs share the same proxy-rotated yt-dlp pipeline as the
+  // source-pool downloads, so they tolerate the same level of parallelism.
+  workers.push(startWorker(QUEUE_NAMES.scriptClip, processScriptClipJob, downloadConcurrency));
+}
+
+if (runSynthetic) {
+  // --- synthetic engine queues (migration 0020). Separate workers + per-queue
+  // concurrency so the synthetic pipeline never contends with the sourced one.
+  // avatar stays at 1: each HeyGen browser session is heavy and account
+  // rotation is serial. ---
+  workers.push(startWorker(QUEUE_NAMES.tts,              processTtsJob,              env.TTS_CONCURRENCY));
+  workers.push(startWorker(QUEUE_NAMES.syntheticPlanner, processSyntheticPlannerJob, env.SYNTHETIC_PLANNER_CONCURRENCY));
+  workers.push(startWorker(QUEUE_NAMES.imageGeneration,  processImageGenJob,         env.IMAGE_GEN_CONCURRENCY));
+  workers.push(startWorker(QUEUE_NAMES.imageToVideo,     processImageToVideoJob,     env.IMAGE_TO_VIDEO_CONCURRENCY));
+  workers.push(startWorker(QUEUE_NAMES.avatar,           processAvatarJob,           env.AVATAR_CONCURRENCY));
+}
 
 // Periodic stall sweeper — the safety net for the case where on("failed")
 // never fires (hard OOM kill, Fly machine eviction). Any media_jobs row stuck

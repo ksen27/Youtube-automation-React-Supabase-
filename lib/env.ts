@@ -384,6 +384,15 @@ const ServerEnvSchema = z.object({
   // Where Playwright failure screenshots are written (R2-uploaded for audit).
   HEYGEN_SCREENSHOT_DIR: z.string().default("./tmp/heygen-shots"),
 
+  // Which queue group this worker process serves. Lets the celebrity
+  // (sourced) and AI-avatar (synthetic) engines run on SEPARATE Fly machines:
+  //   'all'       (default) — both engines, single-worker setup (unchanged).
+  //   'sourced'   — only the celebrity queues (search/download/clip/match/render/scriptClip).
+  //   'synthetic' — only the AI-avatar queues (tts/planner/image/video/avatar).
+  // The synthetic worker can be a separate Fly app with auto_stop (scales to
+  // zero when idle) since avatar generation is bursty, not 24/7.
+  WORKER_ROLE: z.enum(["all", "sourced", "synthetic"]).default("all"),
+
   // Per-queue concurrency for the synthetic asset-generation queues. Mirrors
   // the spec: tts=2, planner=2, image=3, video=2, avatar=1. Avatar stays at 1
   // because each HeyGen browser session is heavy and account-rotation is

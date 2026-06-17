@@ -5,7 +5,7 @@ import { StepCard, type StepState } from "@/components/ui/step-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, Volume2, Download } from "lucide-react";
 import type { SyntheticResp, SyntheticMediaJob, SyntheticSegmentRow } from "./types";
 
 // STEP-by-step generation progress. Aggregates media_jobs by type for the
@@ -102,6 +102,14 @@ export function SyntheticProgressScreen({
         </Button>
       </div>
 
+      {/* Generated voiceover — listen to verify it before assets generate. */}
+      {resp.project.voiceover_url && (
+        <VoiceoverPlayer
+          url={resp.project.voiceover_url}
+          durationSeconds={resp.project.voiceover_duration_seconds}
+        />
+      )}
+
       <div className="space-y-2">
         {steps.map((s, i) => (
           <div key={s.label} className="space-y-1">
@@ -138,5 +146,29 @@ export function SyntheticProgressScreen({
         </Card>
       )}
     </div>
+  );
+}
+
+// Inline player for the generated master voiceover, so the user can listen and
+// verify it before assets are generated (or download it).
+function VoiceoverPlayer({ url, durationSeconds }: { url: string; durationSeconds: number | null }) {
+  return (
+    <Card>
+      <CardContent className="p-3 space-y-2">
+        <div className="flex items-center gap-2">
+          <Volume2 className="h-4 w-4 text-brand-300" />
+          <span className="text-sm font-medium text-fg">Voiceover</span>
+          {durationSeconds != null && (
+            <span className="text-[11px] text-fg-subtle tabular-nums">
+              {Math.floor(durationSeconds / 60)}:{String(durationSeconds % 60).padStart(2, "0")}
+            </span>
+          )}
+          <a href={url} download className="ml-auto text-[11px] text-brand-300 hover:underline inline-flex items-center gap-1">
+            <Download className="h-3.5 w-3.5" /> Download
+          </a>
+        </div>
+        <audio src={url} controls preload="metadata" className="w-full h-9" />
+      </CardContent>
+    </Card>
   );
 }
