@@ -48,7 +48,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
     });
-    const up = await uploadBuffer(img.image, r2Keys.segmentRightImage(projectId, segmentId), "image/jpeg");
+    const up = await uploadBuffer(img.image, r2Keys.segmentRightImage(projectId, segmentId), img.contentType);
     await finishSegment(segmentId, { right_image_url: up.publicUrl });
     await setMediaJob(mediaJobId, { progress: 25 });
   }

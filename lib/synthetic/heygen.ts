@@ -37,11 +37,22 @@ import {
 // adjust against the live UI. They are centralized in SELECTORS for that
 // reason. Behaviour, rotation, cookies, proxy, and screenshots are complete.
 
+// Selectors verified against the live HeyGen app (auth.heygen.com login +
+// app.heygen.com workspace) on 2026-06-18. The login flow is multi-step:
+//   landing -> "Use email" -> "Use password" -> fill email+password -> "Log in"
+// HeyGen also renders multiple STACKED auth panels in the DOM (only one is
+// on-screen), so login interactions must target the on-screen element — see
+// clickOnScreen()/fillOnScreen(). Post-login the workspace shows a left nav
+// with Home / Avatar / Brand / Apps / Projects.
 const SELECTORS = {
-  loggedInMarker: '[data-testid="workspace-nav"], nav[aria-label="primary"]',
-  loginEmail: 'input[type="email"], input[name="email"]',
-  loginPassword: 'input[type="password"], input[name="password"]',
-  loginSubmit: 'button[type="submit"]',
+  // Logged-in marker: the workspace left-nav items (text is stable; the old
+  // data-testid guess was never present on the real app).
+  loggedInMarker: 'text="Avatar"',
+  useEmail: 'text="Use email"',
+  usePassword: 'text="Use password"',
+  loginEmail: 'input[type="email"]',
+  loginPassword: 'input[type="password"]',
+  loginSubmit: 'button:has-text("Log in")',
   createAvatarEntry: 'a[href*="avatar"], button:has-text("Create")',
   photoAvatarUpload: 'input[type="file"]',
   scriptTextarea: 'textarea[placeholder*="script" i], textarea[aria-label*="script" i]',
@@ -50,6 +61,44 @@ const SELECTORS = {
   downloadButton: 'a[download], button:has-text("Download")',
   quotaBanner: ':text("limit"), :text("upgrade"), :text("quota")',
 } as const;
+
+// HeyGen's auth widget keeps several panels mounted at once; only one is laid
+// out on-screen. Plain Playwright clicks/fills can resolve to an off-screen
+// duplicate and either no-op or time out. These helpers pick the first match
+// that actually has an on-screen bounding box.
+async function clickOnScreen(page: Page, selector: string, timeoutMs: number): Promise<void> {
+  const loc = page.locator(selector);
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const n = await loc.count();
+    for (let i = 0; i < n; i++) {
+      const box = await loc.nth(i).boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.y > 50 && box.y < 850) {
+        await loc.nth(i).click({ timeout: timeoutMs });
+        return;
+      }
+    }
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+  throw new Error(`heygen: no on-screen element for ${selector}`);
+}
+
+async function fillOnScreen(page: Page, selector: string, value: string, timeoutMs: number): Promise<void> {
+  const loc = page.locator(selector);
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const n = await loc.count();
+    for (let i = 0; i < n; i++) {
+      const box = await loc.nth(i).boundingBox().catch(() => null);
+      if (box && box.width > 0 && box.y > 50 && box.y < 850) {
+        await loc.nth(i).fill(value);
+        return;
+      }
+    }
+    await page.waitForTimeout(250);
+  } while (Date.now() < deadline);
+  throw new Error(`heygen: no on-screen field for ${selector}`);
+}
 
 export interface GenerateAvatarInput {
   projectId: string;
@@ -108,13 +157,37 @@ async function isLoggedIn(page: Page): Promise<boolean> {
 
 // Interactive login. Persists a fresh storage state on success so future runs
 // skip straight past the login wall.
+//
+// Verified flow (auth.heygen.com, 2026-06-18): the landing screen only offers
+// Google/Apple/"Use email"/"Use SSO". We pick the email path, switch it from
+// the default magic-link mode to password mode, fill credentials, and submit:
+//   /login (commit) -> "Use email" -> "Use password" -> email+password -> "Log in"
 async function login(page: Page, context: BrowserContext, account: DecryptedAccount): Promise<void> {
   const e = env();
-  await page.goto(`${e.HEYGEN_BASE_URL}/login`, { waitUntil: "domcontentloaded" });
-  await page.fill(SELECTORS.loginEmail, account.email);
-  await page.fill(SELECTORS.loginPassword, account.password);
-  await page.click(SELECTORS.loginSubmit);
+  // HeyGen is a heavy SPA whose `domcontentloaded`/`load` lifecycle events may
+  // never settle (streaming/long-poll connections keep the document "loading"),
+  // so we navigate with `commit` (resolves once the response starts) and then
+  // wait for the concrete element we need at each step.
+  await page.goto(`${e.HEYGEN_BASE_URL}/login`, { waitUntil: "commit" });
+
+  // 1) Landing -> email entry. 2) email mode -> password mode.
+  await clickOnScreen(page, SELECTORS.useEmail, e.HEYGEN_NAV_TIMEOUT_MS);
+  await clickOnScreen(page, SELECTORS.usePassword, e.HEYGEN_NAV_TIMEOUT_MS);
+
+  // 3) Fill credentials (on-screen panel only) and submit.
+  await fillOnScreen(page, SELECTORS.loginEmail, account.email, e.HEYGEN_NAV_TIMEOUT_MS);
+  await fillOnScreen(page, SELECTORS.loginPassword, account.password, e.HEYGEN_NAV_TIMEOUT_MS);
+  await clickOnScreen(page, SELECTORS.loginSubmit, e.HEYGEN_NAV_TIMEOUT_MS);
+
+  // 4) Success = we leave the auth page and the workspace nav renders. Surface
+  // a clear error otherwise (wrong password, captcha, email-code challenge).
+  await page
+    .waitForURL((u) => !u.toString().includes("/login"), { timeout: e.HEYGEN_NAV_TIMEOUT_MS })
+    .catch(() => {
+      throw new Error("heygen: login did not complete (still on auth page — bad credentials or a captcha/email-code challenge)");
+    });
   await page.waitForSelector(SELECTORS.loggedInMarker, { timeout: e.HEYGEN_NAV_TIMEOUT_MS });
+
   // Persist the warm session for reuse.
   const state = await context.storageState();
   await saveCookies(account.id, state);
@@ -143,8 +216,15 @@ async function attemptOnAccount(
   try {
     const page = await context.newPage();
 
-    // 1) Ensure authenticated (restore session, else log in).
-    await page.goto(`${e.HEYGEN_BASE_URL}/home`, { waitUntil: "domcontentloaded" });
+    // 1) Ensure authenticated (restore session, else log in). HeyGen's SPA
+    // lifecycle never settles, so navigate with `commit` (see login()) and give
+    // the logged-in marker a brief, bounded chance to render before deciding to
+    // log in — otherwise the check races the SPA and false-negatives into a
+    // needless login.
+    await page.goto(`${e.HEYGEN_BASE_URL}/home`, { waitUntil: "commit" });
+    await page
+      .waitForSelector(SELECTORS.loggedInMarker, { timeout: 15_000 })
+      .catch(() => {});
     if (!(await isLoggedIn(page))) {
       await login(page, context, account);
     }

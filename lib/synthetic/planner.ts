@@ -3,8 +3,10 @@ import { getGeminiModel, withGeminiRetry } from "@/lib/ai/gemini";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import type { WordTiming } from "@/lib/ai/deepgram";
+import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
+import type { Sentence } from "@/lib/ai/sentences";
 import type { SyntheticBlockType } from "@/lib/types";
-import { segmentIsAvatarMarked, type AvatarMarkRange } from "@/lib/synthetic/doc-marks";
+import { type AvatarMarkRange } from "@/lib/synthetic/doc-marks";
 
 // Synthetic timeline planner. Gemini reads the transcript and segments it into
 // ordered visual blocks, choosing a block_type per the spec rules:
@@ -78,15 +80,20 @@ function buildPrompt(transcript: string): string {
   ].join("\n");
 }
 
-// Locate a segment's spoken window by matching its first/last words against the
-// word-timing stream, advancing a shared cursor so blocks stay in order. Falls
-// back to a cadence estimate when a match isn't found (mirrors the sourced
-// aligner's degrade-gracefully behaviour).
-const FALLBACK_WPS = 2.5;
-function norm(w: string): string {
-  return w.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
+// Stamp each Gemini segment with its real spoken window from the Deepgram word
+// timings. This DELEGATES to the sourced engine's battle-tested aligner
+// (alignSentencesToWords) rather than re-implementing alignment here.
+//
+// The previous hand-rolled aligner matched only a segment's FIRST word against
+// the word stream and assumed the segment occupied exactly its (paraphrased)
+// token count of contiguous words. Both assumptions break on real transcripts:
+// a common first word ("It", "So", "How") matched a far-later occurrence,
+// jumping the cursor to the end of the audio — which (a) produced absurd
+// durations for the segment that mis-matched (e.g. 50s+) and (b) stranded every
+// following segment with no remaining words to match, collapsing them all to
+// the 0.5s floor. alignSentencesToWords avoids this with 3-token head+tail
+// brackets, number canonicalization, bounded forward search, and a desync
+// sanity check that recovers instead of cascading.
 function alignSegments(
   segs: Array<z.infer<typeof GeminiSegmentSchema>>,
   words: WordTiming[] | null,
@@ -107,29 +114,30 @@ function alignSegments(
     return out;
   }
 
-  const normWords = words.map((w) => norm(w.word));
-  let wi = 0; // word cursor
-  let prevEnd = 0;
+  // Adapt each segment to the Sentence shape the aligner expects (it only reads
+  // `.text`; the other fields are inert here). The aligner returns a window per
+  // segment, in order, never dropping one.
+  const pseudoSentences: Sentence[] = segs.map((s) => ({
+    text: s.script.trim(),
+    paragraph_index: 0,
+    sentence_index_in_paragraph: 0,
+    is_section_first_sentence: false,
+    char_offset: 0,
+  }));
+  const aligned = alignSentencesToWords(pseudoSentences, words);
   segs.forEach((s, i) => {
-    const tokens = s.script.trim().split(/\s+/).map(norm).filter(Boolean);
-    const tokenCount = Math.max(1, tokens.length);
-    // Find the run start: first transcript token at/after the cursor.
-    let start = -1;
-    for (let j = wi; j < normWords.length; j++) {
-      if (tokens[0] && normWords[j] === tokens[0]) { start = j; break; }
-    }
-    const startIdx = start >= 0 ? start : wi;
-    const endIdx = Math.min(words.length - 1, startIdx + tokenCount - 1);
-    const vo_start = start >= 0 ? words[startIdx].start : prevEnd;
-    const vo_end = words[endIdx]?.end ?? vo_start + tokenCount / FALLBACK_WPS;
-    out.push(mk(s, i, vo_start, Math.max(vo_end, vo_start + 0.5)));
-    wi = endIdx + 1;
-    prevEnd = out[out.length - 1].endTime;
+    const a = aligned[i];
+    out.push(mk(s, i, a.vo_start, Math.max(a.vo_end, a.vo_start + 0.5)));
   });
 
   // Make the timeline continuous: snap each block's start to the previous
   // block's end and the last block's end to the audio duration.
-  for (let i = 1; i < out.length; i++) out[i].startTime = out[i - 1].endTime;
+  for (let i = 1; i < out.length; i++) {
+    out[i].startTime = out[i - 1].endTime;
+    // Keep end >= start after the start snap so duration never goes negative
+    // (a synthesized/short window can land entirely before the prior end).
+    if (out[i].endTime < out[i].startTime) out[i].endTime = out[i].startTime;
+  }
   if (out.length > 0 && totalDuration > 0) out[out.length - 1].endTime = totalDuration;
   for (const seg of out) seg.duration = Math.max(0.5, seg.endTime - seg.startTime);
   return out;
@@ -152,6 +160,132 @@ function mk(
     imagePrompt: isVisual ? (s.imagePrompt?.trim() || null) : null,
     animationPrompt: s.blockType === "ai_clip" ? (s.animationPrompt?.trim() || null) : null,
   };
+}
+
+// Carve a planned segment along avatar-mark boundaries.
+//
+// Doc marks are sub-sentence precise: a red/orange highlight can cover only the
+// FIRST half of a Gemini block (e.g. "...maintenance habit." is marked but the
+// trailing "Repeat it every two to three weeks..." in the SAME block is not).
+// Forcing the whole block to avatar on any overlap mislabels the unmarked tail.
+//
+// Instead we intersect the block's char window [origStart, origEnd) with the
+// marked ranges, producing alternating marked / unmarked runs, and emit one
+// sub-segment per run. The script text and the spoken-time window are carved
+// proportionally by character fraction within the block — exact enough for the
+// review screen (per-block script/timing stay editable), and far better than
+// promoting unmarked narration to a talking-head shot.
+//
+// A run that covers the whole block returns the block unchanged. Sub-segments
+// inherit the parent's blockType for unmarked runs (so a non-avatar block stays
+// whatever Gemini/the demote step chose) and become 'avatar' for marked runs.
+interface MarkRun {
+  start: number; // char offset into transcript, inclusive
+  end: number; // exclusive
+  marked: boolean;
+}
+export function intersectRuns(
+  segStart: number,
+  segEnd: number,
+  ranges: AvatarMarkRange[],
+): MarkRun[] {
+  // Collect mark boundaries strictly inside (segStart, segEnd), build runs.
+  const cuts = new Set<number>([segStart, segEnd]);
+  for (const r of ranges) {
+    if (r.start > segStart && r.start < segEnd) cuts.add(r.start);
+    if (r.end > segStart && r.end < segEnd) cuts.add(r.end);
+  }
+  const sorted = [...cuts].sort((a, b) => a - b);
+  const runs: MarkRun[] = [];
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    if (b <= a) continue;
+    const mid = (a + b) / 2;
+    const marked = ranges.some((r) => r.start <= mid && mid < r.end);
+    const last = runs[runs.length - 1];
+    if (last && last.marked === marked) {
+      last.end = b; // coalesce same-type adjacent runs
+    } else {
+      runs.push({ start: a, end: b, marked });
+    }
+  }
+  return runs;
+}
+
+// Split `seg` (whose transcript char window is [origStart, origEnd)) into one
+// sub-segment per mark run. `position` is assigned by the caller afterward.
+export function splitByMarks(
+  seg: PlannedSegment,
+  origStart: number,
+  origEnd: number,
+  ranges: AvatarMarkRange[],
+): PlannedSegment[] {
+  const span = origEnd - origStart;
+  const runs = span > 0 ? intersectRuns(origStart, origEnd, ranges) : [];
+  // Whole-block (single run) — no carving needed; just label it.
+  if (runs.length <= 1) {
+    const marked = runs.length === 1 ? runs[0].marked : false;
+    return [applyMark(seg, marked)];
+  }
+
+  const scriptLen = seg.script.length;
+  const timeSpan = seg.endTime - seg.startTime;
+  const out: PlannedSegment[] = [];
+  for (const run of runs) {
+    const f0 = (run.start - origStart) / span;
+    const f1 = (run.end - origStart) / span;
+    // Carve script text on a whitespace boundary near the proportional cut so
+    // we don't slice a word in half.
+    const rawStart = Math.round(f0 * scriptLen);
+    const rawEnd = Math.round(f1 * scriptLen);
+    const cutStart = run === runs[0] ? 0 : snapToSpace(seg.script, rawStart);
+    const cutEnd = run === runs[runs.length - 1] ? scriptLen : snapToSpace(seg.script, rawEnd);
+    const piece = seg.script.slice(cutStart, cutEnd).trim();
+    if (!piece) continue;
+    const startTime = seg.startTime + f0 * timeSpan;
+    const endTime = seg.startTime + f1 * timeSpan;
+    const sub: PlannedSegment = {
+      ...seg,
+      startTime,
+      endTime,
+      duration: Math.max(0.5, endTime - startTime),
+      script: piece,
+    };
+    out.push(applyMark(sub, run.marked));
+  }
+  return out.length > 0 ? out : [applyMark(seg, runs.some((r) => r.marked))];
+}
+
+// Round a char index to the nearest whitespace boundary in `text` so a script
+// carve lands between words, not mid-word.
+function snapToSpace(text: string, idx: number): number {
+  if (idx <= 0) return 0;
+  if (idx >= text.length) return text.length;
+  if (/\s/.test(text[idx])) return idx;
+  let left = idx;
+  while (left > 0 && !/\s/.test(text[left - 1])) left--;
+  let right = idx;
+  while (right < text.length && !/\s/.test(text[right])) right++;
+  // Prefer the closer boundary.
+  return idx - left <= right - idx ? left : right;
+}
+
+// Set a segment's avatar-ness. Marked -> avatar (drop visual prompts).
+// Unmarked -> if it was avatar (Gemini's choice, not a real mark), demote to
+// image; otherwise keep whatever non-avatar type it already had.
+function applyMark(seg: PlannedSegment, marked: boolean): PlannedSegment {
+  if (marked) {
+    return { ...seg, blockType: "avatar", imagePrompt: null, animationPrompt: null };
+  }
+  if (seg.blockType === "avatar") {
+    return {
+      ...seg,
+      blockType: "image",
+      imagePrompt: seg.imagePrompt || seg.script.slice(0, 200),
+    };
+  }
+  return seg;
 }
 
 /**
@@ -204,7 +338,7 @@ export async function buildSyntheticTimeline(input: {
     );
   }
 
-  const planned = alignSegments(safe.data.segments, words, voiceoverDuration);
+  let planned = alignSegments(safe.data.segments, words, voiceoverDuration);
 
   // Force avatar on segments that overlap a red/orange doc mark.
   //
@@ -242,45 +376,53 @@ export async function buildSyntheticTimeline(input: {
     let placed = 0;
     let forced = 0;
     let unplaced = 0;
+    let split = 0;
+    const result: PlannedSegment[] = [];
     for (const seg of planned) {
       const needle = normNeedle(seg.script);
-      if (!needle) continue;
+      if (!needle) {
+        result.push(applyMark(seg, false));
+        continue;
+      }
       const at = normStr.indexOf(needle, searchFrom);
       // Whether or not we can locate the segment, doc marks are AUTHORITATIVE:
       // a segment is avatar IFF its text falls inside a marked range. So the
       // DEFAULT for any segment is "not avatar" — we only promote to avatar on
-      // a confirmed overlap. This means a segment that can't be placed, or that
-      // Gemini wrongly chose as avatar, is corrected to a non-avatar type.
-      let marked = false;
-      if (at >= 0) {
-        placed++;
-        const origStart = normToOrig[at];
-        const origEnd = (normToOrig[at + needle.length - 1] ?? origStart) + 1;
-        // Advance the cursor only on a real match so a single miss can't strand
-        // the rest. Re-anchor search from just after this match.
-        searchFrom = at + needle.length;
-        marked = segmentIsAvatarMarked(origStart, origEnd, avatarRanges);
-      } else {
+      // a confirmed overlap. A segment that can't be placed, or that Gemini
+      // wrongly chose as avatar, is corrected to a non-avatar type.
+      //
+      // Marks are sub-segment precise: when a doc highlight covers only PART of
+      // a Gemini block, we SPLIT the block at the mark boundary rather than
+      // promote the whole block — so the marked half becomes avatar and the
+      // unmarked half keeps its visual type.
+      if (at < 0) {
         unplaced++;
+        result.push(applyMark(seg, false));
+        continue;
       }
-      if (marked) {
-        forced++;
-        seg.blockType = "avatar";
-        seg.imagePrompt = null;
-        seg.animationPrompt = null;
-      } else if (seg.blockType === "avatar") {
-        // NOT inside a marked range (or unplaceable) but Gemini chose avatar.
-        // Marks are authoritative -> demote to image.
-        seg.blockType = "image";
-        seg.imagePrompt = seg.imagePrompt || seg.script.slice(0, 200);
+      placed++;
+      const origStart = normToOrig[at];
+      const origEnd = (normToOrig[at + needle.length - 1] ?? origStart) + 1;
+      // Advance the cursor only on a real match so a single miss can't strand
+      // the rest. Re-anchor search from just after this match.
+      searchFrom = at + needle.length;
+      const pieces = splitByMarks(seg, origStart, origEnd, avatarRanges);
+      if (pieces.length > 1) split++;
+      for (const p of pieces) {
+        if (p.blockType === "avatar") forced++;
+        result.push(p);
       }
     }
+    // Renumber positions after any splits so they stay 0..n-1 in order.
+    result.forEach((p, i) => { p.position = i; });
+    planned = result;
     await logJob({ projectId, jobId }, "synthetic.plan.avatar_marks", {
       ranges: avatarRanges.length,
       transcriptChars: transcript.length,
       markedChars: avatarRanges.reduce((a, r) => a + (r.end - r.start), 0),
       segmentsPlaced: placed,
       segmentsUnplaced: unplaced,
+      segmentsSplit: split,
       segmentsTotal: planned.length,
       avatarForced: forced,
     });

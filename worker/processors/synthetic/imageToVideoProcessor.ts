@@ -50,7 +50,7 @@ export async function processImageToVideoJob(
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
     });
-    const up = await uploadBuffer(img.image, r2Keys.segmentImage(projectId, segmentId), "image/jpeg");
+    const up = await uploadBuffer(img.image, r2Keys.segmentImage(projectId, segmentId), img.contentType);
     imageUrl = up.publicUrl;
     // Persist the still immediately so a later video failure can degrade to it.
     await finishSegment(segmentId, { image_url: imageUrl, provider: img.provider });

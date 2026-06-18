@@ -50,7 +50,7 @@ export async function processImageGenJob(
     const key = isSplit
       ? r2Keys.segmentRightImage(projectId, segmentId)
       : r2Keys.segmentImage(projectId, segmentId);
-    const up = await uploadBuffer(out.image, key, "image/jpeg");
+    const up = await uploadBuffer(out.image, key, out.contentType);
 
     await finishSegment(segmentId, {
       status: "ready",

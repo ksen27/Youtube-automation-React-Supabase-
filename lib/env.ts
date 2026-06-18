@@ -346,10 +346,12 @@ const ServerEnvSchema = z.object({
   SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),
   // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).
   SIXTYNINE_LABS_TTS_MODEL: z.string().default("eleven_multilingual_v2"),
-  SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana"),
+  SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana-2"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
   // Max seconds to poll a TTS job to COMPLETED before giving up.
   SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // Max seconds to poll an image job to COMPLETED before giving up.
+  SIXTYNINE_LABS_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
   // Flux image fallback when nano-banana fails (Black Forest Labs or a proxy).
   FLUX_API_KEY: z.string().optional(),
   FLUX_BASE_URL: z.string().url().default("https://api.bfl.ai/v1"),

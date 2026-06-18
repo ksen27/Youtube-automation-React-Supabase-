@@ -61,6 +61,21 @@ export function SyntheticReviewScreen({
     onSuccess: onChange,
   });
 
+  // Bulk-retry every FAILED segment in one click. dispatchSegments fans them
+  // all out at once, so the worker renders them in parallel (up to
+  // IMAGE_GEN_CONCURRENCY) instead of the user clicking Retry per row.
+  const regenerateAll = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/synthetic/regenerate-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "failed" }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `regenerate failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+
   // Three states share this one screen (the user never leaves it during asset
   // generation):
   //   plan_ready        -> review the plan, click "Generate assets"
@@ -72,6 +87,7 @@ export function SyntheticReviewScreen({
     resp.project.status === "generating_clips" ||
     resp.project.status === "generating_avatars";
   const generatingCount = segs.filter((s) => s.status === "generating" || s.status === "pending").length;
+  const failedCount = segs.filter((s) => s.status === "failed").length;
   const allReady = segs.length > 0 && segs.every((s) => s.status === "ready" || s.status === "skipped");
 
   // Re-plan is available in ALL states (not just the plan gate) — re-segmenting
@@ -97,6 +113,14 @@ export function SyntheticReviewScreen({
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          {/* Bulk-retry all failed blocks at once (renders in parallel). Shown
+              outside the plan gate whenever there's at least one failure. */}
+          {!isPlanGate && failedCount > 0 && (
+            <Button type="button" variant="gradient" size="sm" disabled={regenerateAll.isPending} onClick={() => regenerateAll.mutate()}>
+              <RefreshCw className={`h-4 w-4 ${regenerateAll.isPending ? "animate-spin" : ""}`} />
+              {regenerateAll.isPending ? "Retrying…" : `Retry all failed (${failedCount})`}
+            </Button>
+          )}
           {/* Re-plan: always available, re-runs only the planner. */}
           <Button type="button" variant="soft" size="sm" disabled={replan.isPending} onClick={onReplan}>
             <RefreshCw className={`h-4 w-4 ${replan.isPending ? "animate-spin" : ""}`} /> Re-plan
@@ -122,6 +146,7 @@ export function SyntheticReviewScreen({
       {generate.error && <p className="text-xs text-danger">{(generate.error as Error).message}</p>}
       {render.error && <p className="text-xs text-danger">{(render.error as Error).message}</p>}
       {replan.error && <p className="text-xs text-danger">{(replan.error as Error).message}</p>}
+      {regenerateAll.error && <p className="text-xs text-danger">{(regenerateAll.error as Error).message}</p>}
 
       {/* Master voiceover — listen before committing to asset generation/render. */}
       {resp.project.voiceover_url && (

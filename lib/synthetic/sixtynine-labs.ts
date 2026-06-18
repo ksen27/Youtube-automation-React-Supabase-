@@ -4,11 +4,12 @@ import { withStylePrompt } from "@/lib/synthetic/constants";
 
 // 69labs provider: TTS voiceover + nano-banana image generation.
 //
-// 69labs is configured via SIXTYNINE_LABS_* env. The request/response shapes
-// below follow 69labs' documented REST contract (OpenAI-style audio + image
-// endpoints). If the live API differs, only the buildBody / parseResponse
-// blocks here need adjusting — every caller goes through generateVoice() /
-// generateImage() and is insulated from the wire format.
+// 69labs is configured via SIXTYNINE_LABS_* env. Both TTS and image generation
+// are ASYNC JOB APIs on 69labs.vip: submit -> poll status -> download. The
+// request/response shapes below follow 69labs' documented REST contract. If the
+// live API differs, only the submit / poll / download blocks here need
+// adjusting — every caller goes through generateVoice() / generateImage() and
+// is insulated from the wire format.
 //
 // Images get the mandatory STYLE_PROMPT appended (withStylePrompt). The
 // image-to-video and avatar steps live in separate provider modules.
@@ -25,6 +26,7 @@ function cfg() {
     ttsModel: env.SIXTYNINE_LABS_TTS_MODEL,
     ttsPollTimeoutMs: env.SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS * 1000,
     imageModel: env.SIXTYNINE_LABS_IMAGE_MODEL,
+    imagePollTimeoutMs: env.SIXTYNINE_LABS_IMAGE_POLL_TIMEOUT_SECONDS * 1000,
     defaultVoice: env.SIXTYNINE_LABS_DEFAULT_VOICE,
   };
 }
@@ -137,38 +139,74 @@ export interface GenerateImageResult {
   provider: "sixtynine_image" | "flux_image";
 }
 
-// Internal: one nano-banana attempt. Returns a JPEG/PNG buffer.
-async function generateNanoBananaImage(prompt: string): Promise<Buffer> {
+// 69labs image generation is an ASYNC JOB API (same lifecycle as TTS):
+//   1. POST /api/v1/images/generate       -> { id, queuePosition }
+//   2. GET  /api/v1/images/status/:jobId  -> PENDING|PROCESSING|...|COMPLETED|
+//                                            FAILED|CANCELLED|CENSORED
+//   3. GET  /api/v1/images/download/:jobId -> 302 redirect to a presigned R2
+//                                             URL with the image bytes
+// We submit, poll to COMPLETED, then download (fetch follows the 302 by default).
+type ImageStatus = TtsStatus;
+
+interface ImageStatusResponse {
+  id: string;
+  status: ImageStatus;
+}
+
+// Internal: one nano-banana attempt. Returns the image bytes + content type.
+async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer; contentType: string }> {
   const c = cfg();
-  const res = await withHttpRetry("69labs.image", () =>
-    fetchOrThrow(`${c.base}/images/generations`, {
+  const authJson = { Authorization: `Bearer ${c.key}`, "Content-Type": "application/json" };
+  const authOnly = { Authorization: `Bearer ${c.key}` };
+
+  // 1) Submit the job. 16:9 to match the synthetic canvas; the renderer handles
+  // any cropping/letterboxing, so we request a wide aspect ratio.
+  const submit = await withHttpRetry("69labs.image.submit", () =>
+    fetchOrThrow(`${c.base}/api/v1/images/generate`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${c.key}`,
-        "Content-Type": "application/json",
-      },
+      headers: authJson,
       body: JSON.stringify({
-        model: c.imageModel,
         prompt,
-        // 16:9 still to match the synthetic canvas; provider crops/letterboxes
-        // are handled by the renderer, so request a wide source.
-        size: "1280x720",
-        n: 1,
-        response_format: "b64_json",
+        model: c.imageModel,
+        aspectRatio: "16:9",
       }),
+      timeoutMs: 60_000,
+    }),
+  );
+  const { id: jobId } = (await submit.json()) as { id: string; queuePosition?: number };
+  if (!jobId) throw new Error("69labs image: submit returned no job id");
+
+  // 2) Poll status until COMPLETED (or a terminal failure / timeout).
+  const deadline = Date.now() + c.imagePollTimeoutMs;
+  while (Date.now() < deadline) {
+    const statusRes = await fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
+      headers: authOnly,
+      timeoutMs: 30_000,
+    });
+    const st = (await statusRes.json()) as ImageStatusResponse;
+    if (st.status === "COMPLETED") break;
+    if (st.status === "FAILED" || st.status === "CANCELLED") {
+      throw new Error(`69labs image: job ${st.status} (job ${jobId})`);
+    }
+    if (st.status === "CENSORED") {
+      throw new Error(`69labs image: CENSORED (job ${jobId}) — edit the prompt and retry`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (Date.now() >= deadline) throw new Error(`69labs image: poll timed out (job ${jobId})`);
+
+  // 3) Download the finished image. The endpoint returns a 302 redirect to a
+  // presigned R2 URL; fetch follows redirects by default.
+  const dl = await withHttpRetry("69labs.image.download", () =>
+    fetchOrThrow(`${c.base}/api/v1/images/download/${jobId}`, {
+      headers: authOnly,
       timeoutMs: 120_000,
     }),
   );
-  const json = (await res.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
-  const first = json.data?.[0];
-  if (first?.b64_json) return Buffer.from(first.b64_json, "base64");
-  if (first?.url) {
-    const img = await withHttpRetry("69labs.image.fetch", () =>
-      fetchOrThrow(first.url!, { timeoutMs: 60_000 }),
-    );
-    return Buffer.from(await img.arrayBuffer());
-  }
-  throw new Error("69labs image: empty response");
+  return {
+    image: Buffer.from(await dl.arrayBuffer()),
+    contentType: dl.headers.get("content-type") || "image/png",
+  };
 }
 
 // Internal: Flux fallback. Black Forest Labs returns a polling task; we fetch
@@ -219,8 +257,8 @@ async function generateFluxImage(prompt: string): Promise<Buffer> {
 export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
   const prompt = withStylePrompt(basePrompt);
   try {
-    const image = await generateNanoBananaImage(prompt);
-    return { image, contentType: "image/jpeg", provider: "sixtynine_image" };
+    const { image, contentType } = await generateNanoBananaImage(prompt);
+    return { image, contentType, provider: "sixtynine_image" };
   } catch (primaryErr) {
     // eslint-disable-next-line no-console
     console.warn(JSON.stringify({
