@@ -6489,27 +6489,36 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
 
   // ---- Final authoritative duration pass (runs on the EXACT array that
   //      gets inserted, after every other pass) -------------------------
-  // Bug class this closes (2026-06-16, King Charles project): the inserted
-  // timeline summed ~98s short of the voiceover even though
-  // pre_render_validation logged a perfect match. Root cause: a row whose
-  // audio window grew (because a neighbouring row was removed by the marker
-  // dedup) kept its short *planned* duration in the persisted array, while
-  // the in-memory reconciliation passes had stretched a different view. The
-  // result is "orphaned narration" — voiceover plays over a window that no
-  // timeline row's duration covers, so the picture timeline is shorter than
-  // the audio and the render-time guard blocks the project.
+  // Goal: guarantee the persisted non-intro timeline sums to voiceoverSeconds
+  // within the render-route tolerance, closing the "orphaned narration" bug
+  // class (2026-06-16, King Charles project) where a row kept a short planned
+  // duration and the picture timeline ended up shorter than the audio.
   //
-  // The fix is to make the LAST thing before insert the single source of
-  // truth: every adjustable non-intro row's duration = the gap to the next
-  // row's vo_start (its audio interval). This telescopes the body of the
-  // timeline to exactly (last.vo_start - first.vo_start), and the tail row
-  // is sized to reach voiceoverSeconds. Title cards (visual hold beat) and
-  // duration_clamped rows (forced/inline YouTube windows the doc author
-  // chose, already sized by vo_start_duration_pass) are left untouched.
+  // HISTORY / why this pass was rewritten (2026-06-19, Queen Elizabeth II
+  // project): the previous version re-derived EVERY adjustable row's duration
+  // from vo_start gaps (`next.vo_start - cur.vo_start`) while SKIPPING title
+  // cards and duration_clamped rows. That telescoping is subtly lossy:
+  //   • the body collapses to (last.vo_start - first.vo_start), silently
+  //     dropping any lead-in before the first sentence (first.vo_start > 0);
+  //   • every skipped card/clamped row keeps a duration shorter than its
+  //     audio interval, so each one removes (interval - duration) from the
+  //     total.
+  // On this project that turned a correct +1.07s timeline into a -8.51s one
+  // (88 rows rewritten, -9.6s reclaimed) — failing the very gate below and
+  // looping the match through all 3 BullMQ retries. The earlier
+  // vo_start_duration_pass + duration_reclaim + title_card_anchor_pass
+  // already reconcile the timeline to ~0 drift IN THE RENDER COORDINATE
+  // SYSTEM (items[] is in position == vo_start order by now), so a blanket
+  // re-derivation here can only undo their work.
   //
-  // Idempotent: a row already at its audio interval is left as-is, so a
-  // re-match writes the same values. Operates on `items` directly so it is
-  // immune to any upstream pass mutating a copy instead of the real rows.
+  // The correct final pass therefore CORRECTS RESIDUAL DRIFT ONLY: measure
+  // the real shortfall/overage, and if it exceeds a tiny epsilon, absorb it
+  // into the tail's adjustable rows (then hard-snap any remainder onto the
+  // last adjustable row) — the same mechanism the anchor pass's final-section
+  // step uses. This still stretches a short tail row to reach voiceoverSeconds
+  // (the orphaned-narration fix) without rewriting rows that are already
+  // correctly placed. Idempotent: a timeline already within epsilon is left
+  // untouched, so a re-match writes the same values.
   {
     type Row = (typeof items)[number];
     const voOf = (it: Row): number => {
@@ -6517,37 +6526,71 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       const vs = m.vo_start_seconds;
       return typeof vs === "number" ? Number(vs) : Number.NaN;
     };
-    const isClampedOrCard = (it: Row): boolean => {
-      if (it.type === "title_card") return true;
+    // Adjustable = a row we may stretch/shrink to absorb drift. Excludes
+    // intro (separate axis), title cards (pinned typewriter+hold beat) and
+    // duration_clamped rows (forced YouTube windows / title-card padding the
+    // earlier passes already sized).
+    const isAdjustable = (it: Row): boolean => {
+      if (it.type === "intro" || it.type === "title_card") return false;
       const m = (it.metadata ?? {}) as Record<string, unknown>;
-      return m.duration_clamped === true;
+      return m.duration_clamped !== true;
     };
-    // vo_start-ordered view of every non-intro row that has a vo_start. This
-    // is the audio-time order the renderer plays in (rows are inserted in
-    // `position` order, which the title-card-anchor pass already aligned to
-    // vo_start). Rows without vo_start (legacy/defensive) are left alone.
-    const ordered = items
-      .filter((it) => it.type !== "intro" && Number.isFinite(voOf(it)))
-      .sort((a, b) => voOf(a) - voOf(b));
+    const setDuration = (row: Row, next: number): number => {
+      const cur = Number(row.duration ?? 0);
+      const clamped = Math.max(0.3, Math.round(next * 100) / 100);
+      row.duration = clamped;
+      const m = (row.metadata ?? {}) as Record<string, unknown>;
+      const vs = m.vo_start_seconds;
+      if (typeof vs === "number") {
+        m.vo_end_seconds = Number(vs) + clamped;
+        row.metadata = m;
+      }
+      return clamped - cur;
+    };
+
+    const sumNonIntro = (): number =>
+      items
+        .filter((it) => it.type !== "intro")
+        .reduce((s, it) => s + Number(it.duration ?? 0), 0);
 
     let orphanedResized = 0;
     let orphanedReclaimedSeconds = 0;
-    for (let i = 0; i < ordered.length; i++) {
-      const cur = ordered[i];
-      if (isClampedOrCard(cur)) continue;
-      const next = ordered[i + 1];
-      const targetEnd = next ? voOf(next) : voiceoverSeconds;
-      const audioInterval = targetEnd - voOf(cur);
-      if (!(audioInterval > 0.05)) continue;
-      const newDuration = Math.round(audioInterval * 100) / 100;
-      const oldDuration = Number(cur.duration ?? 0);
-      if (Math.abs(newDuration - oldDuration) < 0.05) continue;
-      cur.duration = newDuration;
-      const m = (cur.metadata ?? {}) as Record<string, unknown>;
-      m.vo_end_seconds = voOf(cur) + newDuration;
-      cur.metadata = m;
-      orphanedResized++;
-      orphanedReclaimedSeconds += newDuration - oldDuration;
+    const FINAL_EPSILON = 0.05;
+    let residual = voiceoverSeconds - sumNonIntro();
+    if (Math.abs(residual) > FINAL_EPSILON) {
+      // Spread the drift across the tail's adjustable rows in position order
+      // (a couple of even passes), then dump any remainder on the last
+      // adjustable row so the total lands exactly on voiceoverSeconds. This
+      // never touches a clamped/card row and never depends on first.vo_start.
+      const tail = items.filter((it) => it.type !== "intro" && isAdjustable(it));
+      for (let pass = 0; pass < 4 && Math.abs(residual) > FINAL_EPSILON; pass++) {
+        const eligible = tail.filter(
+          (r) => residual > 0 || Number(r.duration ?? 0) > 0.31,
+        );
+        if (eligible.length === 0) break;
+        const share = residual / eligible.length;
+        let absorbed = 0;
+        for (const r of eligible) {
+          const delta = setDuration(r, Number(r.duration ?? 0) + share);
+          if (Math.abs(delta) > 0.0001) {
+            absorbed += delta;
+            orphanedResized++;
+            orphanedReclaimedSeconds += delta;
+          }
+        }
+        if (Math.abs(absorbed) < 0.0001) break;
+        residual = voiceoverSeconds - sumNonIntro();
+      }
+      // Final exact snap onto the last adjustable row (respecting the 0.3s
+      // floor; any sub-floor remainder is reported via driftSeconds below).
+      if (Math.abs(residual) > FINAL_EPSILON && tail.length > 0) {
+        const last = tail[tail.length - 1];
+        const delta = setDuration(last, Number(last.duration ?? 0) + residual);
+        if (Math.abs(delta) > 0.0001) {
+          orphanedResized++;
+          orphanedReclaimedSeconds += delta;
+        }
+      }
     }
 
     const finalNonIntroSum = items

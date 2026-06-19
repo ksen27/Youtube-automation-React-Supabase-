@@ -23,7 +23,7 @@ import { processSyntheticPlannerJob } from "./processors/synthetic/plannerProces
 import { processImageGenJob }         from "./processors/synthetic/imageGenProcessor";
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
-import { markJobFailedIfExhausted, sweepStalledJobs } from "./reconcile";
+import { markJobFailedIfExhausted, sweepStalledJobs, sweepStalledSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 
 const env = getEnv();
@@ -176,12 +176,26 @@ const SOURCED_TYPES = ["search", "download", "clip", "match", "render", "script_
 const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar"];
 const sweepTypes =
   role === "sourced" ? SOURCED_TYPES : role === "synthetic" ? SYNTHETIC_TYPES : undefined;
+// Orphaned-segment cutoff. A synthetic_segments row stuck "generating" past
+// this is treated as dead and flipped to "failed" so the UI shows a retryable
+// failure instead of an endless spinner. Must exceed the longest legit quiet
+// window during a real avatar generation (HeyGen render timeout ~10 min + the
+// per-step nav timeouts) plus margin. 25 min is safely past a healthy run.
+const SEGMENT_STALE_MS = 25 * 60_000; // 25 min
 const sweepTimer = setInterval(() => {
   void sweepStalledJobs(SWEEP_STALE_MS, sweepTypes)
     .then((n) => {
       if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
     })
     .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+  // Synthetic workers also sweep orphaned "generating" segments (stuck spinners).
+  if (runSynthetic) {
+    void sweepStalledSegments(SEGMENT_STALE_MS)
+      .then((n) => {
+        if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.done", projectsAffected: n }));
+      })
+      .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.error", err: (e as Error).message })));
+  }
   // Render-cache reaping only applies to the render worker (sourced/all); the
   // avatar worker has no /data render cache.
   if (!runSourced) return;

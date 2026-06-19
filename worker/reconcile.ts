@@ -33,6 +33,7 @@
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import { maybeEnqueueMatch } from "./processors/_shared";
+import { maybeFinalizeSynthetic } from "./processors/synthetic/_shared";
 
 // Marks a single media_jobs row failed if it is not already in a terminal
 // state. Idempotent — safe to call from the failed-event handler even if a
@@ -141,4 +142,52 @@ export async function sweepStalledJobs(staleMs: number, onlyTypes?: string[]): P
     }
   }
   return touchedProjects.size;
+}
+
+// Periodic safety net for ORPHANED SEGMENTS. A synthetic_segments row is
+// stamped status="generating" when its job is dispatched; the UI shows a
+// spinner for it. If the worker then dies / the session expires / the job is
+// lost, the segment row is frozen at "generating" forever — a dead spinner the
+// user can't clear (only "Regenerate" re-dispatches, but the row never flips to
+// "failed" on its own). This sweeper flips such stale rows to "failed" so the
+// UI shows a retryable failure instead of an endless spinner.
+//
+// The synthetic_segments_touch trigger keeps updated_at fresh on every write,
+// so a segment a worker is actively updating is never swept. staleMs must
+// exceed the longest legitimate quiet window between segment writes during a
+// real generation (HeyGen renders can take minutes) plus a margin.
+export async function sweepStalledSegments(staleMs: number): Promise<number> {
+  const sb = getServerSupabase();
+  const cutoff = new Date(Date.now() - staleMs).toISOString();
+
+  const { data: stalled, error } = await sb
+    .from("synthetic_segments")
+    .select("id, project_id")
+    .eq("status", "generating")
+    .lt("updated_at", cutoff);
+  if (error) {
+    await logJob({}, "reconcile.segment_sweep.query_error", { err: error.message });
+    return 0;
+  }
+  if (!stalled || stalled.length === 0) return 0;
+
+  const projects = new Set<string>();
+  for (const seg of stalled) {
+    const { error: upErr } = await sb
+      .from("synthetic_segments")
+      .update({ status: "failed", error: "stalled — generation did not complete" })
+      .eq("id", seg.id)
+      .eq("status", "generating"); // guard against a concurrent finish
+    if (upErr) continue;
+    await logJob({ projectId: seg.project_id, sourceId: seg.id },
+      "reconcile.segment_stall_swept", { segmentId: seg.id });
+    projects.add(seg.project_id);
+  }
+
+  // Let the synthetic pipeline finalize on whatever succeeded (drops failed
+  // segments, materializes the timeline) so a stuck project can still advance.
+  for (const projectId of projects) {
+    await maybeFinalizeSynthetic(projectId).catch(() => {});
+  }
+  return projects.size;
 }
