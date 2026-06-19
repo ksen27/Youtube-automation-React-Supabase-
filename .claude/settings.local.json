@@ -2,7 +2,25 @@
   "permissions": {
     "allow": [
       "Bash(echo \"exit=$?\")",
-      "Bash(npx vitest *)"
+      "Bash(npx vitest *)",
+      "PowerShell(npm run heygen:status 2>&1)",
+      "PowerShell(npx tsx --env-file=.env.local scripts/heygen-keycheck.ts 2>&1)",
+      "PowerShell(flyctl ssh console -a video-automation-avatar-worker -C \"node -e `\"const c=require\\('crypto'\\);const k=process.env.SECRET_BOX_KEY||'';console.log\\('fp:'+c.createHash\\('sha256'\\).update\\(k\\).digest\\('hex'\\).slice\\(0,12\\)+' len:'+k.length\\)`\"\" 2>&1)",
+      "PowerShell(npx tsx --env-file=.env.local scripts/_seg.ts 2>&1)",
+      "PowerShell(npx tsx --env-file=.env.local scripts/_enqueue-one.ts 2>&1)",
+      "PowerShell(npx tsx --env-file=.env.local scripts/_job.ts 2>&1)",
+      "Bash(curl -sf -o /dev/null https://media.celebforge.org/heygen-diagnostics/dd19fd07-0d16-494f-b197-21b958b5e2f4_error.png)",
+      "PowerShell(npx tsx --env-file=.env.local scripts/_out.ts 2>&1)",
+      "Bash([ ! -f \"$f\" ])",
+      "Bash(exit 0)",
+      "Bash(grep -oiE '.{0,60}\\(voice|Japan|select a voice|audio\\).{0,60}' C:/Users/HJS/AppData/Local/Temp/heygen_err.html)",
+      "PowerShell(flyctl machine stop 48e4549f4e0d28 -a video-automation-avatar-worker 2>&1)",
+      "PowerShell(npm run heygen:stop f74c1ec1-5a69-4e26-9a66-b4049b8f3608 2>&1)",
+      "PowerShell(npm run typecheck 2>&1)",
+      "PowerShell(npx eslint lib/synthetic/heygen.ts 2>&1)",
+      "PowerShell(npx eslint lib/synthetic/heygen.ts 2>&1 | Select-Object -Last 25; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(npx eslint lib/synthetic/heygen.ts 2>&1 | Select-Object -Last 8; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(flyctl deploy -a video-automation-avatar-worker -c fly.avatar.toml 2>&1)"
     ]
   }
 }

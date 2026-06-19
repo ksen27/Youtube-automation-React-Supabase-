@@ -1,5 +1,6 @@
 import { getEnv } from "@/lib/env";
 import { fetchOrThrow, withHttpRetry, HttpError } from "@/lib/synthetic/http";
+import { generateLtxVideo, isLtxConfigured } from "@/lib/synthetic/ltx";
 
 // fal.ai image-to-video provider. Generates animated clips FROM a still image
 // (the nano-banana output for an ai_clip block), WITHOUT audio — the voiceover
@@ -35,7 +36,7 @@ export interface GenerateClipInput {
 export interface GenerateClipResult {
   video: Buffer;
   contentType: string;
-  provider: "fal_veo3_fast" | "fal_kling";
+  provider: "ltx2" | "fal_veo3_fast" | "fal_kling";
   seconds: number;             // billing dimension
 }
 
@@ -133,18 +134,31 @@ export async function generateKlingVideo(input: GenerateClipInput): Promise<Gene
 }
 
 /**
- * Generate an animated clip with provider fallback: Veo 3 Fast first, Kling on
- * failure. A permanent 4xx from Veo (bad image url / quota) still falls through
- * to Kling — the goal is to produce a clip if EITHER provider can. Throws only
- * when both fail; the caller decides how to degrade (e.g. hold the still).
+ * Generate an animated clip with provider fallback: LTX-2 first (primary, per
+ * client direction), then fal.ai Veo 3 Fast, then Kling. A permanent 4xx from
+ * one provider (bad image url / quota) still falls through to the next — the
+ * goal is to produce a clip if ANY provider can. LTX is skipped when
+ * LTX_API_KEY is unconfigured (reverts to the old Veo->Kling chain). Throws
+ * only when every available provider fails; the caller decides how to degrade
+ * (e.g. hold the still).
  */
 export async function generateClipWithFallback(
   input: GenerateClipInput,
 ): Promise<GenerateClipResult> {
+  if (isLtxConfigured()) {
+    try {
+      return await generateLtxVideo(input);
+    } catch (ltxErr) {
+      console.warn(JSON.stringify({
+        msg: "synthetic.clip.fallback_to_fal",
+        status: ltxErr instanceof HttpError ? ltxErr.status : undefined,
+        err: (ltxErr as Error).message?.slice(0, 200),
+      }));
+    }
+  }
   try {
     return await generateVeoVideo(input);
   } catch (veoErr) {
-    // eslint-disable-next-line no-console
     console.warn(JSON.stringify({
       msg: "synthetic.clip.fallback_to_kling",
       status: veoErr instanceof HttpError ? veoErr.status : undefined,

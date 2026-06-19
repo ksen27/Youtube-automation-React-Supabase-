@@ -64,7 +64,7 @@ export async function POST(req: Request) {
 
 const PatchSchema = z.object({
   id: z.string().uuid(),
-  status: z.enum(["active", "cooldown", "disabled"]),
+  status: z.enum(["active", "cooldown", "disabled", "needs_reauth"]),
 });
 
 export async function PATCH(req: Request) {

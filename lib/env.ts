@@ -356,7 +356,30 @@ const ServerEnvSchema = z.object({
   FLUX_API_KEY: z.string().optional(),
   FLUX_BASE_URL: z.string().url().default("https://api.bfl.ai/v1"),
   FLUX_MODEL: z.string().default("flux-pro-1.1"),
-  // fal.ai — image-to-video. Veo 3 Fast primary, Kling fallback.
+  // LTX-2 (api.ltx.video) — PRIMARY image-to-video provider. Per client
+  // direction (2026-06) the synthetic ai_clip blocks animate via LTX-2's
+  // async image-to-video API; fal.ai (below) is the fallback chain when LTX
+  // fails. Lifecycle: POST /v2/image-to-video -> { id } -> poll
+  // GET /v2/image-to-video/{id} until status 'completed' -> download
+  // result.video_url. When LTX_API_KEY is unset the clip path skips straight
+  // to fal.ai, so leaving it blank reverts to the old fal-only behaviour.
+  //
+  // LTX-2 duration is a DISCRETE tier, not arbitrary: at 1080p/25fps it
+  // accepts 6/8/10/12/14/16/18/20s (max 20s). Higher res/fps caps at 10s.
+  // We request 1920x1080 (16:9, LTX's only supported aspect) which unlocks
+  // the full tier range, and the provider snaps each requested duration to
+  // the nearest allowed tier. Since the planner now caps visual blocks at
+  // ~8s (SYNTHETIC_BLOCK_SPLIT_THRESHOLD below), clips land on 6 or 8 in
+  // practice and never need splitting at render time.
+  LTX_API_KEY: z.string().optional(),
+  LTX_BASE_URL: z.string().url().default("https://api.ltx.video"),
+  LTX_MODEL: z.string().default("ltx-2-3-pro"),
+  LTX_RESOLUTION: z.string().default("1920x1080"),
+  LTX_MAX_DURATION: z.coerce.number().int().positive().default(20),
+  // Hard timeout (seconds) for a single LTX image-to-video job (poll loop).
+  LTX_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // fal.ai — image-to-video FALLBACK (Veo 3 Fast, then Kling). Tried only
+  // when LTX-2 fails or is unconfigured. See generateClipWithFallback.
   FAL_AI_API_KEY: z.string().optional(),
   FAL_AI_BASE_URL: z.string().url().default("https://queue.fal.run"),
   FAL_AI_VEO_MODEL: z.string().default("fal-ai/veo3/fast/image-to-video"),
@@ -372,6 +395,11 @@ const ServerEnvSchema = z.object({
   // Newline/comma-separated residential proxy pool (ip:port:user:pass) for
   // HeyGen browser sessions. Per-account `proxy` column overrides this.
   HEYGEN_PROXIES: z.string().optional(),
+  // Opt-in: let HeyGen reuse the shared YTDLP_PROXIES pool when HEYGEN_PROXIES
+  // is unset. OFF by default — those proxies are tuned for yt-dlp and can
+  // reject the browser with HTTP 407 (proxy auth), failing every avatar job.
+  // Only enable if you've confirmed the shared pool authenticates a browser.
+  HEYGEN_USE_YTDLP_PROXIES: z.coerce.boolean().default(false),
   // Run the browser headful (false) for local debugging of HeyGen automation.
   HEYGEN_HEADLESS: z.coerce.boolean().default(true),
   // Per-attempt timeout (ms) for one HeyGen avatar generation in the browser.
@@ -385,6 +413,40 @@ const ServerEnvSchema = z.object({
   HEYGEN_COOLDOWN_MINUTES: z.coerce.number().int().positive().default(30),
   // Where Playwright failure screenshots are written (R2-uploaded for audit).
   HEYGEN_SCREENSHOT_DIR: z.string().default("./tmp/heygen-shots"),
+  // Where failure diagnostics (screenshot + HTML snapshot + url/title json) are
+  // written locally before R2 upload. See lib/synthetic/heygen-auth.ts.
+  HEYGEN_LOG_DIR: z.string().default("./logs/heygen"),
+  // Debug mode (spec G): run the browser headful with slowMo and a page.pause()
+  // so you can step through HeyGen's UI when it changes. Forces headless off
+  // regardless of HEYGEN_HEADLESS. NEVER enable on a headless worker host.
+  HEYGEN_DEBUG: z.coerce.boolean().default(false),
+  // slowMo (ms) applied to every Playwright action when HEYGEN_DEBUG is on.
+  HEYGEN_SLOWMO_MS: z.coerce.number().int().nonnegative().default(500),
+  // Anti-bot hardening (Cloudflare flags datacenter IPs + headless fingerprints
+  // and kills the session). A realistic desktop Chrome user-agent reduces the
+  // headless fingerprint. Update the Chrome major version periodically.
+  HEYGEN_USER_AGENT: z
+    .string()
+    .default(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    ),
+  // When true, the headed connect flow ALSO routes through the worker's proxy so
+  // the session's exit IP matches the IP the headless worker later uses (HeyGen
+  // flags IP churn between login and use). Requires a WORKING residential proxy
+  // (HEYGEN_PROXIES) — leave false until proxy auth is confirmed (the shared
+  // YTDLP pool 407'd). Default false: connect from the human's own IP.
+  HEYGEN_CONNECT_USES_PROXY: z.coerce.boolean().default(false),
+  // Seconds to wait before each avatar attempt, to break up burst patterns that
+  // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
+  // just spaces serial jobs apart.
+  HEYGEN_JOB_SPACING_SECONDS: z.coerce.number().int().nonnegative().default(20),
+  // HeyGen requires a VOICE to be selected before it will generate (otherwise
+  // it errors "Please select the voice id"). This is the voice NAME to pick in
+  // HeyGen's voice modal — it is HeyGen's own voice, NOT a 69labs voiceId (a
+  // different provider used for the master voiceover). A substring match is
+  // used, so "narrator" or a full name both work. Default targets a neutral
+  // English narrator; set to whatever voice you want every avatar to speak in.
+  HEYGEN_VOICE: z.string().default("narrator"),
 
   // Which queue group this worker process serves. Lets the celebrity
   // (sourced) and AI-avatar (synthetic) engines run on SEPARATE Fly machines:
@@ -404,6 +466,21 @@ const ServerEnvSchema = z.object({
   IMAGE_GEN_CONCURRENCY: z.coerce.number().int().positive().default(3),
   IMAGE_TO_VIDEO_CONCURRENCY: z.coerce.number().int().positive().default(2),
   AVATAR_CONCURRENCY: z.coerce.number().int().positive().default(1),
+
+  // Synthetic visual-block pacing. The client's reference video paces every
+  // visual block (image / ai_clip / split_2) at ~3-8s. Gemini's planner emits
+  // blocks of arbitrary length (a long sentence can yield a 13-21s block),
+  // which (a) reads as a static hold against the reference and (b) exceeds
+  // what LTX-2 can generate in a single image-to-video call. The planner's
+  // duration-split pass divides any visual block longer than
+  // SYNTHETIC_BLOCK_SPLIT_THRESHOLD into round(duration / TARGET) back-to-back
+  // sub-blocks (each inheriting the parent's prompts + a proportional slice of
+  // script and spoken-time window), so every block lands in the 3-8s window
+  // and inside LTX's single-generation tier. 'avatar' blocks are exempt — a
+  // talking head holds for the full sentence and is generated by HeyGen, not
+  // LTX.
+  SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
+  SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

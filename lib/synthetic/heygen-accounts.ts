@@ -3,6 +3,7 @@ import { getEnv } from "@/lib/env";
 import { encryptSecret, decryptSecret, encryptJson, decryptJson } from "@/lib/crypto/secret-box";
 import { logJob } from "@/lib/jobs/db";
 import type { HeygenAccount } from "@/lib/types";
+import type { HeygenDisposition, HeygenErrorClass } from "@/lib/synthetic/heygen-errors";
 
 // HeyGen account pool management — selection, rotation, cooldown, and the
 // encrypted credential/cookie round-trip. Kept SEPARATE from the Playwright
@@ -15,8 +16,11 @@ import type { HeygenAccount } from "@/lib/types";
 //   recordSuccess()       -> reset fail_count, stamp last_used_at.
 //   recordFailure()       -> bump fail_count; cooldown, or disable past the
 //                            HEYGEN_MAX_FAIL_COUNT threshold.
-//   rotateAccount()       -> cooldown the current account and hand back the
-//                            next available one (used mid-job on soft failure).
+//   markNeedsReauth()     -> session expired: out of rotation, NO cooldown, NO
+//                            fail bump (cleared by re-running heygen:connect).
+//   applyDisposition()    -> apply a classified failure's disposition (reauth /
+//                            cooldown / disable / rotate) and hand back the next
+//                            available account (used mid-job on failure).
 
 export interface DecryptedAccount {
   id: string;
@@ -71,7 +75,10 @@ export async function getAvailableAccount(): Promise<DecryptedAccount | null> {
   return decrypt(row);
 }
 
-/** Persist a fresh Playwright storage state (cookies + localStorage). */
+/**
+ * Persist a fresh Playwright storage state (cookies + localStorage). Worker
+ * runs call this to refresh a still-warm session WITHOUT touching status.
+ */
 export async function saveCookies(accountId: string, storageState: unknown): Promise<void> {
   const sb = getServerSupabase();
   const { error } = await sb
@@ -79,6 +86,40 @@ export async function saveCookies(accountId: string, storageState: unknown): Pro
     .update({ cookies_json: encryptJson(storageState) })
     .eq("id", accountId);
   if (error) throw new Error(`saveCookies: ${error.message}`);
+}
+
+/**
+ * Save a freshly-connected session (the headed connect script). Unlike
+ * saveCookies this also clears any needs_reauth/cooldown/disabled state, resets
+ * the failure counters, and stamps auth_saved_at — i.e. it brings a connected
+ * account back into rotation in one shot.
+ */
+export async function saveConnectedSession(accountId: string, storageState: unknown): Promise<void> {
+  const sb = getServerSupabase();
+  const { error } = await sb
+    .from("heygen_accounts")
+    .update({
+      cookies_json: encryptJson(storageState),
+      status: "active",
+      fail_count: 0,
+      cooldown_until: null,
+      last_error_class: null,
+      last_error: null,
+      auth_saved_at: new Date().toISOString(),
+    })
+    .eq("id", accountId);
+  if (error) throw new Error(`saveConnectedSession: ${error.message}`);
+}
+
+/** Fetch one account (decrypted) by email — used by the connect script. */
+export async function getAccountByEmail(email: string): Promise<DecryptedAccount | null> {
+  const sb = getServerSupabase();
+  const { data } = await sb
+    .from("heygen_accounts")
+    .select("*")
+    .eq("email", email.trim().toLowerCase())
+    .maybeSingle();
+  return data ? decrypt(data as HeygenAccount) : null;
 }
 
 /** Decrypt and return the stored storage state for an account, or null. */
@@ -97,7 +138,14 @@ export async function recordSuccess(accountId: string): Promise<void> {
   const sb = getServerSupabase();
   await sb
     .from("heygen_accounts")
-    .update({ fail_count: 0, status: "active", cooldown_until: null, last_used_at: new Date().toISOString() })
+    .update({
+      fail_count: 0,
+      status: "active",
+      cooldown_until: null,
+      last_error_class: null,
+      last_error: null,
+      last_used_at: new Date().toISOString(),
+    })
     .eq("id", accountId);
 }
 
@@ -143,21 +191,101 @@ export async function recordFailure(
 }
 
 /**
- * Cool down the current account and return the next available one. Used when a
- * generation fails on an account that may simply be rate-limited — we don't
- * want to retry the same account immediately.
+ * Flag an account as needing re-authentication. This is the key fix for the
+ * "no available accounts" cascade: an expired session (or one that was never
+ * connected) takes the account OUT of rotation but does NOT cool it down and
+ * does NOT bump fail_count — there is nothing wrong with the account, its
+ * browser session simply lapsed. An operator clears it by re-running
+ * `npm run heygen:connect <email>`.
  */
-export async function rotateAccount(
-  currentAccountId: string,
+export async function markNeedsReauth(accountId: string, reason: string): Promise<void> {
+  const sb = getServerSupabase();
+  await sb
+    .from("heygen_accounts")
+    .update({
+      status: "needs_reauth",
+      cooldown_until: null,
+      last_error_class: "session_expired",
+      last_error: reason.slice(0, 300),
+    })
+    .eq("id", accountId);
+  await logJob({ jobId: undefined }, "synthetic.heygen.needs_reauth", {
+    accountId,
+    reason: reason.slice(0, 200),
+  });
+}
+
+/** Stamp the last failure classification + reason without changing status. */
+export async function recordErrorClass(
+  accountId: string,
+  klass: HeygenErrorClass,
+  reason: string,
+): Promise<void> {
+  const sb = getServerSupabase();
+  await sb
+    .from("heygen_accounts")
+    .update({ last_error_class: klass, last_error: reason.slice(0, 300) })
+    .eq("id", accountId);
+}
+
+/**
+ * Apply a failure DISPOSITION (from the error classifier) to an account and
+ * return the next available account to try, or null if the pool is exhausted.
+ * Replaces the old always-cooldown rotateAccount: only genuinely account-level
+ * problems (rate limit, credit, repeated unknowns) cool an account down; a UI
+ * change or network blip just rotates with no penalty; an expired session is
+ * flagged for re-auth.
+ */
+export async function applyDisposition(
+  accountId: string,
+  disposition: HeygenDisposition,
+  klass: HeygenErrorClass,
   reason: string,
 ): Promise<DecryptedAccount | null> {
-  await recordFailure(currentAccountId, reason);
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: "heygen.applyDisposition",
+      accountId,
+      disposition,
+      klass,
+      reason: reason.slice(0, 200),
+    }),
+  );
+  switch (disposition) {
+    case "reauth":
+      await markNeedsReauth(accountId, reason);
+      break;
+    case "disable": {
+      const sb = getServerSupabase();
+      await sb
+        .from("heygen_accounts")
+        .update({ status: "disabled", last_error_class: klass, last_error: reason.slice(0, 300) })
+        .eq("id", accountId);
+      break;
+    }
+    case "cooldown":
+      await recordErrorClass(accountId, klass, reason);
+      await recordFailure(accountId, reason);
+      break;
+    case "rotate":
+      // No penalty — the account is fine; just note why we moved on.
+      await recordErrorClass(accountId, klass, reason);
+      break;
+  }
   return getAvailableAccount();
 }
 
+
 // --- admin helpers (used by the settings API route) ---
 
-/** Add a HeyGen account. Password is encrypted before storage. */
+/**
+ * Add a HeyGen account. Password is encrypted before storage. The account
+ * starts in 'needs_reauth' — it has no browser session yet, so it is NOT handed
+ * to a worker until a human connects it with `npm run heygen:connect <email>`
+ * (which flips it to 'active'). This avoids burning an avatar attempt on an
+ * account that was always going to be unauthenticated.
+ */
 export async function addAccount(input: {
   email: string;
   password: string;
@@ -170,7 +298,8 @@ export async function addAccount(input: {
       email: input.email.trim().toLowerCase(),
       password_enc: encryptSecret(input.password),
       proxy: input.proxy?.trim() || null,
-      status: "active",
+      status: "needs_reauth",
+      last_error: "never connected — run `npm run heygen:connect <email>`",
     })
     .select("id")
     .single();
@@ -200,12 +329,28 @@ export async function setAccountStatus(
 
 /** Listing for the settings UI — NEVER returns secrets, only status fields. */
 export async function listAccountsSafe(): Promise<
-  Array<Pick<HeygenAccount, "id" | "email" | "status" | "fail_count" | "cooldown_until" | "last_used_at" | "created_at"> & { has_cookies: boolean }>
+  Array<
+    Pick<
+      HeygenAccount,
+      | "id"
+      | "email"
+      | "status"
+      | "fail_count"
+      | "cooldown_until"
+      | "last_used_at"
+      | "created_at"
+      | "last_error_class"
+      | "last_error"
+      | "auth_saved_at"
+    > & { has_cookies: boolean }
+  >
 > {
   const sb = getServerSupabase();
   const { data, error } = await sb
     .from("heygen_accounts")
-    .select("id, email, status, fail_count, cooldown_until, last_used_at, created_at, cookies_json")
+    .select(
+      "id, email, status, fail_count, cooldown_until, last_used_at, created_at, last_error_class, last_error, auth_saved_at, cookies_json",
+    )
     .order("created_at", { ascending: false });
   if (error) throw new Error(`listAccountsSafe: ${error.message}`);
   return (data ?? []).map((r) => ({
@@ -216,6 +361,9 @@ export async function listAccountsSafe(): Promise<
     cooldown_until: r.cooldown_until,
     last_used_at: r.last_used_at,
     created_at: r.created_at,
+    last_error_class: r.last_error_class ?? null,
+    last_error: r.last_error ?? null,
+    auth_saved_at: r.auth_saved_at ?? null,
     has_cookies: Boolean(r.cookies_json),
   }));
 }
@@ -223,20 +371,21 @@ export async function listAccountsSafe(): Promise<
 /**
  * Resolve the proxy for an account. Precedence:
  *   1. per-account override (the optional `proxy` column on the account)
- *   2. HEYGEN_PROXIES        (HeyGen-specific pool, if you want one separate)
- *   3. YTDLP_PROXIES         (the existing CelebForge residential pool — reused
- *                             automatically so you don't have to re-enter the
- *                             same proxies for HeyGen)
- * Returns null only when none of the three is configured. Both pool vars use
- * the same `ip:port:user:pass` (newline/comma-separated) format.
+ *   2. HEYGEN_PROXIES        (HeyGen-specific pool)
+ *   3. YTDLP_PROXIES         (the shared CelebForge residential pool) — ONLY
+ *                             when HEYGEN_USE_YTDLP_PROXIES=true. This fallback
+ *                             is opt-in because those proxies are tuned for
+ *                             yt-dlp and may reject the browser (seen as a 407
+ *                             proxy-auth wall on app.heygen.com), which would
+ *                             fail every avatar job. Leave it off unless you
+ *                             know the shared pool authenticates a browser.
+ * Returns null when no applicable pool is configured. Both pool vars use the
+ * same `ip:port:user:pass` (newline/comma-separated) format.
  */
 export function resolveProxy(account: DecryptedAccount): string | null {
   if (account.proxy) return account.proxy;
   const env = getEnv();
-  // Prefer a dedicated HeyGen pool; otherwise fall back to the shared
-  // CelebForge (yt-dlp) residential pool already configured for the celebrity
-  // engine. This is what lets HeyGen reuse those proxies with no manual entry.
-  const pool = env.HEYGEN_PROXIES || env.YTDLP_PROXIES;
+  const pool = env.HEYGEN_PROXIES || (env.HEYGEN_USE_YTDLP_PROXIES ? env.YTDLP_PROXIES : "");
   if (!pool) return null;
   const list = pool.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   if (list.length === 0) return null;

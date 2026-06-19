@@ -4,19 +4,20 @@ import type { ImageToVideoJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
+import { isLtxConfigured } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
 
-// 'ai_clip' generation: nano-banana still -> fal.ai Veo 3 Fast (Kling fallback)
-// animated clip, WITHOUT audio (the voiceover is the master track). The
-// generated still is uploaded first (so we can degrade to holding it if the
-// animation step fails), then animated.
+// 'ai_clip' generation: nano-banana still -> LTX-2 (fal.ai Veo 3 Fast, then
+// Kling, as fallback) animated clip, WITHOUT audio (the voiceover is the
+// master track). The generated still is uploaded first (so we can degrade to
+// holding it if the animation step fails), then animated.
 //
-// Two-tier fallback:
-//   1. Veo -> Kling is handled inside generateClipWithFallback.
-//   2. If BOTH video providers fail on the FINAL attempt, we degrade to the
+// Multi-tier fallback:
+//   1. LTX-2 -> Veo -> Kling is handled inside generateClipWithFallback.
+//   2. If EVERY video provider fails on the FINAL attempt, we degrade to the
 //      still image (segment becomes a held image) rather than failing the
 //      whole block — a held still is far better than a hole in the timeline.
 export async function processImageToVideoJob(
@@ -60,7 +61,11 @@ export async function processImageToVideoJob(
   // --- step 2: animate the still ---
   try {
     const t0 = Date.now();
-    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "fal_veo3_fast", phase: "request",
+    // The actual provider isn't known until the fallback chain resolves
+    // (reported on the response line via clip.provider); the request line logs
+    // the configured primary so the two lines line up when LTX succeeds.
+    const primaryProvider = isLtxConfigured() ? "ltx2" : "fal_veo3_fast";
+    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: primaryProvider, phase: "request",
       extra: { durationSeconds: duration } });
     const clip = await generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration });
     await logProviderCall({

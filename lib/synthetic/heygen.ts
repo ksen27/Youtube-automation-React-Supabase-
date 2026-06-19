@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { type Page, type BrowserContext } from "playwright";
 import { getEnv } from "@/lib/env";
 import { uploadBuffer } from "@/lib/storage";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -9,135 +9,78 @@ import {
   getAvailableAccount,
   saveCookies,
   recordSuccess,
-  rotateAccount,
-  resolveProxy,
-  parseProxy,
+  applyDisposition,
   type DecryptedAccount,
 } from "@/lib/synthetic/heygen-accounts";
+import {
+  openAuthedContext,
+  verifyAuthenticated,
+  captureDiagnostics,
+} from "@/lib/synthetic/heygen-auth";
+import {
+  HeygenError,
+  classifyHeygenFailure,
+  dispositionOf,
+  classOf,
+} from "@/lib/synthetic/heygen-errors";
+import {
+  photoToVideoTab,
+  photoUpload,
+  uploadTrigger,
+  removePhoto,
+  selectedPhoto,
+  scriptField,
+  generateButton,
+  voicePickerButton,
+  projectVideoCards,
+  cardStillRendering,
+  projectVideoElement,
+  projectDownloadButton,
+  moreActionsButton,
+  clickFirstVisible,
+  fillFirstVisible,
+  waitFirstVisible,
+  isVisible,
+} from "@/lib/synthetic/heygen-selectors";
 
 // HeyGen avatar generation via Playwright browser automation (NOT the HeyGen
-// API, per spec). Drives the live HeyGen web app to: restore a warm session
-// (or log in), create a talking-photo avatar from the uploaded user image,
-// drive it with the segment's narration, render, and download the resulting
-// MP4 (no audio dependency — the master voiceover is muxed in at render time).
+// API, per spec). Drives the live HeyGen web app to: RESTORE a warm session
+// (never log in here — see below), create a talking-photo avatar from the
+// uploaded user image, drive it with the segment's narration, render, and
+// download the resulting MP4.
 //
-// Resilience:
-//   * Account rotation — each attempt may run on a different pool account;
-//     a soft failure cools down the current account and retries on the next.
-//   * Cookie sessions — Playwright storageState is persisted (encrypted) per
-//     account so we skip interactive login on subsequent runs.
-//   * Proxy support — per-account or global residential proxy.
-//   * Screenshot logging — every attempt screenshots key steps + any failure;
-//     shots are uploaded to R2 for audit.
-//   * Failure detection — explicit checks for login walls, quota/limit
-//     banners, and render timeouts, each mapped to a retry/rotate decision.
-//
-// ⚠️ SELECTORS: HeyGen's DOM is not introspectable from here, so the selectors
-// below are best-guess against the current app and are the FIRST thing to
-// adjust against the live UI. They are centralized in SELECTORS for that
-// reason. Behaviour, rotation, cookies, proxy, and screenshots are complete.
+// Resilience redesign (no per-job login):
+//   * Auth is connected ONCE per account by a human (`npm run heygen:connect`).
+//     The encrypted storageState lives in the DB and is reused on every job —
+//     this worker NEVER opens the login page, so login-page UI changes can no
+//     longer break generation or strand the pool. See lib/synthetic/heygen-auth.
+//   * Session expiry is detected (verifyAuthenticated) and flagged needs_reauth
+//     WITHOUT cooldown / fail-count — a stale session never burns the pool.
+//   * Every failure is CLASSIFIED (heygen-errors) and mapped to a disposition
+//     (reauth / cooldown / disable / rotate) so a selector/UI failure no longer
+//     looks like an account failure.
+//   * Diagnostics (url, title, screenshot, HTML) are captured on every failure.
+//   * Per-account or global residential proxy; screenshots uploaded to R2.
 
-// Selectors verified against the live HeyGen app (auth.heygen.com login +
-// app.heygen.com workspace) on 2026-06-18. The login flow is multi-step:
-//   landing -> "Use email" -> "Use password" -> fill email+password -> "Log in"
-// HeyGen also renders multiple STACKED auth panels in the DOM (only one is
-// on-screen), so login interactions must target the on-screen element — see
-// clickOnScreen()/fillOnScreen(). Post-login the workspace shows a left nav
-// with Home / Avatar / Brand / Apps / Projects.
-const SELECTORS = {
-  // Logged-in marker: the workspace left-nav items (text is stable; the old
-  // data-testid guess was never present on the real app).
-  loggedInMarker: 'text="Avatar"',
-  useEmail: 'text="Use email"',
-  usePassword: 'text="Use password"',
-  loginEmail: 'input[type="email"]',
-  loginPassword: 'input[type="password"]',
-  loginSubmit: 'button:has-text("Log in")',
-  createAvatarEntry: 'a[href*="avatar"], button:has-text("Create")',
-  photoAvatarUpload: 'input[type="file"]',
-  scriptTextarea: 'textarea[placeholder*="script" i], textarea[aria-label*="script" i]',
-  generateButton: 'button:has-text("Generate"), button:has-text("Submit")',
-  renderDoneMarker: 'video[src], a[download], button:has-text("Download")',
-  downloadButton: 'a[download], button:has-text("Download")',
-  quotaBanner: ':text("limit"), :text("upgrade"), :text("quota")',
-} as const;
-
-// HeyGen's auth widget keeps several panels mounted at once; only one is laid
-// out on-screen. Plain Playwright clicks/fills can resolve to an off-screen
-// duplicate and either no-op or time out. These helpers pick the first match
-// that actually has an on-screen bounding box.
-async function clickOnScreen(page: Page, selector: string, timeoutMs: number): Promise<void> {
-  const loc = page.locator(selector);
-  const deadline = Date.now() + timeoutMs;
-  do {
-    const n = await loc.count();
-    for (let i = 0; i < n; i++) {
-      const box = await loc.nth(i).boundingBox().catch(() => null);
-      if (box && box.width > 0 && box.y > 50 && box.y < 850) {
-        await loc.nth(i).click({ timeout: timeoutMs });
-        return;
-      }
-    }
-    await page.waitForTimeout(250);
-  } while (Date.now() < deadline);
-  throw new Error(`heygen: no on-screen element for ${selector}`);
-}
-
-async function fillOnScreen(page: Page, selector: string, value: string, timeoutMs: number): Promise<void> {
-  const loc = page.locator(selector);
-  const deadline = Date.now() + timeoutMs;
-  do {
-    const n = await loc.count();
-    for (let i = 0; i < n; i++) {
-      const box = await loc.nth(i).boundingBox().catch(() => null);
-      if (box && box.width > 0 && box.y > 50 && box.y < 850) {
-        await loc.nth(i).fill(value);
-        return;
-      }
-    }
-    await page.waitForTimeout(250);
-  } while (Date.now() < deadline);
-  throw new Error(`heygen: no on-screen field for ${selector}`);
+function env() {
+  return getEnv();
 }
 
 export interface GenerateAvatarInput {
   projectId: string;
   segmentId: string;
   jobId: string;
-  avatarImageUrl: string;   // public URL of the uploaded user photo
-  script: string;           // narration that drives the avatar
+  avatarImageUrl: string; // public URL of the uploaded user photo
+  script: string; // narration that drives the avatar
 }
 
 export interface GenerateAvatarResult {
-  videoUrl: string;         // R2 public URL of the downloaded avatar mp4
-  accountId: string;        // which account produced it
-  seconds: number;          // estimated output length (billing)
+  videoUrl: string; // R2 public URL of the downloaded avatar mp4
+  accountId: string; // which account produced it
+  seconds: number; // estimated output length (billing)
 }
 
-function env() {
-  return getEnv();
-}
-
-// Launch a browser context for an account, restoring its warm session +
-// proxy. Caller owns closing the returned browser.
-async function openContext(account: DecryptedAccount): Promise<{ browser: Browser; context: BrowserContext }> {
-  const e = env();
-  const proxyRaw = resolveProxy(account);
-  const browser = await chromium.launch({
-    headless: e.HEYGEN_HEADLESS,
-    proxy: proxyRaw ? parseProxy(proxyRaw) : undefined,
-  });
-  const context = await browser.newContext({
-    // Restore the warm session if we have one. Playwright accepts the same
-    // object shape it produces from context.storageState().
-    storageState: (account.cookies as Awaited<ReturnType<BrowserContext["storageState"]>> | null) ?? undefined,
-    viewport: { width: 1366, height: 900 },
-  });
-  context.setDefaultTimeout(e.HEYGEN_NAV_TIMEOUT_MS);
-  return { browser, context };
-}
-
-// Capture + upload a screenshot for audit. Best-effort: never throws.
+// Capture + upload a step screenshot for audit. Best-effort: never throws.
 async function shot(page: Page, projectId: string, segmentId: string, label: string): Promise<void> {
   try {
     const dir = env().HEYGEN_SCREENSHOT_DIR;
@@ -151,137 +94,209 @@ async function shot(page: Page, projectId: string, segmentId: string, label: str
   }
 }
 
-async function isLoggedIn(page: Page): Promise<boolean> {
-  return (await page.locator(SELECTORS.loggedInMarker).count()) > 0;
-}
-
-// Interactive login. Persists a fresh storage state on success so future runs
-// skip straight past the login wall.
-//
-// Verified flow (auth.heygen.com, 2026-06-18): the landing screen only offers
-// Google/Apple/"Use email"/"Use SSO". We pick the email path, switch it from
-// the default magic-link mode to password mode, fill credentials, and submit:
-//   /login (commit) -> "Use email" -> "Use password" -> email+password -> "Log in"
-async function login(page: Page, context: BrowserContext, account: DecryptedAccount): Promise<void> {
-  const e = env();
-  // HeyGen is a heavy SPA whose `domcontentloaded`/`load` lifecycle events may
-  // never settle (streaming/long-poll connections keep the document "loading"),
-  // so we navigate with `commit` (resolves once the response starts) and then
-  // wait for the concrete element we need at each step.
-  await page.goto(`${e.HEYGEN_BASE_URL}/login`, { waitUntil: "commit" });
-
-  // 1) Landing -> email entry. 2) email mode -> password mode.
-  await clickOnScreen(page, SELECTORS.useEmail, e.HEYGEN_NAV_TIMEOUT_MS);
-  await clickOnScreen(page, SELECTORS.usePassword, e.HEYGEN_NAV_TIMEOUT_MS);
-
-  // 3) Fill credentials (on-screen panel only) and submit.
-  await fillOnScreen(page, SELECTORS.loginEmail, account.email, e.HEYGEN_NAV_TIMEOUT_MS);
-  await fillOnScreen(page, SELECTORS.loginPassword, account.password, e.HEYGEN_NAV_TIMEOUT_MS);
-  await clickOnScreen(page, SELECTORS.loginSubmit, e.HEYGEN_NAV_TIMEOUT_MS);
-
-  // 4) Success = we leave the auth page and the workspace nav renders. Surface
-  // a clear error otherwise (wrong password, captcha, email-code challenge).
-  await page
-    .waitForURL((u) => !u.toString().includes("/login"), { timeout: e.HEYGEN_NAV_TIMEOUT_MS })
-    .catch(() => {
-      throw new Error("heygen: login did not complete (still on auth page — bad credentials or a captcha/email-code challenge)");
-    });
-  await page.waitForSelector(SELECTORS.loggedInMarker, { timeout: e.HEYGEN_NAV_TIMEOUT_MS });
-
-  // Persist the warm session for reuse.
-  const state = await context.storageState();
-  await saveCookies(account.id, state);
-}
-
-// Detect a quota/limit wall so the caller rotates instead of pointlessly
-// retrying the same exhausted account.
-async function hitQuotaWall(page: Page): Promise<boolean> {
+// Upload a staged file by clicking the upload control and answering the native
+// file chooser it opens. This is more robust than setInputFiles against HeyGen's
+// on-demand (modal) file input, which often doesn't exist until the control is
+// clicked. Throws a classified HeygenError if no chooser appears.
+async function uploadViaChooser(page: Page, filePath: string, timeoutMs: number): Promise<void> {
   try {
-    return (await page.locator(SELECTORS.quotaBanner).count()) > 0;
-  } catch {
-    return false;
+    const [chooser] = await Promise.all([
+      page.waitForEvent("filechooser", { timeout: timeoutMs }),
+      clickFirstVisible(uploadTrigger(page), timeoutMs, "upload control"),
+    ]);
+    await chooser.setFiles(filePath);
+  } catch (err) {
+    // Last resort: a file input may have been injected by the click even if no
+    // chooser event fired (some flows mount a visible <input>).
+    if ((await photoUpload(page).count()) > 0) {
+      await photoUpload(page).first().setInputFiles(filePath);
+      return;
+    }
+    throw new HeygenError("ui_changed", "heygen: could not open photo upload", err);
   }
 }
 
-// One full avatar generation attempt on a single account. Throws on failure;
-// the public generateAvatar() wraps this with account rotation.
+// Ensure a usable voice is selected before generating, WITHOUT opening the
+// voice-detail modal. HeyGen's avatar composer already has a voice selected by
+// default (the toolbar pill, e.g. "Japan - Voice 2"), and our pipeline discards
+// HeyGen's audio at render anyway (the 69labs master voiceover is muxed in), so
+// the specific voice is irrelevant — we only need SOME voice set so HeyGen
+// doesn't block with "Please select the voice id".
+//
+// IMPORTANT: do NOT click the voice pill here. Clicking it opens a "Voice for
+// <name>" detail modal (Switch / Speed / Accent / Save changes) that has no
+// search box and would strand the flow. We just confirm a voice pill exists and
+// move on; if a future avatar truly has none, the generate step's error is
+// captured + classified normally rather than hanging in a modal.
+async function ensureVoicePresent(page: Page): Promise<void> {
+  // The toolbar voice pill (any "... Voice ..." button) being present means a
+  // voice is already selected. Best-effort, short budget, never opens a modal.
+  await isVisible(voicePickerButton(page), 3000);
+}
+
+// Retrieve the finished avatar video from HeyGen's Projects page. HeyGen renders
+// asynchronously and drops the result into /projects (newest first), so we:
+//   1) navigate to /projects and open the newest video card,
+//   2) wait (up to the render timeout) for it to finish rendering,
+//   3) capture the mp4 — primarily by sniffing the CDN response the player
+//      loads (most robust), falling back to the Download control.
+// Returns the video bytes or throws a classified HeygenError.
+async function retrieveRenderedVideo(
+  page: Page,
+  context: BrowserContext,
+): Promise<Buffer> {
+  const e = env();
+
+  // Start sniffing for the rendered mp4 as soon as we navigate — HeyGen's player
+  // streams it from a CDN; catching that response is more reliable than DOM.
+  const mp4Promise = page
+    .waitForResponse((r) => /\.mp4(\?|$)/i.test(r.url()) && r.status() < 400, {
+      timeout: e.HEYGEN_RENDER_TIMEOUT_MS,
+    })
+    .catch(() => null);
+
+  // Go to Projects (newest first) and open the most recent video card. Poll
+  // until the newest card has finished rendering (no spinner / has a duration).
+  const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
+  let opened = false;
+  while (Date.now() < deadline) {
+    await page.goto(`${e.HEYGEN_BASE_URL}/projects`, { waitUntil: "commit" }).catch(() => {});
+    const newest = projectVideoCards(page).locator("visible=true").first();
+    if (await newest.isVisible({ timeout: 10_000 }).catch(() => false)) {
+      // If the newest card is still rendering, wait and re-poll.
+      if (await isVisible(cardStillRendering(newest), 1500)) {
+        await page.waitForTimeout(5000);
+        continue;
+      }
+      await newest.click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
+      opened = true;
+      break;
+    }
+    await page.waitForTimeout(5000);
+  }
+  if (!opened) {
+    throw new HeygenError("ui_changed", "heygen: rendered video never appeared in Projects");
+  }
+
+  // Prefer the sniffed CDN url (pull it through the authed context so cookies
+  // apply); else read the <video> src; else click Download and capture the file.
+  const sniffed = await mp4Promise;
+  let videoUrl: string | null = sniffed?.url() ?? null;
+  if (!videoUrl) {
+    videoUrl = await projectVideoElement(page)
+      .first()
+      .evaluate((el) => (el as HTMLVideoElement).currentSrc || el.getAttribute("src"))
+      .catch(() => null);
+  }
+
+  if (videoUrl && /^https?:/.test(videoUrl)) {
+    const resp = await context.request.get(videoUrl, { timeout: e.HEYGEN_NAV_TIMEOUT_MS });
+    if (resp.ok()) return Buffer.from(await resp.body());
+  }
+
+  // Fallback: open the more-actions menu if needed, click Download, capture it.
+  if (!(await isVisible(projectDownloadButton(page), 2000))) {
+    await clickFirstVisible(moreActionsButton(page), 10_000, "more actions").catch(() => {});
+  }
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: e.HEYGEN_NAV_TIMEOUT_MS }),
+    clickFirstVisible(projectDownloadButton(page), e.HEYGEN_NAV_TIMEOUT_MS, "download control"),
+  ]).catch(() => [null] as const);
+  if (download) {
+    const dlPath = await download.path();
+    if (dlPath) return await fs.readFile(dlPath);
+  }
+  throw new HeygenError("ui_changed", "heygen: could not retrieve rendered video from Projects");
+}
+
+// One full avatar generation attempt on a single account. Throws a classified
+// HeygenError on failure; generateAvatar() wraps this with disposition-aware
+// account rotation.
 async function attemptOnAccount(
   account: DecryptedAccount,
   input: GenerateAvatarInput,
   imageBytes: Buffer,
 ): Promise<GenerateAvatarResult> {
   const e = env();
-  const { browser, context } = await openContext(account);
+  const { browser, context } = await openAuthedContext(account);
   const t0 = Date.now();
+  let page: Page | null = null;
   try {
-    const page = await context.newPage();
+    page = await context.newPage();
+    const p = page; // non-null alias for use inside async callbacks below
 
-    // 1) Ensure authenticated (restore session, else log in). HeyGen's SPA
-    // lifecycle never settles, so navigate with `commit` (see login()) and give
-    // the logged-in marker a brief, bounded chance to render before deciding to
-    // log in — otherwise the check races the SPA and false-negatives into a
-    // needless login.
-    await page.goto(`${e.HEYGEN_BASE_URL}/home`, { waitUntil: "commit" });
-    await page
-      .waitForSelector(SELECTORS.loggedInMarker, { timeout: 15_000 })
-      .catch(() => {});
-    if (!(await isLoggedIn(page))) {
-      await login(page, context, account);
+    // 1) Reuse the stored session and verify it (spec B/C). NO login here. An
+    // expired session is a classified, no-penalty needs_reauth — not a failure.
+    const verdict = await verifyAuthenticated(p);
+    if (verdict === "expired") {
+      throw new HeygenError(
+        "session_expired",
+        `heygen: account ${account.email} session expired — reconnect with \`npm run heygen:connect ${account.email}\``,
+      );
     }
-    await shot(page, input.projectId, input.segmentId, "authed");
+    await shot(p, input.projectId, input.segmentId, "authed");
 
-    // 2) Enter the talking-photo / avatar creation flow.
-    await page.click(SELECTORS.createAvatarEntry);
+    // 2) Go straight to the avatar "Quick create" workspace. (verifyAuthenticated
+    // left us on /home; the avatar composer lives at /avatar.)
+    await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
+    await waitFirstVisible(scriptField(p), e.HEYGEN_NAV_TIMEOUT_MS, "avatar composer");
 
-    // 3) Upload the user's photo. Playwright's setInputFiles needs a path, so
-    // we stage the in-memory bytes to a temp file.
+    // 3) Select the "Photo to video" mode (vs. "Script to video") so the photo
+    // upload pane is active. Best-effort: if it's already the active tab the
+    // click is harmless; if the tab isn't present the upload step still runs.
+    if (await isVisible(photoToVideoTab(p), 3000)) {
+      await clickFirstVisible(photoToVideoTab(p), e.HEYGEN_NAV_TIMEOUT_MS, "photo-to-video tab").catch(
+        () => {},
+      );
+    }
+
+    // 4) Upload the user's photo. Stage the bytes to a temp file first
+    // (setInputFiles / filechooser both need a path).
     const stageDir = path.join(e.TMP_DIR, "heygen-uploads");
     await fs.mkdir(stageDir, { recursive: true });
     const stagePath = path.join(stageDir, `${input.segmentId}.jpg`);
     await fs.writeFile(stagePath, imageBytes);
-    await page.setInputFiles(SELECTORS.photoAvatarUpload, stagePath);
-    await shot(page, input.projectId, input.segmentId, "uploaded");
 
-    // 4) Drive the avatar with the narration script.
-    await page.fill(SELECTORS.scriptTextarea, input.script);
-
-    // 5) Kick off the render.
-    if (await hitQuotaWall(page)) {
-      throw new Error("heygen: quota/limit wall before generate");
-    }
-    await page.click(SELECTORS.generateButton);
-    await shot(page, input.projectId, input.segmentId, "generating");
-
-    // 6) Wait for the render to complete (separate, longer timeout).
-    await page.waitForSelector(SELECTORS.renderDoneMarker, { timeout: e.HEYGEN_RENDER_TIMEOUT_MS });
-    if (await hitQuotaWall(page)) {
-      throw new Error("heygen: quota/limit wall after generate");
+    // A photo may already be selected from a prior session — remove it so we
+    // drive the avatar with OUR image, not a stale one.
+    if (await isVisible(selectedPhoto(p), 2000)) {
+      await clickFirstVisible(removePhoto(p), 10_000, "remove existing photo").catch(() => {});
     }
 
-    // 7) Resolve the rendered video URL and download the bytes.
-    const videoSrc = await page
-      .locator(SELECTORS.renderDoneMarker)
-      .first()
-      .evaluate((el) => el.getAttribute("src") || el.getAttribute("href"))
-      .catch(() => null);
+    // HeyGen creates the file <input> on demand (inside an upload modal), so a
+    // direct setInputFiles often has nothing to target. Prefer catching the
+    // native file chooser that the upload control opens; fall back to a hidden
+    // input if one is already present.
+    const existingInput = (await photoUpload(p).count()) > 0;
+    if (existingInput) {
+      await photoUpload(p).first().setInputFiles(stagePath).catch(async () => {
+        await uploadViaChooser(p, stagePath, e.HEYGEN_NAV_TIMEOUT_MS);
+      });
+    } else {
+      await uploadViaChooser(p, stagePath, e.HEYGEN_NAV_TIMEOUT_MS);
+    }
 
-    let videoBytes: Buffer | null = null;
-    if (videoSrc && /^https?:/.test(videoSrc)) {
-      // Pull it through the authenticated browser context so cookies apply.
-      const resp = await context.request.get(videoSrc, { timeout: e.HEYGEN_NAV_TIMEOUT_MS });
-      if (resp.ok()) videoBytes = Buffer.from(await resp.body());
-    }
-    if (!videoBytes) {
-      // Fall back to clicking the download control and capturing the download.
-      const [download] = await Promise.all([
-        page.waitForEvent("download", { timeout: e.HEYGEN_NAV_TIMEOUT_MS }),
-        page.click(SELECTORS.downloadButton),
-      ]);
-      const dlPath = await download.path();
-      if (!dlPath) throw new Error("heygen: download produced no file");
-      videoBytes = await fs.readFile(dlPath);
-    }
-    await shot(page, input.projectId, input.segmentId, "done");
+    // Confirm the upload landed (our photo shows in the preview pane).
+    await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
+    await shot(p, input.projectId, input.segmentId, "uploaded");
+
+    // 5) Drive the avatar with the narration script.
+    await fillFirstVisible(scriptField(p), input.script, e.HEYGEN_NAV_TIMEOUT_MS, "script field");
+
+    // 6) Confirm a voice is already selected (does NOT open the voice modal —
+    // see ensureVoicePresent). HeyGen's audio is discarded at render anyway.
+    await ensureVoicePresent(p);
+
+    // 7) Kick off the render. HeyGen renders ASYNCHRONOUSLY: clicking Generate
+    // does not produce the file on this page — it sends the avatar to the
+    // /projects grid where it appears (and finishes rendering) minutes later.
+    await clickFirstVisible(generateButton(p), e.HEYGEN_NAV_TIMEOUT_MS, "generate button");
+    await shot(p, input.projectId, input.segmentId, "generating");
+
+    // 8–9) Retrieve the finished video from the Projects page (the only place
+    // the rendered mp4 exists). Returns the downloaded bytes.
+    const videoBytes = await retrieveRenderedVideo(p, context);
+    await shot(p, input.projectId, input.segmentId, "done");
 
     // 8) Upload to R2.
     const up = await uploadBuffer(
@@ -290,7 +305,7 @@ async function attemptOnAccount(
       "video/mp4",
     );
 
-    // Refresh the warm session for the next run.
+    // Refresh the warm session for the next run (status untouched).
     await saveCookies(account.id, await context.storageState()).catch(() => {});
     await recordSuccess(account.id);
 
@@ -309,13 +324,18 @@ async function attemptOnAccount(
 
     return { videoUrl: up.publicUrl, accountId: account.id, seconds };
   } catch (err) {
-    // Capture the failure frame for audit before tearing down.
-    try {
-      const page = context.pages()[0];
-      if (page) await shot(page, input.projectId, input.segmentId, "error");
-    } catch {
-      /* ignore */
-    }
+    // Classify against the live page, then re-throw a typed HeygenError so the
+    // rotation layer can apply the right (often no-penalty) disposition.
+    const klass = await classifyHeygenFailure(page, err);
+    const typed =
+      err instanceof HeygenError
+        ? err
+        : new HeygenError(klass, (err as Error)?.message ?? "heygen: unknown failure", err);
+
+    // Spec E: full diagnostics on every failure (url, title, screenshot, HTML).
+    await captureDiagnostics(page, input.jobId, "error");
+    if (page) await shot(page, input.projectId, input.segmentId, "error");
+
     await logProviderCall({
       projectId: input.projectId,
       jobId: input.jobId,
@@ -323,9 +343,13 @@ async function attemptOnAccount(
       provider: "heygen_avatar",
       phase: "error",
       durationMs: Date.now() - t0,
-      extra: { accountId: account.id, err: (err as Error).message?.slice(0, 200) },
+      extra: {
+        accountId: account.id,
+        errorClass: typed.klass,
+        err: typed.message?.slice(0, 200),
+      },
     });
-    throw err;
+    throw typed;
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
@@ -334,18 +358,32 @@ async function attemptOnAccount(
 
 /**
  * Generate an avatar video, rotating through the account pool on failure. Each
- * account gets one attempt; a failure cools down that account (or disables it
- * past the threshold) and the next available account is tried, up to
- * `maxAccounts` distinct accounts. Throws when the pool is exhausted or no
- * account succeeds — the avatar processor decides how to degrade.
+ * account gets one attempt; the FAILURE CLASS decides what happens to it:
+ *   - session_expired  -> flagged needs_reauth (no cooldown, no fail bump)
+ *   - rate_limit/credit -> cooldown
+ *   - ui_changed/selector/network -> rotate with NO penalty (not the account's
+ *     fault — surfaced via last_error_class + diagnostics instead)
+ * then the next available account is tried, up to `maxAccounts`. Throws when
+ * the pool is exhausted or none succeed — the avatar processor decides how to
+ * degrade.
  */
 export async function generateAvatar(
   input: GenerateAvatarInput,
   imageBytes: Buffer,
   maxAccounts = 3,
 ): Promise<GenerateAvatarResult> {
+  // Anti-bot pacing: space serial avatar jobs apart so a back-to-back burst
+  // doesn't trip HeyGen's Cloudflare protection (which kills the session).
+  const spacingMs = env().HEYGEN_JOB_SPACING_SECONDS * 1000;
+  if (spacingMs > 0) await new Promise((r) => setTimeout(r, spacingMs));
+
   let account = await getAvailableAccount();
-  if (!account) throw new Error("heygen: no available accounts in pool");
+  if (!account) {
+    throw new HeygenError(
+      "session_expired",
+      "heygen: no available accounts in pool — connect or re-auth one with `npm run heygen:connect <email>`",
+    );
+  }
 
   let lastErr: unknown;
   for (let i = 0; i < maxAccounts; i++) {
@@ -353,7 +391,12 @@ export async function generateAvatar(
       return await attemptOnAccount(account, input, imageBytes);
     } catch (err) {
       lastErr = err;
-      const next = await rotateAccount(account.id, (err as Error).message);
+      const next = await applyDisposition(
+        account.id,
+        dispositionOf(err),
+        classOf(err),
+        (err as Error).message ?? "unknown",
+      );
       if (!next) break; // pool exhausted
       account = next;
     }
@@ -366,7 +409,7 @@ export async function generateAvatar(
 // Re-export account helpers so callers can `from "@/lib/synthetic/heygen"`.
 export {
   getAvailableAccount,
-  rotateAccount,
+  applyDisposition,
   saveCookies,
   restoreCookies,
 } from "@/lib/synthetic/heygen-accounts";

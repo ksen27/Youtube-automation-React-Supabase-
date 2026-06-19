@@ -65,7 +65,9 @@ export interface SyntheticSegment {
   updated_at: string;
 }
 
-export type HeygenAccountStatus = "active" | "cooldown" | "disabled";
+// 'needs_reauth' — the stored storageState is missing or expired; the account
+// is out of rotation WITHOUT cooldown until a human re-runs `heygen:connect`.
+export type HeygenAccountStatus = "active" | "cooldown" | "disabled" | "needs_reauth";
 
 export interface HeygenAccount {
   id: string;
@@ -77,6 +79,12 @@ export interface HeygenAccount {
   cooldown_until: string | null;
   last_used_at: string | null;
   proxy: string | null;
+  // Last failure classification + reason, surfaced in the settings UI so an
+  // operator can tell a stale session apart from a real account problem.
+  last_error_class: string | null;
+  last_error: string | null;
+  // When the storageState was last successfully (re)connected by a human.
+  auth_saved_at: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;

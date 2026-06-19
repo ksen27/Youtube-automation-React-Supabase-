@@ -12,6 +12,7 @@ export type SyntheticProvider =
   | "sixtynine_tts"
   | "sixtynine_image"
   | "flux_image"
+  | "ltx2"
   | "fal_veo3_fast"
   | "fal_kling"
   | "heygen_avatar";
@@ -23,6 +24,9 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   sixtynine_tts:   { unit: "per_1k_chars", usd: 0.015 },
   sixtynine_image: { unit: "per_image",    usd: 0.04 },
   flux_image:      { unit: "per_image",    usd: 0.05 },
+  // LTX-2 bills per second of generated video. Placeholder rate — tune when
+  // the real per-second price is confirmed from api.ltx.video pricing.
+  ltx2:            { unit: "per_second",   usd: 0.08 },
   fal_veo3_fast:   { unit: "per_second",   usd: 0.10 },
   fal_kling:       { unit: "per_second",   usd: 0.06 },
   heygen_avatar:   { unit: "per_second",   usd: 0.02 },

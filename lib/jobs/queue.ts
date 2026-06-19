@@ -46,37 +46,65 @@ export interface ImageGenerationJobData  { projectId: string; mediaJobId: string
 export interface ImageToVideoJobData     { projectId: string; mediaJobId: string; segmentId: string; }
 export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; }
 
-// Idle BullMQ workers sit on a long blocking BRPOP. On Fly, idle TCP sockets
-// to the colocated Redis get torn down by the network layer after a few
-// minutes — surfacing as intermittent "read ECONNRESET" worker.error logs
-// even though ioredis silently reconnects. Enabling TCP keepalive every 30s
-// keeps the socket warm so the disconnect never happens.
+// Idle BullMQ workers sit on a long blocking BRPOP. Two distinct teardown
+// causes, depending on how a process reaches Redis:
+//   * COLOCATED (celebrity worker → localhost): idle TCP sockets get torn down
+//     by the network layer after a few minutes. keepAlive every 30s prevents it.
+//   * PUBLIC PROXY (avatar worker is a SEPARATE Fly app, and the Vercel app):
+//     these reach Redis at video-automation-worker.fly.dev:6379 THROUGH Fly's
+//     edge proxy, which forcibly RECYCLES long-lived connections every ~10-20
+//     min ("Fly Proxy process shutting down" → read ECONNRESET). keepAlive can't
+//     stop this — the proxy drops it regardless. The fix is to RECOVER FAST:
+//     treat ECONNRESET/EPIPE as immediately retryable and reconnect without a
+//     ready-check stall, so a recycled connection is back in milliseconds rather
+//     than seconds. Otherwise the worker spends its time reconnecting (6 queue
+//     connections all storming) instead of pulling jobs.
 const REDIS_BASE_OPTIONS = {
   maxRetriesPerRequest: null, // BullMQ requirement on shared connections.
-  enableReadyCheck: true,
+  // Skip the post-connect INFO round-trip. With a flaky proxy that ready-check
+  // is an extra RTT that can itself fail mid-handshake, stretching recovery.
+  enableReadyCheck: false,
   keepAlive: 30_000,
-  // Cap reconnect backoff at 2s. Default ramps to 2s after ~10 tries anyway;
-  // setting it explicitly means a Fly deploy / machine restart gets workers
-  // back on Redis within seconds of it being reachable, rather than waiting
-  // out the default cold-start ramp.
-  retryStrategy: (times: number) => Math.min(times * 100, 2000),
-  // Force a fresh connection when Redis answers but rejects commands —
-  // happens during the AOF-replay window on boot (LOADING) and during a
-  // failover (READONLY). ioredis would otherwise hold the broken socket
-  // until the next command attempt, surfacing as a stuck worker.
-  reconnectOnError: (err: Error) => /READONLY|LOADING/.test(err.message),
+  // Keep the connect attempt itself snappy so a recycled socket fails fast and
+  // retries fast rather than hanging on a dead proxy handle.
+  connectTimeout: 10_000,
+  // Tight reconnect backoff: 50ms → cap 1s. Proxy recycles are frequent, so we
+  // want the worker back on Redis almost immediately, not on a multi-second ramp.
+  retryStrategy: (times: number) => Math.min(times * 50, 1000),
+  // Reconnect immediately on the errors the Fly proxy produces when it recycles
+  // a connection (ECONNRESET / EPIPE / "Connection is closed"), plus the boot
+  // AOF-replay (LOADING) and failover (READONLY) cases. Returning 2 also
+  // RESENDS the in-flight command on the new connection so a BRPOP that died
+  // mid-recycle doesn't silently drop.
+  reconnectOnError: (err: Error) =>
+    /READONLY|LOADING|ECONNRESET|EPIPE|Connection is closed|ETIMEDOUT/i.test(err.message) ? 2 : false,
 } as const;
+
+// Managed Redis (Upstash / Fly Redis) uses rediss:// (TLS). ioredis auto-enables
+// TLS from the rediss:// scheme, but we pass an explicit tls block so SNI is set
+// from the host — some managed providers reject TLS without it. For plain
+// redis:// (the self-hosted box) this stays undefined and nothing changes.
+function tlsOptions(url: string): { tls?: { servername?: string } } {
+  if (!/^rediss:\/\//i.test(url)) return {};
+  try {
+    return { tls: { servername: new URL(url).hostname } };
+  } catch {
+    return { tls: {} };
+  }
+}
 
 let connection: Redis | null = null;
 export function getRedisConnection(): Redis {
   if (connection) return connection;
-  connection = new IORedis(getEnv().REDIS_URL, REDIS_BASE_OPTIONS);
+  const url = getEnv().REDIS_URL;
+  connection = new IORedis(url, { ...REDIS_BASE_OPTIONS, ...tlsOptions(url) });
   return connection;
 }
 
 // One-off clients for ad-hoc Redis ops (e.g. health pings).
 export function newRedisClient(): Redis {
-  return new IORedis(getEnv().REDIS_URL, REDIS_BASE_OPTIONS);
+  const url = getEnv().REDIS_URL;
+  return new IORedis(url, { ...REDIS_BASE_OPTIONS, ...tlsOptions(url) });
 }
 
 const queues = new Map<QueueName, Queue>();

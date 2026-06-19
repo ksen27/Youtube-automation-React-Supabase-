@@ -11,12 +11,15 @@ import { Badge } from "@/components/ui/badge";
 interface Account {
   id: string;
   email: string;
-  status: "active" | "cooldown" | "disabled";
+  status: "active" | "cooldown" | "disabled" | "needs_reauth";
   fail_count: number;
   cooldown_until: string | null;
   last_used_at: string | null;
   created_at: string;
   has_cookies: boolean;
+  last_error_class: string | null;
+  last_error: string | null;
+  auth_saved_at: string | null;
 }
 
 // HeyGen account-pool management for the synthetic engine's avatar automation.
@@ -63,14 +66,18 @@ export function HeygenAccounts() {
   });
 
   const accounts = q.data?.accounts ?? [];
-  const variant = (s: Account["status"]) => (s === "active" ? "success" : s === "cooldown" ? "warning" : "destructive");
+  const variant = (s: Account["status"]) =>
+    s === "active" ? "success" : s === "cooldown" ? "warning" : s === "needs_reauth" ? "warning" : "destructive";
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>HeyGen accounts</CardTitle>
         <CardDescription>
-          Account pool for avatar generation. Credentials are encrypted at rest. The worker rotates accounts on failure and cools down rate-limited ones.
+          Account pool for avatar generation. Credentials are encrypted at rest. Connect each account once with{" "}
+          <code className="text-[11px]">npm run heygen:connect &lt;email&gt;</code> (a one-time headed login) — the worker
+          then reuses that session and never logs in. An account marked <em>needs_reauth</em> has an expired session; just
+          re-run the connect command for it.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -93,19 +100,35 @@ export function HeygenAccounts() {
         ) : (
           <ul className="space-y-2">
             {accounts.map((a) => (
-              <li key={a.id} className="flex items-center gap-3 rounded-[8px] border border-border bg-surface px-3 py-2 text-sm">
-                <span className="truncate flex-1">{a.email}</span>
-                <Badge variant={variant(a.status)}>{a.status}</Badge>
-                {a.fail_count > 0 && <span className="text-[11px] text-fg-subtle tabular-nums">{a.fail_count} fail</span>}
-                {a.has_cookies && <span className="text-[11px] text-emerald-400">session</span>}
-                <span className="text-[11px] text-fg-subtle">{a.last_used_at ? new Date(a.last_used_at).toLocaleDateString() : "unused"}</span>
-                <Button type="button" variant="ghost" size="xs" title={a.status === "disabled" ? "Enable" : "Disable"}
-                  onClick={() => setStatus.mutate({ id: a.id, status: a.status === "disabled" ? "active" : "disabled" })}>
-                  <Power className="h-3.5 w-3.5" />
-                </Button>
-                <Button type="button" variant="ghost" size="xs" onClick={() => remove.mutate(a.id)}>
-                  <Trash2 className="h-3.5 w-3.5 text-danger" />
-                </Button>
+              <li key={a.id} className="flex flex-col gap-1 rounded-[8px] border border-border bg-surface px-3 py-2 text-sm">
+                <div className="flex items-center gap-3">
+                  <span className="truncate flex-1">{a.email}</span>
+                  <Badge variant={variant(a.status)}>{a.status === "needs_reauth" ? "needs re-auth" : a.status}</Badge>
+                  {a.fail_count > 0 && <span className="text-[11px] text-fg-subtle tabular-nums">{a.fail_count} fail</span>}
+                  {a.has_cookies ? (
+                    <span className="text-[11px] text-emerald-400" title={a.auth_saved_at ? `Connected ${new Date(a.auth_saved_at).toLocaleString()}` : undefined}>session</span>
+                  ) : (
+                    <span className="text-[11px] text-amber-400">no session</span>
+                  )}
+                  <span className="text-[11px] text-fg-subtle">{a.last_used_at ? new Date(a.last_used_at).toLocaleDateString() : "unused"}</span>
+                  <Button type="button" variant="ghost" size="xs" title={a.status === "disabled" ? "Enable" : "Disable"}
+                    onClick={() => setStatus.mutate({ id: a.id, status: a.status === "disabled" ? "active" : "disabled" })}>
+                    <Power className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button type="button" variant="ghost" size="xs" onClick={() => remove.mutate(a.id)}>
+                    <Trash2 className="h-3.5 w-3.5 text-danger" />
+                  </Button>
+                </div>
+                {a.status === "needs_reauth" && (
+                  <p className="text-[11px] text-amber-400">
+                    Session expired — run <code>npm run heygen:connect {a.email}</code> to reconnect.
+                  </p>
+                )}
+                {a.last_error && a.status !== "needs_reauth" && (
+                  <p className="text-[11px] text-fg-subtle truncate" title={a.last_error}>
+                    {a.last_error_class ? `${a.last_error_class}: ` : ""}{a.last_error}
+                  </p>
+                )}
               </li>
             ))}
           </ul>
