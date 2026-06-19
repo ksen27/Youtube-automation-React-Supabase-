@@ -30,7 +30,7 @@ import {
   removePhoto,
   selectedPhoto,
   scriptField,
-  generateButton,
+  generateButtonEnabled,
   voicePickerButton,
   projectVideoCards,
   cardStillRendering,
@@ -157,13 +157,24 @@ async function retrieveRenderedVideo(
 
   // Go to Projects (newest first) and open the most recent video card. Poll
   // until the newest card has finished rendering (no spinner / has a duration).
+  //
+  // Two bounded waits so we NEVER reload forever:
+  //   * appearDeadline — a short window for SOME card to show up at all. If no
+  //     card ever appears, generation didn't produce a project (bail fast).
+  //   * deadline — the full render budget, used only once a (rendering) card is
+  //     present, to wait for it to FINISH.
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
+  const appearDeadline = Date.now() + 90_000; // a project must appear within 90s
   let opened = false;
+  let everSawCard = false;
   while (Date.now() < deadline) {
     await page.goto(`${e.HEYGEN_BASE_URL}/projects`, { waitUntil: "commit" }).catch(() => {});
     const newest = projectVideoCards(page).locator("visible=true").first();
-    if (await newest.isVisible({ timeout: 10_000 }).catch(() => false)) {
-      // If the newest card is still rendering, wait and re-poll.
+    const visible = await newest.isVisible({ timeout: 10_000 }).catch(() => false);
+
+    if (visible) {
+      everSawCard = true;
+      // Still rendering -> wait and re-poll (within the full render deadline).
       if (await isVisible(cardStillRendering(newest), 1500)) {
         await page.waitForTimeout(5000);
         continue;
@@ -172,10 +183,21 @@ async function retrieveRenderedVideo(
       opened = true;
       break;
     }
+
+    // No card yet. If we've blown the short appear-window without EVER seeing a
+    // card, generation almost certainly didn't start — bail instead of looping
+    // for the full 10-minute render budget.
+    if (!everSawCard && Date.now() > appearDeadline) {
+      await captureDiagnostics(page, "projects", "no_card");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: no project appeared within 90s of Generate — generation likely never started",
+      );
+    }
     await page.waitForTimeout(5000);
   }
   if (!opened) {
-    throw new HeygenError("ui_changed", "heygen: rendered video never appeared in Projects");
+    throw new HeygenError("ui_changed", "heygen: rendered video never finished in Projects");
   }
 
   // Prefer the sniffed CDN url (pull it through the authed context so cookies
@@ -287,11 +309,39 @@ async function attemptOnAccount(
     // see ensureVoicePresent). HeyGen's audio is discarded at render anyway.
     await ensureVoicePresent(p);
 
-    // 7) Kick off the render. HeyGen renders ASYNCHRONOUSLY: clicking Generate
-    // does not produce the file on this page — it sends the avatar to the
-    // /projects grid where it appears (and finishes rendering) minutes later.
-    await clickFirstVisible(generateButton(p), e.HEYGEN_NAV_TIMEOUT_MS, "generate button");
+    // 7) Kick off the render. HeyGen DISABLES the Generate button until it
+    // considers the composer complete, so we must wait for it to become ENABLED
+    // before clicking — otherwise the click no-ops and we'd poll Projects
+    // forever for a video that never renders. Fail loudly if it never enables
+    // (that means an input didn't register, not an async render in progress).
+    const genEnabled = generateButtonEnabled(p);
+    try {
+      await genEnabled.first().waitFor({ state: "visible", timeout: 30_000 });
+    } catch {
+      await captureDiagnostics(p, input.jobId, "generate_disabled");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: Generate button never enabled — photo or script did not register",
+      );
+    }
+    await genEnabled.first().click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS });
     await shot(p, input.projectId, input.segmentId, "generating");
+
+    // Confirm generation actually STARTED before we go poll Projects: HeyGen
+    // either navigates away from the composer or the Generate button flips to a
+    // disabled/loading state. If neither happens, the click didn't take.
+    const started = await Promise.race([
+      p.waitForURL((u) => !u.toString().includes("/avatar"), { timeout: 30_000 }).then(() => true).catch(() => false),
+      genEnabled
+        .first()
+        .waitFor({ state: "hidden", timeout: 30_000 })
+        .then(() => true)
+        .catch(() => false),
+    ]);
+    if (!started) {
+      await captureDiagnostics(p, input.jobId, "generate_no_start");
+      throw new HeygenError("ui_changed", "heygen: Generate clicked but generation did not start");
+    }
 
     // 8–9) Retrieve the finished video from the Projects page (the only place
     // the rendered mp4 exists). Returns the downloaded bytes.

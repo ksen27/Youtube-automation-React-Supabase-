@@ -148,19 +148,32 @@ export function voiceConfirm(page: Page): Locator {
     .getByRole("button", { name: /use|select|confirm|apply|done/i });
 }
 
-// The render kickoff. It is an ICON-ONLY circular up-arrow (submit) button with
-// no visible text, so we match by accessible name (aria-label often "Submit"/
-// "Generate"/"Send"), then by a text button as a fallback, then by the
-// bottom-right submit-shaped control. We deliberately scope the icon fallback
-// to a button that is NOT the script's mic/upload icons.
+// The render kickoff. Verified in the real DOM: a button with aria-label
+// "Generate" (icon-only, no text). CRITICAL: HeyGen DISABLES this button until
+// it considers the composer complete (photo + script present) — the disabled
+// state carries `disabled` / tw-*-disabled classes. We must only click it once
+// ENABLED, else the click no-ops and the flow proceeds to a doomed Projects
+// poll. generateButtonEnabled() narrows to the clickable instance.
 export function generateButton(page: Page): Locator {
   return page
-    .getByRole("button", { name: /generate|submit|send|create video|render/i })
-    .or(page.locator('button[type="submit"]'))
-    // Icon-only round button at the bottom-right of the composer. HeyGen renders
-    // it as the last button in the panel; match a button whose only child is an
-    // arrow/send icon. (Kept last so the named matches win when present.)
-    .or(page.locator('button:has(svg[class*="arrow"]), button:has(svg[class*="send"])'));
+    .getByRole("button", { name: /^generate$/i })
+    .or(page.getByRole("button", { name: /generate|submit|send|create video|render/i }))
+    .or(page.locator('button[type="submit"]'));
+}
+
+// The Generate button restricted to its ENABLED state. It's the bright blue
+// circular ↑ submit button in the bottom-right of the composer (aria-label
+// "Generate", primary brand color when enabled). Playwright's disabled:false
+// excludes [disabled]/aria-disabled. We add a brand-colored enabled-button
+// fallback in case the accessible name differs across HeyGen builds.
+export function generateButtonEnabled(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^generate$/i, disabled: false })
+    .or(page.getByRole("button", { name: /generate|create video|render/i, disabled: false }))
+    // Enabled primary (brand-colored) submit button that is NOT disabled — the
+    // composer's send/generate control. Scoped to the brand bg so it doesn't
+    // match neutral toolbar buttons.
+    .or(page.locator('button.tw-bg-brand:not([disabled]):not(.tw-cursor-not-allowed)'));
 }
 
 export function renderDoneMarker(page: Page): Locator {
