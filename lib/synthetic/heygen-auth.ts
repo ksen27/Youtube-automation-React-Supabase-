@@ -105,12 +105,19 @@ export async function verifyAuthenticated(page: Page): Promise<AuthVerdict> {
   // `commit` and then probe concrete elements.
   await page.goto(`${e.HEYGEN_BASE_URL}/home`, { waitUntil: "commit" }).catch(() => {});
 
-  // Give the SPA a bounded chance to render either outcome.
+  // Give the SPA a bounded chance to render either outcome. Verified 2026-06-19:
+  // through the residential proxy the authed nav reliably renders, but only at
+  // ~14.5s — right at the edge of the old hardcoded 15s budget, so any extra
+  // latency tipped a VALID session into a FALSE "expired" (which then flagged
+  // the account needs_reauth and stranded the pool). We give the marker a much
+  // more generous budget (env-driven, default 45s) so a slow-but-authenticated
+  // workspace is never mistaken for an expired session.
+  const markerTimeout = e.HEYGEN_AUTH_MARKER_TIMEOUT_MS;
   const authedFirst = authedMarker(page).locator("visible=true").first();
   const signInFirst = signInMarker(page).locator("visible=true").first();
   await Promise.race([
-    authedFirst.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {}),
-    signInFirst.waitFor({ state: "visible", timeout: 15_000 }).catch(() => {}),
+    authedFirst.waitFor({ state: "visible", timeout: markerTimeout }).catch(() => {}),
+    signInFirst.waitFor({ state: "visible", timeout: markerTimeout }).catch(() => {}),
   ]);
 
   // Authority order, strongest first:
@@ -133,12 +140,25 @@ export async function verifyAuthenticated(page: Page): Promise<AuthVerdict> {
   //      "sign in"-ish nodes (menus, tooltips, hidden auth widgets), and the
   //      false "expired" they caused is exactly what stranded the pool. The
   //      authed marker is the trustworthy positive signal.
-  if (await isVisible(authedMarker(page), 2000)) return "authed";
+  if (await isVisible(authedMarker(page), 3000)) return "authed";
 
   //   3. No workspace marker AND a sign-in affordance => expired.
   if (await isVisible(signInMarker(page), 1500)) return "expired";
 
-  // 4. Nothing conclusive — treat as expired (safer than a doomed render).
+  //   4. Still nothing conclusive. Before defaulting to expired (which strands
+  //      the account on needs_reauth), give the authed marker ONE more bounded
+  //      chance — the SPA may still be hydrating behind a slow proxy. Only after
+  //      this do we treat it as expired.
+  if (
+    await authedFirst
+      .waitFor({ state: "visible", timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false)
+  ) {
+    return "authed";
+  }
+
+  // 5. Genuinely inconclusive — treat as expired (safer than a doomed render).
   return "expired";
 }
 

@@ -404,6 +404,11 @@ const ServerEnvSchema = z.object({
   HEYGEN_HEADLESS: z.coerce.boolean().default(true),
   // Per-attempt timeout (ms) for one HeyGen avatar generation in the browser.
   HEYGEN_NAV_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // How long verifyAuthenticated waits for the authed/sign-in marker to render
+  // before judging the session. The heavy HeyGen SPA renders its nav at ~14.5s
+  // through a residential proxy — the old hardcoded 15s caused FALSE expiries
+  // (a valid session timed out and got flagged needs_reauth). Default 45s.
+  HEYGEN_AUTH_MARKER_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
   // How long an avatar render may take inside HeyGen before we give up (ms).
   HEYGEN_RENDER_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   // fail_count threshold past which an account is auto-disabled (taken out of

@@ -12,6 +12,7 @@
     "heygen:reactivate": "tsx scripts/heygen-reactivate.ts",
     "heygen:status": "tsx scripts/heygen-status.ts",
     "heygen:stop": "tsx scripts/heygen-stop.ts",
+    "heygen:debug-gen": "tsx scripts/heygen-debug-gen.ts",
     "test:synthetic": "tsx scripts/test-synthetic.ts",
     "db:migrate": "echo 'Run the SQL files in supabase/migrations/ via the Supabase SQL editor or `supabase db push`.'",
     "lint": "eslint .",

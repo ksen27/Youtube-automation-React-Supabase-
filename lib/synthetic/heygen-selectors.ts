@@ -80,15 +80,19 @@ export function photoUpload(page: Page): Locator {
   return page.locator('input[type="file"][accept*="image"], input[type="file"]');
 }
 
-// The control that opens the photo upload (the ↑ icon in the photo pane, or an
-// "Upload"/"Add" affordance). Clicking it either reveals the file input or
-// fires a native file chooser. Matched broadly because it is icon-only.
+// The control that opens the photo upload. On the current /avatar "Photo to
+// video" UI this is a DIV with role="button", text "Upload", and an
+// svg use[href="#to-top"] icon (NOT a <button>) — so matching must not assume
+// the button tag. We also accept the "Upload photo or drag and drop here"
+// dropzone, and the legacy icon-button variants, for resilience across builds.
 export function uploadTrigger(page: Page): Locator {
   return page
-    .getByRole("button", { name: /upload|add (photo|image)|choose|browse/i })
-    .or(page.locator('button:has(svg use[href="#to-top"])'))
-    .or(page.locator('button:has(svg use[href="#add-image"])'))
-    .or(page.locator('button:has(svg use[href="#upload"])'));
+    .getByRole("button", { name: /^upload$|upload|add (photo|image)|choose|browse/i })
+    .or(page.getByText(/upload photo or drag and drop/i))
+    .or(page.locator('[role="button"]:has(svg use[href="#to-top"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#to-top"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#add-image"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#upload"])'));
 }
 
 // The "remove selected photo" X button overlaid on the photo preview
@@ -141,11 +145,42 @@ export function voiceOption(page: Page, name: string): Locator {
     .or(page.getByRole("option", { name: rx }));
 }
 
+// A selectable voice ROW in the modal's "My voices" list. Verified 2026-06-19:
+// each row has a ▶ play button (svg use[href="#play-s"] / "#play"), the voice
+// name + meta ("Japan - Voice 2 / ElevenLabs, Multilingual, Male"), and a "..."
+// menu. Clicking the row (NOT the play button) selects it, which ENABLES the
+// "Select voice" confirm button. We target rows that contain a play control so
+// we don't match the header tiles ("Clone your voice" etc.). Caller picks
+// .first() — any voice works (HeyGen audio is discarded at render).
+export function voiceRows(page: Page): Locator {
+  const dlg = page.getByRole("dialog");
+  return dlg
+    .locator('[role="option"]')
+    .or(dlg.locator(':is(li,[role="row"],div):has(svg use[href="#play-s"])'))
+    .or(dlg.locator(':is(li,[role="row"],div):has(svg use[href="#play"])'));
+}
+
+// The "Please select a voice" validation toast HeyGen flashes when Generate is
+// clicked before the voice has committed into form state (a RACE — the toolbar
+// pill shows a voice, but the controlled state lagged). Detecting it lets the
+// caller re-commit the voice and retry rather than abandoning the render.
+export function voiceRequiredToast(page: Page): Locator {
+  return page.getByText(/please select (a |the )?voice/i);
+}
+
 // "Use"/"Select"/"Confirm" button in the voice modal (commit the chosen voice).
+// The current UI's button reads "Select voice" and is DISABLED until a row is
+// clicked — so callers must select a row first, then wait for this to enable.
 export function voiceConfirm(page: Page): Locator {
   return page
     .getByRole("dialog")
-    .getByRole("button", { name: /use|select|confirm|apply|done/i });
+    .getByRole("button", { name: /select voice|^use$|^select$|confirm|apply|done/i });
+}
+
+export function voiceConfirmEnabled(page: Page): Locator {
+  return page
+    .getByRole("dialog")
+    .getByRole("button", { name: /select voice|^use$|^select$|confirm|apply|done/i, disabled: false });
 }
 
 // The render kickoff. Verified in the real DOM: a button with aria-label
@@ -155,8 +190,10 @@ export function voiceConfirm(page: Page): Locator {
 // ENABLED, else the click no-ops and the flow proceeds to a doomed Projects
 // poll. generateButtonEnabled() narrows to the clickable instance.
 export function generateButton(page: Page): Locator {
+  // The real accessible name is "Generate for 1 credit" (the cost is appended),
+  // so anchor on a LEADING /generate/ rather than an exact /^generate$/ match.
   return page
-    .getByRole("button", { name: /^generate$/i })
+    .getByRole("button", { name: /^generate\b/i })
     .or(page.getByRole("button", { name: /generate|submit|send|create video|render/i }))
     .or(page.locator('button[type="submit"]'));
 }
@@ -167,13 +204,15 @@ export function generateButton(page: Page): Locator {
 // excludes [disabled]/aria-disabled. We add a brand-colored enabled-button
 // fallback in case the accessible name differs across HeyGen builds.
 export function generateButtonEnabled(page: Page): Locator {
+  // Name is "Generate for 1 credit" — anchor on leading /generate/, NOT exact.
+  // The button is a plain pill (prism:tw-rounded-[100px]), NOT brand-colored, so
+  // the old .tw-bg-brand fallback never matched it. We instead fall back to an
+  // enabled button whose ACCESSIBLE NAME contains "generate" (the credit suffix
+  // varies: "for 1 credit", "for N credits", or none on paid plans).
   return page
-    .getByRole("button", { name: /^generate$/i, disabled: false })
+    .getByRole("button", { name: /^generate\b/i, disabled: false })
     .or(page.getByRole("button", { name: /generate|create video|render/i, disabled: false }))
-    // Enabled primary (brand-colored) submit button that is NOT disabled — the
-    // composer's send/generate control. Scoped to the brand bg so it doesn't
-    // match neutral toolbar buttons.
-    .or(page.locator('button.tw-bg-brand:not([disabled]):not(.tw-cursor-not-allowed)'));
+    .or(page.locator('button:not([disabled]):not(.tw-cursor-not-allowed)', { hasText: /generate/i }));
 }
 
 export function renderDoneMarker(page: Page): Locator {

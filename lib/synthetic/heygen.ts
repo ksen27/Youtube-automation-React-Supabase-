@@ -31,14 +31,10 @@ import {
   selectedPhoto,
   scriptField,
   generateButtonEnabled,
-  voicePickerButton,
-  projectVideoCards,
-  cardStillRendering,
-  projectVideoElement,
-  projectDownloadButton,
-  moreActionsButton,
+  voiceRows,
+  voiceConfirmEnabled,
+  voiceRequiredToast,
   clickFirstVisible,
-  fillFirstVisible,
   waitFirstVisible,
   isVisible,
 } from "@/lib/synthetic/heygen-selectors";
@@ -116,119 +112,130 @@ async function uploadViaChooser(page: Page, filePath: string, timeoutMs: number)
   }
 }
 
-// Ensure a usable voice is selected before generating, WITHOUT opening the
-// voice-detail modal. HeyGen's avatar composer already has a voice selected by
-// default (the toolbar pill, e.g. "Japan - Voice 2"), and our pipeline discards
-// HeyGen's audio at render anyway (the 69labs master voiceover is muxed in), so
-// the specific voice is irrelevant — we only need SOME voice set so HeyGen
-// doesn't block with "Please select the voice id".
-//
-// IMPORTANT: do NOT click the voice pill here. Clicking it opens a "Voice for
-// <name>" detail modal (Switch / Speed / Accent / Save changes) that has no
-// search box and would strand the flow. We just confirm a voice pill exists and
-// move on; if a future avatar truly has none, the generate step's error is
-// captured + classified normally rather than hanging in a modal.
-async function ensureVoicePresent(page: Page): Promise<void> {
-  // The toolbar voice pill (any "... Voice ..." button) being present means a
-  // voice is already selected. Best-effort, short budget, never opens a modal.
-  await isVisible(voicePickerButton(page), 3000);
+// FALLBACK ONLY: explicitly commit a voice via the picker. Used when Generate
+// flashed "Please select a voice" (a state race — a voice is already shown). We
+// open the picker, click the first voice row, and confirm. Any voice is fine —
+// HeyGen's audio is discarded at render (the 69labs master voiceover is muxed
+// in). Best-effort and self-contained; never leaves a modal open.
+async function commitVoice(page: Page): Promise<void> {
+  const e = env();
+  const dialog = page.getByRole("dialog");
+  const pill = page.locator('button:has(svg use[href="#audio"])').locator("visible=true").first();
+  let opened = false;
+  for (let i = 0; i < 3 && !opened; i++) {
+    await pill.click({ timeout: 10_000, force: i > 0 }).catch(() => {});
+    opened = await isVisible(dialog, 6000);
+  }
+  if (!opened) return;
+  const firstRow = voiceRows(page).locator("visible=true").first();
+  await firstRow.click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
+  await voiceConfirmEnabled(page).first().click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
+  await dialog.first().waitFor({ state: "hidden", timeout: 8000 }).catch(() => {});
 }
 
-// Retrieve the finished avatar video from HeyGen's Projects page. HeyGen renders
-// asynchronously and drops the result into /projects (newest first), so we:
-//   1) navigate to /projects and open the newest video card,
-//   2) wait (up to the render timeout) for it to finish rendering,
-//   3) capture the mp4 — primarily by sniffing the CDN response the player
-//      loads (most robust), falling back to the Download control.
-// Returns the video bytes or throws a classified HeygenError.
+// HeyGen's project-list API. The Projects PAGE is a flaky SPA (hover-only card
+// menus, portaled dialogs, stale/blank grids, no card hrefs) that proved
+// unreliable to scrape. Instead we call the SAME JSON API the page itself uses
+// (verified 2026-06-19): it returns avatar videos newest-first, each with a
+// stable `video_id`, a `status` ("completed" when done), and a directly
+// downloadable signed `video_url`. Far more robust than the DOM.
+const HEYGEN_ITEMS_API =
+  "https://api2.heygen.com/v1/project/items?limit=20&filter_groups=avatar_video&sort_key=created_ts&sort_order=desc";
+
+interface HeygenProjectItem {
+  video_id: string;
+  status: string; // "completed" | "processing" | "pending" | "failed" | ...
+  duration?: number;
+  created_ts?: number;
+  video_url?: string;
+  video_download_url?: string;
+  error_message?: string;
+}
+
+// Fetch the avatar-video list via the authed browser context (cookies apply).
+async function fetchProjectItems(context: BrowserContext): Promise<HeygenProjectItem[]> {
+  const resp = await context.request.get(HEYGEN_ITEMS_API, { timeout: env().HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
+  if (!resp || !resp.ok()) return [];
+  const json = (await resp.json().catch(() => null)) as { data?: { items?: HeygenProjectItem[] } } | null;
+  return json?.data?.items ?? [];
+}
+
+// The newest item's video_id (the baseline taken just before we generate, so we
+// can tell OUR render apart from prior ones). "" when the list is empty.
+async function newestItemId(context: BrowserContext): Promise<string> {
+  const items = await fetchProjectItems(context);
+  return items[0]?.video_id ?? "";
+}
+
+// Retrieve the finished avatar video via the project-list API. Polls until OUR
+// render (newest item whose video_id != baseline) reaches status "completed",
+// then downloads its signed video_url. Throws a classified HeygenError on
+// timeout / failure. `baselineId` is the newest video_id captured pre-generate.
 async function retrieveRenderedVideo(
   page: Page,
   context: BrowserContext,
+  baselineId = "",
 ): Promise<Buffer> {
   const e = env();
-
-  // Start sniffing for the rendered mp4 as soon as we navigate — HeyGen's player
-  // streams it from a CDN; catching that response is more reliable than DOM.
-  const mp4Promise = page
-    .waitForResponse((r) => /\.mp4(\?|$)/i.test(r.url()) && r.status() < 400, {
-      timeout: e.HEYGEN_RENDER_TIMEOUT_MS,
-    })
-    .catch(() => null);
-
-  // Go to Projects (newest first) and open the most recent video card. Poll
-  // until the newest card has finished rendering (no spinner / has a duration).
-  //
-  // Two bounded waits so we NEVER reload forever:
-  //   * appearDeadline — a short window for SOME card to show up at all. If no
-  //     card ever appears, generation didn't produce a project (bail fast).
-  //   * deadline — the full render budget, used only once a (rendering) card is
-  //     present, to wait for it to FINISH.
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
-  const appearDeadline = Date.now() + 90_000; // a project must appear within 90s
-  let opened = false;
-  let everSawCard = false;
-  while (Date.now() < deadline) {
-    await page.goto(`${e.HEYGEN_BASE_URL}/projects`, { waitUntil: "commit" }).catch(() => {});
-    const newest = projectVideoCards(page).locator("visible=true").first();
-    const visible = await newest.isVisible({ timeout: 10_000 }).catch(() => false);
+  const appearDeadline = Date.now() + 180_000; // our item must show up within 3 min
 
-    if (visible) {
-      everSawCard = true;
-      // Still rendering -> wait and re-poll (within the full render deadline).
-      if (await isVisible(cardStillRendering(newest), 1500)) {
-        await page.waitForTimeout(5000);
-        continue;
+  let ours: HeygenProjectItem | null = null;
+  let everSawOurs = false;
+  while (Date.now() < deadline) {
+    const items = await fetchProjectItems(context);
+    // OUR render is the newest item whose id differs from the pre-generate
+    // baseline. (At avatar concurrency=1 nobody else is adding items.)
+    const candidate = items.find((it) => it.video_id && it.video_id !== baselineId) ?? null;
+
+    if (candidate) {
+      everSawOurs = true;
+      const status = (candidate.status ?? "").toLowerCase();
+      if (status === "completed" || status === "success" || status === "done") {
+        ours = candidate;
+        break;
       }
-      await newest.click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
-      opened = true;
-      break;
+      if (status === "failed" || status === "error") {
+        throw new HeygenError(
+          "ui_changed",
+          `heygen: render failed on HeyGen side${candidate.error_message ? ` — ${candidate.error_message}` : ""}`,
+        );
+      }
+      // Still processing — wait and re-poll within the render budget.
+      await page.waitForTimeout(5000);
+      continue;
     }
 
-    // No card yet. If we've blown the short appear-window without EVER seeing a
-    // card, generation almost certainly didn't start — bail instead of looping
-    // for the full 10-minute render budget.
-    if (!everSawCard && Date.now() > appearDeadline) {
-      await captureDiagnostics(page, "projects", "no_card");
+    // Our item hasn't appeared yet. If it never does within the appear window,
+    // generation likely never produced a project.
+    if (!everSawOurs && Date.now() > appearDeadline) {
       throw new HeygenError(
         "ui_changed",
-        "heygen: no project appeared within 90s of Generate — generation likely never started",
+        "heygen: our render never appeared in the project list within 3 min — generation likely never started",
       );
     }
     await page.waitForTimeout(5000);
   }
-  if (!opened) {
-    throw new HeygenError("ui_changed", "heygen: rendered video never finished in Projects");
+
+  if (!ours) {
+    throw new HeygenError("ui_changed", "heygen: render did not complete within the render budget");
   }
 
-  // Prefer the sniffed CDN url (pull it through the authed context so cookies
-  // apply); else read the <video> src; else click Download and capture the file.
-  const sniffed = await mp4Promise;
-  let videoUrl: string | null = sniffed?.url() ?? null;
-  if (!videoUrl) {
-    videoUrl = await projectVideoElement(page)
-      .first()
-      .evaluate((el) => (el as HTMLVideoElement).currentSrc || el.getAttribute("src"))
-      .catch(() => null);
+  const url = ours.video_url || ours.video_download_url;
+  if (!url || !/^https?:/.test(url)) {
+    throw new HeygenError("ui_changed", "heygen: completed render has no downloadable video_url");
   }
 
-  if (videoUrl && /^https?:/.test(videoUrl)) {
-    const resp = await context.request.get(videoUrl, { timeout: e.HEYGEN_NAV_TIMEOUT_MS });
-    if (resp.ok()) return Buffer.from(await resp.body());
+  // Download the signed mp4 through the authed context.
+  const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
+  if (!resp || !resp.ok()) {
+    throw new HeygenError("ui_changed", `heygen: failed to download rendered mp4 (HTTP ${resp?.status() ?? "n/a"})`);
   }
-
-  // Fallback: open the more-actions menu if needed, click Download, capture it.
-  if (!(await isVisible(projectDownloadButton(page), 2000))) {
-    await clickFirstVisible(moreActionsButton(page), 10_000, "more actions").catch(() => {});
+  const buf = Buffer.from(await resp.body());
+  if (buf.length < 1024) {
+    throw new HeygenError("ui_changed", `heygen: downloaded mp4 implausibly small (${buf.length} bytes)`);
   }
-  const [download] = await Promise.all([
-    page.waitForEvent("download", { timeout: e.HEYGEN_NAV_TIMEOUT_MS }),
-    clickFirstVisible(projectDownloadButton(page), e.HEYGEN_NAV_TIMEOUT_MS, "download control"),
-  ]).catch(() => [null] as const);
-  if (download) {
-    const dlPath = await download.path();
-    if (dlPath) return await fs.readFile(dlPath);
-  }
-  throw new HeygenError("ui_changed", "heygen: could not retrieve rendered video from Projects");
+  return buf;
 }
 
 // One full avatar generation attempt on a single account. Throws a classified
@@ -257,6 +264,12 @@ async function attemptOnAccount(
       );
     }
     await shot(p, input.projectId, input.segmentId, "authed");
+
+    // 1.5) Record the NEWEST project's video_id (via the project-list API)
+    // BEFORE we generate, so the retrieval step can tell OUR new render apart
+    // from prior renders already at the top of the list. Best-effort: "" on any
+    // hiccup just means retrieval treats the first new completed item as ours.
+    const baselineId = await newestItemId(context).catch(() => "");
 
     // 2) Go straight to the avatar "Quick create" workspace. (verifyAuthenticated
     // left us on /home; the avatar composer lives at /avatar.)
@@ -302,18 +315,57 @@ async function attemptOnAccount(
     await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
     await shot(p, input.projectId, input.segmentId, "uploaded");
 
-    // 5) Drive the avatar with the narration script.
-    await fillFirstVisible(scriptField(p), input.script, e.HEYGEN_NAV_TIMEOUT_MS, "script field");
+    // NOTE: we do NOT touch the voice. The composer already has a real voice
+    // committed by default (the toolbar pill, e.g. "Japan - Voice 2") — exactly
+    // as in the manual flow — so opening the voice picker is unnecessary and
+    // only risks stranding the flow. HeyGen's audio is discarded at render
+    // anyway (the 69labs master voiceover is muxed in).
 
-    // 6) Confirm a voice is already selected (does NOT open the voice modal —
-    // see ensureVoicePresent). HeyGen's audio is discarded at render anyway.
-    await ensureVoicePresent(p);
+    // 5) Drive the avatar with the narration script — done LAST, right before
+    // Generate, because the photo upload re-renders the composer and a script
+    // filled before that re-render gets wiped (observed 2026-06-19: the script
+    // textarea was empty at Generate, so the click no-op'd).
+    //
+    // The script box is a CONTROLLED React <textarea>; a bare .fill() sets the
+    // DOM value but React can overwrite it on the next render. We fill, then
+    // VERIFY the value stuck, and fall back to real keystrokes if it didn't.
+    const scriptBox = scriptField(p).locator("visible=true").first();
+    await scriptBox.fill(input.script, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
+    const stuck = await scriptBox.inputValue().catch(() => "");
+    if (stuck.trim() !== input.script.trim()) {
+      // Re-type with real keystrokes so React's onChange fires per character.
+      await scriptBox.fill("").catch(() => {});
+      await scriptBox.pressSequentially(input.script, { delay: 1, timeout: e.HEYGEN_NAV_TIMEOUT_MS });
+      const stuck2 = await scriptBox.inputValue().catch(() => "");
+      if (stuck2.trim().length === 0) {
+        await captureDiagnostics(p, input.jobId, "script_not_set");
+        throw new HeygenError("ui_changed", "heygen: script field would not accept text");
+      }
+    }
 
-    // 7) Kick off the render. HeyGen DISABLES the Generate button until it
-    // considers the composer complete, so we must wait for it to become ENABLED
-    // before clicking — otherwise the click no-ops and we'd poll Projects
-    // forever for a video that never renders. Fail loudly if it never enables
-    // (that means an input didn't register, not an async render in progress).
+    // Let the composer SETTLE before submitting. Blur the script box (commit its
+    // value) and pause so React flushes the photo + script + voice into form
+    // state. Verified 2026-06-19: clicking Generate too fast races the state and
+    // HeyGen flashes "Please select a voice" even though a voice IS selected.
+    await p.keyboard.press("Tab").catch(() => {});
+    await p.waitForTimeout(1500);
+
+    // 7) Kick off the render.
+    //
+    // IMPORTANT (verified 2026-06-19 against the live /avatar UI): the Generate
+    // button — accessible name "Generate for 1 credit" — is ENABLED even when no
+    // photo is uploaded. So "button enabled" is NOT proof the composer is ready;
+    // the trustworthy readiness signal is the uploaded-photo PREVIEW, which we
+    // already waited for at step 4 (selectedPhoto). We re-assert it here so a
+    // silently-failed upload fails LOUD now instead of as an empty Projects poll
+    // 90s later.
+    if (!(await isVisible(selectedPhoto(p), 3000))) {
+      await captureDiagnostics(p, input.jobId, "no_photo_before_generate");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: photo preview missing before Generate — upload did not register",
+      );
+    }
     const genEnabled = generateButtonEnabled(p);
     try {
       await genEnabled.first().waitFor({ state: "visible", timeout: 30_000 });
@@ -324,28 +376,108 @@ async function attemptOnAccount(
         "heygen: Generate button never enabled — photo or script did not register",
       );
     }
-    await genEnabled.first().click({ timeout: e.HEYGEN_NAV_TIMEOUT_MS });
-    await shot(p, input.projectId, input.segmentId, "generating");
+    // Click Generate and CONFIRM it took. The button is the SAME element in both
+    // visual states — a wide "Generate for 1 credit" text pill OR a compact
+    // circular ↑ icon (layout-dependent) — and BOTH carry aria-label="Generate
+    // for 1 credit" (verified 2026-06-19). The click is FLAKY: the button's class
+    // list includes `data-[loading=true]:tw-pointer-events-none`, so if we click
+    // during a transient loading/disabled frame the click silently no-ops and the
+    // composer just sits there. We therefore target the stable aria-label, escalate
+    // through normal -> force -> DOM click, and RE-CLICK until a positive start
+    // signal appears (the button leaving its enabled state / a route to projects).
+    const genByLabel = p
+      .getByRole("button", { name: /generate/i })
+      .locator("visible=true")
+      .first();
+    let started = false;
+    let everClicked = false;
+    for (let attempt = 0; attempt < 4 && !started; attempt++) {
+      // Make sure it's actually clickable (not mid-loading) before clicking.
+      await genByLabel.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+      let clicked = false;
+      try {
+        await genByLabel.click({ timeout: 15_000 });
+        clicked = true;
+      } catch {
+        // Bypass actionability (overlay / pointer-events) on retry.
+        try {
+          await genByLabel.click({ timeout: 5000, force: true });
+          clicked = true;
+        } catch {
+          // Last resort: dispatch a DOM click straight to the element.
+          clicked = await genByLabel
+            .evaluate((el) => {
+              (el as HTMLElement).click();
+              return true;
+            })
+            .catch(() => false);
+        }
+      }
+      everClicked = everClicked || clicked;
+      if (attempt === 0) await shot(p, input.projectId, input.segmentId, "generating");
 
-    // Confirm generation actually STARTED before we go poll Projects: HeyGen
-    // either navigates away from the composer or the Generate button flips to a
-    // disabled/loading state. If neither happens, the click didn't take.
-    const started = await Promise.race([
-      p.waitForURL((u) => !u.toString().includes("/avatar"), { timeout: 30_000 }).then(() => true).catch(() => false),
-      genEnabled
-        .first()
-        .waitFor({ state: "hidden", timeout: 30_000 })
-        .then(() => true)
-        .catch(() => false),
-    ]);
+      // If HeyGen flashed "Please select a voice", the voice didn't commit in
+      // time (a state race — a voice IS shown in the toolbar). Explicitly commit
+      // one via the picker, then loop to re-click Generate. Best-effort: if the
+      // picker flow fails we still retry the click.
+      if (await isVisible(voiceRequiredToast(p), 2500)) {
+        await commitVoice(p).catch(() => {});
+        await p.waitForTimeout(1000);
+        continue;
+      }
+
+      started = await Promise.race([
+        genEnabled
+          .first()
+          .waitFor({ state: "hidden", timeout: 12_000 })
+          .then(() => true)
+          .catch(() => false),
+        p
+          .waitForURL((u) => /\/(projects|video)\b/i.test(u.toString()), { timeout: 12_000 })
+          .then(() => true)
+          .catch(() => false),
+      ]);
+    }
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.generate_click",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        everClicked,
+        started,
+      }),
+    );
+    // SAFEGUARD: do NOT hard-fail when started-detection is unsure. Observed
+    // 2026-06-19: HeyGen frequently DID start rendering (the finished video
+    // showed up in Projects, costing credits) even on runs we classified as
+    // "did not start". Throwing here orphaned those renders and wasted credits.
+    // The Projects retrieval below has its own bounded 90s appear-deadline, so
+    // it is the safe source of truth: if a NEW card appears we capture it; if
+    // none ever appears, retrieveRenderedVideo throws the no_card error. So when
+    // unsure, we capture diagnostics, log, and PROCEED to Projects anyway.
     if (!started) {
       await captureDiagnostics(p, input.jobId, "generate_no_start");
-      throw new HeygenError("ui_changed", "heygen: Generate clicked but generation did not start");
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.generate_uncertain",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          note: "started-signal not seen; checking Projects anyway (render may have started)",
+        }),
+      );
     }
+
+    // Give HeyGen a moment to REGISTER the new project before we poll /projects.
+    // Navigating instantly after the click can beat the backend creating the
+    // project row, so the grid shows only prior cards. A short settle lets our
+    // render appear (the poll loop below still tolerates it being mid-render).
+    await p.waitForTimeout(4000);
 
     // 8–9) Retrieve the finished video from the Projects page (the only place
     // the rendered mp4 exists). Returns the downloaded bytes.
-    const videoBytes = await retrieveRenderedVideo(p, context);
+    const videoBytes = await retrieveRenderedVideo(p, context, baselineId);
     await shot(p, input.projectId, input.segmentId, "done");
 
     // 8) Upload to R2.
