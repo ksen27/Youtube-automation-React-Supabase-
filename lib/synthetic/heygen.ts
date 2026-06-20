@@ -32,6 +32,7 @@ import {
   scriptField,
   generateButtonEnabled,
   landscapeRatioButton,
+  portraitRatioButton,
   voiceRows,
   voiceConfirmEnabled,
   voiceRequiredToast,
@@ -87,6 +88,12 @@ export interface GenerateAvatarInput {
   // cost/billing estimate (the render length == this) instead of guessing from
   // the script word count. Ignored on the legacy script path.
   audioDurationSeconds?: number;
+  // Composer aspect ratio. "landscape" (16:9) for full-frame avatar blocks — the
+  // synthetic render canvas is 1280×720. "portrait" (9:16) for split_2 avatars:
+  // there the avatar fills only a tall LEFT half-cell (640×720) at render, so a
+  // portrait source fits naturally while a landscape one would be heavily
+  // side-cropped. Defaults to "landscape" when unset.
+  aspectRatio?: "landscape" | "portrait";
 }
 
 export interface GenerateAvatarResult {
@@ -415,15 +422,21 @@ async function attemptOnAccount(
     await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
     await shot(p, input.projectId, input.segmentId, "uploaded");
 
-    // 4.5) Force 16:9 LANDSCAPE. HeyGen's composer defaults to 9:16 portrait, but
-    // the synthetic render canvas is 1280×720 (16:9); a portrait avatar would be
-    // letterboxed/cropped in the final video. Click the landscape toggle. Best-
-    // effort: if it's already landscape the click is a harmless no-op, and if the
-    // toggle isn't found we proceed (the render still composites what we get).
-    if (await isVisible(landscapeRatioButton(p), 3000)) {
-      await clickFirstVisible(landscapeRatioButton(p), 10_000, "16:9 landscape toggle").catch(() => {});
+    // 4.5) Set the composer aspect ratio.
+    //   - Full-frame avatar  -> 16:9 LANDSCAPE (the synthetic canvas is 1280×720;
+    //     a portrait avatar would be letterboxed/cropped in the final video).
+    //   - split_2 avatar      -> 9:16 PORTRAIT: the avatar fills only a tall LEFT
+    //     half-cell (640×720) at render, so a portrait source fits naturally
+    //     while a landscape one would be heavily side-cropped.
+    // Best-effort: a no-op if already in the wanted ratio; if the toggle isn't
+    // found we proceed (the render still composites what we get).
+    const wantPortrait = input.aspectRatio === "portrait";
+    const ratioBtn = wantPortrait ? portraitRatioButton(p) : landscapeRatioButton(p);
+    const ratioLabel = wantPortrait ? "9:16 portrait toggle" : "16:9 landscape toggle";
+    if (await isVisible(ratioBtn, 3000)) {
+      await clickFirstVisible(ratioBtn, 10_000, ratioLabel).catch(() => {});
       await p.waitForTimeout(800); // let the canvas re-render to the new ratio
-      await shot(p, input.projectId, input.segmentId, "landscape");
+      await shot(p, input.projectId, input.segmentId, wantPortrait ? "portrait" : "landscape");
     }
 
     // 5) Drive the avatar. Two paths:

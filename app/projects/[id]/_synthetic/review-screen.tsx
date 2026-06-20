@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -220,30 +220,45 @@ function SegmentRow({
     segment.status === "ready" ? "success" : segment.status === "failed" ? "destructive" : segment.status === "generating" ? "info" : "secondary";
   const isGenerating = segment.status === "generating";
   const isFailed = segment.status === "failed";
+  // Every segment type can be reviewed at full size: video blocks (avatar /
+  // ai_clip) play their mp4; image blocks enlarge the still. The thumbnail is
+  // the click target whenever ANY asset exists — previously only video_url
+  // segments got a preview, leaving image blocks with no way to inspect them.
+  const previewKind: "video" | "image" | null = segment.video_url
+    ? "video"
+    : thumb
+      ? "image"
+      : null;
 
   return (
     <Card className={isFailed ? "border-danger/40" : undefined}>
       <CardContent className="flex gap-4 p-3">
-        {/* Thumbnail — click to play the rendered video in a preview dialog. */}
-        {segment.video_url ? (
+        {/* Thumbnail — click to review the asset (video or still) in a dialog. */}
+        {previewKind ? (
           <button
             type="button"
             onClick={() => setPreviewing(true)}
             className="group relative h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400"
-            aria-label="Play video preview"
+            aria-label={previewKind === "video" ? "Play video preview" : "View image preview"}
           >
-            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-            <video src={segment.video_url} className="h-full w-full object-cover" muted preload="metadata" />
+            {previewKind === "video" ? (
+              // eslint-disable-next-line jsx-a11y/media-has-caption
+              <video src={segment.video_url!} className="h-full w-full object-cover" muted preload="metadata" />
+            ) : (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={thumb!} alt="" className="h-full w-full object-cover" />
+            )}
             <span className="absolute inset-0 grid place-items-center bg-black/25 opacity-0 transition-opacity group-hover:opacity-100">
-              <Play className="h-6 w-6 text-white drop-shadow" fill="currentColor" />
+              {previewKind === "video" ? (
+                <Play className="h-6 w-6 text-white drop-shadow" fill="currentColor" />
+              ) : (
+                <Maximize2 className="h-5 w-5 text-white drop-shadow" />
+              )}
             </span>
           </button>
         ) : (
           <div className="h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center">
-            {thumb ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={thumb} alt="" className="h-full w-full object-cover" />
-            ) : isGenerating ? (
+            {isGenerating ? (
               <Loader2 className="h-5 w-5 animate-spin text-brand-300" />
             ) : isFailed ? (
               <span className="text-[10px] text-danger">failed</span>
@@ -253,25 +268,32 @@ function SegmentRow({
           </div>
         )}
 
-        {/* Video preview dialog — full controls (play / sound / scrub). */}
-        {segment.video_url && (
+        {/* Preview dialog — full controls for video; full-size still for image. */}
+        {previewKind && (
           <Dialog open={previewing} onOpenChange={setPreviewing}>
             <DialogContent className="max-w-3xl">
               <DialogTitle>
                 Preview — #{segment.position + 1} {segment.block_type}
               </DialogTitle>
               <DialogDescription className="sr-only">
-                Rendered video for segment #{segment.position + 1}
+                {previewKind === "video"
+                  ? `Rendered video for segment #${segment.position + 1}`
+                  : `Generated image for segment #${segment.position + 1}`}
               </DialogDescription>
               <div className="overflow-hidden rounded-md border border-border bg-black">
-                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-                <video
-                  src={segment.video_url}
-                  className="max-h-[70vh] w-full bg-black"
-                  controls
-                  autoPlay
-                  preload="metadata"
-                />
+                {previewKind === "video" ? (
+                  // eslint-disable-next-line jsx-a11y/media-has-caption
+                  <video
+                    src={segment.video_url!}
+                    className="max-h-[70vh] w-full bg-black"
+                    controls
+                    autoPlay
+                    preload="metadata"
+                  />
+                ) : (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={thumb!} alt="" className="max-h-[70vh] w-full object-contain bg-black" />
+                )}
               </div>
             </DialogContent>
           </Dialog>

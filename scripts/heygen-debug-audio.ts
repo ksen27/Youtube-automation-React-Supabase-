@@ -37,12 +37,13 @@ import { cutAudio } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 
 function parseArgs(argv: string[]) {
-  const out: { projectId?: string; segmentId?: string; image?: string; audio?: string } = {};
+  const out: { projectId?: string; segmentId?: string; image?: string; audio?: string; portrait?: boolean } = {};
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--image") out.image = argv[++i];
     else if (a === "--audio") out.audio = argv[++i];
+    else if (a === "--portrait") out.portrait = true; // 9:16 (split_2 avatar); default is 16:9
     else positional.push(a);
   }
   out.projectId = out.projectId ?? positional[0];
@@ -129,6 +130,7 @@ async function main() {
   console.log(`  segmentId : ${segmentId}`);
   console.log(`  image     : ${avatarImageUrl}`);
   console.log(`  audio     : ${audioPath} (${audioDurationSeconds.toFixed(2)}s)`);
+  console.log(`  ratio     : ${args.portrait ? "9:16 portrait (split_2)" : "16:9 landscape"}`);
   console.log(`  script    : ${script.slice(0, 80)}${script.length > 80 ? "…" : ""}`);
   console.log("\nFetching image bytes…");
 
@@ -146,6 +148,7 @@ async function main() {
         script,
         audioFilePath: audioPath,
         audioDurationSeconds: audioDurationSeconds || undefined,
+        aspectRatio: args.portrait ? "portrait" : "landscape",
       },
       imageBytes,
       1, // single account — don't burn the whole pool while debugging

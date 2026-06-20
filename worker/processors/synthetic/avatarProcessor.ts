@@ -154,6 +154,9 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
         script: seg.script ?? "",
         audioFilePath: audio?.path,
         audioDurationSeconds: audio?.durationSeconds,
+        // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
+        // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
+        aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
       },
       imageBytes,
     );
