@@ -31,14 +31,17 @@ import {
   selectedPhoto,
   scriptField,
   generateButtonEnabled,
+  landscapeRatioButton,
   voiceRows,
   voiceConfirmEnabled,
   voiceRequiredToast,
   audioUploadTrigger,
+  audioModalHeading,
   uploadAudioTab,
   audioDropzone,
   audioFileInput,
   audioConfirmButton,
+  audioConfirmHeading,
   clickFirstVisible,
   waitFirstVisible,
   isVisible,
@@ -136,14 +139,24 @@ async function uploadViaChooser(page: Page, filePath: string, timeoutMs: number)
 // closes and the composer is driven by the uploaded audio; we then skip the
 // script-fill and voice-picker steps entirely.
 async function uploadAudioTrack(page: Page, audioPath: string, timeoutMs: number): Promise<void> {
-  // 1) Open the audio-upload modal from the Script panel header.
+  // 1) Open the audio-upload modal from the Script panel header. The modal is a
+  // portal-rendered div (NOT role="dialog"), so we detect "open" by its visible
+  // "Upload Audio" heading. CRITICAL: use waitFor({state:"visible"}), NOT
+  // isVisible() — isVisible() returns the CURRENT state immediately (the timeout
+  // only bounds locator resolution, it does NOT poll for appearance), so right
+  // after the click it returned false before the modal animated in, falsely
+  // reporting "modal did not open" even though it opened a beat later. waitFor
+  // actually polls up to the timeout.
   await clickFirstVisible(audioUploadTrigger(page), timeoutMs, "audio upload button");
-  const dialog = page.getByRole("dialog");
-  if (!(await isVisible(dialog, 8000))) {
+  const heading = audioModalHeading(page).locator("visible=true").first();
+  try {
+    await heading.waitFor({ state: "visible", timeout: 15_000 });
+  } catch {
     throw new HeygenError("ui_changed", "heygen: Upload Audio modal did not open");
   }
 
-  // 2) Make sure the "Upload Audio" tab (not "Record Audio") is active.
+  // 2) Make sure the "Upload Audio" tab (not "Record Audio") is active. The
+  // modal usually opens already on this tab; the click is a harmless no-op then.
   if (await isVisible(uploadAudioTab(page), 3000)) {
     await clickFirstVisible(uploadAudioTab(page), timeoutMs, "Upload Audio tab").catch(() => {});
   }
@@ -164,21 +177,38 @@ async function uploadAudioTrack(page: Page, audioPath: string, timeoutMs: number
     }
   }
 
-  // 4) Commit. The modal may show a confirm/"Use" action after the upload
-  // processes, or auto-close. Click confirm if present, then wait for the modal
-  // to close (the trustworthy success signal). HeyGen needs a beat to process
-  // the upload before the confirm enables, so we poll briefly.
-  for (let i = 0; i < 6; i++) {
-    if (await isVisible(audioConfirmButton(page), 3000)) {
-      await audioConfirmButton(page).first().click({ timeout: 8000 }).catch(() => {});
-      break;
+  // 4) Commit. Picking a file advances to a SECOND modal, "Confirm Audio", which
+  // previews the uploaded track and has a "Back" / "Add audio" pair. Wait for
+  // that confirm modal (it processes the upload first — the player has to load
+  // the duration), then click "Add audio". Use waitFor (polls) rather than
+  // isVisible (instant). Tolerate the no-confirm-modal case (some builds may
+  // commit directly) by falling through to the close check.
+  const confirmHeading = audioConfirmHeading(page).locator("visible=true").first();
+  const confirmBtn = audioConfirmButton(page).locator("visible=true").first();
+  await confirmHeading.waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
+  // The "Add audio" button can stay disabled until the track finishes processing;
+  // poll a few times, re-checking, before giving up.
+  let committed = false;
+  for (let i = 0; i < 8 && !committed; i++) {
+    try {
+      await confirmBtn.waitFor({ state: "visible", timeout: 4000 });
+      await confirmBtn.click({ timeout: 6000 });
+      committed = true;
+    } catch {
+      await page.waitForTimeout(2000);
     }
-    if (!(await isVisible(dialog, 1000))) break; // already auto-closed
-    await page.waitForTimeout(2000);
   }
-  await dialog.first().waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
-  if (await isVisible(dialog, 1000)) {
-    throw new HeygenError("ui_changed", "heygen: Upload Audio modal never closed after upload");
+  if (!committed) {
+    throw new HeygenError("ui_changed", "heygen: 'Add audio' confirm button never became clickable");
+  }
+
+  // 5) Both modals must be gone for the audio to be committed to the composer.
+  // Wait for the Upload/Confirm headings to disappear; if either lingers the
+  // audio didn't attach and Generate would stay disabled.
+  await heading.waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
+  await confirmHeading.waitFor({ state: "hidden", timeout: 15_000 }).catch(() => {});
+  if (await isVisible(audioConfirmHeading(page), 1000)) {
+    throw new HeygenError("ui_changed", "heygen: 'Confirm Audio' modal never closed after committing");
   }
 }
 
@@ -384,6 +414,17 @@ async function attemptOnAccount(
     // Confirm the upload landed (our photo shows in the preview pane).
     await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
     await shot(p, input.projectId, input.segmentId, "uploaded");
+
+    // 4.5) Force 16:9 LANDSCAPE. HeyGen's composer defaults to 9:16 portrait, but
+    // the synthetic render canvas is 1280×720 (16:9); a portrait avatar would be
+    // letterboxed/cropped in the final video. Click the landscape toggle. Best-
+    // effort: if it's already landscape the click is a harmless no-op, and if the
+    // toggle isn't found we proceed (the render still composites what we get).
+    if (await isVisible(landscapeRatioButton(p), 3000)) {
+      await clickFirstVisible(landscapeRatioButton(p), 10_000, "16:9 landscape toggle").catch(() => {});
+      await p.waitForTimeout(800); // let the canvas re-render to the new ratio
+      await shot(p, input.projectId, input.segmentId, "landscape");
+    }
 
     // 5) Drive the avatar. Two paths:
     //

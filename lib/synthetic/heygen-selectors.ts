@@ -116,77 +116,122 @@ export function scriptField(page: Page): Locator {
     .or(page.locator("textarea"));
 }
 
+// Aspect-ratio / orientation toggle in the composer's bottom toolbar. Verified
+// 2026-06-20: two adjacent icon-only buttons — svg use[href="#landscape-phone"]
+// (16:9 landscape) and svg use[href="#portrait-phone"] (9:16 portrait). The
+// synthetic render canvas is 1280×720 (16:9), so we click landscape to force a
+// 16:9 avatar video; without it HeyGen defaults to 9:16 portrait and the avatar
+// is letterboxed/cropped in the final render.
+export function landscapeRatioButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /landscape|16:9/i })
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#landscape-phone"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#landscape"])'));
+}
+
+export function portraitRatioButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /portrait|9:16/i })
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#portrait-phone"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#portrait"])'));
+}
+
 // ---------------------------------------------------------------------------
 // Audio-driven avatar (worker hot path) — drive the avatar with an UPLOADED
 // audio file instead of typed script, so HeyGen lip-syncs to the exact 69labs
 // voiceover and the rendered length matches the audio.
 //
-// Verified against the live /avatar "Photo to video" composer (2026-06-20):
+// Verified against the live /avatar "Photo to video" composer (2026-06-20, via
+// a headed debug run + the captured error screenshot/HTML):
 //   - The Script panel header has a mic icon and an up-arrow "↑ Upload" button
 //     (shows the label "Upload" on hover). Clicking it opens an "Upload Audio"
 //     modal.
-//   - The modal has a "Record Audio" / "Upload Audio" tab pair and a dashed
-//     dropzone: "Upload a file or drag and drop here — Audio: MP3, WAV up to
-//     100MB". The dropzone opens a native file chooser.
+//   - The modal is NOT an ARIA dialog (role="dialog" count = 0 in the captured
+//     DOM) — it's a plain portal-rendered div titled "Upload Audio" with a
+//     "Record Audio" / "Upload Audio" tab pair and a dashed dropzone "Upload a
+//     file or drag and drop here — Audio: MP3, WAV up to 100MB". So EVERY
+//     selector here matches by VISIBLE TEXT scoped to the page, never by
+//     getByRole("dialog") (which silently matched nothing and made the
+//     modal-open check fail even though the modal was on screen).
 // ---------------------------------------------------------------------------
 
-// The "↑ Upload" audio button in the Script panel header. Icon-only (an
-// up-arrow, like the photo upload's #to-top) with an accessible name / hover
-// label of "Upload". We match the accessible name first, then the up-arrow icon
-// button sitting next to the mic in the script toolbar.
+// The "↑ Upload" audio button in the Script panel header. Verified 2026-06-20
+// against the live DOM: it is a button with visible text "Upload" carrying
+// svg use[href="#to-top"], in the script toolbar next to the mic. Clicking it
+// opens the "Upload Audio" modal. There is a SECOND #to-top button (the photo
+// dropzone's) but it is only present/visible when no photo is uploaded — by the
+// time we reach this step a photo IS uploaded, so that one is detached/invisible
+// and clickFirstVisible reliably lands on the script-header "Upload" button.
+// (#arrow-up is the Generate button — never match it here; and we don't match a
+// bare "Upload" accessible name alone since the photo control can also read it.)
 export function audioUploadTrigger(page: Page): Locator {
-  return page
-    .getByRole("button", { name: /^upload$|upload audio/i })
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#to-top"])'))
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#upload"])'));
+  return page.locator(':is(button,[role="button"]):has(svg use[href="#to-top"])');
 }
 
-// The "Upload Audio" tab inside the upload modal (vs. "Record Audio"). The
-// dialog opens on whichever tab was last used; clicking this guarantees the
-// file-dropzone tab is active.
+// The OPEN audio modal, detected by its visible "Upload Audio" heading. The
+// modal renders in a React portal and is NOT role="dialog", so we anchor on the
+// heading text and walk up to a container that also holds the dropzone. The
+// presence of this locator IS the "modal is open" signal.
+export function audioModalHeading(page: Page): Locator {
+  return page.getByText(/^upload audio$/i);
+}
+
+// The "Upload Audio" tab inside the modal (vs. "Record Audio"). Both tabs are
+// plain text nodes; clicking this guarantees the file-dropzone tab is active.
+// (The modal usually opens already on Upload Audio, per the screenshot.)
 export function uploadAudioTab(page: Page): Locator {
   return page
-    .getByRole("dialog")
     .getByRole("tab", { name: /upload audio/i })
-    .or(page.getByRole("dialog").getByText(/^upload audio$/i))
-    .or(page.getByRole("tab", { name: /upload audio/i }));
+    .or(page.getByText(/^upload audio$/i));
 }
 
-// The dashed dropzone / file control inside the "Upload Audio" modal. Clicking
-// the "Upload a file" link/dropzone opens the native file chooser. We also
-// expose any hidden audio <input type=file> the modal may mount.
+// The dashed dropzone inside the modal. The visible affordance is the blue
+// "Upload a file" link within "Upload a file or drag and drop here"; clicking it
+// opens the native file chooser. We match that text, plus the dropzone wrapper
+// and any audio <input type=file>, page-scoped (no dialog role).
 export function audioDropzone(page: Page): Locator {
-  const dlg = page.getByRole("dialog");
-  return dlg
-    .getByText(/upload a file|drag and drop/i)
-    .or(dlg.locator('[role="button"]:has-text("Upload a file")'))
-    .or(dlg.locator('input[type="file"][accept*="audio"], input[type="file"]'));
+  return page
+    .getByText(/upload a file/i)
+    .or(page.getByText(/drag and drop here/i))
+    .or(page.locator('input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], input[type="file"][accept*="wav"]'));
 }
 
-// The hidden <input type=file> for audio inside the modal (accept includes
-// audio/mp3/wav). Used as the setInputFiles fallback when the filechooser
-// event doesn't fire.
+// The hidden <input type=file> for audio (accept includes audio/mp3/wav). Used
+// as the setInputFiles fallback when the filechooser event doesn't fire. Falls
+// back to any file input on the page if the accept attr isn't audio-specific.
 export function audioFileInput(page: Page): Locator {
   return page.locator(
     'input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], ' +
-      'input[type="file"][accept*="wav"], [role="dialog"] input[type="file"]',
+      'input[type="file"][accept*="wav"], input[type="file"][accept*=".mp3"], ' +
+      'input[type="file"][accept*=".wav"]',
   );
 }
 
-// After a successful audio upload the modal shows the uploaded track (a player /
-// waveform / filename row) and a confirm/"Use"/"Add" action, OR auto-closes and
-// the composer's voice pill now reflects the uploaded audio. We treat the modal
-// closing (dialog hidden) as the primary success signal; this confirm button is
-// clicked when present to commit the selection.
+// After picking a file the flow advances to a SECOND modal "Confirm Audio" (it
+// shows the uploaded track + its duration, with "Back" and "Add audio" actions).
+// Verified 2026-06-20: the commit button reads "Add audio" — so we match that
+// explicitly (a bare /^add$/ missed it and left the modal open, blocking the
+// composer so Generate never enabled). Other label variants kept for resilience
+// across HeyGen builds. Page-scoped (no dialog role).
+//
+// NOTE: deliberately does NOT match "Upload" — that's the trigger button still on
+// the composer; clicking it would re-open the modal instead of committing.
 export function audioConfirmButton(page: Page): Locator {
-  return page
-    .getByRole("dialog")
-    .getByRole("button", { name: /^use$|^add$|^confirm$|^done$|^select$|apply/i });
+  return page.getByRole("button", {
+    name: /add audio|^use$|^add$|^confirm$|^done$|^select$|^apply$|^save$/i,
+  });
+}
+
+// The "Confirm Audio" review modal heading (the 2nd step, after file pick). Used
+// to detect that we've advanced to the confirm step and, after committing, that
+// it has closed.
+export function audioConfirmHeading(page: Page): Locator {
+  return page.getByText(/^confirm audio$/i);
 }
 
 // A "first audio" empty-state hint in the modal ("Please upload your first
-// audio"). Seen when the account has no prior uploads — purely informational,
-// used to confirm we're on the Upload Audio tab.
+// audio"). Seen when the account has no prior uploads — informational; confirms
+// we're on the Upload Audio tab.
 export function audioEmptyStateHint(page: Page): Locator {
   return page.getByText(/please upload your first audio/i);
 }
