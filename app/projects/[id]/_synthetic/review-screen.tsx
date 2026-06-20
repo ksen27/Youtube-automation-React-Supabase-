@@ -2,11 +2,17 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2 } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import type { SyntheticResp, SyntheticSegmentRow } from "./types";
 
 const BLOCK_TYPES = ["avatar", "image", "ai_clip", "split_2"] as const;
@@ -181,6 +187,7 @@ function SegmentRow({
   onChange: () => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [blockType, setBlockType] = useState(segment.block_type);
   const [imagePrompt, setImagePrompt] = useState(segment.image_prompt ?? "");
   const [animationPrompt, setAnimationPrompt] = useState(segment.animation_prompt ?? "");
@@ -217,22 +224,58 @@ function SegmentRow({
   return (
     <Card className={isFailed ? "border-danger/40" : undefined}>
       <CardContent className="flex gap-4 p-3">
-        {/* Thumbnail */}
-        <div className="h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center">
-          {segment.video_url ? (
-            // eslint-disable-next-line jsx-a11y/media-has-caption
+        {/* Thumbnail — click to play the rendered video in a preview dialog. */}
+        {segment.video_url ? (
+          <button
+            type="button"
+            onClick={() => setPreviewing(true)}
+            className="group relative h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-400"
+            aria-label="Play video preview"
+          >
+            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <video src={segment.video_url} className="h-full w-full object-cover" muted preload="metadata" />
-          ) : thumb ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={thumb} alt="" className="h-full w-full object-cover" />
-          ) : isGenerating ? (
-            <Loader2 className="h-5 w-5 animate-spin text-brand-300" />
-          ) : isFailed ? (
-            <span className="text-[10px] text-danger">failed</span>
-          ) : (
-            <span className="text-[10px] text-fg-subtle">no preview</span>
-          )}
-        </div>
+            <span className="absolute inset-0 grid place-items-center bg-black/25 opacity-0 transition-opacity group-hover:opacity-100">
+              <Play className="h-6 w-6 text-white drop-shadow" fill="currentColor" />
+            </span>
+          </button>
+        ) : (
+          <div className="h-20 w-32 shrink-0 rounded-[8px] overflow-hidden border border-border bg-bg-elevated grid place-items-center">
+            {thumb ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={thumb} alt="" className="h-full w-full object-cover" />
+            ) : isGenerating ? (
+              <Loader2 className="h-5 w-5 animate-spin text-brand-300" />
+            ) : isFailed ? (
+              <span className="text-[10px] text-danger">failed</span>
+            ) : (
+              <span className="text-[10px] text-fg-subtle">no preview</span>
+            )}
+          </div>
+        )}
+
+        {/* Video preview dialog — full controls (play / sound / scrub). */}
+        {segment.video_url && (
+          <Dialog open={previewing} onOpenChange={setPreviewing}>
+            <DialogContent className="max-w-3xl">
+              <DialogTitle>
+                Preview — #{segment.position + 1} {segment.block_type}
+              </DialogTitle>
+              <DialogDescription className="sr-only">
+                Rendered video for segment #{segment.position + 1}
+              </DialogDescription>
+              <div className="overflow-hidden rounded-md border border-border bg-black">
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <video
+                  src={segment.video_url}
+                  className="max-h-[70vh] w-full bg-black"
+                  controls
+                  autoPlay
+                  preload="metadata"
+                />
+              </div>
+            </DialogContent>
+          </Dialog>
+        )}
 
         <div className="flex-1 min-w-0 space-y-2">
           <div className="flex items-center gap-2">

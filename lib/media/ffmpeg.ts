@@ -932,10 +932,17 @@ export async function cutAudio(opts: {
   outputPath: string;
   startSeconds: number;
   durationSeconds: number;
+  // Output codec. Default "aac" (the intro/forced-clip splice path muxes the
+  // result into an .m4a/AAC chain). Pass "mp3" when the output is an .mp3 file —
+  // e.g. the avatar audio slice uploaded to HeyGen, whose modal accepts MP3/WAV.
+  // Writing AAC packets into a .mp3 container is invalid and ffmpeg rejects it,
+  // so the codec MUST match the container the caller asked for.
+  format?: "aac" | "mp3";
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  const codec = opts.format === "mp3" ? ["-c:a", "libmp3lame", "-b:a", "192k"] : ["-c:a", "aac", "-b:a", "192k"];
   const args = [
     "-y",
     "-threads", String(env.FFMPEG_THREADS),
@@ -943,8 +950,7 @@ export async function cutAudio(opts: {
     "-i", opts.inputPath,
     "-t", String(opts.durationSeconds),
     "-vn",
-    "-c:a", "aac",
-    "-b:a", "192k",
+    ...codec,
     opts.outputPath,
   ];
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);

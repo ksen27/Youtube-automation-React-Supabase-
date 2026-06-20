@@ -34,6 +34,11 @@ import {
   voiceRows,
   voiceConfirmEnabled,
   voiceRequiredToast,
+  audioUploadTrigger,
+  uploadAudioTab,
+  audioDropzone,
+  audioFileInput,
+  audioConfirmButton,
   clickFirstVisible,
   waitFirstVisible,
   isVisible,
@@ -68,6 +73,17 @@ export interface GenerateAvatarInput {
   jobId: string;
   avatarImageUrl: string; // public URL of the uploaded user photo
   script: string; // narration that drives the avatar
+  // Path to a local audio file (sliced from the 69labs master voiceover for
+  // this avatar part). When set, the avatar is driven by UPLOADING this audio
+  // to HeyGen instead of typing the script — HeyGen lip-syncs to it, so the
+  // rendered video length equals the audio length (the fix for the avatar /
+  // voiceover duration mismatch). When absent, we fall back to the legacy
+  // script-text path. `script` is still passed through for diagnostics/billing.
+  audioFilePath?: string;
+  // Duration (seconds) of the uploaded audio slice, when known. Used for the
+  // cost/billing estimate (the render length == this) instead of guessing from
+  // the script word count. Ignored on the legacy script path.
+  audioDurationSeconds?: number;
 }
 
 export interface GenerateAvatarResult {
@@ -109,6 +125,60 @@ async function uploadViaChooser(page: Page, filePath: string, timeoutMs: number)
       return;
     }
     throw new HeygenError("ui_changed", "heygen: could not open photo upload", err);
+  }
+}
+
+// Drive the avatar with an UPLOADED audio file (the sliced 69labs voiceover for
+// this avatar part) instead of typed script. Opens the Script panel's "↑ Upload"
+// button -> "Upload Audio" modal -> uploads the staged audio via the native file
+// chooser (falling back to a hidden <input>), then commits. Throws a classified
+// HeygenError if the modal / upload control never appears. On success the modal
+// closes and the composer is driven by the uploaded audio; we then skip the
+// script-fill and voice-picker steps entirely.
+async function uploadAudioTrack(page: Page, audioPath: string, timeoutMs: number): Promise<void> {
+  // 1) Open the audio-upload modal from the Script panel header.
+  await clickFirstVisible(audioUploadTrigger(page), timeoutMs, "audio upload button");
+  const dialog = page.getByRole("dialog");
+  if (!(await isVisible(dialog, 8000))) {
+    throw new HeygenError("ui_changed", "heygen: Upload Audio modal did not open");
+  }
+
+  // 2) Make sure the "Upload Audio" tab (not "Record Audio") is active.
+  if (await isVisible(uploadAudioTab(page), 3000)) {
+    await clickFirstVisible(uploadAudioTab(page), timeoutMs, "Upload Audio tab").catch(() => {});
+  }
+
+  // 3) Upload the file. Prefer catching the native file chooser the dropzone
+  // opens; fall back to setInputFiles on a hidden <input> if one is mounted.
+  try {
+    const [chooser] = await Promise.all([
+      page.waitForEvent("filechooser", { timeout: timeoutMs }),
+      clickFirstVisible(audioDropzone(page), timeoutMs, "audio dropzone"),
+    ]);
+    await chooser.setFiles(audioPath);
+  } catch (err) {
+    if ((await audioFileInput(page).count()) > 0) {
+      await audioFileInput(page).first().setInputFiles(audioPath);
+    } else {
+      throw new HeygenError("ui_changed", "heygen: could not open audio file chooser", err);
+    }
+  }
+
+  // 4) Commit. The modal may show a confirm/"Use" action after the upload
+  // processes, or auto-close. Click confirm if present, then wait for the modal
+  // to close (the trustworthy success signal). HeyGen needs a beat to process
+  // the upload before the confirm enables, so we poll briefly.
+  for (let i = 0; i < 6; i++) {
+    if (await isVisible(audioConfirmButton(page), 3000)) {
+      await audioConfirmButton(page).first().click({ timeout: 8000 }).catch(() => {});
+      break;
+    }
+    if (!(await isVisible(dialog, 1000))) break; // already auto-closed
+    await page.waitForTimeout(2000);
+  }
+  await dialog.first().waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
+  if (await isVisible(dialog, 1000)) {
+    throw new HeygenError("ui_changed", "heygen: Upload Audio modal never closed after upload");
   }
 }
 
@@ -315,40 +385,57 @@ async function attemptOnAccount(
     await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
     await shot(p, input.projectId, input.segmentId, "uploaded");
 
-    // NOTE: we do NOT touch the voice. The composer already has a real voice
-    // committed by default (the toolbar pill, e.g. "Japan - Voice 2") — exactly
-    // as in the manual flow — so opening the voice picker is unnecessary and
-    // only risks stranding the flow. HeyGen's audio is discarded at render
-    // anyway (the 69labs master voiceover is muxed in).
-
-    // 5) Drive the avatar with the narration script — done LAST, right before
-    // Generate, because the photo upload re-renders the composer and a script
-    // filled before that re-render gets wiped (observed 2026-06-19: the script
-    // textarea was empty at Generate, so the click no-op'd).
+    // 5) Drive the avatar. Two paths:
     //
-    // The script box is a CONTROLLED React <textarea>; a bare .fill() sets the
-    // DOM value but React can overwrite it on the next render. We fill, then
-    // VERIFY the value stuck, and fall back to real keystrokes if it didn't.
-    const scriptBox = scriptField(p).locator("visible=true").first();
-    await scriptBox.fill(input.script, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
-    const stuck = await scriptBox.inputValue().catch(() => "");
-    if (stuck.trim() !== input.script.trim()) {
-      // Re-type with real keystrokes so React's onChange fires per character.
-      await scriptBox.fill("").catch(() => {});
-      await scriptBox.pressSequentially(input.script, { delay: 1, timeout: e.HEYGEN_NAV_TIMEOUT_MS });
-      const stuck2 = await scriptBox.inputValue().catch(() => "");
-      if (stuck2.trim().length === 0) {
-        await captureDiagnostics(p, input.jobId, "script_not_set");
-        throw new HeygenError("ui_changed", "heygen: script field would not accept text");
+    //   AUDIO-DRIVEN (input.audioFilePath set): upload the sliced 69labs
+    //   voiceover for this avatar part. HeyGen lip-syncs to it, so the rendered
+    //   video length equals the audio length — fixing the avatar/voiceover
+    //   duration mismatch. The uploaded audio replaces BOTH the script text AND
+    //   the voice picker, so we skip those steps entirely.
+    //
+    //   SCRIPT-DRIVEN (legacy fallback, no audioFilePath): type the narration
+    //   into the script box and let HeyGen's own TTS speak it. Kept so a missing
+    //   audio slice degrades to the old behavior rather than failing the render.
+    //
+    // Done LAST, right before Generate: the photo upload re-renders the composer,
+    // and a script filled (or audio attached) before that re-render can get
+    // wiped (observed 2026-06-19: the script textarea was empty at Generate).
+    if (input.audioFilePath) {
+      await uploadAudioTrack(p, input.audioFilePath, e.HEYGEN_NAV_TIMEOUT_MS);
+      await shot(p, input.projectId, input.segmentId, "audio_uploaded");
+      // Settle so React flushes the photo + audio into form state before submit.
+      await p.waitForTimeout(1500);
+    } else {
+      // NOTE: we do NOT touch the voice in the legacy path. The composer already
+      // has a real voice committed by default (the toolbar pill, e.g. "Japan -
+      // Voice 2") — opening the voice picker is unnecessary and only risks
+      // stranding the flow. HeyGen's audio is discarded at render anyway.
+      //
+      // The script box is a CONTROLLED React <textarea>; a bare .fill() sets the
+      // DOM value but React can overwrite it on the next render. We fill, then
+      // VERIFY the value stuck, and fall back to real keystrokes if it didn't.
+      const scriptBox = scriptField(p).locator("visible=true").first();
+      await scriptBox.fill(input.script, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => {});
+      const stuck = await scriptBox.inputValue().catch(() => "");
+      if (stuck.trim() !== input.script.trim()) {
+        // Re-type with real keystrokes so React's onChange fires per character.
+        await scriptBox.fill("").catch(() => {});
+        await scriptBox.pressSequentially(input.script, { delay: 1, timeout: e.HEYGEN_NAV_TIMEOUT_MS });
+        const stuck2 = await scriptBox.inputValue().catch(() => "");
+        if (stuck2.trim().length === 0) {
+          await captureDiagnostics(p, input.jobId, "script_not_set");
+          throw new HeygenError("ui_changed", "heygen: script field would not accept text");
+        }
       }
-    }
 
-    // Let the composer SETTLE before submitting. Blur the script box (commit its
-    // value) and pause so React flushes the photo + script + voice into form
-    // state. Verified 2026-06-19: clicking Generate too fast races the state and
-    // HeyGen flashes "Please select a voice" even though a voice IS selected.
-    await p.keyboard.press("Tab").catch(() => {});
-    await p.waitForTimeout(1500);
+      // Let the composer SETTLE before submitting. Blur the script box (commit
+      // its value) and pause so React flushes the photo + script + voice into
+      // form state. Verified 2026-06-19: clicking Generate too fast races the
+      // state and HeyGen flashes "Please select a voice" even though a voice IS
+      // selected.
+      await p.keyboard.press("Tab").catch(() => {});
+      await p.waitForTimeout(1500);
+    }
 
     // 7) Kick off the render.
     //
@@ -373,7 +460,7 @@ async function attemptOnAccount(
       await captureDiagnostics(p, input.jobId, "generate_disabled");
       throw new HeygenError(
         "ui_changed",
-        "heygen: Generate button never enabled — photo or script did not register",
+        "heygen: Generate button never enabled — photo or script/audio did not register",
       );
     }
     // Click Generate and CONFIRM it took. The button is the SAME element in both
@@ -491,8 +578,13 @@ async function attemptOnAccount(
     await saveCookies(account.id, await context.storageState()).catch(() => {});
     await recordSuccess(account.id);
 
-    // Rough output length from the narration (HeyGen ~ real-time speech).
-    const seconds = Math.max(2, Math.round(input.script.split(/\s+/).filter(Boolean).length / 2.5));
+    // Output length. For audio-driven renders the render length equals the
+    // uploaded audio, so use its known duration; otherwise fall back to the
+    // rough word-count estimate (HeyGen ~ real-time speech).
+    const seconds =
+      input.audioDurationSeconds && input.audioDurationSeconds > 0
+        ? Math.max(2, Math.round(input.audioDurationSeconds))
+        : Math.max(2, Math.round(input.script.split(/\s+/).filter(Boolean).length / 2.5));
     await logProviderCall({
       projectId: input.projectId,
       jobId: input.jobId,

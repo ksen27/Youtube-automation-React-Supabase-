@@ -116,6 +116,81 @@ export function scriptField(page: Page): Locator {
     .or(page.locator("textarea"));
 }
 
+// ---------------------------------------------------------------------------
+// Audio-driven avatar (worker hot path) — drive the avatar with an UPLOADED
+// audio file instead of typed script, so HeyGen lip-syncs to the exact 69labs
+// voiceover and the rendered length matches the audio.
+//
+// Verified against the live /avatar "Photo to video" composer (2026-06-20):
+//   - The Script panel header has a mic icon and an up-arrow "↑ Upload" button
+//     (shows the label "Upload" on hover). Clicking it opens an "Upload Audio"
+//     modal.
+//   - The modal has a "Record Audio" / "Upload Audio" tab pair and a dashed
+//     dropzone: "Upload a file or drag and drop here — Audio: MP3, WAV up to
+//     100MB". The dropzone opens a native file chooser.
+// ---------------------------------------------------------------------------
+
+// The "↑ Upload" audio button in the Script panel header. Icon-only (an
+// up-arrow, like the photo upload's #to-top) with an accessible name / hover
+// label of "Upload". We match the accessible name first, then the up-arrow icon
+// button sitting next to the mic in the script toolbar.
+export function audioUploadTrigger(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^upload$|upload audio/i })
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#to-top"])'))
+    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#upload"])'));
+}
+
+// The "Upload Audio" tab inside the upload modal (vs. "Record Audio"). The
+// dialog opens on whichever tab was last used; clicking this guarantees the
+// file-dropzone tab is active.
+export function uploadAudioTab(page: Page): Locator {
+  return page
+    .getByRole("dialog")
+    .getByRole("tab", { name: /upload audio/i })
+    .or(page.getByRole("dialog").getByText(/^upload audio$/i))
+    .or(page.getByRole("tab", { name: /upload audio/i }));
+}
+
+// The dashed dropzone / file control inside the "Upload Audio" modal. Clicking
+// the "Upload a file" link/dropzone opens the native file chooser. We also
+// expose any hidden audio <input type=file> the modal may mount.
+export function audioDropzone(page: Page): Locator {
+  const dlg = page.getByRole("dialog");
+  return dlg
+    .getByText(/upload a file|drag and drop/i)
+    .or(dlg.locator('[role="button"]:has-text("Upload a file")'))
+    .or(dlg.locator('input[type="file"][accept*="audio"], input[type="file"]'));
+}
+
+// The hidden <input type=file> for audio inside the modal (accept includes
+// audio/mp3/wav). Used as the setInputFiles fallback when the filechooser
+// event doesn't fire.
+export function audioFileInput(page: Page): Locator {
+  return page.locator(
+    'input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], ' +
+      'input[type="file"][accept*="wav"], [role="dialog"] input[type="file"]',
+  );
+}
+
+// After a successful audio upload the modal shows the uploaded track (a player /
+// waveform / filename row) and a confirm/"Use"/"Add" action, OR auto-closes and
+// the composer's voice pill now reflects the uploaded audio. We treat the modal
+// closing (dialog hidden) as the primary success signal; this confirm button is
+// clicked when present to commit the selection.
+export function audioConfirmButton(page: Page): Locator {
+  return page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^use$|^add$|^confirm$|^done$|^select$|apply/i });
+}
+
+// A "first audio" empty-state hint in the modal ("Please upload your first
+// audio"). Seen when the account has no prior uploads — purely informational,
+// used to confirm we're on the Upload Audio tab.
+export function audioEmptyStateHint(page: Page): Locator {
+  return page.getByText(/please upload your first audio/i);
+}
+
 // The voice picker in the bottom toolbar (the "Japan - Voice 2"-style pill).
 // It's a button carrying an #audio icon, opening a voice modal. We match the
 // audio-icon button, then any toolbar button whose text looks like a voice

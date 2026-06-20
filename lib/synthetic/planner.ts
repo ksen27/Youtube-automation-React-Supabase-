@@ -273,6 +273,56 @@ function snapToSpace(text: string, idx: number): number {
   return idx - left <= right - idx ? left : right;
 }
 
+// Coalesce CONTIGUOUS avatar segments into one atomic avatar "part".
+//
+// The audio-driven HeyGen flow treats one Google-Doc avatar passage as a SINGLE
+// unit: one sliced audio window -> one HeyGen render (lip-synced to that audio)
+// -> one timeline block. But the planner upstream emits avatar narration as
+// several small rows (Gemini's ~6s block sizing, plus splitByMarks carving a
+// marked range that straddles multiple Gemini blocks). Left as-is, a 35s avatar
+// passage would become ~6 separate HeyGen renders driven by text — exactly the
+// duration-mismatch problem we're removing.
+//
+// So after avatar-marking we merge any run of back-to-back avatar segments into
+// one: concatenate the scripts (space-joined), take the first segment's start
+// and the last segment's end, and recompute the duration from that window. The
+// merged row's spoken window [startTime, endTime) is what the avatar processor
+// slices out of master_voiceover.mp3 and uploads to HeyGen.
+//
+// Non-avatar segments pass through untouched. avatar parts are capped at 1 min
+// by the content rules (well under HeyGen Pro's 5-min limit); we LOG a warning
+// if a merged part ever exceeds the cap rather than splitting, since by
+// agreement it never should — the log surfaces a content-rule violation instead
+// of silently producing an over-length HeyGen request.
+const AVATAR_PART_MAX_SECONDS = 60;
+export function coalesceAvatarSegments(segs: PlannedSegment[]): {
+  segments: PlannedSegment[];
+  merged: number;
+  overLengthParts: number;
+} {
+  const out: PlannedSegment[] = [];
+  let merged = 0;
+  let overLengthParts = 0;
+  for (const seg of segs) {
+    const prev = out[out.length - 1];
+    if (prev && prev.blockType === "avatar" && seg.blockType === "avatar") {
+      // Extend the open avatar part to include this segment.
+      prev.script = `${prev.script} ${seg.script}`.replace(/\s+/g, " ").trim();
+      prev.endTime = seg.endTime;
+      prev.duration = Math.max(0.5, prev.endTime - prev.startTime);
+      merged++;
+      if (prev.duration > AVATAR_PART_MAX_SECONDS) overLengthParts++;
+      continue;
+    }
+    // Start a new part (clone so we never mutate the caller's array entries).
+    out.push({ ...seg });
+    if (seg.blockType === "avatar" && seg.duration > AVATAR_PART_MAX_SECONDS) {
+      overLengthParts++;
+    }
+  }
+  return { segments: out, merged, overLengthParts };
+}
+
 // Split a long VISUAL segment into N back-to-back sub-segments so no single
 // block holds longer than the client's pacing window (~3-8s) — which is also
 // the constraint that lets LTX-2 generate each ai_clip in one image-to-video
@@ -479,6 +529,27 @@ export async function buildSyntheticTimeline(input: {
       segmentsTotal: planned.length,
       avatarForced: forced,
     });
+  }
+
+  // Avatar coalesce pass. Merge contiguous avatar segments into one atomic
+  // avatar "part" so the audio-driven HeyGen flow does ONE render per Google-Doc
+  // avatar passage (sliced audio upload), not one per ~6s sub-block. Runs AFTER
+  // avatar-marking (so a marked range split across Gemini blocks is rejoined)
+  // and BEFORE the duration-split pass (which only touches non-avatar blocks, so
+  // ordering is safe either way, but coalescing first keeps positions clean).
+  {
+    const before = planned.length;
+    const { segments, merged, overLengthParts } = coalesceAvatarSegments(planned);
+    if (merged > 0) {
+      segments.forEach((p, i) => { p.position = i; });
+      planned = segments;
+      await logJob({ projectId, jobId }, "synthetic.plan.avatar_coalesce", {
+        segmentsBefore: before,
+        segmentsAfter: planned.length,
+        partsMerged: merged,
+        overLengthParts,
+      });
+    }
   }
 
   // Duration-split pass. Gemini's per-block sizing is a soft prompt hint, so

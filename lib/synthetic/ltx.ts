@@ -21,7 +21,7 @@ import type { GenerateClipInput, GenerateClipResult } from "@/lib/synthetic/fala
 
 // Allowed duration tiers at 1080p/25fps. We pick the nearest tier <= the
 // configured max so a requested 7s lands on 6 or 8, never an unsupported value.
-const LTX_DURATION_TIERS = [6, 8, 10, 12, 14, 16, 18, 20];
+export const LTX_DURATION_TIERS = [6, 8, 10, 12, 14, 16, 18, 20];
 
 function cfg() {
   const env = getEnv();
@@ -43,7 +43,7 @@ export function isLtxConfigured(): boolean {
 // Snap an arbitrary requested duration (seconds) to the nearest LTX tier that
 // does not exceed maxDuration. Tiers start at 6s, so anything shorter rounds up
 // to the 6s floor.
-function snapDuration(requested: number, maxDuration: number): number {
+export function snapDuration(requested: number, maxDuration: number): number {
   const allowed = LTX_DURATION_TIERS.filter((t) => t <= maxDuration);
   const tiers = allowed.length > 0 ? allowed : [LTX_DURATION_TIERS[0]];
   let best = tiers[0];

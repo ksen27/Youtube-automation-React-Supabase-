@@ -153,6 +153,96 @@ async function main() {
     });
   }
 
+  console.log("ltx duration snap");
+  {
+    const { snapDuration, LTX_DURATION_TIERS } = await import("@/lib/synthetic/ltx");
+    test("snaps 7s to the nearest tier (6)", () => {
+      // 7 is equidistant from 6 and 8; the loop keeps the first (6) on a tie.
+      assert.strictEqual(snapDuration(7, 20), 6);
+    });
+    test("snaps 8s exactly to 8", () => {
+      assert.strictEqual(snapDuration(8, 20), 8);
+    });
+    test("rounds a sub-tier request up to the 6s floor", () => {
+      assert.strictEqual(snapDuration(3, 20), 6);
+      assert.strictEqual(snapDuration(0.5, 20), 6);
+    });
+    test("never returns a tier above maxDuration", () => {
+      // With max=10 the only allowed tiers are 6/8/10; a 21s ask clamps to 10.
+      assert.strictEqual(snapDuration(21, 10), 10);
+    });
+    test("every tier is a valid LTX value", () => {
+      for (const t of LTX_DURATION_TIERS) {
+        assert.strictEqual(snapDuration(t, 20), t);
+      }
+    });
+  }
+
+  console.log("synthetic duration split");
+  {
+    const { splitByDuration } = await import("@/lib/synthetic/planner");
+    // Minimal PlannedSegment factory — only the fields splitByDuration reads.
+    const mk = (over: Partial<Record<string, unknown>> = {}) => ({
+      position: 0,
+      blockType: "ai_clip" as const,
+      startTime: 0,
+      endTime: 21,
+      duration: 21,
+      script: "one two three four five six seven eight nine ten eleven twelve",
+      imagePrompt: "a busy market street",
+      animationPrompt: "slow push-in",
+      ...over,
+    });
+
+    test("a 21s ai_clip splits into 4 sub-blocks of ~5.25s", () => {
+      // slots = round(21 / 6) = round(3.5) = 4; 21 / 4 = 5.25s each, all in 3-8s.
+      const out = splitByDuration(mk(), 6, 8);
+      assert.strictEqual(out.length, 4);
+      for (const p of out) assert.ok(Math.abs(p.duration - 5.25) < 1e-9);
+    });
+    test("each sub-block stays under the 8s threshold", () => {
+      const out = splitByDuration(mk(), 6, 8);
+      for (const p of out) assert.ok(p.duration <= 8, `slot ${p.duration}s > 8s`);
+    });
+    test("sub-blocks tile the parent window with no gap/overlap", () => {
+      const out = splitByDuration(mk(), 6, 8);
+      assert.ok(Math.abs(out[0].startTime - 0) < 1e-9);
+      assert.ok(Math.abs(out[out.length - 1].endTime - 21) < 1e-9);
+      for (let i = 1; i < out.length; i++) {
+        assert.ok(Math.abs(out[i].startTime - out[i - 1].endTime) < 1e-9, "gap between slots");
+      }
+    });
+    test("sub-blocks inherit the parent's prompts and type", () => {
+      const out = splitByDuration(mk(), 6, 8);
+      for (const p of out) {
+        assert.strictEqual(p.blockType, "ai_clip");
+        assert.strictEqual(p.imagePrompt, "a busy market street");
+        assert.strictEqual(p.animationPrompt, "slow push-in");
+      }
+    });
+    test("a block at/under threshold is returned unchanged", () => {
+      const seg = mk({ endTime: 7, duration: 7 });
+      const out = splitByDuration(seg, 6, 8);
+      assert.strictEqual(out.length, 1);
+      assert.strictEqual(out[0], seg);
+    });
+    test("avatar blocks are NEVER split", () => {
+      const seg = mk({ blockType: "avatar", endTime: 30, duration: 30 });
+      const out = splitByDuration(seg, 6, 8);
+      assert.strictEqual(out.length, 1);
+      assert.strictEqual(out[0].blockType, "avatar");
+    });
+    test("concatenated sub-block scripts cover the parent script words", () => {
+      const out = splitByDuration(mk(), 6, 8);
+      const joined = out.map((p) => p.script).join(" ").replace(/\s+/g, " ").trim();
+      // Every parent word should appear across the slices (boundary-snapped,
+      // so no word is cut in half).
+      for (const w of "one two three four five six seven eight nine ten eleven twelve".split(" ")) {
+        assert.ok(joined.includes(w), `missing word "${w}" after split`);
+      }
+    });
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
