@@ -35,7 +35,14 @@ const GeminiSegmentSchema = z.object({
   imagePrompt: z.string().optional().default(""),
   animationPrompt: z.string().optional().default(""),
 });
-const GeminiResponseSchema = z.object({ segments: z.array(GeminiSegmentSchema) });
+const GeminiResponseSchema = z.object({
+  // A global "style bible" for the whole video: the recurring subjects, setting,
+  // era, and mood that every block shares. Composed in FRONT of each block's
+  // scene-specific imagePrompt at persist time so adjacent blocks describing the
+  // same scene generate as one continuous world instead of drifting apart.
+  basePrompt: z.string().optional().default(""),
+  segments: z.array(GeminiSegmentSchema),
+});
 
 export interface PlannedSegment {
   position: number;
@@ -69,13 +76,28 @@ function buildPrompt(transcript: string): string {
     "split long passages into multiple blocks rather than one long hold. Never",
     "let a single visual block run longer than ~8 seconds of narration.",
     "",
-    "For image/ai_clip/split_2 blocks, write an `imagePrompt`: a vivid, concrete",
-    "visual description (subject, setting, composition). Do NOT include camera",
-    "or film-grain styling — that is appended automatically.",
+    "FIRST, read the WHOLE transcript and write a single `basePrompt`: the",
+    "video's recurring visual world — the main recurring subjects, the setting /",
+    "location type, the era, and the overall mood. This is a shared style bible",
+    "that every block builds on; it is prepended to each block's imagePrompt",
+    "automatically, so describe the constants here, NOT any one moment. Do NOT",
+    "include camera or film-grain styling — that is appended separately.",
+    "",
+    "THEN segment the transcript. For image/ai_clip/split_2 blocks, write an",
+    "`imagePrompt`: ONLY the scene-specific detail for THIS block (the action,",
+    "the specific subject and composition of this moment). Do NOT repeat the",
+    "basePrompt — assume it is already present. Do NOT include camera or",
+    "film-grain styling.",
+    "",
+    "CONTINUITY (critical): when you split one sentence or one continuous scene",
+    "across several consecutive blocks, those blocks MUST keep the SAME setting,",
+    "lighting, subjects, and framing so they read as one continuous shot. Only",
+    "change the visual world when the narration genuinely moves to a new scene.",
+    "",
     "For ai_clip blocks also write an `animationPrompt` describing the motion",
     "(camera move, subject action). avatar blocks need no prompts.",
     "",
-    'Respond ONLY with JSON: {"segments":[{"blockType","script","imagePrompt","animationPrompt"}]}',
+    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","animationPrompt"}]}',
     "",
     "TRANSCRIPT:",
     transcript.trim(),
@@ -143,6 +165,23 @@ function alignSegments(
   if (out.length > 0 && totalDuration > 0) out[out.length - 1].endTime = totalDuration;
   for (const seg of out) seg.duration = Math.max(0.5, seg.endTime - seg.startTime);
   return out;
+}
+
+// Prepend the video's shared style bible to a block's scene-specific prompt so
+// the stored image_prompt carries the recurring world (subjects, setting, mood)
+// alongside this moment's detail. Keeps adjacent same-scene blocks visually
+// continuous. STYLE_PROMPT (the camera/grain look) is still appended separately
+// at generation time. Returns the block prompt unchanged when there's no base,
+// and the base alone when the block has no specific prompt.
+function composePrompt(basePrompt: string, blockPrompt: string | null): string | null {
+  const base = basePrompt.trim();
+  const block = (blockPrompt ?? "").trim();
+  if (!base) return block || null;
+  if (!block) return base;
+  // Avoid a duplicated base if a block prompt already starts with it (e.g. an
+  // edited row re-run through the planner).
+  if (block.toLowerCase().startsWith(base.toLowerCase())) return block;
+  return `${base.replace(/[.\s]+$/, "")}. ${block}`;
 }
 
 function mk(
@@ -222,13 +261,14 @@ export function splitByMarks(
   origStart: number,
   origEnd: number,
   ranges: AvatarMarkRange[],
+  basePrompt: string = "",
 ): PlannedSegment[] {
   const span = origEnd - origStart;
   const runs = span > 0 ? intersectRuns(origStart, origEnd, ranges) : [];
   // Whole-block (single run) — no carving needed; just label it.
   if (runs.length <= 1) {
     const marked = runs.length === 1 ? runs[0].marked : false;
-    return [applyMark(seg, marked)];
+    return [applyMark(seg, marked, basePrompt)];
   }
 
   const scriptLen = seg.script.length;
@@ -254,9 +294,9 @@ export function splitByMarks(
       duration: Math.max(0.5, endTime - startTime),
       script: piece,
     };
-    out.push(applyMark(sub, run.marked));
+    out.push(applyMark(sub, run.marked, basePrompt));
   }
-  return out.length > 0 ? out : [applyMark(seg, runs.some((r) => r.marked))];
+  return out.length > 0 ? out : [applyMark(seg, runs.some((r) => r.marked), basePrompt)];
 }
 
 // Round a char index to the nearest whitespace boundary in `text` so a script
@@ -377,7 +417,13 @@ export function splitByDuration(
 // Set a segment's avatar-ness. Marked -> avatar (drop visual prompts).
 // Unmarked -> if it was avatar (Gemini's choice, not a real mark), demote to
 // image; otherwise keep whatever non-avatar type it already had.
-function applyMark(seg: PlannedSegment, marked: boolean): PlannedSegment {
+//
+// `basePrompt` is the video's shared style bible. A demoted avatar block carried
+// NO imagePrompt from Gemini (avatar blocks get none), so without a fallback its
+// prompt would be empty. We fall back to the basePrompt — a real, on-style
+// visual of the video's recurring world — instead of the raw narration sentence,
+// which makes a poor, over-literal generation prompt.
+function applyMark(seg: PlannedSegment, marked: boolean, basePrompt: string): PlannedSegment {
   if (marked) {
     return { ...seg, blockType: "avatar", imagePrompt: null, animationPrompt: null };
   }
@@ -385,7 +431,7 @@ function applyMark(seg: PlannedSegment, marked: boolean): PlannedSegment {
     return {
       ...seg,
       blockType: "image",
-      imagePrompt: seg.imagePrompt || seg.script.slice(0, 200),
+      imagePrompt: seg.imagePrompt || basePrompt.trim() || seg.script.slice(0, 200),
     };
   }
   return seg;
@@ -441,6 +487,12 @@ export async function buildSyntheticTimeline(input: {
     );
   }
 
+  // Shared style bible for the whole video. Prepended to each block's
+  // scene-specific prompt at persist time (composePrompt) so adjacent blocks of
+  // the same scene generate as one continuous world, and used as the visual
+  // fallback for demoted avatar blocks instead of raw narration text.
+  const basePrompt = safe.data.basePrompt.trim();
+
   let planned = alignSegments(safe.data.segments, words, voiceoverDuration);
 
   // Force avatar on segments that overlap a red/orange doc mark.
@@ -484,7 +536,7 @@ export async function buildSyntheticTimeline(input: {
     for (const seg of planned) {
       const needle = normNeedle(seg.script);
       if (!needle) {
-        result.push(applyMark(seg, false));
+        result.push(applyMark(seg, false, basePrompt));
         continue;
       }
       const at = normStr.indexOf(needle, searchFrom);
@@ -500,7 +552,7 @@ export async function buildSyntheticTimeline(input: {
       // unmarked half keeps its visual type.
       if (at < 0) {
         unplaced++;
-        result.push(applyMark(seg, false));
+        result.push(applyMark(seg, false, basePrompt));
         continue;
       }
       placed++;
@@ -509,7 +561,7 @@ export async function buildSyntheticTimeline(input: {
       // Advance the cursor only on a real match so a single miss can't strand
       // the rest. Re-anchor search from just after this match.
       searchFrom = at + needle.length;
-      const pieces = splitByMarks(seg, origStart, origEnd, avatarRanges);
+      const pieces = splitByMarks(seg, origStart, origEnd, avatarRanges, basePrompt);
       if (pieces.length > 1) split++;
       for (const p of pieces) {
         if (p.blockType === "avatar") forced++;
@@ -594,7 +646,10 @@ export async function buildSyntheticTimeline(input: {
     end_time: p.endTime,
     duration: p.duration,
     script: p.script,
-    image_prompt: p.imagePrompt,
+    // Compose the shared base prompt in FRONT of the block's scene-specific
+    // prompt so generation always carries the recurring world. avatar blocks
+    // have no visual prompt (imagePrompt is null) and stay null.
+    image_prompt: p.blockType === "avatar" ? null : composePrompt(basePrompt, p.imagePrompt),
     animation_prompt: p.animationPrompt,
     status: "pending" as const,
   }));
@@ -608,6 +663,7 @@ export async function buildSyntheticTimeline(input: {
       return acc;
     }, {}),
     voiceoverDuration,
+    basePromptChars: basePrompt.length,
   });
 
   return planned;
