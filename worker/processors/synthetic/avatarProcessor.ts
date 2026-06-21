@@ -9,7 +9,7 @@ import { generateAvatar } from "@/lib/synthetic/heygen";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
-import { cutAudio } from "@/lib/media/ffmpeg";
+import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
 
@@ -115,7 +115,22 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   const imgRes = await withHttpRetry("avatar.image_fetch", () =>
     fetchOrThrow(project.avatar_image_url as string, { timeoutMs: 60_000 }),
   );
-  const imageBytes = Buffer.from(await imgRes.arrayBuffer());
+  let imageBytes: Buffer<ArrayBuffer> = Buffer.from(await imgRes.arrayBuffer());
+
+  // split_2 avatars go into a 9:16 PORTRAIT canvas. A LANDSCAPE source photo
+  // makes HeyGen pad top/bottom with white (baked-in letterbox bars). Pre-crop
+  // the source to 9:16 so the rendered avatar fills the frame edge-to-edge.
+  // Best-effort: on any crop failure, fall back to the raw bytes (the render's
+  // letterbox-strip still cleans up residual bars).
+  if (seg.block_type === "split_2") {
+    try {
+      imageBytes = await cropImageToPortrait(imageBytes);
+    } catch (e) {
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.portrait_crop_failed", {
+        err: (e as Error).message?.slice(0, 200),
+      });
+    }
+  }
 
   await setMediaJob(mediaJobId, { progress: 30 });
 

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { getEnv } from "@/lib/env";
+import { probeFile } from "@/lib/media/probe";
 
 // All FFmpeg invocations use spawn with an argument array — no shell strings.
 // This is critical when input filenames are derived from external IDs/URLs.
@@ -519,6 +520,133 @@ export async function buildSplitScreenVideo(opts: {
   }
 }
 
+// Run ffmpeg purely to read a value off its stderr (no output file). Used by
+// cropdetect: ffmpeg prints `crop=W:H:X:Y` lines to stderr. We capture the
+// tail, never write a file (-f null -). Returns the full stderr text.
+function runFFmpegCaptureStderr(
+  bin: string,
+  args: string[],
+  signal?: AbortSignal,
+  timeoutSeconds = 30,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
+    const KEEP = 32_768;
+    let tail = "";
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutSeconds * 1000);
+    child.stderr.on("data", (c: Buffer) => {
+      tail += c.toString();
+      if (tail.length > KEEP) tail = tail.slice(-KEEP);
+    });
+    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    // cropdetect exits 0 with `-f null -`; resolve with whatever we captured.
+    child.on("close", () => {
+      clearTimeout(timer);
+      if (timedOut) reject(new Error("ffmpeg cropdetect timed out"));
+      else resolve(tail);
+    });
+    signal?.addEventListener("abort", () => { clearTimeout(timer); child.kill("SIGKILL"); });
+  });
+}
+
+// HeyGen renders a split_2 avatar onto a 9:16 PORTRAIT canvas, but the source
+// avatar PHOTO is often LANDSCAPE — so HeyGen fits-to-width and pads the top
+// and bottom with WHITE, baking letterbox bars into the mp4. Those bars survive
+// the split-cell scale-to-cover and show up in the final video (and the review
+// preview). We strip them: detect the real content box, then crop to it before
+// the cell scale. cropdetect finds BLACK borders, so we negate first (white ->
+// black). Returns a `crop=W:H:X:Y` filter string, or null when no significant
+// border is found (already full-bleed, or an unexpected layout — in which case
+// we leave the frame untouched rather than risk a bad crop).
+async function detectLetterboxCrop(
+  videoPath: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const env = getEnv();
+  try {
+    // Sample ~2s of frames. limit=24 (after negate) treats near-white as
+    // border; reset=0 accumulates the tightest box across sampled frames.
+    const stderr = await runFFmpegCaptureStderr(
+      env.FFMPEG_PATH,
+      ["-y", "-i", videoPath, "-vf", "negate,cropdetect=limit=24:round=2:reset=0",
+        "-frames:v", "60", "-an", "-f", "null", "-"],
+      signal,
+      30,
+    );
+    const matches = stderr.match(/crop=(\d+):(\d+):(\d+):(\d+)/g);
+    if (!matches || matches.length === 0) return null;
+    // Take the LAST line — cropdetect refines toward the tightest stable box.
+    const last = matches[matches.length - 1];
+    const m = last.match(/crop=(\d+):(\d+):(\d+):(\d+)/);
+    if (!m) return null;
+    const [, wS, hS, xS, yS] = m;
+    const cw = Number(wS), ch = Number(hS), cy = Number(yS);
+    // Probe the source height so we only crop when a MEANINGFUL band is removed
+    // (guards against cropdetect noise that shaves a few pixels).
+    let srcH = 0;
+    try { const p = await probeFile(videoPath); srcH = p.height ?? 0; } catch { /* best-effort */ }
+    // Only act when the detected content is clearly shorter than the frame
+    // (>10% removed vertically) and offset from the top — i.e. real letterbox.
+    if (srcH > 0 && ch >= srcH * 0.9 && cy < srcH * 0.05) return null;
+    if (ch <= 0 || cw <= 0) return null;
+    return `crop=${cw}:${ch}:${xS}:${yS}`;
+  } catch {
+    // Detection is best-effort: on any failure, leave the frame untouched.
+    return null;
+  }
+}
+
+// Crop image BYTES to a 9:16 PORTRAIT JPEG (scale-to-cover, center-crop). Used
+// to pre-shape a LANDSCAPE avatar photo before HeyGen upload for split_2 blocks:
+// HeyGen pads a landscape source into its portrait canvas with white bars, so
+// feeding it an already-portrait crop makes the rendered avatar fill the frame.
+// The crop is horizontally centered and anchored toward the TOP (y biased up)
+// so a head-and-shoulders subject stays in frame rather than being cut at the
+// chin. Best-effort: throws only if ffmpeg fails; the caller falls back to the
+// raw bytes. Output is 1080×1920 (HeyGen's portrait canvas).
+export async function cropImageToPortrait(
+  imageBytes: Buffer,
+  signal?: AbortSignal,
+): Promise<Buffer<ArrayBuffer>> {
+  const env = getEnv();
+  const dir = path.join(env.TMP_DIR, "avatar-portrait");
+  await fs.mkdir(dir, { recursive: true });
+  const inPath = path.join(dir, `src_${Math.abs(hashBuf(imageBytes))}.bin`);
+  const outPath = `${inPath}.portrait.jpg`;
+  await fs.writeFile(inPath, imageBytes);
+  try {
+    // scale-to-cover 1080×1920 (increase fills the cell), then center-crop
+    // horizontally but anchor the crop window's TOP at the frame top
+    // ((ih-1920)/2 would center; we use a smaller y to keep the face) — clamp
+    // to >=0 via max(0,...). For a landscape source, ih < 1920 after the
+    // cover-scale never happens (cover makes height >= 1920), so the crop trims
+    // top/bottom; biasing y up keeps the head.
+    const vf =
+      "scale=1080:1920:force_original_aspect_ratio=increase," +
+      "crop=1080:1920:(iw-1080)/2:max(0\\,(ih-1920)/3)";
+    await runFFmpeg(
+      env.FFMPEG_PATH,
+      ["-y", "-i", inPath, "-vf", vf, "-frames:v", "1", "-q:v", "3", outPath],
+      signal,
+      30,
+    );
+    // Re-wrap with Buffer.from so the return type is Buffer<ArrayBuffer>
+    // (fs.readFile yields Buffer<ArrayBufferLike>), matching the caller's let.
+    return Buffer.from(await fs.readFile(outPath));
+  } finally {
+    try { await fs.unlink(inPath); } catch { /* ignore */ }
+    try { await fs.unlink(outPath); } catch { /* ignore */ }
+  }
+}
+
+// Cheap stable filename hash for temp staging (not security-sensitive).
+function hashBuf(b: Buffer): number {
+  let h = 0;
+  for (let i = 0; i < b.length; i += 997) h = (h * 31 + b[i]) | 0;
+  return h;
+}
+
 // SYNTHETIC ENGINE: split-screen with an AVATAR VIDEO on the left and a
 // generated STILL on the right. The synthetic split_2 block pairs a HeyGen
 // talking-head (left) with an illustrative nano-banana image (right).
@@ -556,12 +684,19 @@ export async function buildSplitScreenAvatarVideo(opts: {
     "-y", "-i", opts.rightImagePath, "-frames:v", "1", rightPng,
   ], opts.signal, 30);
 
-  // LEFT (avatar video, input 0): trim to duration, normalize fps, scale-to-
-  // cover the left cell, center-crop, setsar=1. setpts resets the PTS so a
-  // trimmed clip starts at 0.
+  // HeyGen letterbox: a landscape avatar photo padded into the 9:16 portrait
+  // canvas leaves WHITE bars baked into the mp4. Detect and strip them BEFORE
+  // the cell scale, so the avatar fills the left half edge-to-edge (no bars in
+  // the final video). null when already full-bleed -> no-op.
+  const letterboxCrop = await detectLetterboxCrop(opts.avatarVideoPath, opts.signal);
+  const stripBars = letterboxCrop ? `${letterboxCrop},` : "";
+
+  // LEFT (avatar video, input 0): trim to duration, normalize fps, strip any
+  // letterbox bars, scale-to-cover the left cell, center-crop, setsar=1. setpts
+  // resets the PTS so a trimmed clip starts at 0.
   // RIGHT (still, input 1): identical recipe to buildSplitScreenVideo's side.
   const leftChain =
-    `[0:v]trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps},` +
+    `[0:v]trim=duration=${dur},setpts=PTS-STARTPTS,fps=${fps},${stripBars}` +
     `scale=${halfW}:${h}:force_original_aspect_ratio=increase,crop=${halfW}:${h},setsar=1`;
   const rightChain =
     `[1:v]fps=${fps},scale=${halfW}:${h}:force_original_aspect_ratio=increase,` +
