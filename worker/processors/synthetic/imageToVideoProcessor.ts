@@ -74,7 +74,7 @@ export async function processImageToVideoJob(
     });
 
     const up = await uploadBuffer(clip.video, r2Keys.segmentVideo(projectId, segmentId), "video/mp4");
-    await finishSegment(segmentId, { status: "ready", video_url: up.publicUrl, provider: clip.provider });
+    await finishSegment(segmentId, { status: "ready", video_url: up.publicUrl, provider: clip.provider, error: null });
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: clip.provider } });
   } catch (err) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed", {

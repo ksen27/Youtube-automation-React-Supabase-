@@ -17,7 +17,16 @@ export class HttpError extends Error {
 
 export function isRetryableHttp(err: unknown): boolean {
   if (err instanceof HttpError) {
-    return err.status === 429 || err.status >= 500;
+    if (err.status === 429 || err.status >= 500) return true;
+    // 69labs returns 403 (not 429) when its per-account concurrent-generation
+    // limit is hit: {"error":"Concurrent image generation limit reached (7)..."}.
+    // That is a transient rate-limit, not a permanent auth failure — riding it
+    // out with backoff lets a burst of segments drain instead of failing. Match
+    // the message so a genuine auth 403 (bad key) stays permanent.
+    if (err.status === 403 && /concurrent.*limit reached/i.test(err.body ?? err.message)) {
+      return true;
+    }
+    return false;
   }
   // Fetch/network-layer errors (ECONNRESET, ETIMEDOUT, DNS, abort timeouts).
   const m = (err as Error)?.message ?? "";

@@ -14,6 +14,32 @@ import { withStylePrompt } from "@/lib/synthetic/constants";
 // Images get the mandatory STYLE_PROMPT appended (withStylePrompt). The
 // image-to-video and avatar steps live in separate provider modules.
 
+// Process-wide gate on concurrent image generations. The image_gen,
+// image_to_video, and avatar/split_2 lanes each call generateImage on their own
+// BullMQ concurrency, so their combined in-flight count can blow past 69labs'
+// per-account limit (7) and earn a 403. This semaphore caps the TOTAL in-flight
+// image generations for THIS worker process below that limit; excess callers
+// await a freed slot (FIFO). Scope is per-process — correct here because the
+// burst that triggered the 403 came from one worker running all three lanes at
+// once. With multiple worker machines the cap is per-machine; size accordingly.
+let imageSlotsInUse = 0;
+const imageWaiters: Array<() => void> = [];
+
+async function acquireImageSlot(limit: number): Promise<void> {
+  if (imageSlotsInUse < limit) {
+    imageSlotsInUse++;
+    return;
+  }
+  await new Promise<void>((resolve) => imageWaiters.push(resolve));
+  imageSlotsInUse++;
+}
+
+function releaseImageSlot(): void {
+  imageSlotsInUse--;
+  const next = imageWaiters.shift();
+  if (next) next();
+}
+
 function cfg() {
   const env = getEnv();
   if (!env.SIXTYNINE_LABS_API_KEY) {
@@ -161,6 +187,10 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
 
   // 1) Submit the job. 16:9 to match the synthetic canvas; the renderer handles
   // any cropping/letterboxing, so we request a wide aspect ratio.
+  // Extra retry budget on submit: a 403 "concurrent limit reached" needs to
+  // wait for OTHER in-flight generations to finish, which can take longer than
+  // a normal transient blip. 5 attempts with a 2s base gives ~2+6+18+54s of
+  // backoff — enough for a burst to drain — before giving up on the segment.
   const submit = await withHttpRetry("69labs.image.submit", () =>
     fetchOrThrow(`${c.base}/api/v1/images/generate`, {
       method: "POST",
@@ -172,6 +202,7 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
       }),
       timeoutMs: 60_000,
     }),
+    { attempts: 5, baseMs: 2000 },
   );
   const { id: jobId } = (await submit.json()) as { id: string; queuePosition?: number };
   if (!jobId) throw new Error("69labs image: submit returned no job id");
@@ -256,6 +287,10 @@ async function generateFluxImage(prompt: string): Promise<Buffer> {
  */
 export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
   const prompt = withStylePrompt(basePrompt);
+  // Hold a global image slot for the whole nano-banana submit→poll→download so
+  // total in-flight 69labs image work stays under the provider's concurrent cap.
+  // The Flux fallback is a different provider, so it runs OUTSIDE the slot.
+  await acquireImageSlot(getEnv().SIXTYNINE_IMAGE_CONCURRENCY);
   try {
     const { image, contentType } = await generateNanoBananaImage(prompt);
     return { image, contentType, provider: "sixtynine_image" };
@@ -268,5 +303,7 @@ export async function generateImage(basePrompt: string): Promise<GenerateImageRe
     if (!getEnv().FLUX_API_KEY) throw primaryErr; // no fallback configured
     const image = await generateFluxImage(prompt);
     return { image, contentType: "image/jpeg", provider: "flux_image" };
+  } finally {
+    releaseImageSlot();
   }
 }

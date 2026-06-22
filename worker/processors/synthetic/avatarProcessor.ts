@@ -177,7 +177,11 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
     );
     // For split_2 the avatar is the LEFT video; the right still is set by the
     // image-gen processor. video_url holds the avatar mp4 either way.
-    await finishSegment(segmentId, { status: "ready", video_url: result.videoUrl, provider: "heygen" });
+    // Clear any error left by a prior attempt or a premature stall-sweep — a
+    // slow-but-alive HeyGen render can complete AFTER the sweeper wrote a
+    // "stalled" error, and without clearing it the row would show 'ready' with a
+    // stale red error simultaneously.
+    await finishSegment(segmentId, { status: "ready", video_url: result.videoUrl, provider: "heygen", error: null });
     await setMediaJob(mediaJobId, {
       status: "completed",
       progress: 100,

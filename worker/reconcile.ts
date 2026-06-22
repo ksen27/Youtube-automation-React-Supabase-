@@ -162,7 +162,7 @@ export async function sweepStalledSegments(staleMs: number): Promise<number> {
 
   const { data: stalled, error } = await sb
     .from("synthetic_segments")
-    .select("id, project_id")
+    .select("id, project_id, metadata")
     .eq("status", "generating")
     .lt("updated_at", cutoff);
   if (error) {
@@ -171,8 +171,40 @@ export async function sweepStalledSegments(staleMs: number): Promise<number> {
   }
   if (!stalled || stalled.length === 0) return 0;
 
+  // A segment is stamped 'generating' the moment it is DISPATCHED, but with a
+  // serial queue (AVATAR_CONCURRENCY=1, ~5min/HeyGen render) a segment can sit
+  // QUEUED behind many others for far longer than staleMs before its job even
+  // starts. Its updated_at never moves while queued (nothing writes the row), so
+  // the naive cutoff would false-fail avatars that are simply waiting their turn
+  // — exactly the 2026-06-21 mass-sweep (38 segments killed mid-run).
+  //
+  // So before sweeping, look up each segment's linked media_job: if the job is
+  // still 'queued' (never started), the segment is WAITING, not stalled — skip
+  // it. Only sweep segments whose job is actually 'running' (started but went
+  // quiet past the cutoff = genuinely stuck) or whose job is missing/terminal
+  // (orphaned — the spinner can never clear on its own).
+  const jobIds = stalled
+    .map((s) => ((s.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined)
+    .filter((x): x is string => typeof x === "string" && x.length > 0);
+  const jobStatusById = new Map<string, string>();
+  if (jobIds.length > 0) {
+    const { data: jobRows } = await sb
+      .from("media_jobs")
+      .select("id, status")
+      .in("id", jobIds);
+    for (const j of jobRows ?? []) jobStatusById.set(j.id as string, j.status as string);
+  }
+
   const projects = new Set<string>();
+  let skippedQueued = 0;
   for (const seg of stalled) {
+    const jobId = ((seg.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined;
+    const jobStatus = jobId ? jobStatusById.get(jobId) : undefined;
+    // Still waiting in the queue — not stalled. Leave it for its turn.
+    if (jobStatus === "queued") {
+      skippedQueued++;
+      continue;
+    }
     const { error: upErr } = await sb
       .from("synthetic_segments")
       .update({ status: "failed", error: "stalled — generation did not complete" })
@@ -180,8 +212,11 @@ export async function sweepStalledSegments(staleMs: number): Promise<number> {
       .eq("status", "generating"); // guard against a concurrent finish
     if (upErr) continue;
     await logJob({ projectId: seg.project_id, sourceId: seg.id },
-      "reconcile.segment_stall_swept", { segmentId: seg.id });
+      "reconcile.segment_stall_swept", { segmentId: seg.id, jobStatus: jobStatus ?? "none" });
     projects.add(seg.project_id);
+  }
+  if (skippedQueued > 0) {
+    await logJob({}, "reconcile.segment_sweep.skipped_queued", { count: skippedQueued });
   }
 
   // Let the synthetic pipeline finalize on whatever succeeded (drops failed

@@ -55,6 +55,7 @@ export async function processImageGenJob(
     await finishSegment(segmentId, {
       status: "ready",
       provider: out.provider,
+      error: null, // clear any prior-attempt / stall-sweep error on success
       ...(isSplit ? { right_image_url: up.publicUrl } : { image_url: up.publicUrl }),
     });
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: out.provider } });
