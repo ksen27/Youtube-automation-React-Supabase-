@@ -111,31 +111,48 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     "id" | "block_type" | "status" | "position" | "start_time" | "duration" | "script" | "image_url" | "video_url" | "right_image_url">>;
   if (all.length === 0) return;
 
-  const pending = all.filter((s) => s.status === "pending" || s.status === "generating");
-  if (pending.length > 0) {
+  // Finalize ONLY when EVERY segment has reached a terminal state. A segment
+  // is "still working" unless it is ready / failed / skipped — anything else
+  // (pending, generating, or a transient state between a failure and its
+  // retry) must block finalize. The old check only excluded pending/generating,
+  // so a segment momentarily in another state slipped through and triggered a
+  // premature snapshot that froze a partial timeline (the slow ai_clip/split_2
+  // blocks finished hours later and were never added). See reconcile below.
+  const TERMINAL = new Set(["ready", "failed", "skipped"]);
+  const unfinished = all.filter((s) => !TERMINAL.has(String(s.status)));
+  if (unfinished.length > 0) {
     // Still working — keep the status meaningful for the progress screen.
-    await setProjectStatus(projectId, inProgressStatus(new Set(pending.map((s) => s.block_type))));
-    return;
-  }
-
-  // Guard against double-finalize: if timeline_items already exist for this
-  // project's synthetic blocks, don't re-materialize.
-  const { count: existing } = await sb
-    .from("timeline_items")
-    .select("id", { count: "exact", head: true })
-    .eq("project_id", projectId);
-  if ((existing ?? 0) > 0) {
-    await setProjectStatus(projectId, "ready_for_review");
+    await setProjectStatus(projectId, inProgressStatus(new Set(unfinished.map((s) => s.block_type))));
     return;
   }
 
   // Materialize timeline_items from ready segments (skipped/failed are dropped;
   // their narration time is absorbed by neighbours at render via durations).
+  //
+  // RECONCILE, don't skip: a prior finalize may have already materialized the
+  // segments that were ready at the time. Rather than bail when timeline_items
+  // exist, we insert only the ready segments not yet represented (keyed on
+  // metadata.synthetic_segment_id) so late-completing segments are added. This
+  // is what makes finalize idempotent AND eventually-complete instead of
+  // freezing whatever was ready first.
+  const { data: existingItems } = await sb
+    .from("timeline_items")
+    .select("metadata")
+    .eq("project_id", projectId);
+  const alreadyMaterialized = new Set(
+    (existingItems ?? [])
+      .map((it) => (it.metadata as { synthetic_segment_id?: string } | null)?.synthetic_segment_id)
+      .filter((v): v is string => !!v),
+  );
+
   const ready = all.filter((s) => s.status === "ready");
-  const rows = ready.map((s, idx) => ({
+  const missing = ready.filter((s) => !alreadyMaterialized.has(s.id));
+  const rows = missing.map((s) => ({
     project_id: projectId,
     type: s.block_type, // 'avatar' | 'image' | 'ai_clip' | 'split_2'
-    position: idx,
+    // Position is rebuilt below across the WHOLE timeline so order stays clean
+    // whether this is the first finalize or a reconcile of late segments.
+    position: 0,
     start_time: s.start_time,
     duration: s.duration,
     script_text: s.script,
@@ -148,10 +165,30 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
   if (rows.length > 0) {
     const { error } = await sb.from("timeline_items").insert(rows);
     if (error) throw new Error(`maybeFinalizeSynthetic materialize: ${error.message}`);
+    // Renumber every synthetic row by its segment's planned position so the
+    // timeline is contiguous and in order, even after a reconcile inserted late
+    // blocks out of sequence. Segments carry the authoritative order via
+    // synthetic_segments.position; map each timeline row back to it.
+    const segPos = new Map(all.map((s) => [s.id, s.position]));
+    const { data: items } = await sb
+      .from("timeline_items")
+      .select("id, metadata")
+      .eq("project_id", projectId);
+    const ordered = (items ?? [])
+      .map((it) => ({
+        id: it.id as string,
+        segId: (it.metadata as { synthetic_segment_id?: string } | null)?.synthetic_segment_id,
+      }))
+      .filter((x) => x.segId && segPos.has(x.segId))
+      .sort((a, b) => (segPos.get(a.segId!) ?? 0) - (segPos.get(b.segId!) ?? 0));
+    for (let i = 0; i < ordered.length; i++) {
+      await sb.from("timeline_items").update({ position: i }).eq("id", ordered[i].id);
+    }
   }
   await setProjectStatus(projectId, "ready_for_review");
   await logJob({ projectId }, "synthetic.finalize", {
     materialized: rows.length,
+    alreadyPresent: alreadyMaterialized.size,
     failed: all.filter((s) => s.status === "failed").length,
   });
 }
