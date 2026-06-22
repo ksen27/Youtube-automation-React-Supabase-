@@ -116,24 +116,110 @@ export function scriptField(page: Page): Locator {
     .or(page.locator("textarea"));
 }
 
-// Aspect-ratio / orientation toggle in the composer's bottom toolbar. Verified
-// 2026-06-20: two adjacent icon-only buttons — svg use[href="#landscape-phone"]
-// (16:9 landscape) and svg use[href="#portrait-phone"] (9:16 portrait). The
-// synthetic render canvas is 1280×720 (16:9), so we click landscape to force a
-// 16:9 avatar video; without it HeyGen defaults to 9:16 portrait and the avatar
-// is letterboxed/cropped in the final render.
+// Aspect-ratio / orientation toggle in the composer's bottom toolbar. These are
+// ICON-ONLY buttons (no text, no aria-label — confirmed against the live UI on
+// 2026-06-22), so a name-based locator alone misses them. The CONFIRMED markup is:
+//   <button class="… tw-bg-fill-general tw-text-brand tw-shadow-md …">  ← when SELECTED
+//     <div data-state="closed">
+//       <svg><use href="#landscape-phone"></use></svg>   (portrait => #portrait-phone)
+//     </div>
+//   </button>
+// So the PRIMARY, exact locator is the svg sprite id. We keep broader fallbacks
+// (token-in-any-attr, then positional ratioButtonsFallback) only as a safety net
+// against future renames. The selected STATE is read separately by activeRatio()
+// via the tw-bg-fill-general/tw-text-brand/tw-shadow-md active classes.
+const LANDSCAPE_SPRITE = '#landscape-phone';
+const PORTRAIT_SPRITE = '#portrait-phone';
+
 export function landscapeRatioButton(page: Page): Locator {
   return page
-    .getByRole("button", { name: /landscape|16:9/i })
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#landscape-phone"])'))
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#landscape"])'));
+    .locator(`:is(button,[role="button"]):has(svg use[href="${LANDSCAPE_SPRITE}"])`)
+    .or(page.getByRole("button", { name: /landscape|16\s*:\s*9|horizontal|widescreen/i }))
+    .or(page.locator('button[title*="16:9" i], button[title*="landscape" i], [role="button"][aria-label*="landscape" i]'))
+    .or(
+      page.locator(
+        ':is(button,[role="button"]):has(svg use[href*="landscape" i], svg use[href*="horizontal" i], svg use[href*="16-9"], svg use[href*="16_9"])',
+      ),
+    )
+    .or(page.locator(':is(button,[role="button"])[class*="landscape" i], :is(button,[role="button"])[data-ratio*="16" i]'));
 }
 
 export function portraitRatioButton(page: Page): Locator {
   return page
-    .getByRole("button", { name: /portrait|9:16/i })
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#portrait-phone"])'))
-    .or(page.locator(':is(button,[role="button"]):has(svg use[href="#portrait"])'));
+    .locator(`:is(button,[role="button"]):has(svg use[href="${PORTRAIT_SPRITE}"])`)
+    .or(page.getByRole("button", { name: /portrait|9\s*:\s*16|vertical/i }))
+    .or(page.locator('button[title*="9:16" i], button[title*="portrait" i], [role="button"][aria-label*="portrait" i]'))
+    .or(
+      page.locator(
+        ':is(button,[role="button"]):has(svg use[href*="portrait" i], svg use[href*="vertical" i], svg use[href*="9-16"], svg use[href*="9_16"])',
+      ),
+    )
+    .or(page.locator(':is(button,[role="button"])[class*="portrait" i], :is(button,[role="button"])[data-ratio*="9" i]'));
+}
+
+// Positional last-resort: the two orientation toggles sit ADJACENT in the
+// preview pane's bottom toolbar, landscape (wide rectangle) on the LEFT, portrait
+// (tall phone) on the RIGHT. When the attribute-based locators above all miss on
+// a new build, we find the small icon-only buttons inside the composer preview
+// and pick by horizontal position. `which` selects landscape (leftmost of the
+// pair) or portrait (rightmost). Returns null if we can't identify a clean pair.
+export async function ratioButtonsFallback(
+  page: Page,
+  which: "landscape" | "portrait",
+): Promise<Locator | null> {
+  // Icon-only buttons: a button with an svg child and (almost) no text. Scope to
+  // the preview pane so we don't grab unrelated toolbar icons.
+  const candidates = composerPreview(page)
+    .locator("xpath=ancestor-or-self::*[1]")
+    .locator(':is(button,[role="button"]):has(svg)');
+  // Fall back to a page-wide search if the scoped one finds nothing.
+  const scope = (await candidates.count().catch(() => 0)) > 0 ? candidates : page.locator(':is(button,[role="button"]):has(svg)');
+
+  const boxes = await scope
+    .locator("visible=true")
+    .evaluateAll((els) =>
+      els
+        .map((el, i) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          const text = (el.textContent ?? "").trim();
+          return { i, x: r.x, y: r.y, w: r.width, h: r.height, hasText: text.length > 2 };
+        })
+        // Small, square-ish, text-free icon buttons (the orientation toggles).
+        .filter((b) => !b.hasText && b.w > 12 && b.w < 64 && b.h > 12 && b.h < 64),
+    )
+    .catch(() => [] as Array<{ i: number; x: number; y: number; w: number; h: number; hasText: boolean }>);
+  if (boxes.length < 2) return null;
+
+  // The orientation pair is two such icons on (roughly) the same row, adjacent in
+  // x. Find the closest horizontal pair on a shared baseline.
+  boxes.sort((a, b) => a.x - b.x);
+  let best: { left: number; right: number } | null = null;
+  let bestGap = Infinity;
+  for (let i = 0; i < boxes.length - 1; i++) {
+    const a = boxes[i];
+    const b = boxes[i + 1];
+    if (Math.abs(a.y - b.y) > 12) continue; // not on the same row
+    const gap = b.x - (a.x + a.w);
+    if (gap >= 0 && gap < bestGap) {
+      bestGap = gap;
+      best = { left: a.i, right: b.i };
+    }
+  }
+  if (!best) return null;
+  const idx = which === "landscape" ? best.left : best.right;
+  return scope.locator("visible=true").nth(idx);
+}
+
+// One-time diagnostic: dump the composer preview toolbar's outerHTML so we can
+// read the REAL attributes of the orientation toggles on the live build and pin
+// an exact selector. Logged (truncated) — never throws.
+export async function dumpRatioToolbar(page: Page): Promise<string> {
+  return composerPreview(page)
+    .locator("xpath=ancestor-or-self::*[2]")
+    .first()
+    .evaluate((el) => (el as HTMLElement).outerHTML)
+    .catch(() => "")
+    .then((h) => (h || "").slice(0, 4000));
 }
 
 // Read which orientation the composer is ACTUALLY in, rather than trusting that
@@ -146,6 +232,12 @@ export function portraitRatioButton(page: Page): Locator {
 // Best-effort: never throws. A null result means "couldn't confirm" and the
 // caller decides whether that's acceptable.
 export async function activeRatio(page: Page): Promise<"landscape" | "portrait" | null> {
+  // CONFIRMED 2026-06-22: the SELECTED orientation toggle carries HeyGen's active
+  // styling — tw-bg-fill-general + tw-text-brand + tw-shadow-md — while the
+  // unselected one does not. There is NO aria-pressed/data-state="active" signal
+  // (the button's data-state="closed" is an unrelated Radix tooltip state), which
+  // is why the old generic check returned null. We read the real active classes
+  // first, then the generic aria/state signals as a forward-compat fallback.
   const pressed = async (loc: Locator): Promise<boolean> => {
     const el = loc.locator("visible=true").first();
     if (!(await el.count().catch(() => 0))) return false;
@@ -153,7 +245,14 @@ export async function activeRatio(page: Page): Promise<"landscape" | "portrait" 
     const checkedAttr = await el.getAttribute("aria-checked").catch(() => null);
     const stateAttr = await el.getAttribute("data-state").catch(() => null);
     const cls = (await el.getAttribute("class").catch(() => "")) ?? "";
+    // HeyGen's confirmed active styling. tw-text-brand (brand-color icon) +
+    // tw-bg-fill-general (filled background) are the strongest tells; require the
+    // brand text color AND either the fill or shadow to avoid a false positive
+    // from a shared utility class.
+    const heygenActive =
+      /\btw-text-brand\b/.test(cls) && /\b(tw-bg-fill-general|tw-shadow-md)\b/.test(cls);
     return (
+      heygenActive ||
       pressedAttr === "true" ||
       checkedAttr === "true" ||
       stateAttr === "on" ||
@@ -163,18 +262,36 @@ export async function activeRatio(page: Page): Promise<"landscape" | "portrait" 
     );
   };
 
-  if (await pressed(landscapeRatioButton(page))) return "landscape";
-  if (await pressed(portraitRatioButton(page))) return "portrait";
+  // Read BOTH toggles' selected state. The svg-sprite locators are exact, so this
+  // is deterministic. If exactly one is active, that's the answer.
+  const landscapeActive = await pressed(landscapeRatioButton(page));
+  const portraitActive = await pressed(portraitRatioButton(page));
+  if (landscapeActive && !portraitActive) return "landscape";
+  if (portraitActive && !landscapeActive) return "portrait";
 
-  // Fallback: measure the live preview canvas. The composer renders the avatar
-  // into a preview whose box reflects the chosen ratio.
-  const box = await composerPreview(page)
+  // Fallback: measure the LARGEST visible preview box. The broad composerPreview
+  // selector can match several nodes (stray canvases, tiny thumbnails), and the
+  // FIRST one is often not the main frame — so we scan the visible matches and
+  // take the biggest by area, which is the composer's preview. We also require a
+  // clear non-square aspect (>10% off square) before deciding; a near-square box
+  // is ambiguous and returns null (unknown) so the caller doesn't act on noise.
+  const boxes = await composerPreview(page)
     .locator("visible=true")
-    .first()
-    .boundingBox()
-    .catch(() => null);
-  if (box && box.width > 0 && box.height > 0) {
-    return box.width >= box.height ? "landscape" : "portrait";
+    .evaluateAll((els) =>
+      els
+        .map((el) => {
+          const r = (el as HTMLElement).getBoundingClientRect();
+          return { w: r.width, h: r.height };
+        })
+        .filter((b) => b.w > 40 && b.h > 40),
+    )
+    .catch(() => [] as Array<{ w: number; h: number }>);
+  if (boxes.length > 0) {
+    const biggest = boxes.reduce((a, b) => (a.w * a.h >= b.w * b.h ? a : b));
+    const ratio = biggest.w / biggest.h;
+    if (ratio >= 1.1) return "landscape";
+    if (ratio <= 0.9) return "portrait";
+    // Near-square: ambiguous — don't guess.
   }
   return null;
 }

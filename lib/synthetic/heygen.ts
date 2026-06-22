@@ -16,7 +16,7 @@ import {
   captureDiagnostics,
 } from "@/lib/synthetic/heygen-auth";
 import {
-  acquireWarmSession,
+  acquireJobPage,
   invalidateWarmSession,
 } from "@/lib/synthetic/heygen-session";
 import {
@@ -36,6 +36,8 @@ import {
   landscapeRatioButton,
   portraitRatioButton,
   activeRatio,
+  ratioButtonsFallback,
+  dumpRatioToolbar,
   voiceRows,
   voiceConfirmEnabled,
   voiceRequiredToast,
@@ -357,19 +359,19 @@ async function attemptOnAccount(
   imageBytes: Buffer,
 ): Promise<GenerateAvatarResult> {
   const e = env();
-  // Reuse the WARM browser+context (spec point 4): one session is kept alive and
-  // shared across jobs, so we do NOT launch a browser or re-verify /home per job.
-  // acquireWarmSession verifies the session ONCE on first use / after a long idle
-  // gap (throwing a classified session_expired if it's dead) — back-to-back jobs
-  // skip the /home Cloudflare challenge that used to burn the session after ~3
-  // renders. We open only a fresh PAGE here and close just that page in finally;
-  // the context/browser stay warm for the next job.
-  const context = await acquireWarmSession(account);
+  // Reuse the WARM session (spec point 4): one browser+context+page is kept alive
+  // and shared across jobs, so we do NOT launch a browser, re-verify /home, or
+  // open a fresh page per job. acquireJobPage verifies the session ONCE on first
+  // use / after a long idle gap (throwing a classified session_expired if dead)
+  // and hands back a page already warm on /avatar — so back-to-back jobs skip both
+  // the /home Cloudflare challenge (was burning the session after ~3 renders) and
+  // the cold /avatar reload (was making generation take minutes to start). The
+  // page is NOT closed in finally — it stays warm for the next job.
+  const { page: warmPage, context } = await acquireJobPage(account);
   const t0 = Date.now();
-  let page: Page | null = null;
+  const page: Page = warmPage;
   try {
-    page = await context.newPage();
-    const p = page; // non-null alias for use inside async callbacks below
+    const p = page; // alias for use inside async callbacks below
 
     // 1) Session was already restored + verified by acquireWarmSession. NO login
     // here. An expired session surfaced there as a classified, no-penalty
@@ -382,17 +384,18 @@ async function attemptOnAccount(
     // hiccup just means retrieval treats the first new completed item as ours.
     const baselineId = await newestItemId(context).catch(() => "");
 
-    // 2) Go straight to the avatar "Quick create" workspace. The job page starts
-    // blank (the warm context is reused, not re-navigated), so this is the first
-    // navigation of the job; the avatar composer lives at /avatar.
+    // 2) Re-navigate to the avatar "Quick create" workspace for a CLEAN composer
+    // each job. The page is warm (reused across jobs), so this is a fast in-SPA
+    // reload — not a cold load — but it still resets any photo/script/audio the
+    // previous render left behind. The avatar composer lives at /avatar.
     await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
-    await waitFirstVisible(scriptField(p), e.HEYGEN_NAV_TIMEOUT_MS, "avatar composer");
+    await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
 
     // 3) Select the "Photo to video" mode (vs. "Script to video") so the photo
     // upload pane is active. Best-effort: if it's already the active tab the
     // click is harmless; if the tab isn't present the upload step still runs.
     if (await isVisible(photoToVideoTab(p), 3000)) {
-      await clickFirstVisible(photoToVideoTab(p), e.HEYGEN_NAV_TIMEOUT_MS, "photo-to-video tab").catch(
+      await clickFirstVisible(photoToVideoTab(p), e.HEYGEN_SETUP_TIMEOUT_MS, "photo-to-video tab").catch(
         () => {},
       );
     }
@@ -417,14 +420,14 @@ async function attemptOnAccount(
     const existingInput = (await photoUpload(p).count()) > 0;
     if (existingInput) {
       await photoUpload(p).first().setInputFiles(stagePath).catch(async () => {
-        await uploadViaChooser(p, stagePath, e.HEYGEN_NAV_TIMEOUT_MS);
+        await uploadViaChooser(p, stagePath, e.HEYGEN_SETUP_TIMEOUT_MS);
       });
     } else {
-      await uploadViaChooser(p, stagePath, e.HEYGEN_NAV_TIMEOUT_MS);
+      await uploadViaChooser(p, stagePath, e.HEYGEN_SETUP_TIMEOUT_MS);
     }
 
     // Confirm the upload landed (our photo shows in the preview pane).
-    await waitFirstVisible(selectedPhoto(p), e.HEYGEN_NAV_TIMEOUT_MS, "uploaded photo preview");
+    await waitFirstVisible(selectedPhoto(p), e.HEYGEN_SETUP_TIMEOUT_MS, "uploaded photo preview");
     await shot(p, input.projectId, input.segmentId, "uploaded");
 
     // 4.5) Set the composer aspect ratio.
@@ -444,28 +447,76 @@ async function attemptOnAccount(
     const ratioBtn = wantPortrait ? portraitRatioButton(p) : landscapeRatioButton(p);
     const ratioLabel = wantPortrait ? "9:16 portrait toggle" : "16:9 landscape toggle";
 
-    // Click the toggle if it isn't already in the wanted state. Re-check after
-    // so a flaky single click (or a UI that needs a settle) gets one retry.
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // Click the toggle if it isn't already in the wanted state. These are
+    // ICON-ONLY buttons, so the attribute-based locator can miss on a new build;
+    // when it does, fall back to a POSITIONAL match (the orientation pair is two
+    // adjacent icon buttons in the preview toolbar, landscape left / portrait
+    // right). Re-check after each click so a flaky single click gets a retry.
+    let toggleEverFound = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
       if ((await activeRatio(p)) === wantRatio) break;
-      if (!(await isVisible(ratioBtn, 5000))) break; // toggle not present; handled below
-      await clickFirstVisible(ratioBtn, 10_000, ratioLabel).catch(() => {});
+      // Prefer the attribute-based button; if not visible, try positional.
+      let target = ratioBtn;
+      if (await isVisible(ratioBtn, 3000)) {
+        toggleEverFound = true;
+      } else {
+        const fallback = await ratioButtonsFallback(p, wantRatio);
+        if (fallback) {
+          target = fallback;
+          toggleEverFound = true;
+        } else {
+          break; // no toggle locatable at all; handled below
+        }
+      }
+      await clickFirstVisible(target, 10_000, ratioLabel).catch(() => {});
       await p.waitForTimeout(800); // let the canvas re-render to the new ratio
     }
     await shot(p, input.projectId, input.segmentId, wantRatio);
 
-    // Verify the composer actually landed in the wanted ratio. For LANDSCAPE this
-    // is mandatory: if we can't confirm 16:9, fail loudly (classified -> rotates
-    // the account, surfaces in diagnostics) rather than emit a wrong-ratio video.
-    // activeRatio returns null only when no state/geometry signal is readable; we
-    // treat null as "not confirmed landscape" for the strict path.
+    // If we never located the toggle by ANY means, dump the toolbar HTML once so
+    // we can read the real attributes and pin an exact selector. (One-shot
+    // diagnostic — cheap, best-effort.)
+    if (!toggleEverFound) {
+      const html = await dumpRatioToolbar(p).catch(() => "");
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.ratio_toolbar_not_found",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          toolbarHtml: html,
+        }),
+      );
+    }
+
+    // Verify the composer landed in the wanted ratio. We DISTINGUISH two cases:
+    //   - confirmed WRONG (e.g. wanted landscape, read portrait): fail loudly so
+    //     we don't emit a 9:16 letterboxed full-frame avatar.
+    //   - UNCONFIRMED (activeRatio returns null — no readable state/geometry on
+    //     this HeyGen build): we already clicked the landscape toggle above, so
+    //     PROCEED with a logged warning rather than throwing. Hard-failing on an
+    //     unreadable signal was killing otherwise-fine landscape jobs (the toggle
+    //     very likely DID apply; we just can't read it back). The render output is
+    //     the real source of truth, and a rare wrong-ratio render is far cheaper
+    //     than failing every full-frame avatar.
     if (!wantPortrait) {
       const got = await activeRatio(p);
-      if (got !== "landscape") {
+      if (got === "portrait") {
         throw new HeygenError(
           "ui_changed",
-          `heygen: composer is not 16:9 landscape after toggle (active=${got ?? "unknown"}); ` +
-            `a full-frame avatar would render as 9:16 portrait`,
+          "heygen: composer is confirmed 9:16 portrait after the landscape toggle; " +
+            "a full-frame avatar would render letterboxed",
+        );
+      }
+      if (got === null) {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            msg: "synthetic.heygen.ratio_unconfirmed",
+            projectId: input.projectId,
+            segmentId: input.segmentId,
+            note: "landscape toggle clicked but active ratio unreadable; proceeding",
+          }),
         );
       }
     }
@@ -486,7 +537,7 @@ async function attemptOnAccount(
     // and a script filled (or audio attached) before that re-render can get
     // wiped (observed 2026-06-19: the script textarea was empty at Generate).
     if (input.audioFilePath) {
-      await uploadAudioTrack(p, input.audioFilePath, e.HEYGEN_NAV_TIMEOUT_MS);
+      await uploadAudioTrack(p, input.audioFilePath, e.HEYGEN_SETUP_TIMEOUT_MS);
       await shot(p, input.projectId, input.segmentId, "audio_uploaded");
       // Settle so React flushes the photo + audio into form state before submit.
       await p.waitForTimeout(1500);
@@ -696,7 +747,7 @@ async function attemptOnAccount(
 
     // Spec E: full diagnostics on every failure (url, title, screenshot, HTML).
     await captureDiagnostics(page, input.jobId, "error");
-    if (page) await shot(page, input.projectId, input.segmentId, "error");
+    await shot(page, input.projectId, input.segmentId, "error");
 
     await logProviderCall({
       projectId: input.projectId,
@@ -721,12 +772,11 @@ async function attemptOnAccount(
       await invalidateWarmSession().catch(() => {});
     }
     throw typed;
-  } finally {
-    // Close only the per-job PAGE. The browser + context stay WARM for the next
-    // job — that reuse is the whole fix. Teardown happens on worker shutdown
-    // (closeWarmSession) or on a session_expired invalidation above.
-    if (page) await page.close().catch(() => {});
   }
+  // NOTE: no finally that closes the page. The warm page (and its context +
+  // browser) are REUSED across jobs — that reuse is the fix for both the session
+  // expiry and the slow start. Teardown happens on worker shutdown
+  // (closeWarmSession) or when a session_expired invalidation rebuilds it.
 }
 
 /**

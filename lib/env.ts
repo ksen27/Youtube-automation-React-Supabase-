@@ -404,6 +404,14 @@ const ServerEnvSchema = z.object({
   HEYGEN_HEADLESS: z.coerce.boolean().default(true),
   // Per-attempt timeout (ms) for one HeyGen avatar generation in the browser.
   HEYGEN_NAV_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // Timeout (ms) for SETUP-phase UI-readiness waits (composer load, photo
+  // preview, upload chooser) — as distinct from the long render budget. The old
+  // code reused HEYGEN_NAV_TIMEOUT_MS (120s) for these, so a single slow/stale
+  // selector stalled the job up to 2 min EACH and they stacked to ~6 min before
+  // generation even started. A tighter budget fails a genuinely slow run fast so
+  // it retries (or rotates) instead of hanging. Default 45s — generous for the
+  // heavy SPA over a proxy, far below the old 120s. Bump if real loads exceed it.
+  HEYGEN_SETUP_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
   // How long verifyAuthenticated waits for the authed/sign-in marker to render
   // before judging the session. The heavy HeyGen SPA renders its nav at ~14.5s
   // through a residential proxy — the old hardcoded 15s caused FALSE expiries

@@ -4,6 +4,10 @@ import { openAuthedContext, verifyAuthenticated } from "@/lib/synthetic/heygen-a
 import { HeygenError } from "@/lib/synthetic/heygen-errors";
 import type { DecryptedAccount } from "@/lib/synthetic/heygen-accounts";
 
+function baseUrl() {
+  return getEnv().HEYGEN_BASE_URL;
+}
+
 // Warm HeyGen session singleton.
 //
 // THE BUG THIS FIXES: avatar generation opened a NEW browser + context per job
@@ -37,6 +41,11 @@ interface WarmSession {
   context: BrowserContext;
   accountId: string;
   verifiedAtMs: number;
+  // A single page kept warm on /avatar across jobs. Reused so the heavy HeyGen
+  // SPA stays hydrated — a fresh blank page would reload /avatar cold each job
+  // (the cause of the slow ~minutes-to-start). null until first use / after a
+  // crash forces a rebuild.
+  jobPage: Page | null;
 }
 
 let current: WarmSession | null = null;
@@ -75,11 +84,11 @@ async function launch(account: DecryptedAccount): Promise<WarmSession> {
       );
     }
   } finally {
-    // The verify page has done its job; jobs open their own page. Closing it
-    // keeps the context lean. The context/browser stay warm.
+    // The verify page has done its job; jobs reuse a dedicated warm page (lazily
+    // created in acquireJobPage). Closing this keeps the context lean.
     await verifyPage.close().catch(() => {});
   }
-  return { browser, context, accountId: account.id, verifiedAtMs: Date.now() };
+  return { browser, context, accountId: account.id, verifiedAtMs: Date.now(), jobPage: null };
 }
 
 /**
@@ -150,18 +159,45 @@ export async function invalidateWarmSession(): Promise<void> {
 }
 
 /**
- * Open a fresh page on the warm context for one job. Cheap (no navigation /
- * challenge here) — the caller drives it and closes it via the returned closer.
+ * Get the WARM job page for one avatar job. Unlike a fresh page per job (which
+ * reloads /avatar cold and made generation take minutes to start), this REUSES a
+ * single page parked on /avatar so the SPA stays hydrated between jobs:
+ *   - first call (or after a crash): create the page and navigate to /avatar once;
+ *   - subsequent calls: hand back the SAME page, re-navigating to /avatar only if
+ *     it drifted off the composer (e.g. landed on /projects after a render).
+ * The caller drives this page and MUST NOT close it — it stays warm. It's closed
+ * only on session teardown / invalidation. Returns the page plus the context (the
+ * caller still needs context.request for the project-list API + download).
  */
-export async function openJobPage(account: DecryptedAccount): Promise<{ page: Page; close: () => Promise<void> }> {
+export async function acquireJobPage(
+  account: DecryptedAccount,
+): Promise<{ page: Page; context: BrowserContext }> {
   const context = await acquireWarmSession(account);
-  const page = await context.newPage();
-  return {
-    page,
-    close: async () => {
-      await page.close().catch(() => {});
-    },
-  };
+  const session = current; // set by acquireWarmSession
+  if (!session) {
+    // Shouldn't happen (acquire throws or sets current), but be defensive.
+    const page = await context.newPage();
+    return { page, context };
+  }
+
+  // Recreate the warm page if it's missing or was closed (crash / prior teardown).
+  if (!session.jobPage || session.jobPage.isClosed()) {
+    session.jobPage = await context.newPage();
+    await session.jobPage
+      .goto(`${baseUrl()}/avatar`, { waitUntil: "commit" })
+      .catch(() => {});
+  } else {
+    // Reused page: make sure it's still on the composer. After a successful
+    // render HeyGen may have routed it to /projects; bring it back so the job's
+    // own composer waits resolve fast against a warm SPA.
+    const onComposer = /\/avatar\b/i.test(session.jobPage.url());
+    if (!onComposer) {
+      await session.jobPage
+        .goto(`${baseUrl()}/avatar`, { waitUntil: "commit" })
+        .catch(() => {});
+    }
+  }
+  return { page: session.jobPage, context };
 }
 
 /** Graceful teardown for worker shutdown. Never throws. */
