@@ -4,7 +4,7 @@ import type { ImageToVideoJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
-import { isLtxConfigured } from "@/lib/synthetic/ltx";
+import { isLtxConfigured, isLtxPermanentFailure } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
@@ -33,12 +33,17 @@ export async function processImageToVideoJob(
 
   const { data: seg, error } = await sb
     .from("synthetic_segments")
-    .select("id, image_prompt, animation_prompt, script, duration, image_url")
+    .select("id, image_prompt, animation_prompt, script, duration, image_url, metadata")
     .eq("id", segmentId)
     .single();
   if (error || !seg) throw new Error(`image_to_video: segment ${segmentId} not found`);
 
-  const imagePrompt = (seg.image_prompt ?? seg.script ?? "").trim();
+  // Picture prompt for the source still. NEVER fall back to seg.script (the
+  // spoken narration) — that produced literal, off-topic frames. When the
+  // per-block prompt is missing, use the video's recurring world (base_prompt,
+  // stashed by the planner) so the still is on-topic.
+  const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+  const imagePrompt = (seg.image_prompt?.trim() || basePrompt).trim();
   const animationPrompt = (seg.animation_prompt ?? "Subtle natural motion, slow push-in").trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
@@ -47,7 +52,10 @@ export async function processImageToVideoJob(
   if (!imageUrl) {
     const t0 = Date.now();
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
-    const img = await generateImage(imagePrompt || seg.script || "a relevant scene");
+    // imagePrompt already resolves to the per-block scene, else the video's
+    // recurring world (base_prompt). It is intentionally NOT the spoken script.
+    if (!imagePrompt) throw new Error(`image_to_video: segment ${segmentId} has no usable image prompt`);
+    const img = await generateImage(imagePrompt);
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
@@ -78,18 +86,23 @@ export async function processImageToVideoJob(
     await finishSegment(segmentId, { status: "ready", video_url: up.publicUrl, provider: clip.provider, error: null });
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: clip.provider } });
   } catch (err) {
+    // A billing/quota failure (LTX out of funds) can NEVER succeed on retry, and
+    // each retry re-generates the nano-banana still (~4¢) for nothing. Fail it
+    // immediately instead of burning the whole retry budget + image cost.
+    const permanent = isLtxPermanentFailure(err);
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed", {
       err: (err as Error).message?.slice(0, 200),
       isFinalAttempt,
+      permanent,
     });
-    if (isFinalAttempt) {
+    if (isFinalAttempt || permanent) {
       // Per client direction, an ai_clip MUST be real AI video — we do NOT
       // degrade to a held still (that would silently hide a generation failure).
       // Mark the segment failed with the genuine LTX reason so it is visible and
       // retryable in the UI instead of masked as a static image.
       const reason = (err as Error).message?.slice(0, 300);
       await finishSegment(segmentId, { status: "failed", error: reason });
-      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed_final", { err: reason });
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed_final", { err: reason, permanent });
       await setMediaJob(mediaJobId, { status: "failed", error: reason });
       await maybeFinalizeSynthetic(projectId);
       return;

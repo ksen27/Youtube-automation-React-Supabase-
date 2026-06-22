@@ -28,13 +28,21 @@ export async function processImageGenJob(
 
   const { data: seg, error } = await sb
     .from("synthetic_segments")
-    .select("id, block_type, image_prompt, script")
+    .select("id, block_type, image_prompt, script, metadata")
     .eq("id", segmentId)
     .single();
   if (error || !seg) throw new Error(`image_gen: segment ${segmentId} not found`);
 
-  const prompt = (seg.image_prompt ?? seg.script ?? "").trim();
-  if (!prompt) throw new Error(`image_gen: segment ${segmentId} has no prompt`);
+  // Resolve the picture prompt. NEVER fall back to seg.script — the script is
+  // the SPOKEN narration, and drawing it verbatim is what produced literal,
+  // off-topic stills (e.g. "Be honest, I read these." rendered as a person
+  // reading). When the per-block prompt is missing, use the video's recurring
+  // world (base_prompt, stashed by the planner) so the still is at least
+  // on-topic. If neither exists, fail loudly so the segment is retryable rather
+  // than silently mis-generated.
+  const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+  const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
+  if (!prompt) throw new Error(`image_gen: segment ${segmentId} has no usable image prompt`);
 
   try {
     const t0 = Date.now();

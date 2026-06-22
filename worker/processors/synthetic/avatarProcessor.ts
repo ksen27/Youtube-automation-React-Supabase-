@@ -85,7 +85,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   const [{ data: seg, error: segErr }, { data: project, error: projErr }] = await Promise.all([
     sb
       .from("synthetic_segments")
-      .select("id, block_type, script, image_prompt, right_image_url, start_time, end_time")
+      .select("id, block_type, script, image_prompt, right_image_url, start_time, end_time, metadata")
       .eq("id", segmentId)
       .single(),
     sb.from("projects").select("avatar_image_url, voiceover_url").eq("id", projectId).single(),
@@ -100,7 +100,12 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   // at render time by buildSplitScreenAvatarVideo.
   if (seg.block_type === "split_2" && !seg.right_image_url) {
     const t0 = Date.now();
-    const prompt = (seg.image_prompt ?? seg.script ?? "a relevant scene").trim();
+    // Right-half still prompt. NEVER fall back to seg.script (the spoken
+    // narration); use the per-block scene, else the video's recurring world
+    // (base_prompt), so the illustrative half stays on-topic.
+    const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+    const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
+    if (!prompt) throw new Error(`avatar: split_2 segment ${segmentId} has no usable image prompt`);
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
     const img = await generateImage(prompt);
     await logProviderCall({

@@ -53,6 +53,11 @@ export interface PlannedSegment {
   script: string;
   imagePrompt: string | null;
   animationPrompt: string | null;
+  // True for the SECOND visual attached to a long sentence (see
+  // splitByDuration). Both visuals share the full sentence + prompt; this flag
+  // tells the persist step to nudge the second one to a different
+  // composition/angle so the two frames aren't identical.
+  secondVisual?: boolean;
 }
 
 function buildPrompt(transcript: string): string {
@@ -72,9 +77,14 @@ function buildPrompt(transcript: string): string {
     "  - split_2: mixed explanation where a talking presenter AND an",
     "             illustrative image should appear together.",
     "",
-    "Block sizing: aim for 3-8 seconds of narration per block, ~6s typical;",
-    "split long passages into multiple blocks rather than one long hold. Never",
-    "let a single visual block run longer than ~8 seconds of narration.",
+    "Block sizing — ONE SENTENCE = ONE BLOCK. Each block's `script` MUST be a",
+    "WHOLE sentence (or a few short, tightly-related sentences). NEVER break a",
+    "single sentence across two blocks, and NEVER end a block mid-sentence /",
+    "mid-clause — a block always ends at a sentence boundary (. ? !). A long",
+    "sentence stays ONE block even if it runs 10-15 seconds; the system covers a",
+    "long sentence with multiple visuals automatically, so you do NOT need to",
+    "shorten it. Keeping the whole sentence in one block lets you describe a",
+    "visual for the COMPLETE thought instead of a fragment.",
     "",
     "FIRST, read the WHOLE transcript and write a single `basePrompt`: the",
     "video's recurring visual world — the main recurring subjects, the setting /",
@@ -83,16 +93,28 @@ function buildPrompt(transcript: string): string {
     "automatically, so describe the constants here, NOT any one moment. Do NOT",
     "include camera or film-grain styling — that is appended separately.",
     "",
-    "THEN segment the transcript. For image/ai_clip/split_2 blocks, write an",
-    "`imagePrompt`: ONLY the scene-specific detail for THIS block (the action,",
-    "the specific subject and composition of this moment). Do NOT repeat the",
-    "basePrompt — assume it is already present. Do NOT include camera or",
+    "THEN segment the transcript. For EVERY image/ai_clip/split_2 block, write a",
+    "concrete `imagePrompt`: ONLY the scene-specific detail for THIS block (the",
+    "action, the specific subject and composition of this moment). Do NOT repeat",
+    "the basePrompt — assume it is already present. Do NOT include camera or",
     "film-grain styling.",
     "",
-    "CONTINUITY (critical): when you split one sentence or one continuous scene",
-    "across several consecutive blocks, those blocks MUST keep the SAME setting,",
-    "lighting, subjects, and framing so they read as one continuous shot. Only",
-    "change the visual world when the narration genuinely moves to a new scene.",
+    "CRITICAL — the imagePrompt is a PICTURE DESCRIPTION, never the narration.",
+    "NEVER copy, paraphrase, or echo the block's `script` into the imagePrompt.",
+    "The script is what is SPOKEN; the imagePrompt is what is SHOWN — they are",
+    "different things. Every visual block MUST have a non-empty imagePrompt that",
+    "describes a real, filmable scene set in the video's world (the basePrompt).",
+    "When a line is conversational, abstract, or filler (e.g. 'Be honest, I read",
+    "these.', 'the August Panic Method', 'and we are going to fix it') and has no",
+    "literal scene, INVENT an on-topic visual that fits the recurring world",
+    "(e.g. the presenter in the relevant setting, a relevant object or B-roll of",
+    "the subject) — do NOT leave imagePrompt empty and do NOT fall back to the",
+    "spoken words. An empty imagePrompt is INVALID output.",
+    "",
+    "CONTINUITY (critical): when consecutive blocks describe one continuous",
+    "scene, they MUST keep the SAME setting, lighting, subjects, and framing so",
+    "they read as one continuous shot. Only change the visual world when the",
+    "narration genuinely moves to a new scene.",
     "",
     "For ai_clip blocks also write an `animationPrompt` describing the motion",
     "(camera move, subject action). avatar blocks need no prompts.",
@@ -182,6 +204,17 @@ function composePrompt(basePrompt: string, blockPrompt: string | null): string |
   // edited row re-run through the planner).
   if (block.toLowerCase().startsWith(base.toLowerCase())) return block;
   return `${base.replace(/[.\s]+$/, "")}. ${block}`;
+}
+
+// The second visual covering a long sentence shows the SAME moment from a
+// different composition so the two frames don't look like duplicates. We append
+// a short variation hint to the block's own prompt (the full-sentence scene is
+// unchanged). Returns the prompt untouched when this isn't a second visual.
+function secondVisualPrompt(blockPrompt: string | null, isSecond?: boolean): string | null {
+  if (!isSecond) return blockPrompt;
+  const block = (blockPrompt ?? "").trim();
+  if (!block) return block || null;
+  return `${block.replace(/[.\s]+$/, "")}. Show this from a different angle and composition (alternate framing of the same scene).`;
 }
 
 function mk(
@@ -363,55 +396,89 @@ export function coalesceAvatarSegments(segs: PlannedSegment[]): {
   return { segments: out, merged, overLengthParts };
 }
 
-// Split a long VISUAL segment into N back-to-back sub-segments so no single
-// block holds longer than the client's pacing window (~3-8s) — which is also
-// the constraint that lets LTX-2 generate each ai_clip in one image-to-video
-// call (its tiers top out well above 8s, but the planner cap keeps clips on
-// the 6/8s tiers). Mirrors the sourced engine's footage/image slot-split in
-// lib/ai/timeline-plan.ts.
+// Cover a long VISUAL sentence with TWO visuals instead of one — WITHOUT
+// cutting the sentence's script. (Client direction 2026-06.)
 //
-// A block longer than `threshold` is divided into round(duration / target)
-// equal sub-blocks (at least 2). Each sub-block:
-//   - inherits the parent's blockType + image/animation prompts (so an ai_clip
-//     stays an ai_clip; the same prompt drives every sub-clip),
-//   - gets a proportional, word-boundary-snapped slice of the script,
-//   - gets a proportional slice of the spoken-time window.
+// The old behaviour sliced a long block's SCRIPT into fragments and made each
+// fragment its own block. That degraded quality: every visual was then
+// generated from a partial clause ("standing out there in flip-flops…") that
+// Gemini reasoned about out of context, so the image/clip no longer reflected
+// the whole thought. Instead we now keep ONE sentence = ONE thought: every
+// sub-block carries the FULL sentence's script and its FULL-sentence prompt, so
+// the visual is always generated with complete context. We split only the
+// on-screen TIME, attaching a second visual to fill a long sentence so it isn't
+// a static hold.
 //
-// 'avatar' blocks are NEVER split: a talking head holds for the whole sentence
-// and is generated by HeyGen, not LTX, so the duration ceiling doesn't apply.
-// `position` is reassigned by the caller after all splits.
+// Rules (per client):
+//   - A sentence <= threshold (~6-8s): ONE visual, unchanged.
+//   - A sentence > threshold: TWO visuals splitting the sentence's time in half.
+//       * ai_clip sentence  -> CLIP first (snapped to LTX's tier), then an
+//         IMAGE fills the leftover time after the clip ends. So piece 1 stays
+//         ai_clip; piece 2 becomes an `image` (different scene/angle of the
+//         SAME sentence) covering [clipEnd, sentenceEnd).
+//       * image sentence    -> IMAGE first half, a SECOND image (different
+//         scene/angle of the SAME sentence) the second half.
+//       * split_2 sentence  -> left to the avatar flow (a talking presenter
+//         holds the whole sentence); not time-split here.
+//
+// Both pieces keep the parent's script + imagePrompt. The SECOND piece is
+// flagged (metadata.secondVisual) so the persist step / image generator can
+// nudge it to a different composition rather than producing a duplicate frame.
+//
+// 'avatar' / 'split_2' blocks are NEVER time-split: the talking head holds for
+// the whole sentence and is generated by HeyGen. `position` is reassigned by
+// the caller after all splits.
 export function splitByDuration(
   seg: PlannedSegment,
   targetSeconds: number,
   thresholdSeconds: number,
 ): PlannedSegment[] {
-  if (seg.blockType === "avatar") return [seg];
+  if (seg.blockType === "avatar" || seg.blockType === "split_2") return [seg];
   const dur = seg.endTime - seg.startTime;
   if (dur <= thresholdSeconds || dur <= 0) return [seg];
 
-  const slots = Math.max(2, Math.round(dur / targetSeconds));
-  const scriptLen = seg.script.length;
-  const out: PlannedSegment[] = [];
-  for (let k = 0; k < slots; k++) {
-    const f0 = k / slots;
-    const f1 = (k + 1) / slots;
-    const cutStart = k === 0 ? 0 : snapToSpace(seg.script, Math.round(f0 * scriptLen));
-    const cutEnd = k === slots - 1 ? scriptLen : snapToSpace(seg.script, Math.round(f1 * scriptLen));
-    const piece = seg.script.slice(cutStart, cutEnd).trim();
-    const startTime = seg.startTime + f0 * dur;
-    const endTime = seg.startTime + f1 * dur;
-    out.push({
+  // Always exactly TWO visuals for a long sentence: the sentence is one thought,
+  // so we never fragment it further than first-half / second-half.
+  const mid = seg.startTime + dur / 2;
+
+  if (seg.blockType === "ai_clip") {
+    // Clip first (it snaps to an LTX tier at generation time), image fills the
+    // remainder. The clip piece keeps its animationPrompt; the fill image drops
+    // it (an image has no motion) and is marked as the second visual.
+    const clipPiece: PlannedSegment = {
       ...seg,
-      startTime,
-      endTime,
-      duration: Math.max(0.5, endTime - startTime),
-      // A sub-block whose proportional script slice landed empty (e.g. a long
-      // pause with few words) still keeps the parent's image prompt so the
-      // visual generates; fall back to the parent script only if no prompt.
-      script: piece || seg.script.slice(0, 200),
-    });
+      startTime: seg.startTime,
+      endTime: mid,
+      duration: Math.max(0.5, mid - seg.startTime),
+    };
+    const fillImage: PlannedSegment = {
+      ...seg,
+      blockType: "image",
+      animationPrompt: null,
+      startTime: mid,
+      endTime: seg.endTime,
+      duration: Math.max(0.5, seg.endTime - mid),
+      secondVisual: true,
+    };
+    return [clipPiece, fillImage];
   }
-  return out;
+
+  // image: two stills, each holding half the sentence, both from the full
+  // sentence. The second is flagged so it gets a different composition/angle.
+  const first: PlannedSegment = {
+    ...seg,
+    startTime: seg.startTime,
+    endTime: mid,
+    duration: Math.max(0.5, mid - seg.startTime),
+  };
+  const second: PlannedSegment = {
+    ...seg,
+    startTime: mid,
+    endTime: seg.endTime,
+    duration: Math.max(0.5, seg.endTime - mid),
+    secondVisual: true,
+  };
+  return [first, second];
 }
 
 // Set a segment's avatar-ness. Marked -> avatar (drop visual prompts).
@@ -648,9 +715,21 @@ export async function buildSyntheticTimeline(input: {
     script: p.script,
     // Compose the shared base prompt in FRONT of the block's scene-specific
     // prompt so generation always carries the recurring world. avatar blocks
-    // have no visual prompt (imagePrompt is null) and stay null.
-    image_prompt: p.blockType === "avatar" ? null : composePrompt(basePrompt, p.imagePrompt),
+    // have no visual prompt (imagePrompt is null) and stay null. The SECOND
+    // visual of a long sentence gets a "different angle" nudge so the two
+    // frames covering one sentence aren't identical (both still derive from the
+    // SAME full-sentence prompt — only the composition differs).
+    image_prompt:
+      p.blockType === "avatar"
+        ? null
+        : composePrompt(basePrompt, secondVisualPrompt(p.imagePrompt, p.secondVisual)),
     animation_prompt: p.animationPrompt,
+    // Stash the video's recurring world on every row so the image processors
+    // have a LAST-RESORT visual prompt that is on-topic — never the spoken
+    // narration. A visual block should always carry a composed image_prompt
+    // above, but if Gemini ever returns an empty scene AND there's no base, the
+    // processor falls back to this instead of drawing the script verbatim.
+    metadata: { base_prompt: basePrompt || null },
     status: "pending" as const,
   }));
   const { error } = await sb.from("synthetic_segments").insert(rows);

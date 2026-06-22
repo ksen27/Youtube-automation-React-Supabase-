@@ -40,6 +40,17 @@ export function isLtxConfigured(): boolean {
   return Boolean(getEnv().LTX_API_KEY);
 }
 
+// A PERMANENT LTX failure that retrying cannot fix: the account is out of money
+// or over quota. Retrying just burns the upstream image-gen cost (a fresh
+// nano-banana still per attempt) on a clip that can never succeed, so the
+// processor should fail fast on the first attempt instead of exhausting its
+// retry budget. Matched on the reason text LTX returns
+// ("Insufficient funds. Required: 48 cents", quota/credit walls).
+export function isLtxPermanentFailure(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? String(err ?? "");
+  return /insufficient funds|out of (credits?|funds)|no credits|quota|payment required|billing/i.test(msg);
+}
+
 // Coerce LTX's inconsistent failure payload into a human-readable string. The
 // reason can arrive as a plain string, a nested {error|message|detail}, or an
 // arbitrary object — JSON.stringify the object form so we never print
