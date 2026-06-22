@@ -150,7 +150,12 @@ async function uploadViaChooser(page: Page, filePath: string, timeoutMs: number)
 // HeygenError if the modal / upload control never appears. On success the modal
 // closes and the composer is driven by the uploaded audio; we then skip the
 // script-fill and voice-picker steps entirely.
-async function uploadAudioTrack(page: Page, audioPath: string, timeoutMs: number): Promise<void> {
+async function uploadAudioTrack(
+  page: Page,
+  audioPath: string,
+  timeoutMs: number,
+  audioDurationSeconds?: number,
+): Promise<void> {
   // 1) Open the audio-upload modal from the Script panel header. The modal is a
   // portal-rendered div (NOT role="dialog"), so we detect "open" by its visible
   // "Upload Audio" heading. CRITICAL: use waitFor({state:"visible"}), NOT
@@ -198,16 +203,28 @@ async function uploadAudioTrack(page: Page, audioPath: string, timeoutMs: number
   const confirmHeading = audioConfirmHeading(page).locator("visible=true").first();
   const confirmBtn = audioConfirmButton(page).locator("visible=true").first();
   await confirmHeading.waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
-  // The "Add audio" button can stay disabled until the track finishes processing;
-  // poll a few times, re-checking, before giving up.
+  // The "Add audio" button stays disabled until HeyGen finishes PROCESSING the
+  // uploaded track (it has to decode the file and load its duration into the
+  // preview player). That processing time scales with the audio LENGTH: a 3s clip
+  // enables the button in a couple seconds, but a 25-30s clip can take well over a
+  // minute. The old fixed ~40s poll (8 × ~5s) was fine for short parts but
+  // false-failed long ones with "'Add audio' never became clickable" — and with a
+  // single-account pool there is no other account to rotate to, so the job looped
+  // until the stall-sweeper killed it. So budget the poll by duration: a generous
+  // floor for short clips, growing ~6× the audio length, capped so a genuinely
+  // stuck modal still fails in bounded time.
+  const dur = Number.isFinite(audioDurationSeconds) ? Math.max(0, audioDurationSeconds as number) : 0;
+  const confirmBudgetMs = Math.min(180_000, Math.max(45_000, Math.round(dur * 6_000)));
+  const perPollMs = 3_000;
+  const maxPolls = Math.ceil(confirmBudgetMs / (perPollMs + 4_000));
   let committed = false;
-  for (let i = 0; i < 8 && !committed; i++) {
+  for (let i = 0; i < maxPolls && !committed; i++) {
     try {
       await confirmBtn.waitFor({ state: "visible", timeout: 4000 });
       await confirmBtn.click({ timeout: 6000 });
       committed = true;
     } catch {
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(perPollMs);
     }
   }
   if (!committed) {
@@ -357,6 +374,13 @@ async function attemptOnAccount(
   account: DecryptedAccount,
   input: GenerateAvatarInput,
   imageBytes: Buffer,
+  // When true, ignore input.audioFilePath and drive via the legacy script path.
+  // generateAvatar() sets this on the final retry after an audio-upload failure
+  // so a single-account pool still produces an avatar (HeyGen TTS speaks the
+  // script) instead of looping on the same broken "Add audio" step until the
+  // stall-sweeper kills the job. The render length then follows HeyGen's TTS, not
+  // the sliced audio — a worse duration match, but a produced video beats none.
+  forceScriptPath = false,
 ): Promise<GenerateAvatarResult> {
   const e = env();
   // Reuse the WARM session (spec point 4): one browser+context+page is kept alive
@@ -389,7 +413,24 @@ async function attemptOnAccount(
     // reload — not a cold load — but it still resets any photo/script/audio the
     // previous render left behind. The avatar composer lives at /avatar.
     await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
-    await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
+    try {
+      await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
+    } catch (err) {
+      // The composer never rendered — the /avatar SPA came up BLANK (observed:
+      // empty toolbar HTML, no script field). This is almost always the WARM PAGE
+      // itself being wedged (a stale render, a silent Cloudflare interstitial, a
+      // half-dead context), NOT a moved selector. Reusing the same page on the next
+      // retry reproduces the blank page forever — which is exactly the continuous
+      // "avatar composer never appeared" loop on a single-account pool. Throw the
+      // distinct `blank_composer` class so the catch below tears the warm session
+      // down (AFTER capturing diagnostics) and the next attempt rebuilds a fresh
+      // page/context from stored cookies instead of re-driving the broken one.
+      throw new HeygenError(
+        "blank_composer",
+        "heygen: avatar composer never appeared (blank /avatar)",
+        err,
+      );
+    }
 
     // 3) Select the "Photo to video" mode (vs. "Script to video") so the photo
     // upload pane is active. Best-effort: if it's already the active tab the
@@ -536,8 +577,8 @@ async function attemptOnAccount(
     // Done LAST, right before Generate: the photo upload re-renders the composer,
     // and a script filled (or audio attached) before that re-render can get
     // wiped (observed 2026-06-19: the script textarea was empty at Generate).
-    if (input.audioFilePath) {
-      await uploadAudioTrack(p, input.audioFilePath, e.HEYGEN_SETUP_TIMEOUT_MS);
+    if (input.audioFilePath && !forceScriptPath) {
+      await uploadAudioTrack(p, input.audioFilePath, e.HEYGEN_SETUP_TIMEOUT_MS, input.audioDurationSeconds);
       await shot(p, input.projectId, input.segmentId, "audio_uploaded");
       // Settle so React flushes the photo + audio into form state before submit.
       await p.waitForTimeout(1500);
@@ -763,12 +804,20 @@ async function attemptOnAccount(
       },
     });
 
-    // If the SESSION died (login wall mid-job), drop the warm singleton so the
-    // next attempt rebuilds from the stored cookies rather than reusing a context
-    // whose cookies HeyGen just invalidated. Other failure classes (ui_changed,
-    // network, …) are NOT the session's fault — keep the warm context so we don't
-    // pay a fresh Cloudflare challenge to rebuild it.
-    if (typed.klass === "session_expired" || typed.klass === "login_required") {
+    // Drop the warm singleton so the next attempt rebuilds a FRESH page/context
+    // (from stored cookies) instead of re-driving a broken one, for the two cases
+    // where the held session is the actual problem:
+    //   - session_expired/login_required: HeyGen invalidated the cookies mid-job.
+    //   - blank_composer: /avatar came up blank — the warm page is wedged, and
+    //     reusing it reproduces the blank composer on every retry (the continuous
+    //     "composer never appeared" loop, acute on a single-account pool).
+    // Other classes (ui_changed, network, …) are NOT the session's fault — keep the
+    // warm context so we don't pay a fresh Cloudflare challenge to rebuild it.
+    if (
+      typed.klass === "session_expired" ||
+      typed.klass === "login_required" ||
+      typed.klass === "blank_composer"
+    ) {
       await invalidateWarmSession().catch(() => {});
     }
     throw typed;
@@ -809,11 +858,22 @@ export async function generateAvatar(
   }
 
   let lastErr: unknown;
+  // Once an audio-upload step has failed, drive subsequent retries via the script
+  // path. Critical for a SINGLE-account pool: applyDisposition hands back the SAME
+  // account (nothing else to rotate to), so re-uploading the same long audio would
+  // fail identically every time and loop until the stall-sweeper kills the job.
+  // Falling back to HeyGen's TTS still produces a video.
+  let forceScriptPath = false;
   for (let i = 0; i < maxAccounts; i++) {
     try {
-      return await attemptOnAccount(account, input, imageBytes);
+      return await attemptOnAccount(account, input, imageBytes, forceScriptPath);
     } catch (err) {
       lastErr = err;
+      // An "Add audio"/upload failure is the one case where retrying with the same
+      // audio is futile — degrade to the script path on the next attempt.
+      if (input.audioFilePath && /add audio|audio file chooser|Confirm Audio|Upload Audio/i.test((err as Error)?.message ?? "")) {
+        forceScriptPath = true;
+      }
       const next = await applyDisposition(
         account.id,
         dispositionOf(err),

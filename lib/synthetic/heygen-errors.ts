@@ -16,6 +16,7 @@ export type HeygenErrorClass =
   | "login_required"     // hit a login wall on the worker (should never happen now)
   | "session_expired"    // stored storageState no longer authenticates
   | "ui_changed"         // an expected element is simply gone — HeyGen changed its frontend
+  | "blank_composer"     // /avatar came up BLANK — the warm page is wedged, not a moved selector
   | "selector_failure"   // an element wasn't found/clickable in time (likely UI change)
   | "rate_limit"         // throttled — back off and rotate
   | "credit_exhausted"   // quota/credit wall — this account can't produce more right now
@@ -37,6 +38,11 @@ export const DISPOSITION_BY_CLASS: Record<HeygenErrorClass, HeygenDisposition> =
   // leave it eligible. (Repeated UI failures across the pool are visible in the
   // last_error_class column and the diagnostics, which is the real fix path.)
   ui_changed: "rotate",
+  // A blank composer is NOT the account's fault (no cooldown/disable), so it
+  // rotates like a UI failure — but the real recovery is the warm-session
+  // teardown that attemptOnAccount() does for this class, which forces the next
+  // attempt onto a FRESH page/context instead of re-driving the wedged one.
+  blank_composer: "rotate",
   selector_failure: "rotate",
   rate_limit: "cooldown",
   credit_exhausted: "cooldown",
@@ -94,6 +100,7 @@ export function userFacingMessage(e: unknown): string {
     case "rate_limit":
       return "Too many avatar requests right now. Please wait a moment and try again.";
     case "ui_changed":
+    case "blank_composer":
     case "selector_failure":
     case "network":
     case "unknown":
