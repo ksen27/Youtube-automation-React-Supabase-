@@ -40,6 +40,25 @@ export function isLtxConfigured(): boolean {
   return Boolean(getEnv().LTX_API_KEY);
 }
 
+// Coerce LTX's inconsistent failure payload into a human-readable string. The
+// reason can arrive as a plain string, a nested {error|message|detail}, or an
+// arbitrary object — JSON.stringify the object form so we never print
+// "[object Object]". Returns "" when there is genuinely nothing to report.
+function ltxErrorReason(st: { error?: unknown; message?: unknown; detail?: unknown }): string {
+  const candidate = st.error ?? st.message ?? st.detail;
+  if (candidate == null) return "";
+  if (typeof candidate === "string") return candidate.slice(0, 300);
+  // Nested object: pull a message-ish field if present, else stringify the whole.
+  const obj = candidate as Record<string, unknown>;
+  const nested = obj.message ?? obj.error ?? obj.detail ?? obj.reason;
+  if (typeof nested === "string") return nested.slice(0, 300);
+  try {
+    return JSON.stringify(candidate).slice(0, 300);
+  } catch {
+    return String(candidate).slice(0, 300);
+  }
+}
+
 // Snap an arbitrary requested duration (seconds) to the nearest LTX tier that
 // does not exceed maxDuration. Tiers start at 6s, so anything shorter rounds up
 // to the 6s floor.
@@ -98,14 +117,22 @@ export async function generateLtxVideo(input: GenerateClipInput): Promise<Genera
     const st = (await statusRes.json()) as {
       status?: string;
       result?: { video_url?: string };
-      error?: string;
+      error?: unknown;
+      message?: unknown;
+      detail?: unknown;
     };
     if (st.status === "completed") {
       result = st.result;
       break;
     }
     if (st.status === "failed") {
-      throw new Error(`ltx: job failed${st.error ? ` :: ${st.error}` : ""} (job ${jobId})`);
+      // LTX reports the failure reason inconsistently: sometimes a string under
+      // `error`, sometimes an object, sometimes under `message`/`detail`. The old
+      // code interpolated it directly, yielding an undiagnosable "[object Object]".
+      // Serialize whatever we got so the real reason (content policy, bad image,
+      // unsupported duration) is visible in the job.failed log.
+      const reason = ltxErrorReason(st);
+      throw new Error(`ltx: job failed${reason ? ` :: ${reason}` : ""} (job ${jobId})`);
     }
     await new Promise((r) => setTimeout(r, 5000));
   }

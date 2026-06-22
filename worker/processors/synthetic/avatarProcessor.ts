@@ -11,6 +11,7 @@ import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
+import { classOf, userFacingMessage } from "@/lib/synthetic/heygen-errors";
 import type { JobAttemptInfo } from "@/worker/index";
 
 // An avatar part is capped at 1 minute by the content rules (well under HeyGen
@@ -188,13 +189,18 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
       metadata: { accountId: result.accountId, seconds: result.seconds },
     });
   } catch (err) {
+    // Raw error → logs only (the admin diagnoses from here + heygen_accounts).
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.failed", {
       err: (err as Error).message?.slice(0, 200),
+      klass: classOf(err),
       isFinalAttempt,
     });
     if (isFinalAttempt) {
-      await finishSegment(segmentId, { status: "failed", error: (err as Error).message?.slice(0, 300) });
-      await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: (err as Error).message });
+      // User-visible fields get a plain-language message — never the raw error
+      // (which could say "re-auth with `npm run …`", meaningless to an end user).
+      const friendly = userFacingMessage(err);
+      await finishSegment(segmentId, { status: "failed", error: friendly });
+      await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: friendly });
       await maybeFinalizeSynthetic(projectId);
       return;
     }

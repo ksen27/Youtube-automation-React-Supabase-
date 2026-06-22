@@ -25,6 +25,7 @@ import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoP
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
 import { markJobFailedIfExhausted, sweepStalledJobs, sweepStalledSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
+import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -211,9 +212,34 @@ const sweepTimer = setInterval(() => {
 // Don't keep the process alive solely for the sweep timer.
 sweepTimer.unref?.();
 
+// Server-side HeyGen keep-alive. Refreshes the shared account pool's sessions
+// on a slow timer so they don't lapse on HeyGen's idle TTL — the fix that keeps
+// end users (who never touch a CLI) from hitting "no available accounts". Only
+// the avatar/synthetic worker runs this (it's the host with browser automation
+// and the one that owns HeyGen). A confirmed-expired session is flagged
+// needs_reauth so the admin is alerted; transient blips don't penalize.
+const KEEPALIVE_INTERVAL_MS = Math.max(5, env.HEYGEN_KEEPALIVE_MINUTES) * 60_000;
+let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+if (runSynthetic) {
+  // Kick once shortly after boot (don't wait a full interval), then on the timer.
+  const runKeepAlive = () =>
+    void sweepKeepAlive()
+      .then((r) => {
+        if (r.refreshed + r.expired + r.errors > 0) {
+          console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "heygen.keepalive.done", ...r }));
+        }
+      })
+      .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "heygen.keepalive.error", err: (e as Error).message })));
+  const kickoff = setTimeout(runKeepAlive, 60_000);
+  kickoff.unref?.();
+  keepAliveTimer = setInterval(runKeepAlive, KEEPALIVE_INTERVAL_MS);
+  keepAliveTimer.unref?.();
+}
+
 async function shutdown(signal: string) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.shutdown", signal }));
   clearInterval(sweepTimer);
+  if (keepAliveTimer) clearInterval(keepAliveTimer);
   // Order matters: close workers first so they finish their current job and
   // stop polling, then close the Queue/QueueEvents objects, then quit the
   // shared Redis connection. Quitting Redis first would race in-flight

@@ -1,5 +1,5 @@
 import { getEnv } from "@/lib/env";
-import { fetchOrThrow, withHttpRetry, HttpError } from "@/lib/synthetic/http";
+import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { generateLtxVideo, isLtxConfigured } from "@/lib/synthetic/ltx";
 
 // fal.ai image-to-video provider. Generates animated clips FROM a still image
@@ -134,36 +134,22 @@ export async function generateKlingVideo(input: GenerateClipInput): Promise<Gene
 }
 
 /**
- * Generate an animated clip with provider fallback: LTX-2 first (primary, per
- * client direction), then fal.ai Veo 3 Fast, then Kling. A permanent 4xx from
- * one provider (bad image url / quota) still falls through to the next — the
- * goal is to produce a clip if ANY provider can. LTX is skipped when
- * LTX_API_KEY is unconfigured (reverts to the old Veo->Kling chain). Throws
- * only when every available provider fails; the caller decides how to degrade
- * (e.g. hold the still).
+ * Generate an animated clip via LTX-2 ONLY (per client direction: ai_clip must
+ * be real AI video, no still degrade and no fal.ai Veo/Kling fallback). LTX is
+ * the sole provider, so when it fails we surface its actual error to the caller
+ * — the failure reason must be visible, not masked behind a fallback chain.
+ * Throws if LTX is unconfigured or its job fails; the caller logs the reason.
+ *
+ * NOTE: generateVeoVideo / generateKlingVideo remain exported for any other
+ * caller, but are intentionally NOT used here.
  */
 export async function generateClipWithFallback(
   input: GenerateClipInput,
 ): Promise<GenerateClipResult> {
-  if (isLtxConfigured()) {
-    try {
-      return await generateLtxVideo(input);
-    } catch (ltxErr) {
-      console.warn(JSON.stringify({
-        msg: "synthetic.clip.fallback_to_fal",
-        status: ltxErr instanceof HttpError ? ltxErr.status : undefined,
-        err: (ltxErr as Error).message?.slice(0, 200),
-      }));
-    }
+  if (!isLtxConfigured()) {
+    throw new Error("ai_clip: LTX_API_KEY not configured — LTX is the only clip provider");
   }
-  try {
-    return await generateVeoVideo(input);
-  } catch (veoErr) {
-    console.warn(JSON.stringify({
-      msg: "synthetic.clip.fallback_to_kling",
-      status: veoErr instanceof HttpError ? veoErr.status : undefined,
-      err: (veoErr as Error).message?.slice(0, 200),
-    }));
-    return generateKlingVideo(input);
-  }
+  // No try/catch: let the real LTX error propagate so the processor logs the
+  // genuine failure reason (LTX job error / poll timeout / bad image url).
+  return generateLtxVideo(input);
 }

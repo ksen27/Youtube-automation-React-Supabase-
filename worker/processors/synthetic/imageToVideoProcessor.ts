@@ -15,11 +15,12 @@ import type { JobAttemptInfo } from "@/worker/index";
 // master track). The generated still is uploaded first (so we can degrade to
 // holding it if the animation step fails), then animated.
 //
-// Multi-tier fallback:
-//   1. LTX-2 -> Veo -> Kling is handled inside generateClipWithFallback.
-//   2. If EVERY video provider fails on the FINAL attempt, we degrade to the
-//      still image (segment becomes a held image) rather than failing the
-//      whole block — a held still is far better than a hole in the timeline.
+// Provider policy (per client direction):
+//   - LTX-2 is the ONLY clip provider (no fal.ai Veo/Kling fallback). See
+//     generateClipWithFallback in falai.ts.
+//   - An ai_clip MUST be real AI video. On the FINAL attempt we do NOT degrade
+//     to a held still; the segment is marked failed with LTX's actual error so
+//     the reason is visible and the segment stays retryable in the UI.
 export async function processImageToVideoJob(
   data: ImageToVideoJobData,
   attempt?: JobAttemptInfo,
@@ -82,13 +83,14 @@ export async function processImageToVideoJob(
       isFinalAttempt,
     });
     if (isFinalAttempt) {
-      // Degrade: keep the still as a held image so the block survives.
-      await finishSegment(segmentId, {
-        status: "ready",
-        error: `video failed, held still: ${(err as Error).message?.slice(0, 200)}`,
-      });
-      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.degraded_to_still", {});
-      await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { degradedToStill: true } });
+      // Per client direction, an ai_clip MUST be real AI video — we do NOT
+      // degrade to a held still (that would silently hide a generation failure).
+      // Mark the segment failed with the genuine LTX reason so it is visible and
+      // retryable in the UI instead of masked as a static image.
+      const reason = (err as Error).message?.slice(0, 300);
+      await finishSegment(segmentId, { status: "failed", error: reason });
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed_final", { err: reason });
+      await setMediaJob(mediaJobId, { status: "failed", error: reason });
       await maybeFinalizeSynthetic(projectId);
       return;
     }

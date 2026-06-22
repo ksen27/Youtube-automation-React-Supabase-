@@ -6,9 +6,13 @@ import { uploadBuffer } from "@/lib/storage";
 import {
   resolveProxy,
   parseProxy,
+  saveCookies,
+  markNeedsReauth,
+  getRefreshableAccounts,
   type DecryptedAccount,
 } from "@/lib/synthetic/heygen-accounts";
 import { HeygenError } from "@/lib/synthetic/heygen-errors";
+import { logJob } from "@/lib/jobs/db";
 import { authedMarker, signInMarker, isVisible } from "@/lib/synthetic/heygen-selectors";
 
 // HeyGen authentication manager.
@@ -160,6 +164,88 @@ export async function verifyAuthenticated(page: Page): Promise<AuthVerdict> {
 
   // 5. Genuinely inconclusive — treat as expired (safer than a doomed render).
   return "expired";
+}
+
+/**
+ * Keep-alive: refresh a stored HeyGen session WITHOUT running a job, so the
+ * provider's sliding-window token does not lapse between generation bursts (the
+ * cause of "logged out after several generations / idle"). Restores the session,
+ * opens /home, verifies it, and — if still authed — re-saves the fresh cookies
+ * (resetting the expiry window). Because the session lives in the shared DB, a
+ * keep-alive run from a machine WITH a display keeps the headless Fly worker's
+ * session warm too.
+ *
+ * Returns the verdict so the caller can report / flag needs_reauth. NEVER logs
+ * in (login needs a human) — an expired session is reported, not repaired here.
+ */
+export async function keepAliveSession(
+  account: DecryptedAccount,
+): Promise<AuthVerdict> {
+  const { browser, context } = await openAuthedContext(account, { withStorageState: true });
+  try {
+    // No stored session at all => treat as expired (nothing to keep alive).
+    if (!account.cookies) return "expired";
+    const page = await context.newPage();
+    const verdict = await verifyAuthenticated(page);
+    if (verdict === "authed") {
+      // Re-save the now-fresh cookies so HeyGen's sliding TTL resets. saveCookies
+      // does NOT touch status — a warm refresh, exactly like the post-job path.
+      await saveCookies(account.id, await context.storageState()).catch(() => {});
+    }
+    return verdict;
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
+}
+
+/**
+ * Server-side keep-alive sweep — refreshes EVERY refreshable account's session
+ * so the shared HeyGen pool stays logged in WITHOUT any human or CLI. Designed
+ * to run on a periodic timer in the worker process (where the avatar jobs run),
+ * so end users never hit "no available accounts" from an idle/expired session.
+ *
+ * For each account: re-verify + re-save cookies (resets the sliding TTL). A
+ * genuinely expired session is flagged needs_reauth so the admin is alerted and
+ * the worker won't burn an avatar attempt on it. A transient error (proxy blip,
+ * slow SPA) is logged but does NOT flag the account — only a confirmed "expired"
+ * verdict does, avoiding the false-expiry cascade. Returns counts for logging.
+ *
+ * NOTE: only safe to run where browser automation is available (the avatar
+ * worker host). Never throws — keep-alive must not crash the worker loop.
+ */
+export async function sweepKeepAlive(): Promise<{ refreshed: number; expired: number; errors: number }> {
+  let refreshed = 0;
+  let expired = 0;
+  let errors = 0;
+  let accounts: DecryptedAccount[] = [];
+  try {
+    accounts = await getRefreshableAccounts();
+  } catch (err) {
+    await logJob({}, "synthetic.heygen.keepalive.query_error", {
+      err: (err as Error).message?.slice(0, 200),
+    }).catch(() => {});
+    return { refreshed, expired, errors: 1 };
+  }
+  for (const acc of accounts) {
+    try {
+      const verdict = await keepAliveSession(acc);
+      if (verdict === "authed") {
+        refreshed++;
+      } else {
+        expired++;
+        // Out of rotation + admin alert; reconnect clears it (npm run heygen:reconnect).
+        await markNeedsReauth(acc.id, "keepalive: session expired").catch(() => {});
+      }
+    } catch (err) {
+      errors++;
+      await logJob({}, "synthetic.heygen.keepalive.error", {
+        accountId: acc.id,
+        err: (err as Error).message?.slice(0, 200),
+      }).catch(() => {});
+    }
+  }
+  return { refreshed, expired, errors };
 }
 
 /**

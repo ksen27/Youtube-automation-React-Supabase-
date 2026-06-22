@@ -445,6 +445,10 @@ const ServerEnvSchema = z.object({
   // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
   // just spaces serial jobs apart.
   HEYGEN_JOB_SPACING_SECONDS: z.coerce.number().int().nonnegative().default(20),
+  // Minutes between session refreshes for `npm run heygen:keepalive --watch`.
+  // Keep it below HeyGen's idle-session TTL so the sliding window never lapses
+  // and a single account stays logged in across bursts and quiet periods.
+  HEYGEN_KEEPALIVE_MINUTES: z.coerce.number().int().positive().default(30),
   // HeyGen requires a VOICE to be selected before it will generate (otherwise
   // it errors "Please select the voice id"). This is the voice NAME to pick in
   // HeyGen's voice modal — it is HeyGen's own voice, NOT a 69labs voiceId (a

@@ -75,6 +75,33 @@ export function dispositionOf(e: unknown): HeygenDisposition {
   return isHeygenError(e) ? e.disposition : DISPOSITION_BY_CLASS.unknown;
 }
 
+/**
+ * Translate an avatar failure into a message safe to show a NON-TECHNICAL end
+ * user. The raw error (selectors, `npm run …`, stack-ish text) belongs in logs,
+ * never in the UI — a shared-account user can't act on "re-auth with the CLI".
+ * These messages tell the user what's happening in plain language; the admin
+ * sees the real cause in the worker logs + the heygen_accounts.last_error column.
+ */
+export function userFacingMessage(e: unknown): string {
+  const klass = classOf(e);
+  switch (klass) {
+    case "session_expired":
+    case "login_required":
+      // The "no available accounts" / expired-session case the user hit.
+      return "Avatar generation is temporarily unavailable. The administrator has been notified — please try again shortly.";
+    case "credit_exhausted":
+      return "Avatar generation is temporarily at capacity. Please try again later.";
+    case "rate_limit":
+      return "Too many avatar requests right now. Please wait a moment and try again.";
+    case "ui_changed":
+    case "selector_failure":
+    case "network":
+    case "unknown":
+    default:
+      return "Avatar generation failed. Please try again — if it keeps happening, contact the administrator.";
+  }
+}
+
 // Heuristic text/URL signatures. Kept here (not in selectors) because these are
 // for READING failure state, not driving the happy path.
 const LOGIN_URL = /\/(login|signin|sign-in|auth)\b/i;

@@ -76,6 +76,23 @@ export async function getAvailableAccount(): Promise<DecryptedAccount | null> {
 }
 
 /**
+ * All accounts that currently hold a live session worth keeping warm — 'active'
+ * or 'cooldown' (a cooled-down account is still authenticated, just resting).
+ * needs_reauth / disabled accounts have nothing to refresh, so they're excluded.
+ * Used by the server-side keep-alive sweep and the keepalive CLI. Returns
+ * decrypted accounts (cookies included) — never log these.
+ */
+export async function getRefreshableAccounts(): Promise<DecryptedAccount[]> {
+  const sb = getServerSupabase();
+  const { data, error } = await sb
+    .from("heygen_accounts")
+    .select("*")
+    .in("status", ["active", "cooldown"]);
+  if (error) throw new Error(`getRefreshableAccounts: ${error.message}`);
+  return (data ?? []).map((row) => decrypt(row as HeygenAccount));
+}
+
+/**
  * Persist a fresh Playwright storage state (cookies + localStorage). Worker
  * runs call this to refresh a still-warm session WITHOUT touching status.
  */
