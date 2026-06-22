@@ -13,10 +13,12 @@ import {
   type DecryptedAccount,
 } from "@/lib/synthetic/heygen-accounts";
 import {
-  openAuthedContext,
-  verifyAuthenticated,
   captureDiagnostics,
 } from "@/lib/synthetic/heygen-auth";
+import {
+  acquireWarmSession,
+  invalidateWarmSession,
+} from "@/lib/synthetic/heygen-session";
 import {
   HeygenError,
   classifyHeygenFailure,
@@ -33,6 +35,7 @@ import {
   generateButtonEnabled,
   landscapeRatioButton,
   portraitRatioButton,
+  activeRatio,
   voiceRows,
   voiceConfirmEnabled,
   voiceRequiredToast,
@@ -354,22 +357,23 @@ async function attemptOnAccount(
   imageBytes: Buffer,
 ): Promise<GenerateAvatarResult> {
   const e = env();
-  const { browser, context } = await openAuthedContext(account);
+  // Reuse the WARM browser+context (spec point 4): one session is kept alive and
+  // shared across jobs, so we do NOT launch a browser or re-verify /home per job.
+  // acquireWarmSession verifies the session ONCE on first use / after a long idle
+  // gap (throwing a classified session_expired if it's dead) — back-to-back jobs
+  // skip the /home Cloudflare challenge that used to burn the session after ~3
+  // renders. We open only a fresh PAGE here and close just that page in finally;
+  // the context/browser stay warm for the next job.
+  const context = await acquireWarmSession(account);
   const t0 = Date.now();
   let page: Page | null = null;
   try {
     page = await context.newPage();
     const p = page; // non-null alias for use inside async callbacks below
 
-    // 1) Reuse the stored session and verify it (spec B/C). NO login here. An
-    // expired session is a classified, no-penalty needs_reauth — not a failure.
-    const verdict = await verifyAuthenticated(p);
-    if (verdict === "expired") {
-      throw new HeygenError(
-        "session_expired",
-        `heygen: account ${account.email} session expired — reconnect with \`npm run heygen:connect ${account.email}\``,
-      );
-    }
+    // 1) Session was already restored + verified by acquireWarmSession. NO login
+    // here. An expired session surfaced there as a classified, no-penalty
+    // needs_reauth — not a failure.
     await shot(p, input.projectId, input.segmentId, "authed");
 
     // 1.5) Record the NEWEST project's video_id (via the project-list API)
@@ -378,8 +382,9 @@ async function attemptOnAccount(
     // hiccup just means retrieval treats the first new completed item as ours.
     const baselineId = await newestItemId(context).catch(() => "");
 
-    // 2) Go straight to the avatar "Quick create" workspace. (verifyAuthenticated
-    // left us on /home; the avatar composer lives at /avatar.)
+    // 2) Go straight to the avatar "Quick create" workspace. The job page starts
+    // blank (the warm context is reused, not re-navigated), so this is the first
+    // navigation of the job; the avatar composer lives at /avatar.
     await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
     await waitFirstVisible(scriptField(p), e.HEYGEN_NAV_TIMEOUT_MS, "avatar composer");
 
@@ -428,15 +433,41 @@ async function attemptOnAccount(
     //   - split_2 avatar      -> 9:16 PORTRAIT: the avatar fills only a tall LEFT
     //     half-cell (640×720) at render, so a portrait source fits naturally
     //     while a landscape one would be heavily side-cropped.
-    // Best-effort: a no-op if already in the wanted ratio; if the toggle isn't
-    // found we proceed (the render still composites what we get).
+    //
+    // HeyGen DEFAULTS to 9:16 portrait, so for a full-frame avatar we MUST flip
+    // it to landscape and CONFIRM it took — historically this was best-effort
+    // and a missed/renamed toggle silently produced a 9:16 letterboxed avatar.
+    // For portrait we keep it best-effort: portrait IS the default, so a missed
+    // toggle is harmless (the source is already pre-cropped 9:16 either way).
     const wantPortrait = input.aspectRatio === "portrait";
+    const wantRatio: "landscape" | "portrait" = wantPortrait ? "portrait" : "landscape";
     const ratioBtn = wantPortrait ? portraitRatioButton(p) : landscapeRatioButton(p);
     const ratioLabel = wantPortrait ? "9:16 portrait toggle" : "16:9 landscape toggle";
-    if (await isVisible(ratioBtn, 3000)) {
+
+    // Click the toggle if it isn't already in the wanted state. Re-check after
+    // so a flaky single click (or a UI that needs a settle) gets one retry.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if ((await activeRatio(p)) === wantRatio) break;
+      if (!(await isVisible(ratioBtn, 5000))) break; // toggle not present; handled below
       await clickFirstVisible(ratioBtn, 10_000, ratioLabel).catch(() => {});
       await p.waitForTimeout(800); // let the canvas re-render to the new ratio
-      await shot(p, input.projectId, input.segmentId, wantPortrait ? "portrait" : "landscape");
+    }
+    await shot(p, input.projectId, input.segmentId, wantRatio);
+
+    // Verify the composer actually landed in the wanted ratio. For LANDSCAPE this
+    // is mandatory: if we can't confirm 16:9, fail loudly (classified -> rotates
+    // the account, surfaces in diagnostics) rather than emit a wrong-ratio video.
+    // activeRatio returns null only when no state/geometry signal is readable; we
+    // treat null as "not confirmed landscape" for the strict path.
+    if (!wantPortrait) {
+      const got = await activeRatio(p);
+      if (got !== "landscape") {
+        throw new HeygenError(
+          "ui_changed",
+          `heygen: composer is not 16:9 landscape after toggle (active=${got ?? "unknown"}); ` +
+            `a full-frame avatar would render as 9:16 portrait`,
+        );
+      }
     }
 
     // 5) Drive the avatar. Two paths:
@@ -628,7 +659,10 @@ async function attemptOnAccount(
       "video/mp4",
     );
 
-    // Refresh the warm session for the next run (status untouched).
+    // Persist the now-fresh cookies to the DB (status untouched) so a cold start
+    // or the keep-alive sweep has the latest session. The LIVE context already
+    // holds these cookies and stays warm for the next job — we save, we do not
+    // reload.
     await saveCookies(account.id, await context.storageState()).catch(() => {});
     await recordSuccess(account.id);
 
@@ -677,10 +711,21 @@ async function attemptOnAccount(
         err: typed.message?.slice(0, 200),
       },
     });
+
+    // If the SESSION died (login wall mid-job), drop the warm singleton so the
+    // next attempt rebuilds from the stored cookies rather than reusing a context
+    // whose cookies HeyGen just invalidated. Other failure classes (ui_changed,
+    // network, …) are NOT the session's fault — keep the warm context so we don't
+    // pay a fresh Cloudflare challenge to rebuild it.
+    if (typed.klass === "session_expired" || typed.klass === "login_required") {
+      await invalidateWarmSession().catch(() => {});
+    }
     throw typed;
   } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    // Close only the per-job PAGE. The browser + context stay WARM for the next
+    // job — that reuse is the whole fix. Teardown happens on worker shutdown
+    // (closeWarmSession) or on a session_expired invalidation above.
+    if (page) await page.close().catch(() => {});
   }
 }
 

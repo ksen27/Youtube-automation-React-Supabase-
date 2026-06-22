@@ -449,6 +449,15 @@ const ServerEnvSchema = z.object({
   // Keep it below HeyGen's idle-session TTL so the sliding window never lapses
   // and a single account stays logged in across bursts and quiet periods.
   HEYGEN_KEEPALIVE_MINUTES: z.coerce.number().int().positive().default(30),
+  // The avatar worker keeps ONE warm browser+context alive and reuses it across
+  // jobs (lib/synthetic/heygen-session). Re-verifying the session by navigating
+  // to /home on EVERY job is what burned the session after ~3 renders (each
+  // /home hit is a fresh Cloudflare challenge). Instead we re-verify only when
+  // the warm session was last verified more than this many minutes ago; back-to-
+  // back jobs within the window skip the /home check and go straight to /avatar.
+  // Keep it below HeyGen's idle TTL but high enough that a burst doesn't re-verify
+  // each time. Default 20.
+  HEYGEN_REVERIFY_AFTER_MINUTES: z.coerce.number().int().nonnegative().default(20),
   // HeyGen requires a VOICE to be selected before it will generate (otherwise
   // it errors "Please select the voice id"). This is the voice NAME to pick in
   // HeyGen's voice modal — it is HeyGen's own voice, NOT a 69labs voiceId (a

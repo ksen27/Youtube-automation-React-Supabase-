@@ -26,6 +26,7 @@ import { processAvatarJob }           from "./processors/synthetic/avatarProcess
 import { markJobFailedIfExhausted, sweepStalledJobs, sweepStalledSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
+import { closeWarmSession, warmAccountId } from "@/lib/synthetic/heygen-session";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -223,7 +224,9 @@ let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 if (runSynthetic) {
   // Kick once shortly after boot (don't wait a full interval), then on the timer.
   const runKeepAlive = () =>
-    void sweepKeepAlive()
+    // Skip the account whose warm browser is in use — refreshing it would open a
+    // second concurrent HeyGen session for it (the churn we're avoiding).
+    void sweepKeepAlive({ skipAccountId: warmAccountId() })
       .then((r) => {
         if (r.refreshed + r.expired + r.errors > 0) {
           console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "heygen.keepalive.done", ...r }));
@@ -246,6 +249,9 @@ async function shutdown(signal: string) {
   // BullMQ commands and leave the AOF without a clean shutdown marker —
   // which is exactly what makes the next boot's replay window long.
   await Promise.all(workers.map((w) => w.close()));
+  // Workers are now idle — tear down the warm HeyGen browser/context (kept alive
+  // and reused across avatar jobs). Safe only after jobs stopped. Never throws.
+  await closeWarmSession().catch(() => {});
   await closeAllQueues();
   await getRedisConnection().quit();
   process.exit(0);

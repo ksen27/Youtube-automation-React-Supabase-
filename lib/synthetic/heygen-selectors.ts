@@ -136,6 +136,57 @@ export function portraitRatioButton(page: Page): Locator {
     .or(page.locator(':is(button,[role="button"]):has(svg use[href="#portrait"])'));
 }
 
+// Read which orientation the composer is ACTUALLY in, rather than trusting that
+// a click landed. Returns "landscape" | "portrait" | null (unknown). We can't
+// rely on a single signal because HeyGen marks the active toggle differently
+// across builds, so we try, in order:
+//   1) the toggle's pressed/selected state (aria-pressed / data-state /
+//      aria-checked / a *selected*/*active* class) — the most direct signal;
+//   2) the composer preview canvas geometry (wider-than-tall => landscape).
+// Best-effort: never throws. A null result means "couldn't confirm" and the
+// caller decides whether that's acceptable.
+export async function activeRatio(page: Page): Promise<"landscape" | "portrait" | null> {
+  const pressed = async (loc: Locator): Promise<boolean> => {
+    const el = loc.locator("visible=true").first();
+    if (!(await el.count().catch(() => 0))) return false;
+    const pressedAttr = await el.getAttribute("aria-pressed").catch(() => null);
+    const checkedAttr = await el.getAttribute("aria-checked").catch(() => null);
+    const stateAttr = await el.getAttribute("data-state").catch(() => null);
+    const cls = (await el.getAttribute("class").catch(() => "")) ?? "";
+    return (
+      pressedAttr === "true" ||
+      checkedAttr === "true" ||
+      stateAttr === "on" ||
+      stateAttr === "active" ||
+      stateAttr === "selected" ||
+      /\b(selected|active|is-active|is-selected)\b/.test(cls)
+    );
+  };
+
+  if (await pressed(landscapeRatioButton(page))) return "landscape";
+  if (await pressed(portraitRatioButton(page))) return "portrait";
+
+  // Fallback: measure the live preview canvas. The composer renders the avatar
+  // into a preview whose box reflects the chosen ratio.
+  const box = await composerPreview(page)
+    .locator("visible=true")
+    .first()
+    .boundingBox()
+    .catch(() => null);
+  if (box && box.width > 0 && box.height > 0) {
+    return box.width >= box.height ? "landscape" : "portrait";
+  }
+  return null;
+}
+
+// The composer preview pane (the framed area showing the uploaded photo / avatar
+// before Generate). Used to measure the active aspect ratio as a fallback.
+export function composerPreview(page: Page): Locator {
+  return page
+    .locator('[data-testid*="preview"], [data-testid*="canvas"], [class*="preview" i], [class*="canvas" i]')
+    .or(page.locator("video, canvas"));
+}
+
 // ---------------------------------------------------------------------------
 // Audio-driven avatar (worker hot path) — drive the avatar with an UPLOADED
 // audio file instead of typed script, so HeyGen lip-syncs to the exact 69labs

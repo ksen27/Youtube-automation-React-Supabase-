@@ -214,10 +214,13 @@ export async function keepAliveSession(
  * NOTE: only safe to run where browser automation is available (the avatar
  * worker host). Never throws — keep-alive must not crash the worker loop.
  */
-export async function sweepKeepAlive(): Promise<{ refreshed: number; expired: number; errors: number }> {
+export async function sweepKeepAlive(
+  opts: { skipAccountId?: string | null } = {},
+): Promise<{ refreshed: number; expired: number; errors: number; skipped: number }> {
   let refreshed = 0;
   let expired = 0;
   let errors = 0;
+  let skipped = 0;
   let accounts: DecryptedAccount[] = [];
   try {
     accounts = await getRefreshableAccounts();
@@ -225,9 +228,17 @@ export async function sweepKeepAlive(): Promise<{ refreshed: number; expired: nu
     await logJob({}, "synthetic.heygen.keepalive.query_error", {
       err: (err as Error).message?.slice(0, 200),
     }).catch(() => {});
-    return { refreshed, expired, errors: 1 };
+    return { refreshed, expired, errors: 1, skipped };
   }
   for (const acc of accounts) {
+    // Skip the account whose warm browser session is currently in use by the
+    // avatar worker — opening a SECOND concurrent HeyGen browser for it is the
+    // fingerprint churn this whole design avoids; its cookies are kept fresh by
+    // the post-render saveCookies anyway.
+    if (opts.skipAccountId && acc.id === opts.skipAccountId) {
+      skipped++;
+      continue;
+    }
     try {
       const verdict = await keepAliveSession(acc);
       if (verdict === "authed") {
@@ -245,7 +256,7 @@ export async function sweepKeepAlive(): Promise<{ refreshed: number; expired: nu
       }).catch(() => {});
     }
   }
-  return { refreshed, expired, errors };
+  return { refreshed, expired, errors, skipped };
 }
 
 /**
