@@ -7,6 +7,45 @@ import { probeFile } from "@/lib/media/probe";
 // All FFmpeg invocations use spawn with an argument array — no shell strings.
 // This is critical when input filenames are derived from external IDs/URLs.
 
+// Shared H.264 codec flags for EVERY per-segment encode (still images, clips,
+// split-screens, xfades, mixed boundaries, black filler). ALL segments in one
+// render MUST share this identical block so the final concat can stay on the
+// `-c:v copy` fast path (the concat demuxer requires every input to share codec
+// params, GOP structure, and SPS/PPS — see concatNormalizedClips).
+//
+// Quality is chosen PER RENDER by the project's engine (both engines render on
+// the same worker, so it can't be a per-worker env):
+//   • sourced (celebrity): HARD-PINNED to the original ultrafast/crf25 so
+//     celebrity output is byte-for-byte unchanged. Never reads env.
+//   • synthetic (AI avatar): SYNTHETIC_X264_PRESET / SYNTHETIC_X264_CRF
+//     (default veryfast/crf21) for sharper output.
+// renderProcessor resolves this ONCE per render and passes the result into every
+// segment encoder via the `vcodecArgs` option, so the whole video is uniform.
+// Encoders that aren't given vcodecArgs fall back to the sourced default, which
+// preserves the historical behavior for any caller outside the render loop.
+// Do NOT add "-tune" or vary tokens between segments — divergence forces the
+// concat to re-encode (30× slower) or fail on strict demuxers.
+export type RenderEngine = "sourced" | "synthetic";
+export function segmentVcodecArgsFor(engine: RenderEngine): string[] {
+  if (engine === "synthetic") {
+    const env = getEnv();
+    return [
+      "-c:v", "libx264",
+      "-preset", env.SYNTHETIC_X264_PRESET,
+      "-crf", String(env.SYNTHETIC_X264_CRF),
+      "-pix_fmt", "yuv420p",
+    ];
+  }
+  // sourced (celebrity): unchanged from the original hardcoded values.
+  return [
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+  ];
+}
+const SOURCED_VCODEC_ARGS = segmentVcodecArgsFor("sourced");
+
 export interface CutClipOptions {
   inputPath: string;
   outputPath: string;
@@ -204,6 +243,7 @@ export async function buildStillVideo(opts: {
   // startOffsetSeconds delays the chyron to the in-clip moment the narrator
   // says the marked word (see normalizeClip's lowerThird doc).
   lowerThird?: { text: string; startOffsetSeconds?: number };
+  vcodecArgs?: string[]; // per-render codec flags; defaults to sourced (see segmentVcodecArgsFor)
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -355,11 +395,9 @@ export async function buildStillVideo(opts: {
     // cause concat to fall back to re-encoding (or fail outright on strict
     // demuxers). The ~5% extra bitrate that "tune stillimage" would save on
     // image segments is dwarfed by the 30× speedup from skipping concat
-    // re-encode, so we deliberately use the same plain ultrafast/crf 25.
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    // re-encode, so we deliberately use the SAME shared codec block as every
+    // other segment encoder (segmentVcodecArgs()).
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     // Force a keyframe at the start of every segment so concat boundaries
     // are clean on stream-copy. Without this, x264's adaptive GOP can put
@@ -396,6 +434,7 @@ export async function buildBlackVideo(opts: {
   width?: number;
   height?: number;
   fps?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -409,11 +448,59 @@ export async function buildBlackVideo(opts: {
     "-f", "lavfi",
     "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds.toFixed(3)}`,
     "-an",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
+    "-force_key_frames", "expr:eq(n,0)",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// Extend an already-rendered segment to `targetSeconds` by HOLDING ITS LAST
+// FRAME (tpad=stop_mode=clone). Used by the renderer when a generated clip
+// (HeyGen avatar / LTX ai_clip) comes back SHORTER than the narration window it
+// was planned for: those providers routinely return a clip a fraction — and
+// occasionally many seconds — under the audio window, so summing actual
+// durations makes the whole video drift shorter than the voiceover and the
+// final mux's `-t` clips the voiceover tail.
+//
+// Padding the slot back up to its planned duration keeps cumulative video-time
+// tracking the voiceover, so the audio is never cut and every later block stays
+// on its spoken moment. The held frame plays silent — fine for the small
+// sub-second/1s shortfalls that are unavoidable. A GROSS shortfall (e.g. a 25s
+// avatar that returned 10s) should be REGENERATED instead — a 15s frozen face
+// is the symptom of a provider failure, not something to paper over here; the
+// caller logs those so they surface on the review screen.
+//
+// Encoder flags match every other segment (segmentVcodecArgs()) + a forced
+// start keyframe, so the padded file stays on the concat `-c:v copy` fast path.
+export async function padVideoToLength(opts: {
+  inputPath: string;
+  outputPath: string;
+  targetSeconds: number;
+  fps?: number;
+  vcodecArgs?: string[];
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const fps = opts.fps ?? 30;
+  const target = Math.max(0.1, opts.targetSeconds);
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+  // tpad clones the last frame to extend the stream, then `-t` pins the exact
+  // length. setsar=1 keeps SAR identical to the other segments. The input may
+  // carry audio (avatar/split_2 clips do); we drop it with -an because the
+  // master voiceover is the only audio track the concat mixes in.
+  const vf = `tpad=stop_mode=clone:stop_duration=${target.toFixed(3)},setsar=1`;
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputPath,
+    "-an",
+    "-vf", vf,
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    "-r", String(fps),
+    "-t", target.toFixed(3),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
     opts.outputPath,
@@ -445,6 +532,7 @@ export async function buildSplitScreenVideo(opts: {
   // split_2 block, the renderer burns the proper-noun text in.
   // startOffsetSeconds delays the chyron to the spoken-word moment.
   lowerThird?: { text: string; startOffsetSeconds?: number };
+  vcodecArgs?: string[]; // per-render codec flags; defaults to sourced (see segmentVcodecArgsFor)
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -503,10 +591,7 @@ export async function buildSplitScreenVideo(opts: {
     "-an",
     "-filter_complex", filter,
     "-map", "[v]",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -667,6 +752,7 @@ export async function buildSplitScreenAvatarVideo(opts: {
   height?: number;
   fps?: number;
   lowerThird?: { text: string; startOffsetSeconds?: number };
+  vcodecArgs?: string[]; // per-render codec flags; defaults to sourced (see segmentVcodecArgsFor)
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -720,10 +806,7 @@ export async function buildSplitScreenAvatarVideo(opts: {
     "-an",
     "-filter_complex", filter,
     "-map", "[v]",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -765,6 +848,7 @@ export async function buildTitleCardVideo(opts: {
   // pipeline. Script-doc title cards pass "typewriter".
   animation?: "static" | "typewriter";
   typewriterDurationSeconds?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -966,10 +1050,7 @@ export async function buildTitleCardVideo(opts: {
     "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds}`,
     "-vf", vfChain,
     "-an",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-t", String(opts.durationSeconds),
     "-force_key_frames", "expr:eq(n,0)",
@@ -1208,6 +1289,7 @@ export interface NormalizeOptions {
   // it is frame-accurate, and combined with pinDurationSeconds the output is
   // exactly the requested source window.
   startOffsetSeconds?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }
 
@@ -1417,10 +1499,7 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     "-i", opts.inputPath,
     ...(opts.keepAudio ? ["-c:a", "aac"] : ["-an"]),
     "-vf", vf,
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     // Trim the copy-cut's GOP overshoot back to the asked length. Placed
@@ -1471,6 +1550,7 @@ export async function xfadePair(opts: {
   transitionDurationSeconds: number;
   style?: XfadeStyle;
   fps?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -1494,10 +1574,7 @@ export async function xfadePair(opts: {
     "-filter_complex", filter,
     "-map", "[v]",
     "-an",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -1527,6 +1604,7 @@ export async function xfadeFadeBlack(opts: {
   inputADurationSeconds: number;
   transitionDurationSeconds: number;
   fps?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -1548,10 +1626,7 @@ export async function xfadeFadeBlack(opts: {
     "-filter_complex", filter,
     "-map", "[v]",
     "-an",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -1578,6 +1653,7 @@ export async function applyEdgeFade(opts: {
   fadeInSeconds?: number;    // 0 disables; default 0
   fadeOutSeconds?: number;   // 0 disables; default 0
   fps?: number;
+  vcodecArgs?: string[];
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -1603,10 +1679,7 @@ export async function applyEdgeFade(opts: {
     "-i", opts.inputPath,
     "-an",
     "-vf", vf,
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
-    "-pix_fmt", "yuv420p",
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",

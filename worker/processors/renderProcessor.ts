@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, segmentVcodecArgsFor, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -62,6 +62,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
   await sb.from("render_jobs").update({ status: "running", progress: 5 }).eq("id", renderJobId);
   await setProjectStatus(projectId, "rendering");
+
+  // Engine decides per-segment encode quality. Celebrity (sourced) renders keep
+  // the original ultrafast/crf25 (byte-for-byte unchanged); only synthetic
+  // renders use the higher-quality preset. Both engines render on THIS worker
+  // (the render queue is sourced-side only), so the choice can't be a per-worker
+  // env — it must be per-render, driven by the project's engine. Resolved once
+  // here and passed into every segment encoder so the whole video stays uniform
+  // (required for the -c:v copy concat fast path).
+  const { data: projRow } = await sb
+    .from("projects")
+    .select("engine")
+    .eq("id", projectId)
+    .single();
+  const isSyntheticRender = ((projRow?.engine as string | null) ?? "sourced") === "synthetic";
+  const vcodec = segmentVcodecArgsFor(isSyntheticRender ? "synthetic" : "sourced");
 
   // Pull approved timeline items (only ones with clips — placeholders are skipped
   // for MVP rendering; their script_text/overlay_text would be added in v2)
@@ -415,6 +430,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           if (isSyntheticSplit) {
             // Reuse the synthetic split-screen builder: avatar video left, still right.
             await buildSplitScreenAvatarVideo({
+              vcodecArgs: vcodec,
               avatarVideoPath: leftLocal,
               rightImagePath: rightLocal,
               outputPath: out,
@@ -426,6 +442,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             });
           } else {
             await buildSplitScreenVideo({
+              vcodecArgs: vcodec,
               leftImagePath: leftLocal,
               rightImagePath: rightLocal,
               outputPath: out,
@@ -468,10 +485,38 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           try {
             await downloadHttp(it.video_url as string, localPre);
             await cutClip({ inputPath: localPre, outputPath: trimmed, startSeconds: 0, durationSeconds: renderDur, keepAudio: false });
-            await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30, keepAudio: false });
+            await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30, keepAudio: false, vcodecArgs: vcodec });
             slots[i] = out;
             let actualDur = renderDur;
             try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = p.durationSeconds; } catch { /* fallback */ }
+            // HeyGen/LTX often return a clip SHORTER than the narration window
+            // it was planned for (cutClip can't extend, only trim). Summing the
+            // short actual duration drags the whole video below the voiceover
+            // and the final mux clips the voiceover tail. Hold the last frame up
+            // to renderDur so the slot always fills its planned window — video
+            // and voiceover stay in sync, audio is never cut. A gross shortfall
+            // (a long frozen face) is logged for regeneration on the review
+            // screen rather than silently shipped.
+            if (renderDur - actualDur > 0.2) {
+              const padOut = path.join(tmp, `synvid_pad_${idx}.mp4`);
+              try {
+                await padVideoToLength({ inputPath: out, outputPath: padOut, targetSeconds: renderDur, fps: 30, vcodecArgs: vcodec });
+                await safeUnlink(out);
+                slots[i] = padOut;
+                if (renderDur - actualDur >= 3) {
+                  await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_video.gross_short", {
+                    idx: i, type: it.type,
+                    plannedSeconds: Math.round(renderDur * 100) / 100,
+                    renderedSeconds: Math.round(actualDur * 100) / 100,
+                    shortfallSeconds: Math.round((renderDur - actualDur) * 100) / 100,
+                    note: "held last frame to fill slot; regenerate this block for true sync",
+                  });
+                }
+                actualDur = renderDur;
+              } catch (e) {
+                await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_video.pad_failed", { idx: i, err: (e as Error).message });
+              }
+            }
             slotDurations[i] = actualDur;
             slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
           } catch (e) {
@@ -487,6 +532,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           try {
             await downloadHttp(it.image_url as string, localImg);
             await buildStillVideo({
+              vcodecArgs: vcodec,
               inputImagePath: localImg, outputPath: out, durationSeconds: renderDur,
               width: 1280, height: 720, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
             });
@@ -543,6 +589,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             : undefined;
         try {
           await buildTitleCardVideo({
+            vcodecArgs: vcodec,
             text,
             outputPath: out,
             durationSeconds: renderDur,
@@ -601,6 +648,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const MOTION_CYCLE = ["in", "pan_right", "out", "pan_left"] as const;
           const motion = MOTION_CYCLE[i % MOTION_CYCLE.length];
           await buildStillVideo({
+            vcodecArgs: vcodec,
             inputImagePath: localImg,
             outputPath: out,
             durationSeconds: renderDur,
@@ -713,6 +761,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                 slowmoFactor: forcedSlowmoFactor,
               });
               await normalizeClip({
+                vcodecArgs: vcodec,
                 inputPath: trimmedPre, outputPath: out,
                 width: 1280, height: 720, fps: 30,
                 lowerThird: lt?.text
@@ -771,6 +820,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               slowmoFactor: forcedSlowmoFactor,
             });
             await normalizeClip({
+              vcodecArgs: vcodec,
               inputPath: trimmed, outputPath: out,
               width: 1280, height: 720, fps: 30,
               lowerThird: lt?.text
@@ -898,6 +948,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // exactly renderDur long. Without the pin that assumption was false
           // and the residual leaked as ~9s of cumulative positive drift.
           await normalizeClip({
+            vcodecArgs: vcodec,
             inputPath: trimmed, outputPath: out,
             width: 1280, height: 720, fps: 30,
             lowerThird: lt?.text
@@ -976,6 +1027,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const out = path.join(tmp, `filler_${String(i).padStart(3, "0")}.mp4`);
         try {
           await buildBlackVideo({
+            vcodecArgs: vcodec,
             outputPath: out,
             durationSeconds: plannedDur,
             width: 1280, height: 720, fps: 30,
@@ -1050,6 +1102,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       const out = path.join(tmp, `mixfade_${String(idx).padStart(3, "0")}.mp4`);
       try {
         await xfadeFadeBlack({
+          vcodecArgs: vcodec,
           inputAPath: a,
           inputBPath: seg,
           outputPath: out,
@@ -1116,6 +1169,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         boundaryStart += aDur - IMAGE_XFADE_SECONDS;
         try {
           await xfadePair({
+            vcodecArgs: vcodec,
             inputAPath: a,
             inputBPath: seg,
             outputPath: mergedOut,
@@ -1292,6 +1346,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // ceremonial opening title — 60% gives a more deliberate beat.
           const OPENING_TITLE_TYPEWRITER_RATIO = 0.6;
           await buildTitleCardVideo({
+            vcodecArgs: vcodec,
             text: titleText,
             outputPath: cardPath,
             durationSeconds: OPENING_TITLE_DURATION,
@@ -1303,6 +1358,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           });
           const normalizedCard = path.join(openingTmp, "card_norm.mp4");
           await normalizeClip({
+            vcodecArgs: vcodec,
             inputPath: cardPath,
             outputPath: normalizedCard,
             width: 1280,
@@ -1407,6 +1463,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                 if (overshoot > INTRO_CARD_PIN_TOLERANCE_SECONDS) {
                   const pinned = path.join(introTmp, `pre_card_${row.ordinal}_pinned.mp4`);
                   await normalizeClip({
+                    vcodecArgs: vcodec,
                     inputPath: localClip, outputPath: pinned,
                     width: 1280, height: 720, fps: 30,
                     startOffsetSeconds: overshoot,
@@ -1466,6 +1523,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               cardHeadTrim = Math.max(0, trimmedProbe.durationSeconds - dur);
             } catch { /* pin-only fallback below */ }
             await normalizeClip({
+              vcodecArgs: vcodec,
               inputPath: trimmed, outputPath: normalizedCard,
               width: 1280, height: 720, fps: 30,
               startOffsetSeconds: cardHeadTrim > 0 ? cardHeadTrim : undefined,
@@ -1577,6 +1635,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         });
         const introNormalized = path.join(tmp, "intro_user_norm.mp4");
         await normalizeClip({
+          vcodecArgs: vcodec,
           inputPath: introTrimmed, outputPath: introNormalized,
           width: 1280, height: 720, fps: 30,
         });
@@ -1692,6 +1751,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         });
         const introNormalized = path.join(tmp, "intro_norm.mp4");
         await normalizeClip({
+          vcodecArgs: vcodec,
           inputPath: introTrimmed, outputPath: introNormalized,
           width: 1280, height: 720, fps: 30,
         });
@@ -1836,6 +1896,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       const fadedLast = path.join(tmp, "outro_fade.mp4");
       try {
         await applyEdgeFade({
+          vcodecArgs: vcodec,
           inputPath: normalized[lastIdx],
           outputPath: fadedLast,
           inputDurationSeconds: lastSegDur,
@@ -2203,8 +2264,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         const it = renderable[i];
         if (it.type === "intro") continue;
         const meta = (it.metadata ?? {}) as Record<string, unknown>;
-        const vs = meta.vo_start_seconds;
-        if (typeof vs !== "number") continue;
+        // Sourced engine stamps the narration start in metadata.vo_start_seconds.
+        // Synthetic engine has no such metadata — its narration start IS the
+        // row's `start_time` column (the planner aligned every block to the
+        // master voiceover). Without this fallback, synthetic rows had NO audio
+        // interval, so the writeback below fell through to the SHORT rendered
+        // length and overwrote the planned duration — e.g. a 25.2s avatar slot
+        // whose HeyGen clip returned 10.2s got its row clobbered to 10.2s,
+        // permanently desyncing the timeline and clipping the voiceover tail on
+        // every later render. Using start_time keeps the writeback anchored to
+        // the planned narration window, so it stays idempotent for synthetic
+        // projects too.
+        const vs = typeof meta.vo_start_seconds === "number"
+          ? (meta.vo_start_seconds as number)
+          : (typeof it.start_time === "number" ? it.start_time : null);
+        if (vs == null) continue;
         voStarts.push({ idx: i, voStart: Number(vs) });
       }
       voStarts.sort((a, b) => a.voStart - b.voStart);

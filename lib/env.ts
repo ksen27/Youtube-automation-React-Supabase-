@@ -254,6 +254,18 @@ const ServerEnvSchema = z.object({
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
   YTDLP_PATH: z.string().default("yt-dlp"),
+  // Per-segment H.264 encode quality (libx264) for the SYNTHETIC engine only.
+  // Both engines render on the same worker, so quality is chosen per-render by
+  // project.engine (see renderProcessor), NOT per-worker. Celebrity (sourced)
+  // renders are HARD-PINNED in code to the original ultrafast/crf25 and ignore
+  // these vars entirely, so celebrity output is byte-for-byte unchanged. These
+  // only tune the synthetic path; defaults give synthetic the sharper
+  // veryfast/crf21. EVERY segment in one render shares the chosen values so the
+  // final concat stays on the -c:v copy fast path.
+  SYNTHETIC_X264_PRESET: z
+    .enum(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
+    .default("veryfast"),
+  SYNTHETIC_X264_CRF: z.coerce.number().int().min(0).max(51).default(21),
   // Global full-video effect overlay. A single effect clip (e.g. floating
   // dust/particle specks on a pure-black background) is screen-blended over
   // EVERY frame of the finished video — across intro clips, the opening
