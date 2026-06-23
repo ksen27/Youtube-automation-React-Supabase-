@@ -291,17 +291,46 @@ async function fetchProjectItems(context: BrowserContext): Promise<HeygenProject
   return json?.data?.items ?? [];
 }
 
-// The newest item's video_id (the baseline taken just before we generate, so we
-// can tell OUR render apart from prior ones). "" when the list is empty.
-async function newestItemId(context: BrowserContext): Promise<string> {
+// The FULL set of video_ids present before we generate. Used to pin retrieval to
+// the EXACT render we just made: after clicking Generate, the one id that is NOT
+// in this set is unambiguously ours — no inference from "newest" or duration.
+async function baselineItemIds(context: BrowserContext): Promise<Set<string>> {
   const items = await fetchProjectItems(context);
-  return items[0]?.video_id ?? "";
+  return new Set(items.map((it) => it.video_id).filter(Boolean));
+}
+
+// After Generate, poll the list until a NEW video_id (not in the pre-generate
+// baseline set) appears, and return it. This is OUR render's stable id. Polls
+// within `appearMs` — HeyGen registers the new project row a few seconds after
+// the click. Returns "" if none appears (caller falls back to the gated
+// newest-non-baseline retrieval, so a missed pin degrades, never hard-fails).
+async function awaitNewItemId(
+  context: BrowserContext,
+  baseline: Set<string>,
+  appearMs: number,
+  waitMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<string> {
+  const deadline = Date.now() + appearMs;
+  while (Date.now() < deadline) {
+    const items = await fetchProjectItems(context);
+    // Newest-first list: the first id not in the baseline is the freshest new
+    // render. (A single avatar Generate creates exactly one new item.)
+    const fresh = items.find((it) => it.video_id && !baseline.has(it.video_id));
+    if (fresh) return fresh.video_id;
+    await sleep(waitMs);
+  }
+  return "";
 }
 
 // Retrieve the finished avatar video via the project-list API. Polls until OUR
 // render reaches status "completed", then downloads its signed video_url. Throws
-// a classified HeygenError on timeout / failure. `baselineId` is the newest
-// video_id captured pre-generate.
+// a classified HeygenError on timeout / failure.
+//
+// IDENTITY: the strongest signal is `pinnedVideoId` (see below) — the exact id
+// of the render we just created. When present we poll only that item. `baselineId`
+// (the newest pre-generate id) and the duration/aspect gates remain as the
+// fallback identity when no pin was captured.
 //
 // `expectedSeconds` is the duration we EXPECT (the uploaded audio slice length).
 // It's the permanent fix for a real bug: when a segment is REGENERATED, HeyGen's
@@ -313,12 +342,16 @@ async function newestItemId(context: BrowserContext): Promise<string> {
 //
 // Defense in depth, both gated on expectedSeconds (legacy script path with no
 // expectation keeps the old newest-non-baseline behavior):
-//   1) Candidate filter on HeyGen's reported `duration` — skip items shorter
-//      than expected (the stale 10s render).
+//   1) Candidate filter on HeyGen's reported `duration` — skip items whose
+//      length is materially OFF (a stale 10s render, or a too-long 48s one).
 //   2) POST-DOWNLOAD PROBE — after downloading, ffprobe the ACTUAL file and
-//      reject it if it's materially short. This catches the case HeyGen's
-//      metadata is wrong or the signed URL serves a partial: we never RETURN a
-//      short file, we keep polling within the render budget for the real one.
+//      reject it if its length is materially off (too short OR too long). This
+//      catches the case HeyGen's metadata is wrong or the signed URL serves a
+//      partial: we never RETURN a mismatched file, we keep polling within the
+//      render budget for the one whose length matches the uploaded audio.
+//      The gate is TWO-SIDED — a 48s file returned for a 25.3s audio slice
+//      (an older/multi-part or different-segment render in the same list) is
+//      the duration-mismatch bug this gate exists to prevent.
 // Only #2 is authoritative (bytes don't lie); #1 just avoids wasted downloads.
 //
 // `expectedAspect` adds the same defense for ORIENTATION. A regenerate (or a
@@ -327,23 +360,39 @@ async function newestItemId(context: BrowserContext): Promise<string> {
 // tell a 16:9 landscape avatar from a 9:16 portrait one. We probe the actual
 // file's width/height and reject the wrong orientation, so a full-frame avatar
 // (landscape) never gets a portrait file and vice versa. null = no aspect gate.
+// `pinnedVideoId` is the EXACT render we just created (captured at generate time
+// by diffing the project list — the one new id that appeared). When set, we poll
+// ONLY that item to completion and ignore every other render in the shared list,
+// which removes the "newest matching" ambiguity entirely: a same-length render
+// of a DIFFERENT segment can no longer be picked. The duration/aspect probe
+// gates still run on the pinned item as a last-resort integrity check. "" = no
+// pin (the pin wasn't captured); falls back to the gated newest-non-baseline scan.
 async function retrieveRenderedVideo(
   page: Page,
   context: BrowserContext,
   baselineId = "",
   expectedSeconds = 0,
   expectedAspect: "landscape" | "portrait" | null = null,
+  pinnedVideoId = "",
 ): Promise<Buffer> {
   const e = env();
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
   const appearDeadline = Date.now() + 180_000; // our item must show up within 3 min
-  // Tolerance: a render within ~2s (or 15%) of the expected length is accepted;
-  // shorter than that and we treat it as a partial/stale render.
-  const minAcceptable = expectedSeconds > 0 ? expectedSeconds - Math.max(2, expectedSeconds * 0.15) : 0;
+  // Tolerance: a render within ~2s (or 15%) of the expected length is accepted.
+  // The gate is TWO-SIDED — a render that is materially SHORTER is a partial/
+  // stale render, and one that is materially LONGER is a different/older render
+  // (e.g. a pre-coalesce multi-part avatar, or another segment's longer video
+  // sitting in the same account's project list). Both must be rejected: a 48s
+  // file returned for a 25.3s audio slice is exactly the duration-mismatch bug
+  // this gate exists to prevent. We keep polling for the render that actually
+  // matches the uploaded audio length.
+  const tol = expectedSeconds > 0 ? Math.max(2, expectedSeconds * 0.15) : 0;
+  const minAcceptable = expectedSeconds > 0 ? expectedSeconds - tol : 0;
+  const maxAcceptable = expectedSeconds > 0 ? expectedSeconds + tol : 0;
   const durOk = (d: number | undefined): boolean => {
     if (minAcceptable <= 0) return true; // no expectation
     if (typeof d !== "number" || d <= 0) return true; // HeyGen didn't report — defer to the probe
-    return d >= minAcceptable;
+    return d >= minAcceptable && d <= maxAcceptable;
   };
   // Orientation of a probed file: landscape (w>h), portrait (h>w), or null.
   const aspectOf = (w: number | null, h: number | null): "landscape" | "portrait" | null => {
@@ -374,13 +423,20 @@ async function retrieveRenderedVideo(
 
   let everSawOurs = false;
   let sawShort = false; // saw a completed/downloaded item that was too short
+  let sawWrongLength = false; // saw a completed item that was too LONG
   let sawWrongAspect = false; // saw a completed item with the wrong orientation
   let lastShortSeconds = 0;
+  let lastWrongLengthSeconds = 0;
   while (Date.now() < deadline) {
     const items = await fetchProjectItems(context);
-    // Candidates = every item that isn't the pre-generate baseline (a
-    // regenerate leaves several of our own prior renders in the list).
-    const candidates = items.filter((it) => it.video_id && it.video_id !== baselineId);
+    // Candidates. When we captured the exact id of OUR render at generate time,
+    // poll ONLY that item — no other render in the shared list can be mistaken
+    // for ours. Otherwise fall back to "every item that isn't the pre-generate
+    // baseline" (a regenerate leaves several of our own prior renders in the
+    // list), disambiguated downstream by the duration/aspect gates.
+    const candidates = pinnedVideoId
+      ? items.filter((it) => it.video_id === pinnedVideoId)
+      : items.filter((it) => it.video_id && it.video_id !== baselineId);
     const completed = candidates.filter((it) => {
       const s = (it.status ?? "").toLowerCase();
       return s === "completed" || s === "success" || s === "done";
@@ -404,6 +460,15 @@ async function retrieveRenderedVideo(
         // partial. Do NOT return it; keep waiting for the full render.
         sawShort = true;
         lastShortSeconds = got.seconds;
+        continue;
+      }
+      if (maxAcceptable > 0 && got.seconds > maxAcceptable) {
+        // The file is materially LONGER than the uploaded audio — a different or
+        // older render (e.g. a pre-coalesce multi-part avatar, or another
+        // segment's video in this account's list). Returning it is the 48s-for-
+        // 25.3s mismatch bug. Reject and keep polling for the matching render.
+        sawWrongLength = true;
+        lastWrongLengthSeconds = got.seconds;
         continue;
       }
       if (expectedAspect && got.aspect && got.aspect !== expectedAspect) {
@@ -446,6 +511,8 @@ async function retrieveRenderedVideo(
     "ui_changed",
     sawWrongAspect
       ? `heygen: only a wrong-orientation render appeared within the render budget — expected ${expectedAspect}, the matching render never finalized`
+      : sawWrongLength
+      ? `heygen: only a wrong-length render (~${Math.round(lastWrongLengthSeconds)}s vs expected ${Math.round(expectedSeconds)}s) was available within the render budget — the matching-length render never finalized`
       : sawShort
       ? `heygen: only a short render (~${Math.round(lastShortSeconds)}s < expected ${Math.round(expectedSeconds)}s) was available within the render budget — the full-length render never finalized`
       : "heygen: render did not complete within the render budget",
@@ -487,11 +554,15 @@ async function attemptOnAccount(
     // needs_reauth — not a failure.
     await shot(p, input.projectId, input.segmentId, "authed");
 
-    // 1.5) Record the NEWEST project's video_id (via the project-list API)
-    // BEFORE we generate, so the retrieval step can tell OUR new render apart
-    // from prior renders already at the top of the list. Best-effort: "" on any
-    // hiccup just means retrieval treats the first new completed item as ours.
-    const baselineId = await newestItemId(context).catch(() => "");
+    // 1.5) Snapshot the project list BEFORE we generate, so the retrieval step
+    // can tell OUR new render apart from prior renders already in the list.
+    //   - baselineId: the newest id (legacy fallback used when no pin is found).
+    //   - baselineIds: the FULL id set, so after Generate we can pin to the ONE
+    //     new id that appears — our render's exact identity, no inference.
+    // Best-effort: an empty/"" snapshot just degrades to the gated newest-non-
+    // baseline retrieval; it never hard-fails.
+    const baselineIds = await baselineItemIds(context).catch(() => new Set<string>());
+    const baselineId = [...baselineIds][0] ?? "";
 
     // 2) Re-navigate to the avatar "Quick create" workspace for a CLEAN composer
     // each job. The page is warm (reused across jobs), so this is a fast in-SPA
@@ -824,6 +895,29 @@ async function attemptOnAccount(
     // render appear (the poll loop below still tolerates it being mid-render).
     await p.waitForTimeout(4000);
 
+    // PIN our exact render: find the ONE video_id that appeared since the pre-
+    // generate snapshot. That id IS our render — retrieval then polls only it and
+    // can never pick a same-length render of another segment from the shared
+    // account list. Best-effort within ~30s; "" degrades to the gated newest-non-
+    // baseline scan (still protected by the duration/aspect probe gates).
+    const pinnedVideoId = await awaitNewItemId(
+      context,
+      baselineIds,
+      30_000,
+      3000,
+      (ms) => p.waitForTimeout(ms),
+    ).catch(() => "");
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.render_pinned",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        pinnedVideoId: pinnedVideoId || null,
+        pinned: !!pinnedVideoId,
+      }),
+    );
+
     // 8–9) Retrieve the finished video from the Projects page (the only place
     // the rendered mp4 exists). Returns the downloaded bytes.
     //
@@ -845,6 +939,7 @@ async function attemptOnAccount(
       baselineId,
       usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
       expectedAspect,
+      pinnedVideoId,
     );
     await shot(p, input.projectId, input.segmentId, "done");
 

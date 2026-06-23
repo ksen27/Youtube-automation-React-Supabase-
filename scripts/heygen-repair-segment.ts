@@ -61,16 +61,21 @@ try {
   console.log(`fetched ${items.length} project items`);
 
   const completed = items.filter((it) => ["completed", "success", "done"].includes((it.status ?? "").toLowerCase()));
-  // Candidates whose duration matches the planned window, newest first.
+  // Candidates whose duration matches the planned window, newest first. The
+  // match is TWO-SIDED: skip items materially SHORTER (a stale partial) AND
+  // materially LONGER (a pre-coalesce multi-part or different-segment render —
+  // e.g. a 48s item for a 25.3s segment) than the planned length.
   const tol = Math.max(2, expected * 0.15);
   const durMatches = completed
-    .filter((it) => typeof it.duration === "number" && it.duration! >= expected - tol)
+    .filter((it) => typeof it.duration === "number" && it.duration! >= expected - tol && it.duration! <= expected + tol)
     .sort((a, b) => (b.created_ts ?? 0) - (a.created_ts ?? 0));
   console.log("completed durations:", completed.map((it) => Math.round((it.duration ?? 0) * 10) / 10).join(", "));
 
   // Probe each duration-matching candidate and pick the one whose ACTUAL
   // orientation matches the expected aspect (both 16:9 and 9:16 renders of the
   // same segment have the same duration, so duration alone can't disambiguate).
+  // The probe ALSO re-checks the real file length two-sided — HeyGen's reported
+  // duration can be wrong, so bytes are authoritative.
   let buf: Buffer | null = null;
   for (const cand of durMatches) {
     const url = cand.video_url || cand.video_download_url;
@@ -81,22 +86,30 @@ try {
     if (b.length < 1024) continue;
     const tmp = path.join(os.tmpdir(), `repair_${cand.video_id}.mp4`);
     let aspect: "landscape" | "portrait" | null = null;
+    let probedSeconds = 0;
     try {
       await fs.writeFile(tmp, b);
       const p = await probeFile(tmp);
       aspect = !p.width || !p.height || p.width === p.height ? null : p.width > p.height ? "landscape" : "portrait";
+      probedSeconds = p.durationSeconds;
       console.log(`  candidate ${cand.video_id}: ${p.width}x${p.height} (${aspect}) dur=${p.durationSeconds.toFixed(1)}s`);
     } finally {
       await fs.unlink(tmp).catch(() => {});
     }
+    // Authoritative file-length gate (two-sided): reject if the real file is
+    // materially off the planned length even when HeyGen's metadata looked ok.
+    if (probedSeconds > 0 && (probedSeconds < expected - tol || probedSeconds > expected + tol)) {
+      console.log(`  rejected ${cand.video_id}: real length ${probedSeconds.toFixed(1)}s outside ${(expected - tol).toFixed(1)}–${(expected + tol).toFixed(1)}s`);
+      continue;
+    }
     if (aspect === expectedAspect) {
       buf = b;
-      console.log(`matched item ${cand.video_id} (${aspect})`);
+      console.log(`matched item ${cand.video_id} (${aspect}, ${probedSeconds.toFixed(1)}s)`);
       break;
     }
   }
   if (!buf) {
-    throw new Error(`no completed HeyGen item matching duration>=${(expected - tol).toFixed(1)}s AND aspect=${expectedAspect} — cannot repair`);
+    throw new Error(`no completed HeyGen item matching duration ${(expected - tol).toFixed(1)}–${(expected + tol).toFixed(1)}s AND aspect=${expectedAspect} — cannot repair`);
   }
   console.log(`downloaded ${(buf.length / 1e6).toFixed(2)} MB`);
 

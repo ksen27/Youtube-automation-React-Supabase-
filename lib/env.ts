@@ -536,11 +536,18 @@ const ServerEnvSchema = z.object({
   // Hard cap on CONCURRENT 69labs image generations across ALL queues. The
   // image_gen, image_to_video (generates a still first), and avatar/split_2
   // (right-half still) lanes all call generateImage independently, so their
-  // combined in-flight count can exceed 69labs' per-account limit (7), which
-  // returns a 403 "Concurrent image generation limit reached" that fails the
-  // segment. This semaphore bounds the total below that limit regardless of how
-  // the per-queue concurrencies add up. Default 6 leaves headroom under 7.
-  SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(6),
+  // combined in-flight count can exceed 69labs' real per-account limit, which
+  // returns a 403 "Concurrent image generation limit reached" / a 503 cooldown
+  // that fails the segment. This semaphore bounds the total below that limit
+  // regardless of how the per-queue concurrencies add up.
+  //
+  // 69labs allows only 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER
+  // (per 69labs guidance), and pushing past the tier ceiling triggers cooldowns
+  // — NOT the "7" an earlier comment assumed. Default 3 sits inside the 1–4 band
+  // and assumes a tier that permits at least 3 concurrent. Lower to 1–2 if you
+  // hit 503 "service unavailable" / cooldowns (a lower tier), or raise toward 4
+  // only after confirming your tier's real ceiling.
+  SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(3),
 
   // Synthetic visual-block pacing. The client's reference video paces every
   // visual block (image / ai_clip / split_2) at ~3-8s. Gemini's planner emits

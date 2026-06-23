@@ -17,11 +17,15 @@ import { withStylePrompt } from "@/lib/synthetic/constants";
 // Process-wide gate on concurrent image generations. The image_gen,
 // image_to_video, and avatar/split_2 lanes each call generateImage on their own
 // BullMQ concurrency, so their combined in-flight count can blow past 69labs'
-// per-account limit (7) and earn a 403. This semaphore caps the TOTAL in-flight
-// image generations for THIS worker process below that limit; excess callers
-// await a freed slot (FIFO). Scope is per-process — correct here because the
-// burst that triggered the 403 came from one worker running all three lanes at
-// once. With multiple worker machines the cap is per-machine; size accordingly.
+// real per-account limit and earn a 403 / a 503 cooldown. 69labs allows only
+// 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER, and exceeding the
+// tier ceiling triggers cooldowns — see SIXTYNINE_IMAGE_CONCURRENCY (default 3).
+// This semaphore caps the TOTAL in-flight image generations for THIS worker
+// process below that limit; excess callers await a freed slot (FIFO). Scope is
+// per-process — correct here because the burst that triggered the 403 came from
+// one worker running all three lanes at once. With multiple worker machines the
+// cap is per-machine, so the cluster total is limit × machines: keep ONE image
+// worker (or size the cap so machines × cap stays within your tier's ceiling).
 let imageSlotsInUse = 0;
 const imageWaiters: Array<() => void> = [];
 
@@ -163,7 +167,7 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
 export interface GenerateImageResult {
   image: Buffer;
   contentType: string;
-  provider: "sixtynine_image" | "flux_image";
+  provider: "sixtynine_image";
 }
 
 // 69labs image generation is an ASYNC JOB API (same lifecycle as TTS):
@@ -245,69 +249,31 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
   };
 }
 
-// Internal: Flux fallback. Black Forest Labs returns a polling task; we fetch
-// the result image once ready. Kept minimal — only invoked when nano-banana
-// fails outright.
-async function generateFluxImage(prompt: string): Promise<Buffer> {
-  const env = getEnv();
-  if (!env.FLUX_API_KEY) throw new Error("FLUX_API_KEY not configured (image fallback)");
-  const base = env.FLUX_BASE_URL.replace(/\/$/, "");
-
-  const submit = await withHttpRetry("flux.submit", () =>
-    fetchOrThrow(`${base}/${env.FLUX_MODEL}`, {
-      method: "POST",
-      headers: { "x-key": env.FLUX_API_KEY!, "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, width: 1280, height: 720 }),
-      timeoutMs: 60_000,
-    }),
-  );
-  const { id, polling_url } = (await submit.json()) as { id: string; polling_url?: string };
-  const pollUrl = polling_url ?? `${base}/get_result?id=${id}`;
-
-  // Poll up to ~2 min for the result.
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    const poll = await fetchOrThrow(pollUrl, {
-      headers: { "x-key": env.FLUX_API_KEY! },
-      timeoutMs: 30_000,
-    });
-    const body = (await poll.json()) as { status?: string; result?: { sample?: string } };
-    if (body.status === "Ready" && body.result?.sample) {
-      const img = await fetchOrThrow(body.result.sample, { timeoutMs: 60_000 });
-      return Buffer.from(await img.arrayBuffer());
-    }
-    if (body.status === "Error" || body.status === "Failed") {
-      throw new Error(`flux: generation ${body.status}`);
-    }
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  throw new Error("flux: timed out waiting for result");
-}
-
 /**
- * Generate an image from a base prompt. The mandatory STYLE_PROMPT is appended
- * here so every caller gets the consistent look. nano-banana is primary; on
- * failure we fall back to Flux (when configured). The chosen provider is
- * returned for cost attribution.
+ * Generate an image from a base prompt via 69labs (nano-banana). The mandatory
+ * STYLE_PROMPT is appended here so every caller gets the consistent look.
+ *
+ * 69labs is the ONLY image provider — there is no cross-provider fallback. Safe
+ * multi-image generation comes from two mechanisms, NOT a fallback:
+ *   1. The global image slot below caps total in-flight 69labs jobs under the
+ *      provider's per-tier concurrent limit (1–4 by subscription;
+ *      SIXTYNINE_IMAGE_CONCURRENCY default 3), so a burst of segments queues
+ *      instead of earning a 403 / a 503 cooldown.
+ *   2. generateNanoBananaImage's withHttpRetry rides out transient 503 "service
+ *      unavailable" / 403 "concurrent limit" spikes with exponential backoff.
+ * When 69labs is genuinely down past the retry budget, the call throws — the
+ * caller (image processor) lets BullMQ retry the whole job, and the segment can
+ * be re-run from the UI once 69labs recovers. The chosen provider is returned
+ * for cost attribution (always "sixtynine_image").
  */
 export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
   const prompt = withStylePrompt(basePrompt);
-  // Hold a global image slot for the whole nano-banana submit→poll→download so
-  // total in-flight 69labs image work stays under the provider's concurrent cap.
-  // The Flux fallback is a different provider, so it runs OUTSIDE the slot.
+  // Hold a global image slot for the whole submit→poll→download so total
+  // in-flight 69labs image work stays under the provider's concurrent cap.
   await acquireImageSlot(getEnv().SIXTYNINE_IMAGE_CONCURRENCY);
   try {
     const { image, contentType } = await generateNanoBananaImage(prompt);
     return { image, contentType, provider: "sixtynine_image" };
-  } catch (primaryErr) {
-    // eslint-disable-next-line no-console
-    console.warn(JSON.stringify({
-      msg: "synthetic.image.fallback_to_flux",
-      err: (primaryErr as Error).message?.slice(0, 200),
-    }));
-    if (!getEnv().FLUX_API_KEY) throw primaryErr; // no fallback configured
-    const image = await generateFluxImage(prompt);
-    return { image, contentType: "image/jpeg", provider: "flux_image" };
   } finally {
     releaseImageSlot();
   }
