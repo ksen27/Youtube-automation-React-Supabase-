@@ -37,4 +37,11 @@ export const r2Keys = {
     `synthetic/${projectId}/avatars/${segmentId}.mp4`,
   avatarShot: (projectId: string, segmentId: string, label: string) =>
     `synthetic/${projectId}/heygen-shots/${segmentId}_${label}.png`,
+  // Cached audio slice uploaded to HeyGen for an avatar part. Keyed by the
+  // spoken WINDOW (start/end, ms) as well as the segment so a TIMING EDIT or a
+  // re-aligned voiceover produces a NEW key — the old cached slice is never
+  // reused for a changed window. Lets a regenerate skip re-downloading the full
+  // master voiceover and re-cutting when the window is unchanged.
+  avatarAudioSlice: (projectId: string, segmentId: string, startMs: number, endMs: number) =>
+    `synthetic/${projectId}/avatar-audio/${segmentId}_${startMs}_${endMs}.mp3`,
 };

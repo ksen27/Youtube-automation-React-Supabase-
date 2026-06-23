@@ -4,7 +4,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { AvatarJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
-import { uploadBuffer, ensureTmp, safeUnlink } from "@/lib/storage";
+import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -46,7 +46,27 @@ async function stageAvatarAudio(
   const masterPath = path.join(tmp, `${segmentId}_master.mp3`);
   const slicePath = path.join(tmp, `${segmentId}.mp3`);
 
-  // Fetch the full master voiceover once, then cut the part window out of it.
+  // Cache key: the slice is fully determined by the segment's spoken WINDOW, so
+  // keying on start/end (ms) lets a REGENERATE reuse the prior slice instead of
+  // re-downloading the whole master voiceover and re-cutting every time. A
+  // timing edit changes the key, so a stale slice is never reused.
+  const startMs = Math.round(start * 1000);
+  const endMs = Math.round(end * 1000);
+  const cacheKey = r2Keys.avatarAudioSlice(projectId, segmentId, startMs, endMs);
+
+  // Cache hit: download the cached slice and skip the master fetch + ffmpeg cut.
+  const cached = await headObject(cacheKey).catch(() => null);
+  if (cached && cached.size > 0) {
+    try {
+      await downloadToFile(cacheKey, slicePath);
+      return { path: slicePath, durationSeconds };
+    } catch {
+      // Cache fetch failed for some reason — fall through and rebuild the slice.
+    }
+  }
+
+  // Cache miss: fetch the full master voiceover once, cut the part window out of
+  // it, then cache the slice for future regenerates.
   const res = await withHttpRetry("avatar.voiceover_fetch", () =>
     fetchOrThrow(voiceoverUrl, { timeoutMs: 120_000 }),
   );
@@ -62,6 +82,9 @@ async function stageAvatarAudio(
   } finally {
     await safeUnlink(masterPath);
   }
+  // Best-effort cache write — a failure here just means the next regenerate
+  // re-cuts; never fail the avatar job over the cache.
+  await uploadFile(slicePath, cacheKey, "audio/mpeg").catch(() => {});
   return { path: slicePath, durationSeconds };
 }
 

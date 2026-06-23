@@ -359,6 +359,18 @@ const ServerEnvSchema = z.object({
   // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).
   SIXTYNINE_LABS_TTS_MODEL: z.string().default("eleven_multilingual_v2"),
   SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana-2"),
+  // Output resolution for nano-banana image generation. The 69labs UI exposes a
+  // 1K/2K/4K selector (Nano Banana Pro); the API defaulted to 1K (~720p), which
+  // is BELOW the 1080p synthetic render, so images were upscaled and soft.
+  // Default 2K so generated stills are sharp at 1080p output. Sent as the
+  // `resolution` field on the generate request ONLY when non-empty; set to ""
+  // to omit it (revert to the provider default) if the API rejects the value.
+  // The exact accepted value string ("2K" vs "2k" etc.) is provider-defined —
+  // override here without a code change if needed. Pro resolutions may also
+  // require setting SIXTYNINE_LABS_IMAGE_MODEL to the Pro model name.
+  // Verified valid values for nano-banana-2: "1k" | "2k" | "4k" (LOWERCASE —
+  // the API 400s on "2K"). "" omits the field (provider default = 1k).
+  SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("2k"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
   // Max seconds to poll a TTS job to COMPLETED before giving up.
   SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),

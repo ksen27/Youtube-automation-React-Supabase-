@@ -78,6 +78,17 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   const isSyntheticRender = ((projRow?.engine as string | null) ?? "sourced") === "synthetic";
   const vcodec = segmentVcodecArgsFor(isSyntheticRender ? "synthetic" : "sourced");
 
+  // Output resolution, also per-render by engine. Synthetic sources (HeyGen
+  // avatars + LTX ai_clips) are natively 1920x1080, so rendering at 720p
+  // downscaled them and lost ~44% of the pixels (the soft-picture complaint).
+  // Synthetic now renders at 1080p so those sources pass through at native res.
+  // Celebrity (sourced) STAYS 1280x720 — byte-for-byte unchanged — because its
+  // YouTube footage is often sub-1080p and upscaling it would only add encode
+  // cost with no real detail gain. Every segment in one render shares these
+  // dims (required for the -c:v copy concat fast path).
+  const outW = isSyntheticRender ? 1920 : 1280;
+  const outH = isSyntheticRender ? 1080 : 720;
+
   // Pull approved timeline items (only ones with clips — placeholders are skipped
   // for MVP rendering; their script_text/overlay_text would be added in v2)
   const { data: items, error: itemsErr } = await sb
@@ -435,7 +446,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               rightImagePath: rightLocal,
               outputPath: out,
               durationSeconds: renderDur,
-              width: 1280, height: 720, fps: 30,
+              width: outW, height: outH, fps: 30,
               lowerThird: splitLt?.text
                 ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
                 : undefined,
@@ -447,7 +458,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               rightImagePath: rightLocal,
               outputPath: out,
               durationSeconds: renderDur,
-              width: 1280, height: 720, fps: 30,
+              width: outW, height: outH, fps: 30,
               lowerThird: splitLt?.text
                 ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
                 : undefined,
@@ -485,7 +496,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           try {
             await downloadHttp(it.video_url as string, localPre);
             await cutClip({ inputPath: localPre, outputPath: trimmed, startSeconds: 0, durationSeconds: renderDur, keepAudio: false });
-            await normalizeClip({ inputPath: trimmed, outputPath: out, width: 1280, height: 720, fps: 30, keepAudio: false, vcodecArgs: vcodec });
+            await normalizeClip({ inputPath: trimmed, outputPath: out, width: outW, height: outH, fps: 30, keepAudio: false, vcodecArgs: vcodec });
             slots[i] = out;
             let actualDur = renderDur;
             try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = p.durationSeconds; } catch { /* fallback */ }
@@ -534,7 +545,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await buildStillVideo({
               vcodecArgs: vcodec,
               inputImagePath: localImg, outputPath: out, durationSeconds: renderDur,
-              width: 1280, height: 720, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
+              width: outW, height: outH, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
             });
             slots[i] = out;
             slotDurations[i] = renderDur;
@@ -593,7 +604,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             text,
             outputPath: out,
             durationSeconds: renderDur,
-            width: 1280, height: 720, fps: 30,
+            width: outW, height: outH, fps: 30,
             animation: tcAnimation,
             typewriterDurationSeconds: tcTypewriterSeconds,
           });
@@ -652,7 +663,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             inputImagePath: localImg,
             outputPath: out,
             durationSeconds: renderDur,
-            width: 1280, height: 720, fps: 30,
+            width: outW, height: outH, fps: 30,
             motionDirection: motion,
             lowerThird: imgLt?.text
               ? { text: imgLt.text, startOffsetSeconds: imgLtOffset }
@@ -763,7 +774,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               await normalizeClip({
                 vcodecArgs: vcodec,
                 inputPath: trimmedPre, outputPath: out,
-                width: 1280, height: 720, fps: 30,
+                width: outW, height: outH, fps: 30,
                 lowerThird: lt?.text
                   ? { text: lt.text, startOffsetSeconds: ltStartOffset }
                   : undefined,
@@ -822,7 +833,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await normalizeClip({
               vcodecArgs: vcodec,
               inputPath: trimmed, outputPath: out,
-              width: 1280, height: 720, fps: 30,
+              width: outW, height: outH, fps: 30,
               lowerThird: lt?.text
                 ? { text: lt.text, startOffsetSeconds: ltStartOffset }
                 : undefined,
@@ -950,7 +961,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           await normalizeClip({
             vcodecArgs: vcodec,
             inputPath: trimmed, outputPath: out,
-            width: 1280, height: 720, fps: 30,
+            width: outW, height: outH, fps: 30,
             lowerThird: lt?.text
               ? { text: lt.text, startOffsetSeconds: ltStartOffset }
               : undefined,
@@ -1030,7 +1041,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             vcodecArgs: vcodec,
             outputPath: out,
             durationSeconds: plannedDur,
-            width: 1280, height: 720, fps: 30,
+            width: outW, height: outH, fps: 30,
           });
           slots[i] = out;
           slotDurations[i] = plannedDur;
@@ -1350,8 +1361,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             text: titleText,
             outputPath: cardPath,
             durationSeconds: OPENING_TITLE_DURATION,
-            width: 1280,
-            height: 720,
+            width: outW,
+            height: outH,
             fps: 30,
             animation: "typewriter",
             typewriterDurationSeconds: OPENING_TITLE_DURATION * OPENING_TITLE_TYPEWRITER_RATIO,
@@ -1361,8 +1372,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             vcodecArgs: vcodec,
             inputPath: cardPath,
             outputPath: normalizedCard,
-            width: 1280,
-            height: 720,
+            width: outW,
+            height: outH,
             fps: 30,
           });
           // Silent audio track matching the card's duration so the intro
@@ -1465,7 +1476,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
                   await normalizeClip({
                     vcodecArgs: vcodec,
                     inputPath: localClip, outputPath: pinned,
-                    width: 1280, height: 720, fps: 30,
+                    width: outW, height: outH, fps: 30,
                     startOffsetSeconds: overshoot,
                     pinDurationSeconds: dur,
                   });
@@ -1525,7 +1536,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await normalizeClip({
               vcodecArgs: vcodec,
               inputPath: trimmed, outputPath: normalizedCard,
-              width: 1280, height: 720, fps: 30,
+              width: outW, height: outH, fps: 30,
               startOffsetSeconds: cardHeadTrim > 0 ? cardHeadTrim : undefined,
               pinDurationSeconds: dur,
             });
@@ -1637,7 +1648,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         await normalizeClip({
           vcodecArgs: vcodec,
           inputPath: introTrimmed, outputPath: introNormalized,
-          width: 1280, height: 720, fps: 30,
+          width: outW, height: outH, fps: 30,
         });
         normalized.unshift(introNormalized);
         await safeUnlink(videoDl.outputPath);
@@ -1753,7 +1764,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         await normalizeClip({
           vcodecArgs: vcodec,
           inputPath: introTrimmed, outputPath: introNormalized,
-          width: 1280, height: 720, fps: 30,
+          width: outW, height: outH, fps: 30,
         });
         normalized.unshift(introNormalized);   // prepend
         await safeUnlink(introVideoLocal);
@@ -2138,7 +2149,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             inputPath: finalLocal,
             effectPath: effectLocalPath,
             outputPath: overlaidLocal,
-            width: 1280, height: 720, fps: 30,
+            width: outW, height: outH, fps: 30,
             opacity: env.EFFECT_OVERLAY_OPACITY,
             gain: env.EFFECT_OVERLAY_GAIN,
           });

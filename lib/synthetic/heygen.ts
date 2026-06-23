@@ -320,11 +320,19 @@ async function newestItemId(context: BrowserContext): Promise<string> {
 //      metadata is wrong or the signed URL serves a partial: we never RETURN a
 //      short file, we keep polling within the render budget for the real one.
 // Only #2 is authoritative (bytes don't lie); #1 just avoids wasted downloads.
+//
+// `expectedAspect` adds the same defense for ORIENTATION. A regenerate (or a
+// prior run that used the other aspect) leaves renders of BOTH orientations in
+// the list — same segment, same ~duration — so the duration gate alone can't
+// tell a 16:9 landscape avatar from a 9:16 portrait one. We probe the actual
+// file's width/height and reject the wrong orientation, so a full-frame avatar
+// (landscape) never gets a portrait file and vice versa. null = no aspect gate.
 async function retrieveRenderedVideo(
   page: Page,
   context: BrowserContext,
   baselineId = "",
   expectedSeconds = 0,
+  expectedAspect: "landscape" | "portrait" | null = null,
 ): Promise<Buffer> {
   const e = env();
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
@@ -337,20 +345,28 @@ async function retrieveRenderedVideo(
     if (typeof d !== "number" || d <= 0) return true; // HeyGen didn't report — defer to the probe
     return d >= minAcceptable;
   };
+  // Orientation of a probed file: landscape (w>h), portrait (h>w), or null.
+  const aspectOf = (w: number | null, h: number | null): "landscape" | "portrait" | null => {
+    if (!w || !h || w === h) return null;
+    return w > h ? "landscape" : "portrait";
+  };
+  const probeGateOn = minAcceptable > 0 || expectedAspect != null;
 
-  // Download a signed URL and probe its REAL duration. Returns null on a failed
-  // download so the caller keeps polling rather than throwing on a transient.
-  const downloadAndProbe = async (url: string): Promise<{ buf: Buffer; seconds: number } | null> => {
+  // Download a signed URL and probe its REAL duration + dimensions. Returns null
+  // on a failed download so the caller keeps polling rather than throwing.
+  const downloadAndProbe = async (
+    url: string,
+  ): Promise<{ buf: Buffer; seconds: number; aspect: "landscape" | "portrait" | null } | null> => {
     const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
     if (!resp || !resp.ok()) return null;
     const buf = Buffer.from(await resp.body());
     if (buf.length < 1024) return null;
-    if (minAcceptable <= 0) return { buf, seconds: 0 }; // legacy path: no probe gate
+    if (!probeGateOn) return { buf, seconds: 0, aspect: null }; // legacy path: no probe gate
     const tmpPath = path.join(os.tmpdir(), `heygen_probe_${Date.now()}_${Math.round(buf.length)}.mp4`);
     try {
       await fs.writeFile(tmpPath, buf);
-      const probed = await probeFile(tmpPath).catch(() => ({ durationSeconds: 0 }));
-      return { buf, seconds: probed.durationSeconds };
+      const probed = await probeFile(tmpPath).catch(() => ({ durationSeconds: 0, width: null, height: null }));
+      return { buf, seconds: probed.durationSeconds, aspect: aspectOf(probed.width, probed.height) };
     } finally {
       await fs.unlink(tmpPath).catch(() => {});
     }
@@ -358,6 +374,7 @@ async function retrieveRenderedVideo(
 
   let everSawOurs = false;
   let sawShort = false; // saw a completed/downloaded item that was too short
+  let sawWrongAspect = false; // saw a completed item with the wrong orientation
   let lastShortSeconds = 0;
   while (Date.now() < deadline) {
     const items = await fetchProjectItems(context);
@@ -371,7 +388,7 @@ async function retrieveRenderedVideo(
 
     // Try each completed candidate whose HeyGen-reported duration looks right
     // (or unknown), newest first. Download + probe; accept the first whose ACTUAL
-    // file duration is long enough. This is the authoritative gate.
+    // file duration AND orientation match. This is the authoritative gate.
     for (const cand of completed) {
       if (!durOk(cand.duration)) {
         sawShort = true;
@@ -389,8 +406,14 @@ async function retrieveRenderedVideo(
         lastShortSeconds = got.seconds;
         continue;
       }
+      if (expectedAspect && got.aspect && got.aspect !== expectedAspect) {
+        // Wrong orientation — a stale render of the other aspect ratio. Skip it
+        // and keep looking for the one matching this block's expected aspect.
+        sawWrongAspect = true;
+        continue;
+      }
       everSawOurs = true;
-      return got.buf; // verified full-length (or legacy path)
+      return got.buf; // verified duration + orientation (or legacy path)
     }
 
     if (candidates.length > 0) {
@@ -421,7 +444,9 @@ async function retrieveRenderedVideo(
 
   throw new HeygenError(
     "ui_changed",
-    sawShort
+    sawWrongAspect
+      ? `heygen: only a wrong-orientation render appeared within the render budget — expected ${expectedAspect}, the matching render never finalized`
+      : sawShort
       ? `heygen: only a short render (~${Math.round(lastShortSeconds)}s < expected ${Math.round(expectedSeconds)}s) was available within the render budget — the full-length render never finalized`
       : "heygen: render did not complete within the render budget",
   );
@@ -808,11 +833,18 @@ async function attemptOnAccount(
     // the length (not our audio), so passing audioDurationSeconds would let the
     // probe wrongly reject a valid render — pass 0 to keep the legacy behavior.
     const usedAudioPath = !!input.audioFilePath && !forceScriptPath;
+    // Expected orientation always matches what we asked HeyGen to compose:
+    // full-frame avatar = landscape, split_2 avatar-half = portrait. Defaults to
+    // landscape when unset (the full-frame default). This guards against picking
+    // a stale render of the OTHER aspect ratio for the same segment.
+    const expectedAspect: "landscape" | "portrait" =
+      input.aspectRatio === "portrait" ? "portrait" : "landscape";
     const videoBytes = await retrieveRenderedVideo(
       p,
       context,
       baselineId,
       usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
+      expectedAspect,
     );
     await shot(p, input.projectId, input.segmentId, "done");
 

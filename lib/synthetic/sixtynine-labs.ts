@@ -52,6 +52,7 @@ function cfg() {
     ttsModel: env.SIXTYNINE_LABS_TTS_MODEL,
     ttsPollTimeoutMs: env.SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS * 1000,
     imageModel: env.SIXTYNINE_LABS_IMAGE_MODEL,
+    imageResolution: env.SIXTYNINE_LABS_IMAGE_RESOLUTION,
     imagePollTimeoutMs: env.SIXTYNINE_LABS_IMAGE_POLL_TIMEOUT_SECONDS * 1000,
     defaultVoice: env.SIXTYNINE_LABS_DEFAULT_VOICE,
   };
@@ -199,6 +200,10 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
         prompt,
         model: c.imageModel,
         aspectRatio: "16:9",
+        // Request a higher resolution (1K/2K/4K, Nano Banana Pro) so stills are
+        // sharp at the 1080p render. Omitted when the env value is empty so the
+        // provider default applies. Field name per 69labs' generate contract.
+        ...(c.imageResolution ? { resolution: c.imageResolution } : {}),
       }),
       timeoutMs: 60_000,
     }),

@@ -10,10 +10,14 @@
 //
 // Usage: npx tsx --env-file=.env.local scripts/heygen-repair-segment.ts <segmentId>
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { createClient } from "@supabase/supabase-js";
 import { getAccountByEmail } from "@/lib/synthetic/heygen-accounts";
 import { openAuthedContext } from "@/lib/synthetic/heygen-auth";
 import { uploadBuffer } from "@/lib/storage";
+import { probeFile } from "@/lib/media/probe";
 import { r2Keys } from "@/lib/synthetic/constants";
 
 const HEYGEN_ITEMS_API =
@@ -32,13 +36,15 @@ const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPAB
 async function main() {
 const { data: seg, error: segErr } = await sb
   .from("synthetic_segments")
-  .select("id, project_id, start_time, end_time, duration, video_url")
+  .select("id, project_id, block_type, start_time, end_time, duration, video_url")
   .eq("id", segmentId)
   .single();
 if (segErr || !seg) throw new Error(`segment ${segmentId} not found: ${segErr?.message}`);
 
 const expected = Number(seg.end_time) - Number(seg.start_time);
-console.log(`segment ${segmentId} | project ${seg.project_id} | planned ${expected.toFixed(2)}s`);
+// Full-frame avatar = landscape; split_2 avatar-half = portrait.
+const expectedAspect: "landscape" | "portrait" = seg.block_type === "split_2" ? "portrait" : "landscape";
+console.log(`segment ${segmentId} | project ${seg.project_id} | block_type ${seg.block_type} | planned ${expected.toFixed(2)}s | expect ${expectedAspect}`);
 
 // Use the same account that the worker uses. Single-account pool here.
 const { data: accRow } = await sb.from("heygen_accounts").select("email").eq("status", "active").limit(1).single();
@@ -55,26 +61,44 @@ try {
   console.log(`fetched ${items.length} project items`);
 
   const completed = items.filter((it) => ["completed", "success", "done"].includes((it.status ?? "").toLowerCase()));
-  // Pick the NEWEST completed item whose duration matches the planned window.
+  // Candidates whose duration matches the planned window, newest first.
   const tol = Math.max(2, expected * 0.15);
-  const matches = completed
+  const durMatches = completed
     .filter((it) => typeof it.duration === "number" && it.duration! >= expected - tol)
     .sort((a, b) => (b.created_ts ?? 0) - (a.created_ts ?? 0));
   console.log("completed durations:", completed.map((it) => Math.round((it.duration ?? 0) * 10) / 10).join(", "));
 
-  const pick = matches[0];
-  if (!pick) {
-    throw new Error(`no completed HeyGen item with duration >= ${(expected - tol).toFixed(1)}s found — cannot repair`);
+  // Probe each duration-matching candidate and pick the one whose ACTUAL
+  // orientation matches the expected aspect (both 16:9 and 9:16 renders of the
+  // same segment have the same duration, so duration alone can't disambiguate).
+  let buf: Buffer | null = null;
+  for (const cand of durMatches) {
+    const url = cand.video_url || cand.video_download_url;
+    if (!url) continue;
+    const dl = await context.request.get(url, { timeout: 120_000 });
+    if (!dl.ok()) continue;
+    const b = Buffer.from(await dl.body());
+    if (b.length < 1024) continue;
+    const tmp = path.join(os.tmpdir(), `repair_${cand.video_id}.mp4`);
+    let aspect: "landscape" | "portrait" | null = null;
+    try {
+      await fs.writeFile(tmp, b);
+      const p = await probeFile(tmp);
+      aspect = !p.width || !p.height || p.width === p.height ? null : p.width > p.height ? "landscape" : "portrait";
+      console.log(`  candidate ${cand.video_id}: ${p.width}x${p.height} (${aspect}) dur=${p.durationSeconds.toFixed(1)}s`);
+    } finally {
+      await fs.unlink(tmp).catch(() => {});
+    }
+    if (aspect === expectedAspect) {
+      buf = b;
+      console.log(`matched item ${cand.video_id} (${aspect})`);
+      break;
+    }
   }
-  console.log(`matched item ${pick.video_id} duration=${pick.duration}s`);
-
-  const url = pick.video_url || pick.video_download_url;
-  if (!url) throw new Error("matched item has no downloadable url");
-  const dl = await context.request.get(url, { timeout: 120_000 });
-  if (!dl.ok()) throw new Error(`download HTTP ${dl.status()}`);
-  const buf = Buffer.from(await dl.body());
+  if (!buf) {
+    throw new Error(`no completed HeyGen item matching duration>=${(expected - tol).toFixed(1)}s AND aspect=${expectedAspect} — cannot repair`);
+  }
   console.log(`downloaded ${(buf.length / 1e6).toFixed(2)} MB`);
-  if (buf.length < 1024) throw new Error("downloaded file implausibly small");
 
   const up = await uploadBuffer(buf, r2Keys.avatarVideo(seg.project_id as string, segmentId), "video/mp4");
   console.log(`uploaded -> ${up.publicUrl}`);
