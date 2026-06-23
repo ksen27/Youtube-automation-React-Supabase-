@@ -1,7 +1,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { type Page, type BrowserContext } from "playwright";
 import { getEnv } from "@/lib/env";
+import { probeFile } from "@/lib/media/probe";
 import { uploadBuffer } from "@/lib/storage";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
@@ -297,40 +299,111 @@ async function newestItemId(context: BrowserContext): Promise<string> {
 }
 
 // Retrieve the finished avatar video via the project-list API. Polls until OUR
-// render (newest item whose video_id != baseline) reaches status "completed",
-// then downloads its signed video_url. Throws a classified HeygenError on
-// timeout / failure. `baselineId` is the newest video_id captured pre-generate.
+// render reaches status "completed", then downloads its signed video_url. Throws
+// a classified HeygenError on timeout / failure. `baselineId` is the newest
+// video_id captured pre-generate.
+//
+// `expectedSeconds` is the duration we EXPECT (the uploaded audio slice length).
+// It's the permanent fix for a real bug: when a segment is REGENERATED, HeyGen's
+// project list holds several renders of the same segment (one per attempt).
+// Picking "newest non-baseline completed" grabbed whichever item happened to be
+// at the top — which could be a STALE shorter render (e.g. a prior 10s attempt)
+// while the fresh 25s render was still processing. HeyGen reported the right 25s
+// on its side, but we downloaded the wrong 10s item.
+//
+// Defense in depth, both gated on expectedSeconds (legacy script path with no
+// expectation keeps the old newest-non-baseline behavior):
+//   1) Candidate filter on HeyGen's reported `duration` — skip items shorter
+//      than expected (the stale 10s render).
+//   2) POST-DOWNLOAD PROBE — after downloading, ffprobe the ACTUAL file and
+//      reject it if it's materially short. This catches the case HeyGen's
+//      metadata is wrong or the signed URL serves a partial: we never RETURN a
+//      short file, we keep polling within the render budget for the real one.
+// Only #2 is authoritative (bytes don't lie); #1 just avoids wasted downloads.
 async function retrieveRenderedVideo(
   page: Page,
   context: BrowserContext,
   baselineId = "",
+  expectedSeconds = 0,
 ): Promise<Buffer> {
   const e = env();
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
   const appearDeadline = Date.now() + 180_000; // our item must show up within 3 min
+  // Tolerance: a render within ~2s (or 15%) of the expected length is accepted;
+  // shorter than that and we treat it as a partial/stale render.
+  const minAcceptable = expectedSeconds > 0 ? expectedSeconds - Math.max(2, expectedSeconds * 0.15) : 0;
+  const durOk = (d: number | undefined): boolean => {
+    if (minAcceptable <= 0) return true; // no expectation
+    if (typeof d !== "number" || d <= 0) return true; // HeyGen didn't report — defer to the probe
+    return d >= minAcceptable;
+  };
 
-  let ours: HeygenProjectItem | null = null;
+  // Download a signed URL and probe its REAL duration. Returns null on a failed
+  // download so the caller keeps polling rather than throwing on a transient.
+  const downloadAndProbe = async (url: string): Promise<{ buf: Buffer; seconds: number } | null> => {
+    const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
+    if (!resp || !resp.ok()) return null;
+    const buf = Buffer.from(await resp.body());
+    if (buf.length < 1024) return null;
+    if (minAcceptable <= 0) return { buf, seconds: 0 }; // legacy path: no probe gate
+    const tmpPath = path.join(os.tmpdir(), `heygen_probe_${Date.now()}_${Math.round(buf.length)}.mp4`);
+    try {
+      await fs.writeFile(tmpPath, buf);
+      const probed = await probeFile(tmpPath).catch(() => ({ durationSeconds: 0 }));
+      return { buf, seconds: probed.durationSeconds };
+    } finally {
+      await fs.unlink(tmpPath).catch(() => {});
+    }
+  };
+
   let everSawOurs = false;
+  let sawShort = false; // saw a completed/downloaded item that was too short
+  let lastShortSeconds = 0;
   while (Date.now() < deadline) {
     const items = await fetchProjectItems(context);
-    // OUR render is the newest item whose id differs from the pre-generate
-    // baseline. (At avatar concurrency=1 nobody else is adding items.)
-    const candidate = items.find((it) => it.video_id && it.video_id !== baselineId) ?? null;
+    // Candidates = every item that isn't the pre-generate baseline (a
+    // regenerate leaves several of our own prior renders in the list).
+    const candidates = items.filter((it) => it.video_id && it.video_id !== baselineId);
+    const completed = candidates.filter((it) => {
+      const s = (it.status ?? "").toLowerCase();
+      return s === "completed" || s === "success" || s === "done";
+    });
 
-    if (candidate) {
-      everSawOurs = true;
-      const status = (candidate.status ?? "").toLowerCase();
-      if (status === "completed" || status === "success" || status === "done") {
-        ours = candidate;
-        break;
+    // Try each completed candidate whose HeyGen-reported duration looks right
+    // (or unknown), newest first. Download + probe; accept the first whose ACTUAL
+    // file duration is long enough. This is the authoritative gate.
+    for (const cand of completed) {
+      if (!durOk(cand.duration)) {
+        sawShort = true;
+        lastShortSeconds = cand.duration ?? lastShortSeconds;
+        continue;
       }
-      if (status === "failed" || status === "error") {
+      const url = cand.video_url || cand.video_download_url;
+      if (!url || !/^https?:/.test(url)) continue;
+      const got = await downloadAndProbe(url);
+      if (!got) continue; // transient download issue — re-poll
+      if (minAcceptable > 0 && got.seconds > 0 && got.seconds < minAcceptable) {
+        // The file itself is short — HeyGen's metadata lied or it served a
+        // partial. Do NOT return it; keep waiting for the full render.
+        sawShort = true;
+        lastShortSeconds = got.seconds;
+        continue;
+      }
+      everSawOurs = true;
+      return got.buf; // verified full-length (or legacy path)
+    }
+
+    if (candidates.length > 0) {
+      everSawOurs = true;
+      // Surface a hard HeyGen-side failure on the newest candidate.
+      const newest = candidates[0];
+      const ns = (newest.status ?? "").toLowerCase();
+      if (ns === "failed" || ns === "error") {
         throw new HeygenError(
           "ui_changed",
-          `heygen: render failed on HeyGen side${candidate.error_message ? ` — ${candidate.error_message}` : ""}`,
+          `heygen: render failed on HeyGen side${newest.error_message ? ` — ${newest.error_message}` : ""}`,
         );
       }
-      // Still processing — wait and re-poll within the render budget.
       await page.waitForTimeout(5000);
       continue;
     }
@@ -346,25 +419,12 @@ async function retrieveRenderedVideo(
     await page.waitForTimeout(5000);
   }
 
-  if (!ours) {
-    throw new HeygenError("ui_changed", "heygen: render did not complete within the render budget");
-  }
-
-  const url = ours.video_url || ours.video_download_url;
-  if (!url || !/^https?:/.test(url)) {
-    throw new HeygenError("ui_changed", "heygen: completed render has no downloadable video_url");
-  }
-
-  // Download the signed mp4 through the authed context.
-  const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
-  if (!resp || !resp.ok()) {
-    throw new HeygenError("ui_changed", `heygen: failed to download rendered mp4 (HTTP ${resp?.status() ?? "n/a"})`);
-  }
-  const buf = Buffer.from(await resp.body());
-  if (buf.length < 1024) {
-    throw new HeygenError("ui_changed", `heygen: downloaded mp4 implausibly small (${buf.length} bytes)`);
-  }
-  return buf;
+  throw new HeygenError(
+    "ui_changed",
+    sawShort
+      ? `heygen: only a short render (~${Math.round(lastShortSeconds)}s < expected ${Math.round(expectedSeconds)}s) was available within the render budget — the full-length render never finalized`
+      : "heygen: render did not complete within the render budget",
+  );
 }
 
 // One full avatar generation attempt on a single account. Throws a classified
@@ -741,7 +801,19 @@ async function attemptOnAccount(
 
     // 8–9) Retrieve the finished video from the Projects page (the only place
     // the rendered mp4 exists). Returns the downloaded bytes.
-    const videoBytes = await retrieveRenderedVideo(p, context, baselineId);
+    //
+    // expectedSeconds gates the duration validation. ONLY pass it on the
+    // audio-driven path: there the render length == the uploaded audio, so the
+    // probe gate is correct. On the forced-script fallback HeyGen's own TTS sets
+    // the length (not our audio), so passing audioDurationSeconds would let the
+    // probe wrongly reject a valid render — pass 0 to keep the legacy behavior.
+    const usedAudioPath = !!input.audioFilePath && !forceScriptPath;
+    const videoBytes = await retrieveRenderedVideo(
+      p,
+      context,
+      baselineId,
+      usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
+    );
     await shot(p, input.projectId, input.segmentId, "done");
 
     // 8) Upload to R2.
