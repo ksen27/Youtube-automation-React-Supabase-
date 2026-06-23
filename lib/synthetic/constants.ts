@@ -33,8 +33,17 @@ export const r2Keys = {
     `synthetic/${projectId}/images/${segmentId}_right.jpg`,
   segmentVideo: (projectId: string, segmentId: string) =>
     `synthetic/${projectId}/clips/${segmentId}.mp4`,
-  avatarVideo: (projectId: string, segmentId: string) =>
-    `synthetic/${projectId}/avatars/${segmentId}.mp4`,
+  // Avatar (or split_2 left-half) video. An optional `version` suffix makes a
+  // REGENERATE write to a NEW URL instead of overwriting the same key. Without
+  // it, the new render reused the same URL and the CDN/browser kept serving the
+  // STALE cached copy — so a regenerated avatar showed the OLD video (old aspect
+  // ratio / duration) until the cache expired. A fresh URL has nothing cached to
+  // serve. The DB row stores this exact URL, so the app always points at the new
+  // file. Omit `version` for the legacy stable key (back-compat).
+  avatarVideo: (projectId: string, segmentId: string, version?: string | number) =>
+    version != null && `${version}` !== ""
+      ? `synthetic/${projectId}/avatars/${segmentId}_${version}.mp4`
+      : `synthetic/${projectId}/avatars/${segmentId}.mp4`,
   avatarShot: (projectId: string, segmentId: string, label: string) =>
     `synthetic/${projectId}/heygen-shots/${segmentId}_${label}.png`,
   // Cached audio slice uploaded to HeyGen for an avatar part. Keyed by the

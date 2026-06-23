@@ -78,6 +78,26 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   const isSyntheticRender = ((projRow?.engine as string | null) ?? "sourced") === "synthetic";
   const vcodec = segmentVcodecArgsFor(isSyntheticRender ? "synthetic" : "sourced");
 
+  // PERFORMANCE_MODE: synthetic-engine "no visual effects" pipeline. ONLY active
+  // for synthetic renders — the sourced/celebrity path is never affected. When
+  // on, the merge loop is bypassed (hard cuts only — no xfade/fadeblack), all
+  // transition headroom is zeroed so segments render at their exact planned
+  // length, and the global particle overlay post-pass is skipped. Audio,
+  // timing, subtitles and avatar generation are untouched. Resolved once here so
+  // every stage below reads the same value.
+  const performanceMode = getEnv().PERFORMANCE_MODE && isSyntheticRender;
+  // Per-stage wall-clock timing (ms) so the log shows exactly where render time
+  // goes and how much PERFORMANCE_MODE saves. Stamped as each stage completes.
+  const stageTimings: Record<string, number> = {};
+  await logJob({ projectId, jobId: mediaJobId }, "render.performance_mode", {
+    enabled: performanceMode,
+    rawEnvFlag: getEnv().PERFORMANCE_MODE,
+    engine: isSyntheticRender ? "synthetic" : "sourced",
+    note: performanceMode
+      ? "EFFECTS DISABLED: hard cuts only, no transitions, no global overlay"
+      : "effects active (PERFORMANCE_MODE off or non-synthetic engine)",
+  });
+
   // Output resolution, also per-render by engine. Synthetic sources (HeyGen
   // avatars + LTX ai_clips) are natively 1920x1080, so rendering at 720p
   // downscaled them and lost ~44% of the pixels (the soft-picture complaint).
@@ -316,6 +336,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const it = renderable[i];
     return it?.type === "image" && !!it.image_url;
   };
+  // Transition headroom for the side of block `i` facing neighbor `neighborIdx`.
+  // Normally a still segment is rendered XFADE/2 (0.25s) longer toward an image
+  // neighbor and MIXED/2 (0.2s) longer toward a video neighbor so the xfade/
+  // fadeblack pass can consume the overlap. In PERFORMANCE_MODE there IS no
+  // transition pass, so headroom must be 0 — otherwise every block would render
+  // a fraction long with nothing to eat it, drifting the timeline past the
+  // voiceover. Returning 0 here keeps each segment at its exact planned length
+  // for the hard-cut concat. The merge loop is also skipped (see below), so the
+  // two changes stay consistent.
+  const headroomFor = (neighborIdx: number): number => {
+    if (performanceMode) return 0;
+    if (isImageNeighbor(neighborIdx)) return IMAGE_XFADE_SECONDS / 2;
+    if (isVideoNeighbor(neighborIdx)) return MIXED_FADE_SECONDS / 2;
+    return 0;
+  };
   let imageRendered = 0;
   let imageFailed = 0;
 
@@ -357,6 +392,15 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // at its untrimmed length.
           duration: plannedDurations[i],
           metadata: it.metadata ?? null,
+          // PERFORMANCE_MODE renders each segment WITHOUT the transition
+          // headroom (headroomFor returns 0), so a perf-mode segment is shorter
+          // than the same block rendered with effects on. The two must NEVER
+          // share a cache entry: a normal-mode clip carries ~0.2-0.45s of baked
+          // headroom, and serving it to a perf-mode render restores that
+          // inflated slotDuration with no transition to absorb it — summed
+          // across ~50 cached blocks that drifted the video ~22s past the
+          // voiceover. Keying on the mode forces a clean re-render per mode.
+          performanceMode,
         },
       });
 
@@ -402,20 +446,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // half-width side-by-side composite. Same headroom logic as a
         // single image — split blocks are still frames, so their
         // transition partners treat them identically.
-        const leftPartnerImage = isImageNeighbor(i - 1);
-        const leftPartnerVideo = isVideoNeighbor(i - 1);
-        const rightPartnerImage = isImageNeighbor(i + 1);
-        const rightPartnerVideo = isVideoNeighbor(i + 1);
-        const headLeft = leftPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : leftPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
-        const headRight = rightPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : rightPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
+        const headLeft = headroomFor(i - 1);
+        const headRight = headroomFor(i + 1);
         const renderDur = plannedDur + headLeft + headRight;
         const meta = (it.metadata ?? {}) as Record<string, unknown>;
         // SYNTHETIC split: avatar VIDEO (video_url) left + still (right_image_url)
@@ -482,12 +514,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // (a degraded ai_clip may have only image_url -> render as a held
         // still). The master voiceover is the single audio track, muxed at
         // concat time, so these segments are silent like every other one.
-        const leftPartnerImage = isImageNeighbor(i - 1);
-        const leftPartnerVideo = isVideoNeighbor(i - 1);
-        const rightPartnerImage = isImageNeighbor(i + 1);
-        const rightPartnerVideo = isVideoNeighbor(i + 1);
-        const headLeft = leftPartnerImage ? IMAGE_XFADE_SECONDS / 2 : leftPartnerVideo ? MIXED_FADE_SECONDS / 2 : 0;
-        const headRight = rightPartnerImage ? IMAGE_XFADE_SECONDS / 2 : rightPartnerVideo ? MIXED_FADE_SECONDS / 2 : 0;
+        const headLeft = headroomFor(i - 1);
+        const headRight = headroomFor(i + 1);
         const renderDur = plannedDur + headLeft + headRight;
 
         if (it.video_url) {
@@ -565,20 +593,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // sectionTitle. We bake the same per-side headroom an image
         // neighbor would (still frames behave identically through xfades),
         // so the transition math downstream still adds up.
-        const leftPartnerImage = isImageNeighbor(i - 1);
-        const leftPartnerVideo = isVideoNeighbor(i - 1);
-        const rightPartnerImage = isImageNeighbor(i + 1);
-        const rightPartnerVideo = isVideoNeighbor(i + 1);
-        const headLeft = leftPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : leftPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
-        const headRight = rightPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : rightPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
+        const headLeft = headroomFor(i - 1);
+        const headRight = headroomFor(i + 1);
         const renderDur = plannedDur + headLeft + headRight;
         const text = String(it.overlay_text ?? "").trim();
         // Script-doc title cards opt in to typewriter animation by stamping
@@ -623,20 +639,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // darkens the last frames into black (still visible, but content
         // time effectively halves on that side). Either way the visible
         // "useful" hold time stays close to plannedDur.
-        const leftPartnerImage = isImageNeighbor(i - 1);
-        const leftPartnerVideo = isVideoNeighbor(i - 1);
-        const rightPartnerImage = isImageNeighbor(i + 1);
-        const rightPartnerVideo = isVideoNeighbor(i + 1);
-        const headLeft = leftPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : leftPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
-        const headRight = rightPartnerImage
-          ? IMAGE_XFADE_SECONDS / 2
-          : rightPartnerVideo
-            ? MIXED_FADE_SECONDS / 2
-            : 0;
+        const headLeft = headroomFor(i - 1);
+        const headRight = headroomFor(i + 1);
         const renderDur = plannedDur + headLeft + headRight;
         try {
           const localImg = path.join(tmp, `img_${idx}`);
@@ -999,6 +1003,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       }
     }
 
+    const renderStageStart = Date.now();
     await Promise.all(
       Array.from({ length: laneCount }, async () => {
         while (true) {
@@ -1012,6 +1017,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         }
       }),
     );
+    stageTimings.render_clips_ms = Date.now() - renderStageStart;
 
     // ---- failed-slot filler pass ----------------------------------------
     // A slot that failed to render (source download timeout, ffmpeg error)
@@ -1156,6 +1162,51 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       await touchMediaJob(mediaJobId);
     };
 
+    const mergeStageStart = Date.now();
+    // Count every boundary that WOULD have received a transition in the normal
+    // pipeline, so the log shows how many xfade/fadeblack re-encodes
+    // PERFORMANCE_MODE skipped (in normal mode this matches xfadeMerges +
+    // mixedFades). Computed by walking adjacent successfully-rendered slots.
+    let transitionsSkipped = 0;
+    {
+      let prevWasStill: boolean | null = null;
+      for (let i = 0; i < slots.length; i++) {
+        if (slots[i] === null) continue;
+        const still = isImageNeighbor(i);
+        if (prevWasStill !== null) {
+          // still↔still (xfade), still↔video / video↔still (fadeblack) get a
+          // transition; video↔video is already a hard cut.
+          if (prevWasStill || still) transitionsSkipped++;
+        }
+        prevWasStill = still;
+      }
+    }
+
+    if (performanceMode) {
+      // PERFORMANCE_MODE: NO transitions. Every successfully-rendered slot is
+      // appended as a hard cut — no xfadePair, no xfadeFadeBlack, no
+      // mergeMixedBoundary, no headroom to consume (headroomFor returned 0 so
+      // each slot is exactly its planned length). This is the simplest possible
+      // assembly: render clips → (concat) → audio. mergedKinds /
+      // mergedTailIsRealImage are still tracked so the (now empty) SFX cadence
+      // and downstream duration accounting see consistent state.
+      for (let i = 0; i < slots.length; i++) {
+        await mergeHeartbeat();
+        const seg = slots[i];
+        if (seg === null) continue;
+        const itemKind: SegKind = isImageNeighbor(i) ? "image" : "video";
+        mergedSegments.push(seg);
+        mergedDurations.push(slotDurations[i]);
+        mergedKinds.push(itemKind);
+        mergedTailIsRealImage.push(isRealImage(i));
+      }
+      await logJob({ projectId, jobId: mediaJobId }, "render.transitions.skipped", {
+        performanceMode: true,
+        transitionsSkipped,
+        hardCuts: mergedSegments.length,
+        note: "all clip-to-clip transitions disabled — hard cuts only",
+      });
+    } else {
     for (let i = 0; i < slots.length; i++) {
       await mergeHeartbeat();
       const seg = slots[i];
@@ -1245,6 +1296,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         mergedTailIsRealImage.push(isRealImage(i));
       }
     }
+    } // end normal (effects-on) merge path
+    stageTimings.merge_transitions_ms = Date.now() - mergeStageStart;
     const normalized: string[] = mergedSegments;
 
     if (normalized.length === 0) throw new Error("all timeline items failed to render");
@@ -1254,8 +1307,14 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       built: normalized.length,
       imageRendered,
       imageFailed,
+      // In PERFORMANCE_MODE both stay 0 (no transition encodes ran); the count
+      // that WOULD have run is logged as transitionsSkipped above.
       xfadeMerges,
       mixedFades,
+      transitionsSkipped,
+      performanceMode,
+      mergeStageMs: stageTimings.merge_transitions_ms,
+      renderClipsMs: stageTimings.render_clips_ms,
     });
 
     // 3) Optional voiceover from project + intro clip selection + bg music + SFX
@@ -2080,6 +2139,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       lastConcatHeartbeat = now;
       void touchMediaJob(mediaJobId);
     };
+    const concatStageStart = Date.now();
     await concatNormalizedClips({
       onProgress: concatHeartbeat,
       inputPaths: normalized,
@@ -2095,6 +2155,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       outroFadeStartSeconds: outroFadeStartSeconds > 0 ? outroFadeStartSeconds : undefined,
       totalVideoDurationSeconds,
     });
+    stageTimings.concat_audio_ms = Date.now() - concatStageStart;
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
 
@@ -2115,7 +2176,19 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     //     (./assets/... → /app/assets/... under the Dockerfile's WORKDIR).
     // The downloaded copy lives in tmp and is reaped by the finally-block
     // cleanup like every other render artifact.
-    if (env.EFFECT_OVERLAY_ENABLED) {
+    // PERFORMANCE_MODE force-skips the overlay regardless of its own toggle —
+    // it's a full-video re-encode pass and the avatar performance pipeline wants
+    // zero post-processing effects. In normal mode the EFFECT_OVERLAY_ENABLED
+    // flag governs it as before.
+    const overlayStageStart = Date.now();
+    const overlayEnabled = env.EFFECT_OVERLAY_ENABLED && !performanceMode;
+    if (performanceMode && env.EFFECT_OVERLAY_ENABLED) {
+      await logJob({ projectId, jobId: mediaJobId }, "render.effect_overlay.skipped", {
+        performanceMode: true,
+        note: "global overlay disabled by PERFORMANCE_MODE",
+      });
+    }
+    if (overlayEnabled) {
       const effectSource = env.EFFECT_OVERLAY_PATH;
       const isRemote = /^https?:\/\//i.test(effectSource);
       let effectLocalPath: string | null = null;
@@ -2175,6 +2248,21 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         }
       }
     }
+    stageTimings.overlay_ms = Date.now() - overlayStageStart;
+
+    // Per-stage timing summary — the single line to read when comparing a
+    // PERFORMANCE_MODE render against a normal one. render_clips and
+    // concat_audio run in both modes; merge_transitions and overlay collapse to
+    // near-zero when PERFORMANCE_MODE is on (no transition/overlay encodes).
+    await logJob({ projectId, jobId: mediaJobId }, "render.stage_timings", {
+      performanceMode,
+      overlayEnabled,
+      renderClipsMs: stageTimings.render_clips_ms ?? null,
+      mergeTransitionsMs: stageTimings.merge_transitions_ms ?? null,
+      concatAudioMs: stageTimings.concat_audio_ms ?? null,
+      overlayMs: stageTimings.overlay_ms ?? null,
+      transitionsSkipped,
+    });
 
     // 4a) Per-block drift audit. Emit one log line per renderable item with
     // the four numbers needed to diagnose any future sync regression:

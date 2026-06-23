@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
-import { getGeminiModel, withGeminiRetry } from "@/lib/ai/gemini";
+import { withGeminiModelFallback } from "@/lib/ai/gemini";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import type { WordTiming } from "@/lib/ai/deepgram";
@@ -524,21 +524,25 @@ export async function buildSyntheticTimeline(input: {
   const avatarRanges = input.avatarRanges ?? [];
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
 
-  const model = getGeminiModel();
   // Gemini 2.5-flash hits intermittent 503 "high demand" spikes. The planner is
   // a single one-shot call per project (not high-volume), so we can afford to
   // wait it out: 6 attempts with a longer base backoff rather than the default
-  // 3. This turns a transient Google outage from a hard failure into a slightly
-  // slower success.
-  const res = await withGeminiRetry(
+  // 3. A demand spike is per-model, so if the primary model still fails after
+  // all 6 retries we fall back to GEMINI_FALLBACK_MODEL and retry there — turning
+  // a transient Google outage on one model into a slightly slower success on
+  // another, instead of a hard job failure.
+  const { result: res, model: usedModel } = await withGeminiModelFallback(
     "buildSyntheticTimeline",
-    () =>
+    (model) =>
       model.generateContent({
         contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
       }),
     { attempts: 6, baseMs: 2000 },
   );
+  if (usedModel !== getEnv().GEMINI_MODEL) {
+    await logJob({ projectId, jobId }, "synthetic.plan.model_fallback", { model: usedModel });
+  }
   const txt = res.response.text();
 
   let parsed: unknown;

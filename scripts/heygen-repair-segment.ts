@@ -100,7 +100,8 @@ try {
   }
   console.log(`downloaded ${(buf.length / 1e6).toFixed(2)} MB`);
 
-  const up = await uploadBuffer(buf, r2Keys.avatarVideo(seg.project_id as string, segmentId), "video/mp4");
+  // Versioned key so the repaired file lands at a FRESH URL (no stale CDN copy).
+  const up = await uploadBuffer(buf, r2Keys.avatarVideo(seg.project_id as string, segmentId, Date.now()), "video/mp4");
   console.log(`uploaded -> ${up.publicUrl}`);
 
   // Refresh DB: segment + any timeline_item materialized from it back to planned.

@@ -33,6 +33,12 @@ const ServerEnvSchema = z.object({
   GOOGLE_SEARCH_API_KEY: z.string().optional(),
   GOOGLE_SEARCH_CX: z.string().optional(),
   GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+  // Secondary model the planner falls back to when GEMINI_MODEL keeps throwing
+  // retryable 503/429 "high demand" errors after its full retry budget. A demand
+  // spike on one Gemini model (e.g. gemini-2.5-flash) usually does NOT hit a
+  // different model, so re-running the call on gemini-2.0-flash turns a Google
+  // outage into a slightly slower success. Set empty to disable the fallback.
+  GEMINI_FALLBACK_MODEL: z.string().default("gemini-2.0-flash"),
   DEEPGRAM_API_KEY: z.string().optional(),
   DEEPGRAM_MODEL: z.string().default("nova-3"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
@@ -289,6 +295,17 @@ const ServerEnvSchema = z.object({
   // adds one libx264 pass over the whole timeline. Audio is stream-copied —
   // the voiceover/music/SFX mix is already baked into the concat output.
   EFFECT_OVERLAY_ENABLED: z.coerce.boolean().default(false),
+  // PERFORMANCE_MODE — diagnostic "no visual effects" render path for the
+  // SYNTHETIC (AI avatar) engine ONLY. When true, a synthetic render skips ALL
+  // clip-to-clip transitions (image↔image xfade, image↔video / video↔image
+  // fade-through-black) and the global particle overlay, producing the simplest
+  // possible pipeline: render clips → concat → add audio → output. Hard cuts
+  // only. Clips, timing, audio, subtitles, and avatar functionality are
+  // unchanged — only the visual-effect re-encode passes are removed, so the
+  // render-time delta isolates exactly how much those effects cost. The sourced
+  // (celebrity) engine ignores this flag entirely (byte-for-byte unchanged).
+  // Off by default — a normal deploy renders with effects as before.
+  PERFORMANCE_MODE: z.coerce.boolean().default(false),
   EFFECT_OVERLAY_PATH: z.string().default("./assets/effect-overlay.mp4"),
   EFFECT_OVERLAY_OPACITY: z.coerce.number().min(0).max(1).default(0.85),
   // Pre-blend brightness gain on the effect layer. Multiplies the particle

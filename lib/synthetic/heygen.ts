@@ -848,10 +848,14 @@ async function attemptOnAccount(
     );
     await shot(p, input.projectId, input.segmentId, "done");
 
-    // 8) Upload to R2.
+    // 8) Upload to R2 under a VERSIONED key (timestamp) so a regenerate writes a
+    // NEW URL. Overwriting the same key left the CDN/browser serving the stale
+    // cached video (old aspect ratio/duration) after a regenerate; a fresh URL
+    // has nothing cached. The new URL is persisted to the segment row by the
+    // caller, so the app always points at this file.
     const up = await uploadBuffer(
       videoBytes,
-      r2Keys.avatarVideo(input.projectId, input.segmentId),
+      r2Keys.avatarVideo(input.projectId, input.segmentId, Date.now()),
       "video/mp4",
     );
 

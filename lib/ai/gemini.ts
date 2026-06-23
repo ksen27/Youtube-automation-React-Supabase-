@@ -6,18 +6,19 @@ import { getEnv } from "@/lib/env";
 // Gemini wrapper used by the search and match processors.
 // API key: https://aistudio.google.com/app/apikey  (env GEMINI_API_KEY)
 
-function getModel() {
+function getModel(modelId?: string) {
   const env = getEnv();
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
   const genai = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-  return genai.getGenerativeModel({ model: env.GEMINI_MODEL });
+  return genai.getGenerativeModel({ model: modelId ?? env.GEMINI_MODEL });
 }
 
 // Exported accessor so other modules (e.g. the synthetic planner) can reuse the
 // same configured model + withGeminiRetry path instead of re-instantiating the
 // SDK. Internal callers keep using the private getModel() above unchanged.
-export function getGeminiModel() {
-  return getModel();
+// Pass a modelId to build a specific model (used by the fallback path below).
+export function getGeminiModel(modelId?: string) {
+  return getModel(modelId);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,49 @@ export async function withGeminiRetry<T>(
     }
   }
   throw lastErr;
+}
+
+// Run a Gemini call with a SECONDARY-MODEL fallback on top of withGeminiRetry.
+//
+// A "high demand" 503/429 spike is per-model: gemini-2.5-flash can be throttled
+// while gemini-2.0-flash answers fine. So when the primary model (GEMINI_MODEL)
+// exhausts its full retry budget AND the final error is still a retryable
+// outage, we rebuild the call against GEMINI_FALLBACK_MODEL and spend the retry
+// budget again there. A non-retryable error (400/schema/auth) is NOT a Google
+// outage, so we throw it immediately without burning the fallback.
+//
+// `run` is a factory so the SAME per-call config (generationConfig, prompt) is
+// reused for whichever model it's handed. Returns the result and which model
+// produced it. No fallback model configured (env empty) -> behaves exactly like
+// withGeminiRetry on the primary.
+export async function withGeminiModelFallback<T>(
+  label: string,
+  run: (model: ReturnType<typeof getGeminiModel>) => Promise<T>,
+  opts: { attempts?: number; baseMs?: number } = {},
+): Promise<{ result: T; model: string }> {
+  const env = getEnv();
+  const primary = env.GEMINI_MODEL;
+  try {
+    const result = await withGeminiRetry(label, () => run(getGeminiModel(primary)), opts);
+    return { result, model: primary };
+  } catch (e) {
+    const fallback = env.GEMINI_FALLBACK_MODEL?.trim();
+    // Only fall back for a genuine outage, and only if a DIFFERENT model is set.
+    if (!fallback || fallback === primary || !isRetryableGeminiError(e)) throw e;
+    console.warn(JSON.stringify({
+      msg: "gemini.fallback",
+      op: label,
+      from: primary,
+      to: fallback,
+      err: (e as Error).message?.slice(0, 200),
+    }));
+    const result = await withGeminiRetry(
+      `${label}:fallback`,
+      () => run(getGeminiModel(fallback)),
+      opts,
+    );
+    return { result, model: fallback };
+  }
 }
 
 // ---------------------------------------------------------------------------

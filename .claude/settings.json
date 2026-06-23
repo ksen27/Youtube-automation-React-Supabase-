@@ -93,10 +93,14 @@
       "Bash(curl -s -m 10 -o /dev/null -w \"3001=%{http_code}\\\\n\" http://127.0.0.1:3001/login)",
       "Bash(grep -qE \"Failed to compile|Compiled with|Route \\\\\\(app\\\\\\)|✓ Generating|Linting|error\\\\b|✓ Finalizing|build completed\" /tmp/build.log)",
       "Bash(grep -qE \"Route \\\\\\(app\\\\\\)|Failed to compile|build error\" /tmp/build.log)",
-      "Bash(ffmpeg -y -f lavfi -i color=c=black:s=640x360:d=1 -filter_script:v \"C:/Users/HJS/AppData/Local/Temp/lt_fixed.txt\" -f null -)"
+      "Bash(ffmpeg -y -f lavfi -i color=c=black:s=640x360:d=1 -filter_script:v \"C:/Users/HJS/AppData/Local/Temp/lt_fixed.txt\" -f null -)",
+      "Bash(which ffprobe *)",
+      "Bash(cat > *)",
+      "PowerShell(npx eslint worker/processors/renderProcessor.ts 2>&1)"
     ],
     "additionalDirectories": [
-      "C:\\Users\\HJS\\AppData\\Local\\Temp"
+      "C:\\Users\\HJS\\AppData\\Local\\Temp",
+      "\\tmp"
     ]
   }
 }
