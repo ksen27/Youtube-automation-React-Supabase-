@@ -55,9 +55,13 @@ export async function processImageGenJob(
     });
 
     const isSplit = seg.block_type === "split_2";
+    // Versioned key (timestamp) so a regenerate writes a NEW file and the prior
+    // version survives in R2 for the review screen's history. finishSegment
+    // archives the previous URL into asset_history.
+    const version = Date.now();
     const key = isSplit
-      ? r2Keys.segmentRightImage(projectId, segmentId)
-      : r2Keys.segmentImage(projectId, segmentId);
+      ? r2Keys.segmentRightImage(projectId, segmentId, version)
+      : r2Keys.segmentImage(projectId, segmentId, version);
     const up = await uploadBuffer(out.image, key, out.contentType);
 
     await finishSegment(segmentId, {

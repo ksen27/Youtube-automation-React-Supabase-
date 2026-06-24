@@ -24,7 +24,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
       .select("id, type, status, progress, attempts, error, metadata, created_at, updated_at")
       .eq("project_id", id).order("created_at", { ascending: true }),
     sb.from("synthetic_segments")
-      .select("id, position, block_type, start_time, end_time, duration, script, image_prompt, animation_prompt, status, image_url, video_url, right_image_url, provider, error, metadata")
+      .select("id, position, block_type, start_time, end_time, duration, script, image_prompt, animation_prompt, status, image_url, video_url, right_image_url, provider, error, metadata, asset_history")
       .eq("project_id", id).order("position", { ascending: true }),
   ]);
 

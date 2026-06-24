@@ -60,7 +60,7 @@ export async function processImageToVideoJob(
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
     });
-    const up = await uploadBuffer(img.image, r2Keys.segmentImage(projectId, segmentId), img.contentType);
+    const up = await uploadBuffer(img.image, r2Keys.segmentImage(projectId, segmentId, Date.now()), img.contentType);
     imageUrl = up.publicUrl;
     // Persist the still immediately so a later video failure can degrade to it.
     await finishSegment(segmentId, { image_url: imageUrl, provider: img.provider });
@@ -82,7 +82,7 @@ export async function processImageToVideoJob(
       durationMs: Date.now() - t0, cost: { provider: clip.provider, seconds: clip.seconds },
     });
 
-    const up = await uploadBuffer(clip.video, r2Keys.segmentVideo(projectId, segmentId), "video/mp4");
+    const up = await uploadBuffer(clip.video, r2Keys.segmentVideo(projectId, segmentId, Date.now()), "video/mp4");
     await finishSegment(segmentId, { status: "ready", video_url: up.publicUrl, provider: clip.provider, error: null });
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: clip.provider } });
   } catch (err) {

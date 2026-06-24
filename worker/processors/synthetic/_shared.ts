@@ -199,9 +199,79 @@ export async function finishSegment(
   patch: Partial<Pick<SyntheticSegment, "status" | "image_url" | "video_url" | "right_image_url" | "provider" | "error">>,
 ): Promise<void> {
   const sb = getServerSupabase();
-  const { error } = await sb.from("synthetic_segments").update(patch).eq("id", segmentId);
+
+  // Version history: when this patch sets an asset URL that REPLACES a different
+  // existing one (a regenerate), push the segment's CURRENT asset trio into
+  // asset_history (newest last) BEFORE overwriting, so the review screen can show
+  // and restore prior versions. We only read+merge when an asset field is in the
+  // patch — status/error-only updates skip the extra round-trip.
+  const setsAsset =
+    patch.image_url !== undefined ||
+    patch.video_url !== undefined ||
+    patch.right_image_url !== undefined;
+
+  const finalPatch: Record<string, unknown> = { ...patch };
+  if (setsAsset) {
+    const { data: cur } = await sb
+      .from("synthetic_segments")
+      .select("image_url, video_url, right_image_url, provider, asset_history")
+      .eq("id", segmentId)
+      .single();
+    if (cur) {
+      // Is any incoming asset url actually DIFFERENT from the current one (and
+      // is there a current asset to preserve)? Only then do we archive.
+      const replaces =
+        (patch.image_url !== undefined && patch.image_url !== cur.image_url && cur.image_url) ||
+        (patch.video_url !== undefined && patch.video_url !== cur.video_url && cur.video_url) ||
+        (patch.right_image_url !== undefined && patch.right_image_url !== cur.right_image_url && cur.right_image_url);
+      if (replaces) {
+        const prior = {
+          image_url: (cur.image_url as string | null) ?? null,
+          video_url: (cur.video_url as string | null) ?? null,
+          right_image_url: (cur.right_image_url as string | null) ?? null,
+          provider: (cur.provider as string | null) ?? null,
+          created_at: new Date().toISOString(),
+        };
+        const history = Array.isArray(cur.asset_history) ? cur.asset_history : [];
+        finalPatch.asset_history = [...history, prior];
+      }
+    }
+  }
+
+  let { error } = await sb.from("synthetic_segments").update(finalPatch).eq("id", segmentId);
+  // Back-compat: if the asset_history column hasn't been migrated yet, retry the
+  // update WITHOUT it so generation still works (history just isn't recorded
+  // until migration 0023 is applied).
+  if (error && /asset_history/.test(error.message)) {
+    const { asset_history: _omit, ...withoutHistory } = finalPatch;
+    void _omit;
+    ({ error } = await sb.from("synthetic_segments").update(withoutHistory).eq("id", segmentId));
+  }
   if (error) throw new Error(`finishSegment: ${error.message}`);
 }
 
 // Re-export so processors import job helpers from one place if they prefer.
 export { setMediaJob };
+
+// Reset a segment for REGENERATION without losing its current asset.
+//
+// The old behaviour nulled image_url/video_url/right_image_url at reset time, so
+// (a) the UI went blank during regen and (b) finishSegment had nothing to archive
+// into asset_history — the previous version was lost. Instead we KEEP the current
+// asset urls in place and only flip status + clear error. The worker's
+// finishSegment then archives the still-present current asset into asset_history
+// before writing the new one, and the old asset stays visible in the UI until the
+// new one lands. `status` is 'pending' for batch dispatch (dispatchSegments picks
+// up 'pending') or 'generating' for a single immediate re-enqueue.
+export async function resetSegmentForRegen(
+  segmentIds: string[],
+  status: "pending" | "generating",
+): Promise<void> {
+  if (segmentIds.length === 0) return;
+  const sb = getServerSupabase();
+  const { error } = await sb
+    .from("synthetic_segments")
+    .update({ status, error: null })
+    .in("id", segmentIds);
+  if (error) throw new Error(`resetSegmentForRegen: ${error.message}`);
+}

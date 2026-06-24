@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { createMediaJob } from "@/lib/jobs/db";
 import { enqueueImageGeneration, enqueueImageToVideo, enqueueAvatar } from "@/lib/jobs/queue";
-import { queueForBlockType } from "@/worker/processors/synthetic/_shared";
+import { queueForBlockType, resetSegmentForRegen } from "@/worker/processors/synthetic/_shared";
 import type { SyntheticBlockType } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -77,10 +77,10 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const mediaType = queue === "avatar" ? "avatar" : queue === "image_to_video" ? "image_to_video" : "image_gen";
 
   const sb = getServerSupabase();
-  await sb
-    .from("synthetic_segments")
-    .update({ status: "generating", image_url: null, video_url: null, right_image_url: null, error: null })
-    .eq("id", segmentId);
+  // Keep the current asset urls in place — finishSegment archives them into
+  // asset_history before writing the new one, and the old asset stays visible
+  // until the new one lands. Only flip status + clear error.
+  await resetSegmentForRegen([segmentId], "generating");
   // Drop any timeline_item materialized from a prior run so finalize re-creates it.
   await sb.from("timeline_items").delete().eq("project_id", id).contains("metadata", { synthetic_segment_id: segmentId });
 

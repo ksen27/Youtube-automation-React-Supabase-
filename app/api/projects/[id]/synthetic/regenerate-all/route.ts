@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { checkProjectEngine, setProjectStatus } from "@/lib/jobs/db";
-import { dispatchSegments } from "@/worker/processors/synthetic/_shared";
+import { dispatchSegments, resetSegmentForRegen } from "@/worker/processors/synthetic/_shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -78,11 +78,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ ok: true, enqueued: 0, note: "nothing to regenerate" }, { status: 200 });
   }
 
-  const { error: updErr } = await sb
-    .from("synthetic_segments")
-    .update({ status: "pending", image_url: null, video_url: null, right_image_url: null, error: null })
-    .in("id", ids);
-  if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+  // Keep current asset urls — finishSegment archives them into asset_history
+  // before writing the new ones, and the old assets stay visible until the new
+  // ones land. Reset to 'pending' so dispatchSegments re-enqueues them.
+  try {
+    await resetSegmentForRegen(ids, "pending");
+  } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+  }
 
   for (const segId of ids) {
     await sb

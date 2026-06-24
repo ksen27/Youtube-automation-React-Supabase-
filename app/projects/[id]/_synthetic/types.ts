@@ -45,6 +45,17 @@ export interface SyntheticSegmentRow {
   provider: string | null;
   error: string | null;
   metadata: Record<string, unknown>;
+  // Prior asset versions (newest last), preserved on each regenerate so the
+  // review screen can preview + restore them. Empty for never-regenerated rows.
+  asset_history?: AssetVersion[] | null;
+}
+
+export interface AssetVersion {
+  image_url: string | null;
+  video_url: string | null;
+  right_image_url: string | null;
+  provider: string | null;
+  created_at?: string;
 }
 
 export interface SyntheticResp {

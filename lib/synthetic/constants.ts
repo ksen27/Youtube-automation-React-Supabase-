@@ -37,12 +37,23 @@ export const SYNTHETIC_FPS = 30;
 // easy to audit / sweep. {projectId} is substituted by callers.
 export const r2Keys = {
   masterVoiceover: (projectId: string) => `synthetic/${projectId}/master_voiceover.mp3`,
-  segmentImage: (projectId: string, segmentId: string) =>
-    `synthetic/${projectId}/images/${segmentId}.jpg`,
-  segmentRightImage: (projectId: string, segmentId: string) =>
-    `synthetic/${projectId}/images/${segmentId}_right.jpg`,
-  segmentVideo: (projectId: string, segmentId: string) =>
-    `synthetic/${projectId}/clips/${segmentId}.mp4`,
+  // Image / clip keys take an optional `version` suffix so a REGENERATE writes a
+  // NEW file instead of overwriting the previous one — keeping prior versions in
+  // R2 so the review screen can show + restore them (mirrors avatarVideo). Omit
+  // version for the legacy stable key (back-compat with assets generated before
+  // versioning; their history simply starts from the next regenerate).
+  segmentImage: (projectId: string, segmentId: string, version?: string | number) =>
+    version != null && `${version}` !== ""
+      ? `synthetic/${projectId}/images/${segmentId}_${version}.jpg`
+      : `synthetic/${projectId}/images/${segmentId}.jpg`,
+  segmentRightImage: (projectId: string, segmentId: string, version?: string | number) =>
+    version != null && `${version}` !== ""
+      ? `synthetic/${projectId}/images/${segmentId}_right_${version}.jpg`
+      : `synthetic/${projectId}/images/${segmentId}_right.jpg`,
+  segmentVideo: (projectId: string, segmentId: string, version?: string | number) =>
+    version != null && `${version}` !== ""
+      ? `synthetic/${projectId}/clips/${segmentId}_${version}.mp4`
+      : `synthetic/${projectId}/clips/${segmentId}.mp4`,
   // Avatar (or split_2 left-half) video. An optional `version` suffix makes a
   // REGENERATE write to a NEW URL instead of overwriting the same key. Without
   // it, the new render reused the same URL and the CDN/browser kept serving the

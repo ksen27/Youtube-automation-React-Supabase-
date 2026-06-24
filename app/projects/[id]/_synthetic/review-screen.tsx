@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2, Images } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2, Images, History, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -13,7 +13,7 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import type { SyntheticResp, SyntheticSegmentRow } from "./types";
+import type { SyntheticResp, SyntheticSegmentRow, AssetVersion } from "./types";
 
 const BLOCK_TYPES = ["avatar", "image", "ai_clip", "split_2"] as const;
 
@@ -210,6 +210,62 @@ function thumbUrl(s: SyntheticSegmentRow): string | null {
   return s.image_url ?? s.right_image_url ?? null;
 }
 
+// One previous-version tile in a segment's history: a thumbnail (image) or a
+// small inline player (video), with a Restore button. Clicking a still opens a
+// full-size preview; videos play inline.
+function HistoryVersion({
+  version,
+  label,
+  restoring,
+  onRestore,
+}: {
+  version: AssetVersion;
+  label: string;
+  restoring: boolean;
+  onRestore: () => void;
+}) {
+  const [preview, setPreview] = useState(false);
+  const img = version.image_url ?? version.right_image_url ?? null;
+  const vid = version.video_url ?? null;
+  return (
+    <div className="w-28 shrink-0 space-y-1">
+      <div className="relative aspect-video overflow-hidden rounded border border-border bg-black">
+        {vid ? (
+          <video src={vid} className="h-full w-full object-cover" muted preload="metadata" controls />
+        ) : img ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={img}
+            alt={label}
+            className="h-full w-full cursor-pointer object-cover"
+            onClick={() => setPreview(true)}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-[10px] text-fg-subtle">no asset</div>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-1">
+        <span className="text-[10px] text-fg-subtle tabular-nums">{label}</span>
+        <Button type="button" variant="ghost" size="xs" disabled={restoring} onClick={onRestore} title="Make this version the active one">
+          <RotateCcw className={`h-3 w-3 ${restoring ? "animate-spin" : ""}`} /> Restore
+        </Button>
+      </div>
+      {img && preview && (
+        <Dialog open={preview} onOpenChange={setPreview}>
+          <DialogContent className="max-w-3xl">
+            <DialogTitle>Previous version — {label}</DialogTitle>
+            <DialogDescription className="sr-only">A previously generated asset for this segment</DialogDescription>
+            <div className="overflow-hidden rounded-md border border-border bg-black">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={img} alt={label} className="max-h-[70vh] w-full object-contain bg-black" />
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
+  );
+}
+
 function SegmentRow({
   projectId,
   segment,
@@ -257,6 +313,20 @@ function SegmentRow({
     mutationFn: async () => { await fetch(base, { method: "DELETE" }); },
     onSuccess: onChange,
   });
+  // Restore a previous asset version (history). index = position in asset_history.
+  const restore = useMutation({
+    mutationFn: async (index: number) => {
+      const r = await fetch(`${base}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ index }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `restore failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+  const [showHistory, setShowHistory] = useState(false);
+  const history = segment.asset_history ?? [];
 
   const thumb = thumbUrl(segment);
   const statusVariant =
@@ -413,7 +483,36 @@ function SegmentRow({
               <p className="text-xs text-fg-muted line-clamp-2">{segment.script || <span className="text-fg-subtle">no script</span>}</p>
               {segment.image_prompt && <p className="text-[11px] text-fg-subtle line-clamp-1">🖼 {segment.image_prompt}</p>}
               {regeneratePrompt.error && <p className="text-[11px] text-danger line-clamp-1">{(regeneratePrompt.error as Error).message}</p>}
+              {restore.error && <p className="text-[11px] text-danger line-clamp-1">{(restore.error as Error).message}</p>}
               {segment.error && <p className="text-[11px] text-danger line-clamp-1">{segment.error}</p>}
+
+              {/* Previous versions. Each regenerate archives the prior asset here
+                  (newest last), so the user can preview and restore an old one. */}
+              {history.length > 0 && (
+                <div className="pt-1">
+                  <Button type="button" variant="ghost" size="xs" onClick={() => setShowHistory((v) => !v)}>
+                    <History className="h-3.5 w-3.5" /> {showHistory ? "Hide" : "Show"} previous versions ({history.length})
+                  </Button>
+                  {showHistory && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {/* Render newest-first for review. The API index is the
+                          ORIGINAL position in asset_history, so map back. */}
+                      {history.map((v, origIdx) => ({ v, origIdx }))
+                        .slice()
+                        .reverse()
+                        .map(({ v, origIdx }) => (
+                          <HistoryVersion
+                            key={origIdx}
+                            version={v}
+                            label={`v${origIdx + 1}`}
+                            restoring={restore.isPending}
+                            onRestore={() => restore.mutate(origIdx)}
+                          />
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>
