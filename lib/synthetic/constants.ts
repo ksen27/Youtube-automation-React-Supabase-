@@ -10,7 +10,17 @@ export const STYLE_PROMPT =
   "style, no studio lighting, real-world environment, slightly overexposed " +
   "highlights, muted earthy color grading, shallow depth of field on subject, " +
   "background slightly out of focus, grainy texture consistent with 1080p " +
-  "video still, no filters, unposed candid moment";
+  "video still, no filters, unposed candid moment. " +
+  // Client requirement (2026-06): every still must be ONE single full-frame
+  // photo of ONE subject — nano-banana was drawing multi-subject COLLAGES
+  // (e.g. a calendar next to a garden path) that read as a "split image" in
+  // the right half of split_2 blocks, and was burning TEXT/captions/numbers
+  // into frames (e.g. calendar dates, "cook rice"). Both are forbidden here.
+  "A SINGLE photograph of ONE subject filling the whole frame — NOT a collage, " +
+  "NOT a split-screen, NOT a grid, NOT a diptych or triptych, NOT multiple " +
+  "panels or side-by-side images, NO borders or dividing lines between scenes. " +
+  "Absolutely NO text, NO captions, NO subtitles, NO letters, NO numbers, " +
+  "NO words, NO watermark, NO logo, NO signage, NO calendar, NO labels of any kind.";
 
 /** Append the mandatory style prompt to a base image prompt. */
 export function withStylePrompt(basePrompt: string): string {

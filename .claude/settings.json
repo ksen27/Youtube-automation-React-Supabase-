@@ -96,7 +96,13 @@
       "Bash(ffmpeg -y -f lavfi -i color=c=black:s=640x360:d=1 -filter_script:v \"C:/Users/HJS/AppData/Local/Temp/lt_fixed.txt\" -f null -)",
       "Bash(which ffprobe *)",
       "Bash(cat > *)",
-      "PowerShell(npx eslint worker/processors/renderProcessor.ts 2>&1)"
+      "PowerShell(npx eslint worker/processors/renderProcessor.ts 2>&1)",
+      "Bash(flyctl releases *)",
+      "Bash(grep -v \"^$\")",
+      "PowerShell(npx tsx scripts/_qcheck.ts 2>&1)",
+      "PowerShell(npx tsx scripts/stop-synthetic.ts 2>&1)",
+      "PowerShell(npx tsx scripts/_69probe.ts 2>&1)",
+      "PowerShell(npx tsx scripts/_69ping.ts 2>&1)"
     ],
     "additionalDirectories": [
       "C:\\Users\\HJS\\AppData\\Local\\Temp",

@@ -12,13 +12,24 @@ export const dynamic = "force-dynamic";
 // out at once via dispatchSegments — the worker then renders them in PARALLEL
 // up to IMAGE_GEN_CONCURRENCY, instead of the user clicking Retry per row.
 //
-// Body: { scope?: "failed" | "incomplete" }  (default "failed")
+// Body: { scope?: "failed" | "incomplete" | "images" | "all" }  (default "failed")
 //   failed     -> only segments whose status is 'failed'
 //   incomplete -> failed + anything not yet 'ready' (failed/pending/generating),
 //                 useful to kick a batch that stalled mid-run.
+//   images     -> EVERY image-bearing block (image / ai_clip / split_2),
+//                 regardless of status. Used to re-test a prompt change (e.g. a
+//                 new STYLE_PROMPT) on an EXISTING project without re-planning
+//                 or making a new project. Avatars are left untouched — the
+//                 client is happy with them and re-rendering them is slow/costly.
+//   all        -> every segment, any status, including avatars.
 const Body = z.object({
-  scope: z.enum(["failed", "incomplete"]).optional(),
+  scope: z.enum(["failed", "incomplete", "images", "all"]).optional(),
 });
+
+// Block types that produce a generated IMAGE (and so are affected by an image
+// prompt / STYLE_PROMPT change). avatar is excluded — it is HeyGen-driven and
+// carries no image prompt.
+const IMAGE_BLOCK_TYPES = ["image", "ai_clip", "split_2"] as const;
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -37,20 +48,29 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "invalid input", issues: body.error.flatten() }, { status: 400 });
   }
   const scope = body.data.scope ?? "failed";
-  const statuses = scope === "incomplete"
-    ? ["failed", "pending", "generating"]
-    : ["failed"];
 
   const sb = getServerSupabase();
+
+  // Build the target query. status-based scopes filter on status; the
+  // prompt-retest scopes ("images"/"all") ignore status and instead target by
+  // block type so a READY segment is re-generated too (that's the whole point —
+  // re-run already-good blocks against the new prompt).
+  let query = sb.from("synthetic_segments").select("id").eq("project_id", id);
+  if (scope === "images") {
+    query = query.in("block_type", IMAGE_BLOCK_TYPES as unknown as string[]);
+  } else if (scope === "all") {
+    // no extra filter — every segment
+  } else {
+    const statuses = scope === "incomplete"
+      ? ["failed", "pending", "generating"]
+      : ["failed"];
+    query = query.in("status", statuses);
+  }
 
   // Reset the targeted segments to 'pending' and clear prior asset state so
   // dispatchSegments (which only picks up 'pending') re-enqueues them. We also
   // drop any timeline_items materialized from a prior run for these segments.
-  const { data: targets, error: selErr } = await sb
-    .from("synthetic_segments")
-    .select("id")
-    .eq("project_id", id)
-    .in("status", statuses);
+  const { data: targets, error: selErr } = await query;
   if (selErr) return NextResponse.json({ error: selErr.message }, { status: 500 });
 
   const ids = (targets ?? []).map((t) => t.id);

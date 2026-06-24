@@ -524,10 +524,23 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           try {
             await downloadHttp(it.video_url as string, localPre);
             await cutClip({ inputPath: localPre, outputPath: trimmed, startSeconds: 0, durationSeconds: renderDur, keepAudio: false });
-            await normalizeClip({ inputPath: trimmed, outputPath: out, width: outW, height: outH, fps: 30, keepAudio: false, vcodecArgs: vcodec });
+            // Pin the normalize re-encode to renderDur. cutClip's stream-copy
+            // overshoots to the next keyframe (60-180ms), and HeyGen/LTX clips
+            // already run a few frames longer than their audio slice. Without
+            // the pin, normalizeClip preserved that surplus and slotDurations
+            // recorded it — every one of the ~80 synthetic-video blocks landed a
+            // fraction long, compounding to ~1.1s positive drift on a 6-min
+            // render and ~6s at 249 blocks (post_validation driftMs 1124,
+            // passed:false). The video then runs longer than the voiceover and
+            // each avatar part's last words drift past their lip movement. This
+            // is the same overshoot the footage branch pins out below (line ~972).
+            await normalizeClip({ inputPath: trimmed, outputPath: out, width: outW, height: outH, fps: 30, keepAudio: false, vcodecArgs: vcodec, pinDurationSeconds: renderDur });
             slots[i] = out;
             let actualDur = renderDur;
-            try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = p.durationSeconds; } catch { /* fallback */ }
+            // Probe is now only ever ≤ renderDur (the pin caps the upper end);
+            // it still detects a clip that came back SHORT so the pad-up branch
+            // below can hold the last frame to fill the planned window.
+            try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = Math.min(p.durationSeconds, renderDur); } catch { /* fallback */ }
             // HeyGen/LTX often return a clip SHORTER than the narration window
             // it was planned for (cutClip can't extend, only trim). Summing the
             // short actual duration drags the whole video below the voiceover
@@ -565,8 +578,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             await safeUnlink(trimmed);
           }
         } else if (it.image_url) {
-          // Degraded ai_clip: hold the still with motion, same as an image block.
-          const MOTION_CYCLE = ["in", "pan_right", "out", "pan_left"] as const;
+          // Degraded ai_clip: hold the still with zoom-only motion, same as an
+          // image block (client wants zoom, no pan — see the image branch).
+          const MOTION_CYCLE = ["in", "out"] as const;
           const localImg = path.join(tmp, `synimg_${idx}`);
           try {
             await downloadHttp(it.image_url as string, localImg);
@@ -650,17 +664,12 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             | { text?: string; vo_start_seconds?: number }
             | undefined;
           const imgLtOffset = lowerThirdStartOffset(imgLt, imgMeta, headLeft, renderDur);
-          // Cycle through four motion modes per consecutive image so the
-          // viewer never sees the same motion twice in a row:
-          //   0 → zoom-in
-          //   1 → pan-right
-          //   2 → zoom-out
-          //   3 → pan-left
-          // The four-step cycle (rather than a simple in/out toggle)
-          // matches the client direction: "Either Zoom, moving to the left
-          // or moving to the right". Keeps a still image from reading as
-          // a static frame even on slow narration.
-          const MOTION_CYCLE = ["in", "pan_right", "out", "pan_left"] as const;
+          // ZOOM ONLY, alternating in/out per consecutive image (client
+          // requirement 2026-06: "the small zoom effect, you can add that …
+          // only single images" — they want a gentle zoom, NOT the pan/slide
+          // moves). Alternating zoom-in / zoom-out keeps consecutive stills
+          // from moving identically while staying pan-free.
+          const MOTION_CYCLE = ["in", "out"] as const;
           const motion = MOTION_CYCLE[i % MOTION_CYCLE.length];
           await buildStillVideo({
             vcodecArgs: vcodec,

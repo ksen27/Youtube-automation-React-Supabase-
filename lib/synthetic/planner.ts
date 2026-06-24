@@ -60,6 +60,18 @@ export interface PlannedSegment {
   secondVisual?: boolean;
 }
 
+// Shared single-subject / no-text rule (client requirement 2026-06). Used by
+// BOTH the full planner prompt and the per-segment prompt regenerator so they
+// produce identically-clean prompts. nano-banana was drawing multi-subject
+// collages (read as a "split image") and burning text/captions into frames.
+const SINGLE_SUBJECT_RULE =
+  "SINGLE SUBJECT (critical, client requirement): the imagePrompt MUST " +
+  "describe ONE single photographic scene with ONE clear subject that fills the " +
+  "whole frame. NEVER describe a collage, split-screen, grid, diptych, side-by-" +
+  "side comparison, before/after, or multiple separate scenes in one image, and " +
+  "NEVER ask for any text, caption, label, sign, calendar, or written words in " +
+  "the picture. One block = one clean single photo of one subject.";
+
 function buildPrompt(transcript: string): string {
   return [
     "You are a video director planning the visual track for an AI-generated",
@@ -111,6 +123,8 @@ function buildPrompt(transcript: string): string {
     "the subject) — do NOT leave imagePrompt empty and do NOT fall back to the",
     "spoken words. An empty imagePrompt is INVALID output.",
     "",
+    SINGLE_SUBJECT_RULE,
+    "",
     "CONTINUITY (critical): when consecutive blocks describe one continuous",
     "scene, they MUST keep the SAME setting, lighting, subjects, and framing so",
     "they read as one continuous shot. Only change the visual world when the",
@@ -124,6 +138,105 @@ function buildPrompt(transcript: string): string {
     "TRANSCRIPT:",
     transcript.trim(),
   ].join("\n");
+}
+
+// Build the prompt for a SINGLE-segment image-prompt regeneration. Mirrors the
+// scene-prompt rules of the full planner (CRITICAL picture-not-narration rule +
+// the single-subject / no-text rule) but for ONE block: given this block's
+// spoken `script` and the video's shared `basePrompt`, return only a fresh
+// scene-specific imagePrompt. No segmentation, no JSON array.
+function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType: SyntheticBlockType): string {
+  const wantsAnimation = blockType === "ai_clip";
+  return [
+    "You are a video director writing the visual for ONE block of an",
+    "AI-generated narrated video. Below is the block's spoken narration",
+    "(`script`) and the video's shared visual world (`basePrompt`).",
+    "",
+    "Write a concrete `imagePrompt`: ONLY the scene-specific detail for THIS",
+    "block — the action, the specific subject and composition of this moment.",
+    "Do NOT repeat the basePrompt (it is prepended automatically). Do NOT include",
+    "camera or film-grain styling (appended separately).",
+    "",
+    "CRITICAL — the imagePrompt is a PICTURE DESCRIPTION, never the narration.",
+    "NEVER copy, paraphrase, or echo the `script` into the imagePrompt. The script",
+    "is what is SPOKEN; the imagePrompt is what is SHOWN. When the line is",
+    "conversational, abstract, or filler, INVENT an on-topic visual that fits the",
+    "video's world — do NOT fall back to the spoken words.",
+    "",
+    SINGLE_SUBJECT_RULE,
+    "",
+    wantsAnimation
+      ? 'Respond ONLY with JSON: {"imagePrompt","animationPrompt"}  (animationPrompt describes the motion: camera move, subject action).'
+      : 'Respond ONLY with JSON: {"imagePrompt"}',
+    "",
+    `basePrompt: ${basePrompt.trim() || "(none)"}`,
+    "",
+    "script:",
+    script.trim(),
+  ].join("\n");
+}
+
+const SingleSegmentSchema = z.object({
+  imagePrompt: z.string().min(1),
+  animationPrompt: z.string().optional().default(""),
+});
+
+export interface RegeneratedPrompt {
+  imagePrompt: string;        // composed WITH the base prompt in front
+  animationPrompt: string | null;
+}
+
+/**
+ * Regenerate the AI image prompt for a SINGLE segment (review screen:
+ * "Regenerate prompt"). Re-runs Gemini for just this block's script using the
+ * same single-subject / no-text rules as the full planner, and returns the
+ * composed image_prompt (base prompt prepended, exactly like buildSyntheticTimeline
+ * persists it). Does NOT regenerate the image — the caller persists the new
+ * prompt and the user clicks Regenerate to rebuild the asset.
+ */
+export async function regenerateSegmentPrompt(input: {
+  projectId: string;
+  jobId?: string;
+  script: string;
+  basePrompt: string;
+  blockType: SyntheticBlockType;
+}): Promise<RegeneratedPrompt> {
+  const { projectId, jobId, script, basePrompt, blockType } = input;
+  if (blockType === "avatar") {
+    throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
+  }
+  if (!script.trim()) throw new Error("regenerateSegmentPrompt: empty script");
+
+  const { result: res, model: usedModel } = await withGeminiModelFallback(
+    "regenerateSegmentPrompt",
+    (model) =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType) }] }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
+      }),
+    { attempts: 4, baseMs: 1500 },
+  );
+  if (usedModel !== getEnv().GEMINI_MODEL) {
+    await logJob({ projectId, jobId }, "synthetic.prompt_regen.model_fallback", { model: usedModel });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.response.text());
+  } catch {
+    throw new Error(`regenerateSegmentPrompt: Gemini returned non-JSON: ${res.response.text().slice(0, 200)}`);
+  }
+  const safe = SingleSegmentSchema.safeParse(parsed);
+  if (!safe.success) {
+    throw new Error(`regenerateSegmentPrompt: schema: ${JSON.stringify(safe.error.flatten()).slice(0, 200)}`);
+  }
+
+  return {
+    // Compose the base in front exactly like persist does, so the stored prompt
+    // carries the recurring world (composePrompt is the same helper).
+    imagePrompt: composePrompt(basePrompt, safe.data.imagePrompt.trim()) ?? safe.data.imagePrompt.trim(),
+    animationPrompt: blockType === "ai_clip" ? (safe.data.animationPrompt?.trim() || null) : null,
+  };
 }
 
 // Stamp each Gemini segment with its real spoken window from the Deepgram word

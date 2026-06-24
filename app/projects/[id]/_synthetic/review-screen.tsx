@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2 } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2, Images } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -82,6 +82,29 @@ export function SyntheticReviewScreen({
     onSuccess: onChange,
   });
 
+  // Regenerate EVERY image-bearing block (image / ai_clip / split_2) against the
+  // CURRENT prompts — even ones already 'ready'. This re-runs the image
+  // generation with the latest STYLE_PROMPT, so a prompt change (e.g. the
+  // no-text / single-subject rules) can be tested on THIS project without
+  // re-planning or creating a new one. Avatars are left as-is (client likes
+  // them; re-rendering them is slow). Destructive of existing images, so confirm.
+  const regenerateImages = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/synthetic/regenerate-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "images" }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `regenerate images failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+  const onRegenerateImages = () => {
+    if (confirm("Regenerate ALL images (image, animation, and split blocks) against the current prompts? This re-creates every image — including ones already generated — so the latest prompt changes take effect. Avatars are kept. Continue?")) {
+      regenerateImages.mutate();
+    }
+  };
+
   // Three states share this one screen (the user never leaves it during asset
   // generation):
   //   plan_ready        -> review the plan, click "Generate assets"
@@ -127,6 +150,15 @@ export function SyntheticReviewScreen({
               {regenerateAll.isPending ? "Retrying…" : `Retry all failed (${failedCount})`}
             </Button>
           )}
+          {/* Regenerate all images against the current prompts — re-tests a
+              prompt/STYLE_PROMPT change on this project without re-planning or a
+              new project. Shown outside the plan gate (once images exist). */}
+          {!isPlanGate && (
+            <Button type="button" variant="soft" size="sm" disabled={regenerateImages.isPending} onClick={onRegenerateImages}>
+              <Images className={`h-4 w-4 ${regenerateImages.isPending ? "animate-spin" : ""}`} />
+              {regenerateImages.isPending ? "Regenerating…" : "Regenerate all images"}
+            </Button>
+          )}
           {/* Re-plan: always available, re-runs only the planner. */}
           <Button type="button" variant="soft" size="sm" disabled={replan.isPending} onClick={onReplan}>
             <RefreshCw className={`h-4 w-4 ${replan.isPending ? "animate-spin" : ""}`} /> Re-plan
@@ -153,6 +185,7 @@ export function SyntheticReviewScreen({
       {render.error && <p className="text-xs text-danger">{(render.error as Error).message}</p>}
       {replan.error && <p className="text-xs text-danger">{(replan.error as Error).message}</p>}
       {regenerateAll.error && <p className="text-xs text-danger">{(regenerateAll.error as Error).message}</p>}
+      {regenerateImages.error && <p className="text-xs text-danger">{(regenerateImages.error as Error).message}</p>}
 
       {/* Master voiceover — listen before committing to asset generation/render. */}
       {resp.project.voiceover_url && (
@@ -208,6 +241,16 @@ function SegmentRow({
   });
   const regenerate = useMutation({
     mutationFn: async () => { await fetch(base, { method: "POST" }); },
+    onSuccess: onChange,
+  });
+  // Regenerate ONLY the AI image prompt for this segment (re-runs Gemini for
+  // this block's script with the single-subject/no-text rules). Does not rebuild
+  // the image — the user reviews the new prompt, then clicks Regenerate.
+  const regeneratePrompt = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`${base}/regenerate-prompt`, { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error ?? `regenerate prompt failed (${r.status})`);
+    },
     onSuccess: onChange,
   });
   const del = useMutation({
@@ -308,6 +351,23 @@ function SegmentRow({
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
             <div className="ml-auto flex items-center gap-1">
               <Button type="button" variant="ghost" size="xs" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</Button>
+              {/* AI-regenerate this segment's image prompt (Gemini rewrites the
+                  scene with the single-subject/no-text rules). Non-avatar only —
+                  avatars have no image prompt. Rewrites the prompt only; click
+                  Regenerate after to rebuild the image. */}
+              {segment.block_type !== "avatar" && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  disabled={regeneratePrompt.isPending || isGenerating}
+                  onClick={() => regeneratePrompt.mutate()}
+                  title="Re-run AI to rewrite this segment's image prompt"
+                >
+                  <Sparkles className={`h-3.5 w-3.5 ${regeneratePrompt.isPending ? "animate-spin" : ""}`} />
+                  {regeneratePrompt.isPending ? "Rewriting…" : "Regenerate prompt"}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant={isFailed ? "gradient" : "soft"}
@@ -352,6 +412,7 @@ function SegmentRow({
             <>
               <p className="text-xs text-fg-muted line-clamp-2">{segment.script || <span className="text-fg-subtle">no script</span>}</p>
               {segment.image_prompt && <p className="text-[11px] text-fg-subtle line-clamp-1">🖼 {segment.image_prompt}</p>}
+              {regeneratePrompt.error && <p className="text-[11px] text-danger line-clamp-1">{(regeneratePrompt.error as Error).message}</p>}
               {segment.error && <p className="text-[11px] text-danger line-clamp-1">{segment.error}</p>}
             </>
           )}
