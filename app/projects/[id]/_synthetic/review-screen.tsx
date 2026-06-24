@@ -277,6 +277,10 @@ function SegmentRow({
 }) {
   const [editing, setEditing] = useState(false);
   const [previewing, setPreviewing] = useState(false);
+  // split_2 has BOTH an avatar video and a right-half image. The main preview
+  // shows the avatar video; this separate state opens the right image so it can
+  // be reviewed too (previously the image half had no preview at all).
+  const [previewingImage, setPreviewingImage] = useState(false);
   const [blockType, setBlockType] = useState(segment.block_type);
   const [imagePrompt, setImagePrompt] = useState(segment.image_prompt ?? "");
   const [animationPrompt, setAnimationPrompt] = useState(segment.animation_prompt ?? "");
@@ -297,6 +301,15 @@ function SegmentRow({
   });
   const regenerate = useMutation({
     mutationFn: async () => { await fetch(base, { method: "POST" }); },
+    onSuccess: onChange,
+  });
+  // split_2 only: regenerate ONLY the right-half image, keeping the avatar video
+  // (no HeyGen re-render). The full Regenerate above redoes both.
+  const regenerateImage = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`${base}?imageOnly=1`, { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error ?? `regenerate image failed (${r.status})`);
+    },
     onSuccess: onChange,
   });
   // Regenerate ONLY the AI image prompt for this segment (re-runs Gemini for
@@ -342,6 +355,11 @@ function SegmentRow({
     : thumb
       ? "image"
       : null;
+  // For split_2, the right-half IMAGE is separate from the avatar video. Expose
+  // it as its own preview so both halves are reviewable. (For non-split blocks
+  // the image IS the main asset and already previews via previewKind.)
+  const splitRightImage =
+    segment.block_type === "split_2" ? (segment.right_image_url ?? null) : null;
 
   return (
     <Card className={isFailed ? "border-danger/40" : undefined}>
@@ -379,6 +397,24 @@ function SegmentRow({
               <span className="text-[10px] text-fg-subtle">no preview</span>
             )}
           </div>
+        )}
+
+        {/* split_2 right-image preview dialog. The thumbnail above shows the
+            avatar video; this lets the user also inspect the image half. The
+            trigger button lives in the action row below. */}
+        {splitRightImage && previewingImage && (
+          <Dialog open={previewingImage} onOpenChange={setPreviewingImage}>
+            <DialogContent className="max-w-3xl">
+              <DialogTitle>Image half — #{segment.position + 1} split</DialogTitle>
+              <DialogDescription className="sr-only">
+                Generated right-half image for split segment #{segment.position + 1}
+              </DialogDescription>
+              <div className="overflow-hidden rounded-md border border-border bg-black">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={splitRightImage} alt="" className="max-h-[70vh] w-full object-contain bg-black" />
+              </div>
+            </DialogContent>
+          </Dialog>
         )}
 
         {/* Preview dialog — full controls for video; full-size still for image. */}
@@ -419,6 +455,13 @@ function SegmentRow({
             <Badge variant={statusVariant as "success" | "destructive" | "info" | "secondary"}>{segment.status}</Badge>
             <span className="text-[11px] text-fg-subtle tabular-nums">{segment.duration.toFixed(1)}s</span>
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
+            {/* split_2: a quick way to inspect the IMAGE half (the thumbnail
+                shows the avatar video). */}
+            {splitRightImage && (
+              <Button type="button" variant="ghost" size="xs" onClick={() => setPreviewingImage(true)} title="Preview the image half">
+                <Images className="h-3.5 w-3.5" /> View image
+              </Button>
+            )}
             <div className="ml-auto flex items-center gap-1">
               <Button type="button" variant="ghost" size="xs" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</Button>
               {/* AI-regenerate this segment's image prompt (Gemini rewrites the
@@ -438,15 +481,32 @@ function SegmentRow({
                   {regeneratePrompt.isPending ? "Rewriting…" : "Regenerate prompt"}
                 </Button>
               )}
+              {/* split_2 only: regenerate just the right image, keep the avatar
+                  video. The full Regenerate to the right redoes BOTH (incl. a
+                  HeyGen avatar render). */}
+              {segment.block_type === "split_2" && (
+                <Button
+                  type="button"
+                  variant="soft"
+                  size="xs"
+                  disabled={regenerateImage.isPending || isGenerating}
+                  onClick={() => regenerateImage.mutate()}
+                  title="Regenerate only the image half (keep the avatar video)"
+                >
+                  <Images className={`h-3.5 w-3.5 ${regenerateImage.isPending ? "animate-spin" : ""}`} />
+                  {regenerateImage.isPending ? "Image…" : "Regenerate image"}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant={isFailed ? "gradient" : "soft"}
                 size="xs"
                 disabled={regenerate.isPending || isGenerating}
                 onClick={() => regenerate.mutate()}
+                title={segment.block_type === "split_2" ? "Regenerate the avatar video AND the image" : undefined}
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${regenerate.isPending ? "animate-spin" : ""}`} />
-                {isFailed ? "Retry" : "Regenerate"}
+                {isFailed ? "Retry" : segment.block_type === "split_2" ? "Regenerate all" : "Regenerate"}
               </Button>
               <Button type="button" variant="ghost" size="xs" onClick={() => del.mutate()} disabled={del.isPending}>
                 <Trash2 className="h-3.5 w-3.5 text-danger" />
@@ -483,6 +543,7 @@ function SegmentRow({
               <p className="text-xs text-fg-muted line-clamp-2">{segment.script || <span className="text-fg-subtle">no script</span>}</p>
               {segment.image_prompt && <p className="text-[11px] text-fg-subtle line-clamp-1">🖼 {segment.image_prompt}</p>}
               {regeneratePrompt.error && <p className="text-[11px] text-danger line-clamp-1">{(regeneratePrompt.error as Error).message}</p>}
+              {regenerateImage.error && <p className="text-[11px] text-danger line-clamp-1">{(regenerateImage.error as Error).message}</p>}
               {restore.error && <p className="text-[11px] text-danger line-clamp-1">{(restore.error as Error).message}</p>}
               {segment.error && <p className="text-[11px] text-danger line-clamp-1">{segment.error}</p>}
 

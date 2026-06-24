@@ -530,7 +530,10 @@ const ServerEnvSchema = z.object({
   // serial by design.
   TTS_CONCURRENCY: z.coerce.number().int().positive().default(2),
   SYNTHETIC_PLANNER_CONCURRENCY: z.coerce.number().int().positive().default(2),
-  IMAGE_GEN_CONCURRENCY: z.coerce.number().int().positive().default(3),
+  // image=4 to match the confirmed 69labs tier ceiling (4 concurrent). The
+  // SIXTYNINE_IMAGE_CONCURRENCY semaphore below is the real safety cap; this just
+  // lets the image_gen worker feed up to 4 jobs into it.
+  IMAGE_GEN_CONCURRENCY: z.coerce.number().int().positive().default(4),
   IMAGE_TO_VIDEO_CONCURRENCY: z.coerce.number().int().positive().default(2),
   AVATAR_CONCURRENCY: z.coerce.number().int().positive().default(1),
   // Hard cap on CONCURRENT 69labs image generations across ALL queues. The
@@ -543,11 +546,12 @@ const ServerEnvSchema = z.object({
   //
   // 69labs allows only 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER
   // (per 69labs guidance), and pushing past the tier ceiling triggers cooldowns
-  // — NOT the "7" an earlier comment assumed. Default 3 sits inside the 1–4 band
-  // and assumes a tier that permits at least 3 concurrent. Lower to 1–2 if you
-  // hit 503 "service unavailable" / cooldowns (a lower tier), or raise toward 4
-  // only after confirming your tier's real ceiling.
-  SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(3),
+  // — NOT the "7" an earlier comment assumed. Default 4 = the confirmed tier
+  // ceiling (the client's account permits 4 concurrent), the fastest setting
+  // that stays inside the band. Lower to 1–2 if you ever hit 503 "service
+  // unavailable" / cooldowns (a lower tier / shared account); do NOT raise above
+  // 4 without confirming a higher tier, or the cooldowns return.
+  SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
 
   // Synthetic visual-block pacing. The client's reference video paces every
   // visual block (image / ai_clip / split_2) at ~3-8s. Gemini's planner emits

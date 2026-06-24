@@ -44,7 +44,11 @@ export interface SyntheticPlannerJobData { projectId: string; mediaJobId: string
 // processor reads its block_type, prompts and timings from the row.
 export interface ImageGenerationJobData  { projectId: string; mediaJobId: string; segmentId: string; }
 export interface ImageToVideoJobData     { projectId: string; mediaJobId: string; segmentId: string; }
-export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; }
+// imageOnly: for a split_2 block, regenerate ONLY the right-half image and KEEP
+// the existing avatar video (no HeyGen re-render). Used by "Regenerate image"
+// and the bulk "images" scope so re-testing image prompts never re-renders the
+// (slow, costly) avatar. Ignored for non-split_2 blocks.
+export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; imageOnly?: boolean; }
 
 // Idle BullMQ workers sit on a long blocking BRPOP. Two distinct teardown
 // causes, depending on how a process reaches Redis:

@@ -95,8 +95,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       .contains("metadata", { synthetic_segment_id: segId });
   }
 
-  // Fan everything out at once — the worker renders them concurrently.
-  const enqueued = await dispatchSegments(id);
+  // Fan everything out at once — the worker renders them concurrently. For the
+  // "images" scope, split_2 blocks regenerate ONLY their right still (the avatar
+  // video is kept) and pure-avatar blocks are skipped entirely.
+  const enqueued = await dispatchSegments(id, { imageOnly: scope === "images" });
   if (enqueued > 0) await setProjectStatus(id, "generating_images");
 
   return NextResponse.json({ ok: true, enqueued }, { status: 202 });

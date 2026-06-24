@@ -98,8 +98,31 @@ async function stageAvatarAudio(
 // Account rotation, cookie sessions, proxy support, screenshots, and failure
 // detection all live in generateAvatar(); this processor handles the DB/job
 // lifecycle and the final-attempt degrade.
+// Generate (or re-generate) a split_2 block's RIGHT-half still and persist it.
+// finishSegment archives the prior right_image_url into asset_history first.
+async function generateSplitRightImage(
+  projectId: string, mediaJobId: string, segmentId: string,
+  seg: { image_prompt: string | null; metadata: unknown },
+): Promise<void> {
+  const t0 = Date.now();
+  // Right-half still prompt. NEVER fall back to seg.script (the spoken
+  // narration); use the per-block scene, else the video's recurring world
+  // (base_prompt), so the illustrative half stays on-topic.
+  const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+  const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
+  if (!prompt) throw new Error(`avatar: split_2 segment ${segmentId} has no usable image prompt`);
+  await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
+  const img = await generateImage(prompt);
+  await logProviderCall({
+    projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
+    durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
+  });
+  const up = await uploadBuffer(img.image, r2Keys.segmentRightImage(projectId, segmentId, Date.now()), img.contentType);
+  await finishSegment(segmentId, { right_image_url: up.publicUrl });
+}
+
 export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttemptInfo): Promise<void> {
-  const { projectId, mediaJobId, segmentId } = data;
+  const { projectId, mediaJobId, segmentId, imageOnly } = data;
   const sb = getServerSupabase();
   const isFinalAttempt = (attempt?.attemptsMade ?? 1) >= (attempt?.attemptsAllowed ?? 1);
 
@@ -114,6 +137,34 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
     sb.from("projects").select("avatar_image_url, voiceover_url").eq("id", projectId).single(),
   ]);
   if (segErr || !seg) throw new Error(`avatar: segment ${segmentId} not found`);
+
+  // IMAGE-ONLY regenerate (split_2): re-create ONLY the right-half still and KEEP
+  // the existing avatar video — no HeyGen re-render. Used by "Regenerate image"
+  // and the bulk "images" scope. For a non-split_2 block there is no image to
+  // regenerate here, so we just mark it ready (its avatar video is untouched).
+  if (imageOnly) {
+    try {
+      if (seg.block_type === "split_2") {
+        await generateSplitRightImage(projectId, mediaJobId, segmentId, seg);
+      }
+      await finishSegment(segmentId, { status: "ready", error: null });
+      await setMediaJob(mediaJobId, { status: "completed", progress: 100 });
+    } catch (err) {
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.image_only_failed", {
+        err: (err as Error).message?.slice(0, 200), isFinalAttempt,
+      });
+      if (isFinalAttempt) {
+        await finishSegment(segmentId, { status: "failed", error: userFacingMessage(err) });
+        await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: userFacingMessage(err) });
+        await maybeFinalizeSynthetic(projectId);
+        return;
+      }
+      throw err;
+    }
+    await maybeFinalizeSynthetic(projectId);
+    return;
+  }
+
   if (projErr || !project?.avatar_image_url) {
     throw new Error(`avatar: project ${projectId} has no avatar_image_url`);
   }
@@ -122,21 +173,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   // on retry once present). The avatar video becomes the LEFT half, composited
   // at render time by buildSplitScreenAvatarVideo.
   if (seg.block_type === "split_2" && !seg.right_image_url) {
-    const t0 = Date.now();
-    // Right-half still prompt. NEVER fall back to seg.script (the spoken
-    // narration); use the per-block scene, else the video's recurring world
-    // (base_prompt), so the illustrative half stays on-topic.
-    const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
-    const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
-    if (!prompt) throw new Error(`avatar: split_2 segment ${segmentId} has no usable image prompt`);
-    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
-    const img = await generateImage(prompt);
-    await logProviderCall({
-      projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
-      durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
-    });
-    const up = await uploadBuffer(img.image, r2Keys.segmentRightImage(projectId, segmentId, Date.now()), img.contentType);
-    await finishSegment(segmentId, { right_image_url: up.publicUrl });
+    await generateSplitRightImage(projectId, mediaJobId, segmentId, seg);
     await setMediaJob(mediaJobId, { progress: 25 });
   }
 

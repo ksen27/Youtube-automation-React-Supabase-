@@ -231,7 +231,10 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
     if (st.status === "CENSORED") {
       throw new Error(`69labs image: CENSORED (job ${jobId}) — edit the prompt and retry`);
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    // Poll every 1s (was 2s): a status GET is cheap and doesn't count against the
+    // generation concurrency cap, so a tighter interval shaves up to ~1s of dead
+    // wait per image off the time between "done on 69labs" and "we notice".
+    await new Promise((r) => setTimeout(r, 1000));
   }
   if (Date.now() >= deadline) throw new Error(`69labs image: poll timed out (job ${jobId})`);
 

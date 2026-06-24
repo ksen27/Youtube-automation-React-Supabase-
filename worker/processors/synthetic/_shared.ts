@@ -46,7 +46,16 @@ export function queueForBlockType(blockType: SyntheticSegment["block_type"]): Se
  * number of jobs enqueued. Safe to call repeatedly — only 'pending' segments
  * are dispatched, so a retry re-dispatches just the unfinished ones.
  */
-export async function dispatchSegments(projectId: string): Promise<number> {
+export async function dispatchSegments(
+  projectId: string,
+  opts: {
+    // Image-only regen (the bulk "images" scope): for split_2 blocks, enqueue an
+    // image-only avatar job (regenerate the right still, KEEP the avatar video),
+    // and SKIP pure-avatar blocks entirely (they have no image to regenerate and
+    // we don't want to re-render them). avatar-queue split_2 still routes here.
+    imageOnly?: boolean;
+  } = {},
+): Promise<number> {
   const sb = getServerSupabase();
   const { data: segs, error } = await sb
     .from("synthetic_segments")
@@ -58,6 +67,11 @@ export async function dispatchSegments(projectId: string): Promise<number> {
 
   let count = 0;
   for (const seg of segs ?? []) {
+    // In image-only mode, a PURE avatar block has nothing to regenerate — skip
+    // it so we never re-render an avatar the client is happy with. (split_2 is
+    // kept: it has a right image to regenerate.)
+    if (opts.imageOnly && seg.block_type === "avatar") continue;
+
     const queue = queueForBlockType(seg.block_type);
     const mediaType =
       queue === "avatar" ? "avatar" : queue === "image_to_video" ? "image_to_video" : "image_gen";
@@ -73,7 +87,8 @@ export async function dispatchSegments(projectId: string): Promise<number> {
       .eq("id", seg.id);
 
     if (queue === "avatar") {
-      await enqueueAvatar({ projectId, mediaJobId, segmentId: seg.id });
+      // split_2 in image-only mode regenerates just the right still.
+      await enqueueAvatar({ projectId, mediaJobId, segmentId: seg.id, imageOnly: opts.imageOnly && seg.block_type === "split_2" });
     } else if (queue === "image_to_video") {
       await enqueueImageToVideo({ projectId, mediaJobId, segmentId: seg.id });
     } else {
@@ -81,7 +96,7 @@ export async function dispatchSegments(projectId: string): Promise<number> {
     }
     count++;
   }
-  await logJob({ projectId }, "synthetic.dispatch", { enqueued: count });
+  await logJob({ projectId }, "synthetic.dispatch", { enqueued: count, imageOnly: !!opts.imageOnly });
   return count;
 }
 
