@@ -95,6 +95,21 @@ const BROLL_OBJECT_RULE =
   "in frame ONLY when the line is genuinely about a person or a first-person " +
   "action; otherwise show the object / plant / place itself.";
 
+// Amateur-real look rule (client requirement 2026-06). Even though the phone-shot
+// STYLE_PROMPT is appended at generation time, Gemini tends to slip cinematic
+// words into the scene prompt ("cinematic", "shallow depth of field", "golden
+// hour", "professional photo", "dramatic lighting"), which fight the amateur look
+// and bring back the gorgeous-but-fake stock/CGI vibe the client rejected. Forbid
+// those here so the scene prompt describes WHAT is shown, never a produced style.
+const AMATEUR_LOOK_RULE =
+  "AMATEUR REAL LOOK (client requirement): describe the scene as if shot by an " +
+  "ordinary person on a phone in their own garden. Do NOT add any cinematic, " +
+  "professional, or stock-photo styling words — NO 'cinematic', NO 'shallow depth " +
+  "of field' / 'bokeh' / 'blurred background', NO 'golden hour' / 'dramatic " +
+  "lighting' / 'lens flare', NO 'professional photo' / 'award-winning' / '8k'. " +
+  "Just describe the real subject and setting plainly; the camera look is added " +
+  "separately.";
+
 function buildPrompt(transcript: string): string {
   return [
     "You are a video director planning the visual track for an AI-generated",
@@ -150,6 +165,8 @@ function buildPrompt(transcript: string): string {
     "",
     BROLL_OBJECT_RULE,
     "",
+    AMATEUR_LOOK_RULE,
+    "",
     "CONTINUITY (critical): when consecutive blocks describe one continuous",
     "scene, they MUST keep the SAME setting, lighting, subjects, and framing so",
     "they read as one continuous shot. Only change the visual world when the",
@@ -197,6 +214,8 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
     SINGLE_SUBJECT_RULE,
     "",
     BROLL_OBJECT_RULE,
+    "",
+    AMATEUR_LOOK_RULE,
     "",
     wantsAnimation
       ? 'Respond ONLY with JSON: {"imagePrompt","animationPrompt"}  (animationPrompt = GENTLE camera motion over an otherwise still scene: a slow horizontal pan or slow push-in, NOT dramatic action or eventful motion).'

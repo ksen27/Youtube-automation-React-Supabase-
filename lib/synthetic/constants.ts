@@ -1,16 +1,43 @@
 // Shared synthetic-engine constants.
 
 // Appended to EVERY image prompt (nano-banana / Flux) so generated stills share
-// the client's required "candid documentary" look instead of a studio-render
-// aesthetic. Per spec — do not edit without client sign-off.
+// the client's required "regular person filmed it on their phone" look instead
+// of a polished cinema / stock-photo aesthetic. Per spec — do not edit without
+// client sign-off.
+//
+// Realism fix (client requirement 2026-06): the previous style produced
+// gorgeous-but-fake frames — shallow depth of field, dreamy background bokeh,
+// golden-hour grade — which read as professional stock footage / a CGI render,
+// NOT as someone filming their own garden on a phone. The client wants the
+// "own vlog" feel. So we now push the OPPOSITE of cinematic: a smartphone has a
+// tiny sensor, so EVERYTHING is in focus (deep depth of field, no creamy bokeh),
+// the light is flat/even/ambient (no cinematic golden-hour rim light), framing
+// is plain and a little imperfect, and the overall look is an ordinary,
+// authentic phone snapshot — real, not arty. Keep it clean (not ugly/blurry),
+// just unmistakably amateur-real rather than produced.
 export const STYLE_PROMPT =
-  "Candid video frame grab, mid-range consumer camera quality, slightly " +
-  "compressed JPEG artifact look, natural daylight or golden hour lighting, " +
-  "handheld camera feel with subtle motion softness, authentic documentary " +
-  "style, no studio lighting, real-world environment, slightly overexposed " +
-  "highlights, muted earthy color grading, shallow depth of field on subject, " +
-  "background slightly out of focus, grainy texture consistent with 1080p " +
-  "video still, no filters, unposed candid moment. " +
+  "Amateur smartphone photo taken by an ordinary person, candid phone snapshot " +
+  "of a real everyday scene, shot on a typical mobile phone camera. " +
+  // Realism via LOWER quality (client requirement 2026-06): our stills read as
+  // AI precisely because they are TOO clean / TOO sharp / TOO perfect. Real phone
+  // footage has imperfections AI generators don't add by default. So deliberately
+  // degrade toward authentic low-fi capture — a slightly grainy, soft, compressed
+  // real photo, NOT a pristine render. Moderate, not broken: still readable.
+  "Slightly low quality like a real phone video frame grab: visible digital " +
+  "sensor noise and fine grain, mild softness and lack of perfect sharpness, " +
+  "light JPEG / video compression artifacts, slightly imperfect exposure with " +
+  "mildly blown highlights and a little muddy shadow detail, subtle handheld " +
+  "motion softness. NOT crisp, NOT pristine, NOT high-resolution studio quality, " +
+  "NOT clean — an ordinary, slightly rough real-camera capture. " +
+  "EVERYTHING in focus front to back (deep depth of field, large in-focus area " +
+  "like a phone lens) — NO shallow depth of field, NO blurred or creamy bokeh " +
+  "background, NO cinematic background blur. Flat, even, natural ambient daylight " +
+  "(overcast or plain daylight) — NOT golden hour, NOT dramatic rim light, NOT " +
+  "moody cinematic lighting, no lens flare. Plain, slightly imperfect handheld " +
+  "framing, ordinary realistic colors (NOT a stylized cinematic color grade), " +
+  "real-world clutter and texture, unposed and unedited. Looks like a normal " +
+  "person's phone photo, NOT professional photography, NOT " +
+  "stock footage, NOT a cinema shot, NOT a CGI render, no filters. " +
   // Client requirement (2026-06): every still must be ONE single full-frame
   // photo of ONE subject — nano-banana was drawing multi-subject COLLAGES
   // (e.g. a calendar next to a garden path) that read as a "split image" in

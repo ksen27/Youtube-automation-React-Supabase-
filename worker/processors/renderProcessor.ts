@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, segmentVcodecArgsFor, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, degradeVideoLowFi, segmentVcodecArgsFor, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -2167,6 +2167,44 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     stageTimings.concat_audio_ms = Date.now() - concatStageStart;
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
+
+    // 4a-pre0) Low-fi "vlogging" video degrade (best-effort, synthetic only).
+    // One re-encode pass over the finished video that lowers TEXTURE quality
+    // (grain + slight softness + stronger compression) so the footage reads as
+    // a real phone vlog, not a clean AI render. Dimensions are UNCHANGED — the
+    // client still wants 1080p; we degrade quality at full size. Runs BEFORE the
+    // effect overlay so the overlay composites onto the degraded base. Like the
+    // overlay it is polish, never a render-blocker: on any failure we keep the
+    // un-degraded finalLocal. PERFORMANCE_MODE skips it (zero post-effects path).
+    const degradeEnabled = isSyntheticRender && env.SYNTHETIC_DEGRADE_ENABLED && !performanceMode;
+    if (degradeEnabled) {
+      const degradeStart = Date.now();
+      const degradedLocal = path.join(tmp, `degraded_${projectId}.mp4`);
+      try {
+        await touchMediaJob(mediaJobId);
+        await degradeVideoLowFi({
+          inputPath: finalLocal,
+          outputPath: degradedLocal,
+          width: outW,
+          height: outH,
+          fps: 30,
+          onProgress: () => void touchMediaJob(mediaJobId),
+        });
+        await safeUnlink(finalLocal);
+        finalLocal = degradedLocal;
+        await logJob({ projectId, jobId: mediaJobId }, "render.degrade.done", {
+          blurSigma: env.SYNTHETIC_DEGRADE_BLUR_SIGMA,
+          videoNoise: env.SYNTHETIC_DEGRADE_VIDEO_NOISE,
+          crfDelta: env.SYNTHETIC_DEGRADE_VIDEO_CRF_DELTA,
+          ms: Date.now() - degradeStart,
+        });
+      } catch (e) {
+        await safeUnlink(degradedLocal);
+        await logJob({ projectId, jobId: mediaJobId }, "render.degrade.failed", {
+          err: (e as Error).message,
+        });
+      }
+    }
 
     // 4a-pre) Global effect overlay (best-effort). Screen-blend the configured
     // particle/dust effect over the ENTIRE finished video — intro, opening

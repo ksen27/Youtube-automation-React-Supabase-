@@ -574,6 +574,30 @@ const ServerEnvSchema = z.object({
   // this cutoff blocks keep whatever type Gemini chose (stills dominate, cheaper).
   // 0 disables the promotion entirely.
   SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(180),
+  // Low-fi "vlogging" degrade (client requirement 2026-06). The reference channel
+  // looks REAL precisely because its footage is slightly LOW QUALITY — grainy,
+  // soft, compressed, like a real phone vlog. Our generations come out too clean
+  // / too perfect, which reads as AI. So we deliberately degrade BOTH the stills
+  // (sharp, before upload) and the final rendered video (one ffmpeg pass) toward
+  // that look. RESOLUTION IS UNCHANGED — the client still wants 1080p; we lower
+  // texture quality (grain/softness/compression) at full dimensions, NOT the
+  // pixel size. Defaults are MODERATE: real-footage feel without looking broken.
+  //   SYNTHETIC_DEGRADE_ENABLED — master toggle (both image + video).
+  //   *_BLUR_SIGMA  — gaussian softness (0 = none). ~0.6 is subtle.
+  //   *_NOISE       — grain amount. image: sharp 0..100-ish; video: ffmpeg noise
+  //                   strength (alls). ~8-12 reads as real sensor grain.
+  //   IMAGE_JPEG_QUALITY — re-encode quality 1..100 (lower = more artifacts).
+  //   VIDEO_CRF_DELTA    — added to SYNTHETIC_X264_CRF on the degrade pass
+  //                        (higher CRF = more compression artifacts).
+  // Defaults = "moderate" on the tuning ladder (client-picked 2026-06): clearly
+  // low-fi and matching the reference's grain/softness while still reading as a
+  // real photo, not a damaged one. Earlier defaults were too weak to see.
+  SYNTHETIC_DEGRADE_ENABLED: z.coerce.boolean().default(true),
+  SYNTHETIC_DEGRADE_BLUR_SIGMA: z.coerce.number().nonnegative().default(0.8),
+  SYNTHETIC_DEGRADE_IMAGE_NOISE: z.coerce.number().nonnegative().default(22),
+  SYNTHETIC_DEGRADE_IMAGE_JPEG_QUALITY: z.coerce.number().int().min(1).max(100).default(60),
+  SYNTHETIC_DEGRADE_VIDEO_NOISE: z.coerce.number().nonnegative().default(18),
+  SYNTHETIC_DEGRADE_VIDEO_CRF_DELTA: z.coerce.number().int().nonnegative().default(6),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

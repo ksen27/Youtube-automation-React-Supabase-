@@ -7,6 +7,7 @@ import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
@@ -117,7 +118,13 @@ async function generateSplitRightImage(
     projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
     durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
   });
-  const up = await uploadBuffer(img.image, r2Keys.segmentRightImage(projectId, segmentId, Date.now()), img.contentType);
+  // Low-fi degrade the illustrative half so it matches the real-footage look.
+  const deg = await degradeImageLowFi(img.image);
+  const up = await uploadBuffer(
+    deg.image,
+    r2Keys.segmentRightImage(projectId, segmentId, Date.now()),
+    deg.degraded ? deg.contentType : img.contentType,
+  );
   await finishSegment(segmentId, { right_image_url: up.publicUrl });
 }
 

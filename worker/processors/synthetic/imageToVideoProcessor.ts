@@ -3,6 +3,7 @@ import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageToVideoJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -45,9 +46,13 @@ export async function processImageToVideoJob(
   const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
   const imagePrompt = (seg.image_prompt?.trim() || basePrompt).trim();
   // Default to the client's preferred look: a gentle camera move over an
-  // otherwise still scene (slow pan / slow push-in), NOT eventful motion.
+  // otherwise still scene (slow pan / slow push-in), NOT eventful motion. Add a
+  // real-phone-footage cue so the clip keeps the slightly low-fi handheld feel of
+  // the source still instead of a smooth, pristine AI render.
   const animationPrompt = (
-    seg.animation_prompt ?? "Slow horizontal camera pan left to right across the scene, the scene itself static, gentle and steady"
+    seg.animation_prompt ??
+    "Slow horizontal camera pan left to right across the scene, the scene itself static, gentle and steady, " +
+      "handheld real phone footage with subtle natural shake and minor motion blur, slightly low quality and grainy, not smooth or cinematic"
   ).trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
@@ -64,7 +69,14 @@ export async function processImageToVideoJob(
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
     });
-    const up = await uploadBuffer(img.image, r2Keys.segmentImage(projectId, segmentId, Date.now()), img.contentType);
+    // Low-fi degrade the source still BEFORE upload so the animated clip
+    // inherits the real-footage texture (keeps dimensions, lowers quality only).
+    const deg = await degradeImageLowFi(img.image);
+    const up = await uploadBuffer(
+      deg.image,
+      r2Keys.segmentImage(projectId, segmentId, Date.now()),
+      deg.degraded ? deg.contentType : img.contentType,
+    );
     imageUrl = up.publicUrl;
     // Persist the still immediately so a later video failure can degrade to it.
     await finishSegment(segmentId, { image_url: imageUrl, provider: img.provider });

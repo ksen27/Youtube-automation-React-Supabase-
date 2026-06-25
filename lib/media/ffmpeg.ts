@@ -2174,6 +2174,62 @@ export async function overlayEffectVideo(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// Low-fi "vlogging" video degrade (client requirement 2026-06). One re-encode
+// pass over the finished video that lowers TEXTURE quality — grain, a touch of
+// softness, and stronger compression — so the footage reads as a real phone
+// vlog instead of a clean AI render. RESOLUTION IS UNCHANGED (the client still
+// wants 1080p): we scale to the same w×h and only degrade quality, never size.
+//
+// Filter chain:
+//   gblur=sigma   — subtle softness (skipped when sigma<=0)
+//   noise=alls=N  — luminance grain with temporal variation (allf=t), the real-
+//                   sensor-noise feel AI never adds (skipped when N<=0)
+// Stronger compression comes from running libx264 at SYNTHETIC_X264_CRF +
+// VIDEO_CRF_DELTA. Audio is stream-copied — the mix is already baked in.
+export async function degradeVideoLowFi(opts: {
+  inputPath: string;
+  outputPath: string;
+  width?: number;   // default 1920
+  height?: number;  // default 1080
+  fps?: number;     // default 30
+  signal?: AbortSignal;
+  onProgress?: () => void;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1920;
+  const h = opts.height ?? 1080;
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  const blur = env.SYNTHETIC_DEGRADE_BLUR_SIGMA;
+  const noise = env.SYNTHETIC_DEGRADE_VIDEO_NOISE;
+  const crf = Math.min(51, env.SYNTHETIC_X264_CRF + env.SYNTHETIC_DEGRADE_VIDEO_CRF_DELTA);
+
+  const vf = [
+    `scale=${w}:${h}`,
+    `fps=${fps}`,
+    ...(blur > 0 ? [`gblur=sigma=${blur.toFixed(2)}`] : []),
+    ...(noise > 0 ? [`noise=alls=${Math.round(noise)}:allf=t`] : []),
+    "format=yuv420p",
+  ].join(",");
+
+  const args = [
+    "-y",
+    "-threads", String(env.FFMPEG_THREADS),
+    "-i", opts.inputPath,
+    "-vf", vf,
+    "-c:v", "libx264",
+    "-preset", env.SYNTHETIC_X264_PRESET,
+    "-crf", String(crf),
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  ];
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal, undefined, opts.onProgress);
+}
+
 function runFFmpeg(
   bin: string,
   args: string[],

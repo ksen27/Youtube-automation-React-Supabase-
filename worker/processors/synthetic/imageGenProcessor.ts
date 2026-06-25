@@ -3,6 +3,7 @@ import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageGenerationJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
@@ -54,6 +55,10 @@ export async function processImageGenJob(
       durationMs: Date.now() - t0, cost: { provider: out.provider, images: 1 },
     });
 
+    // Low-fi "vlogging" degrade (keeps dimensions, lowers texture quality) so
+    // the still reads as real phone footage instead of a clean AI render.
+    const deg = await degradeImageLowFi(out.image);
+
     const isSplit = seg.block_type === "split_2";
     // Versioned key (timestamp) so a regenerate writes a NEW file and the prior
     // version survives in R2 for the review screen's history. finishSegment
@@ -62,7 +67,7 @@ export async function processImageGenJob(
     const key = isSplit
       ? r2Keys.segmentRightImage(projectId, segmentId, version)
       : r2Keys.segmentImage(projectId, segmentId, version);
-    const up = await uploadBuffer(out.image, key, out.contentType);
+    const up = await uploadBuffer(deg.image, key, deg.degraded ? deg.contentType : out.contentType);
 
     await finishSegment(segmentId, {
       status: "ready",

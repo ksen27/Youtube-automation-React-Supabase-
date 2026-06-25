@@ -194,15 +194,20 @@ async function main() {
       ...over,
     });
 
-    test("a 21s ai_clip splits into 4 sub-blocks of ~5.25s", () => {
-      // slots = round(21 / 6) = round(3.5) = 4; 21 / 4 = 5.25s each, all in 3-8s.
+    test("a long ai_clip splits into exactly 2 pieces (clip + fill image)", () => {
+      // A long sentence is ONE thought: cover it with a clip then a fill image,
+      // each holding half the window (21 / 2 = 10.5s), never fragmented further.
       const out = splitByDuration(mk(), 6, 8);
-      assert.strictEqual(out.length, 4);
-      for (const p of out) assert.ok(Math.abs(p.duration - 5.25) < 1e-9);
+      assert.strictEqual(out.length, 2);
+      for (const p of out) assert.ok(Math.abs(p.duration - 10.5) < 1e-9);
     });
-    test("each sub-block stays under the 8s threshold", () => {
+    test("piece 1 is the ai_clip, piece 2 is the fill image", () => {
       const out = splitByDuration(mk(), 6, 8);
-      for (const p of out) assert.ok(p.duration <= 8, `slot ${p.duration}s > 8s`);
+      assert.strictEqual(out[0].blockType, "ai_clip");
+      assert.strictEqual(out[1].blockType, "image");
+      // The fill image drops the animation prompt and is flagged as second visual.
+      assert.strictEqual(out[1].animationPrompt, null);
+      assert.strictEqual(out[1].secondVisual, true);
     });
     test("sub-blocks tile the parent window with no gap/overlap", () => {
       const out = splitByDuration(mk(), 6, 8);
@@ -212,13 +217,12 @@ async function main() {
         assert.ok(Math.abs(out[i].startTime - out[i - 1].endTime) < 1e-9, "gap between slots");
       }
     });
-    test("sub-blocks inherit the parent's prompts and type", () => {
+    test("both pieces inherit the parent's image prompt; clip keeps animation", () => {
       const out = splitByDuration(mk(), 6, 8);
-      for (const p of out) {
-        assert.strictEqual(p.blockType, "ai_clip");
-        assert.strictEqual(p.imagePrompt, "a busy market street");
-        assert.strictEqual(p.animationPrompt, "slow push-in");
-      }
+      // Both pieces describe the SAME full-sentence scene.
+      for (const p of out) assert.strictEqual(p.imagePrompt, "a busy market street");
+      // Only the clip piece carries motion.
+      assert.strictEqual(out[0].animationPrompt, "slow push-in");
     });
     test("a block at/under threshold is returned unchanged", () => {
       const seg = mk({ endTime: 7, duration: 7 });
