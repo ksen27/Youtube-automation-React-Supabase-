@@ -72,6 +72,29 @@ const SINGLE_SUBJECT_RULE =
   "NEVER ask for any text, caption, label, sign, calendar, or written words in " +
   "the picture. One block = one clean single photo of one subject.";
 
+// Object-first B-roll rule (client requirement 2026-06). The reference channel
+// reads as the creator filming his OWN garden, not a stock library: when the
+// narration names a THING, the screen shows THAT thing (script says "water" ->
+// show water; "clogged gutter" -> show the gutter; "potted geranium" -> show the
+// flower; "female mosquito" -> show the mosquito), NOT a person. Our earlier
+// output leaned on people (an old lady / an old man / the presenter) for lines
+// that were really about objects, which read as generic stock footage. So the
+// DEFAULT subject is the concrete object, plant, tool, pest, or patch of garden
+// the line is about — shoot it close, hands-and-soil B-roll, owner's-own-garden
+// feel. Only put a PERSON in frame when the narration is genuinely about a
+// person or a first-person action; never as filler for an object-focused line.
+const BROLL_OBJECT_RULE =
+  "B-ROLL, OBJECTS NOT PEOPLE (critical, client requirement): this is an " +
+  "owner filming his OWN garden, NOT a stock-photo library. When the narration " +
+  "names a concrete thing — a plant, flower, tool, pest, water, soil, a patch " +
+  "of lawn, a gutter, etc. — the imagePrompt MUST show THAT thing as the single " +
+  "subject (close, candid, hands-in-the-dirt B-roll of the real object in a " +
+  "real garden), NOT a person. Do NOT default to people (no 'an elderly woman', " +
+  "'a man', 'a gardener' standing there) for lines that are about objects — that " +
+  "reads as generic stock footage, which the client does NOT want. Put a PERSON " +
+  "in frame ONLY when the line is genuinely about a person or a first-person " +
+  "action; otherwise show the object / plant / place itself.";
+
 function buildPrompt(transcript: string): string {
   return [
     "You are a video director planning the visual track for an AI-generated",
@@ -125,13 +148,21 @@ function buildPrompt(transcript: string): string {
     "",
     SINGLE_SUBJECT_RULE,
     "",
+    BROLL_OBJECT_RULE,
+    "",
     "CONTINUITY (critical): when consecutive blocks describe one continuous",
     "scene, they MUST keep the SAME setting, lighting, subjects, and framing so",
     "they read as one continuous shot. Only change the visual world when the",
     "narration genuinely moves to a new scene.",
     "",
-    "For ai_clip blocks also write an `animationPrompt` describing the motion",
-    "(camera move, subject action). avatar blocks need no prompts.",
+    "For ai_clip blocks also write an `animationPrompt`. The client wants GENTLE",
+    "CAMERA MOTION over an otherwise STILL scene — the camera slowly pans left-to-",
+    "right (or right-to-left) or slowly pushes in, while the scene itself stays",
+    "essentially static. This is the reference channel's look. Do NOT describe",
+    "dramatic action, fast motion, or eventful 'something happening' in the scene;",
+    "default to a slow, steady camera move (e.g. 'slow horizontal pan left to",
+    "right across the scene, otherwise still' or 'slow push-in, scene static').",
+    "avatar blocks need no prompts.",
     "",
     'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","animationPrompt"}]}',
     "",
@@ -165,8 +196,10 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
     "",
     SINGLE_SUBJECT_RULE,
     "",
+    BROLL_OBJECT_RULE,
+    "",
     wantsAnimation
-      ? 'Respond ONLY with JSON: {"imagePrompt","animationPrompt"}  (animationPrompt describes the motion: camera move, subject action).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","animationPrompt"}  (animationPrompt = GENTLE camera motion over an otherwise still scene: a slow horizontal pan or slow push-in, NOT dramatic action or eventful motion).'
       : 'Respond ONLY with JSON: {"imagePrompt"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
@@ -785,6 +818,39 @@ export async function buildSyntheticTimeline(input: {
         partsMerged: merged,
         overLengthParts,
       });
+    }
+  }
+
+  // Clip-heavy intro pass (client requirement 2026-06). The reference channel
+  // opens with mostly MOVING footage and switches to still images later to save
+  // credits. Promote every 'image' block whose spoken window STARTS before
+  // SYNTHETIC_CLIP_HEAVY_SECONDS to an 'ai_clip' so the opening stretch is
+  // animated; blocks after the cutoff keep Gemini's choice (stills dominate).
+  //
+  // Runs AFTER avatar-marking and coalescing (so it never touches an avatar
+  // block or overrides a doc mark — only plain 'image' blocks are promoted) and
+  // BEFORE the duration-split pass (so a promoted long clip is still carved into
+  // LTX-tier pieces with the usual clip-then-fill-image handling).
+  //
+  // A promoted block has no animationPrompt from Gemini (it was an 'image'); the
+  // worker falls back to the client's default gentle pan, so we leave it null
+  // here rather than inventing per-block motion text.
+  {
+    const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
+    if (cutoff > 0) {
+      let promoted = 0;
+      for (const seg of planned) {
+        if (seg.blockType === "image" && seg.startTime < cutoff) {
+          seg.blockType = "ai_clip";
+          promoted++;
+        }
+      }
+      if (promoted > 0) {
+        await logJob({ projectId, jobId }, "synthetic.plan.clip_heavy_intro", {
+          cutoffSeconds: cutoff,
+          blocksPromoted: promoted,
+        });
+      }
     }
   }
 

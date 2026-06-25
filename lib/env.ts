@@ -567,6 +567,13 @@ const ServerEnvSchema = z.object({
   // LTX.
   SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
   SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
+  // Clip-heavy intro (client requirement 2026-06). The reference channel opens
+  // with mostly MOVING footage and shifts to still images later to save credits.
+  // Any 'image' block whose spoken window STARTS before this many seconds is
+  // promoted to 'ai_clip' so the first stretch of the video is animated. After
+  // this cutoff blocks keep whatever type Gemini chose (stills dominate, cheaper).
+  // 0 disables the promotion entirely.
+  SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(180),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

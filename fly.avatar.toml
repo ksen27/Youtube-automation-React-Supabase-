@@ -27,6 +27,17 @@ primary_region = 'lhr'
   WORKER_ROLE = "synthetic"
   # Headless Chromium for HeyGen automation.
   HEYGEN_HEADLESS = "true"
+  # How long the warm HeyGen session is trusted before the worker re-verifies it
+  # by loading /home. That /home hit is a fresh Cloudflare challenge, and in a
+  # long unbroken batch (20-30 avatar videos) the default 20-min re-verify fired
+  # mid-batch (~video 10-15), failed the challenge, and logged the account out —
+  # forcing a manual `npm run heygen:connect`. Set very high (~7 days) so the
+  # re-verify never fires DURING a batch; the renders themselves prove the session
+  # is alive and cookies are re-saved after each render, so the /home check adds no
+  # safety it doesn't already have. NOTE: this only removes the worker-triggered
+  # logout — Cloudflare/HeyGen can still revoke a session on their side, so rare
+  # logouts remain possible (mitigate with multiple connected accounts).
+  HEYGEN_REVERIFY_AFTER_MINUTES = "9999"
   # Local scratch for downloads/screenshots (ephemeral is fine — no resume
   # cache is needed for avatar jobs the way renders need /data).
   TMP_DIR = "/tmp/work"

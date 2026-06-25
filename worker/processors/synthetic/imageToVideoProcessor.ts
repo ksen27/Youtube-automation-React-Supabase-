@@ -44,7 +44,11 @@ export async function processImageToVideoJob(
   // stashed by the planner) so the still is on-topic.
   const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
   const imagePrompt = (seg.image_prompt?.trim() || basePrompt).trim();
-  const animationPrompt = (seg.animation_prompt ?? "Subtle natural motion, slow push-in").trim();
+  // Default to the client's preferred look: a gentle camera move over an
+  // otherwise still scene (slow pan / slow push-in), NOT eventful motion.
+  const animationPrompt = (
+    seg.animation_prompt ?? "Slow horizontal camera pan left to right across the scene, the scene itself static, gentle and steady"
+  ).trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
   // --- step 1: ensure a source still exists (reuse on retry) ---
