@@ -53,6 +53,12 @@ primary_region = 'lhr'
   # to a FRESH fingerprint before the 3rd render avoids the wall. Tune down if
   # the wall moves earlier, up if a fresh session survives more renders.
   HEYGEN_MAX_RENDERS_PER_SESSION = "2"
+  # Use patchright (stealth-patched Chromium) instead of vanilla Playwright.
+  # Vanilla headless Chromium intermittently fails Cloudflare's bot challenge on
+  # /home and /avatar (blank_composer in bursts, session + IP both healthy).
+  # patchright removes the CDP/headless tells the hand-rolled init scripts can't.
+  # Requires `npx patchright install chromium` in the image (see Dockerfile.worker).
+  HEYGEN_USE_STEALTH = "true"
   # Local scratch for downloads/screenshots (ephemeral is fine — no resume
   # cache is needed for avatar jobs the way renders need /data).
   TMP_DIR = "/tmp/work"

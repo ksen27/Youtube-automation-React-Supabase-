@@ -26,6 +26,12 @@ RUN npm ci --omit=dev=false
 # Debian slim. Browsers land under /root/.cache/ms-playwright by default.
 RUN npx playwright install --with-deps chromium
 
+# patchright (stealth-patched Chromium) for HEYGEN_USE_STEALTH=true — it ships
+# its OWN patched Chromium build, so it must be installed separately from the
+# Playwright one above. The OS deps are already present from --with-deps, so a
+# plain `install chromium` (no --with-deps) suffices here.
+RUN npx patchright install chromium
+
 COPY . .
 
 # AOF (appendonly) keeps queue state durable across restarts; noeviction is

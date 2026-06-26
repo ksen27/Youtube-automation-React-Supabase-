@@ -494,6 +494,18 @@ const ServerEnvSchema = z.object({
   // (HEYGEN_PROXIES) — leave false until proxy auth is confirmed (the shared
   // YTDLP pool 407'd). Default false: connect from the human's own IP.
   HEYGEN_CONNECT_USES_PROXY: z.coerce.boolean().default(false),
+  // Use the stealth-patched Chromium (patchright) instead of vanilla Playwright
+  // for the HeyGen browser. Vanilla headless Chromium intermittently fails
+  // Cloudflare's bot challenge on /home and /avatar — the page comes up blank
+  // ("blank_composer") even though the session is valid (observed 2026-06-26:
+  // bursts of successes interleaved with bursts of blank-composer failures, IP
+  // and session both healthy). patchright removes the CDP/headless tells that
+  // hand-rolled init scripts can't. When true, openAuthedContext also DROPS the
+  // manual anti-automation args/UA override — those are themselves detection
+  // tells that patchright strips automatically. Toggleable so we can A/B and
+  // revert without a code change. Requires patchright + its Chromium installed
+  // (see Dockerfile.worker). Default false (vanilla Playwright).
+  HEYGEN_USE_STEALTH: z.coerce.boolean().default(false),
   // Seconds to wait before each avatar attempt, to break up burst patterns that
   // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
   // just spaces serial jobs apart.

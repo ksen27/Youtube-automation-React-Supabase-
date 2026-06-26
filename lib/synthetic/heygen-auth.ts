@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium as playwrightChromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { getEnv } from "@/lib/env";
 import { uploadBuffer } from "@/lib/storage";
 import {
@@ -32,6 +32,30 @@ function env() {
   return getEnv();
 }
 
+// Pick the Chromium launcher: patchright (stealth-patched) when HEYGEN_USE_STEALTH
+// is on, else vanilla Playwright. patchright exposes the SAME chromium API
+// surface, so the rest of this module is unchanged. We require() it lazily so a
+// build/host without patchright installed still loads this module (the flag must
+// be off there). Falls back to Playwright with a warning if the require fails.
+function chromiumLauncher(): typeof playwrightChromium {
+  if (!env().HEYGEN_USE_STEALTH) return playwrightChromium;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const patchright = require("patchright") as { chromium: typeof playwrightChromium };
+    return patchright.chromium;
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "heygen.stealth.unavailable",
+        err: (err as Error).message,
+        note: "HEYGEN_USE_STEALTH=true but patchright not installed — falling back to playwright",
+      }),
+    );
+    return playwrightChromium;
+  }
+}
+
 // True when we should run the browser visibly (debugging). In debug mode we
 // also apply slowMo. Never true on a headless worker host unless explicitly set.
 function debugEnabled(): boolean {
@@ -52,18 +76,23 @@ export async function openAuthedContext(
   // worker path still proxies normally.
   const proxyRaw = opts.noProxy ? null : resolveProxy(account);
   const headed = opts.headedOverride || debugEnabled();
-  const browser = await chromium.launch({
+  const stealth = e.HEYGEN_USE_STEALTH;
+  const browser = await chromiumLauncher().launch({
     headless: !headed,
     slowMo: headed ? e.HEYGEN_SLOWMO_MS : undefined,
     proxy: proxyRaw ? parseProxy(proxyRaw) : undefined,
-    // Anti-automation hardening: drop the flags Cloudflare's bot detection keys
-    // on. --disable-blink-features=AutomationControlled removes the most obvious
-    // navigator.webdriver/automation tell.
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-    ],
+    // In stealth mode patchright removes the automation tells itself, and
+    // --disable-blink-features=AutomationControlled is ITSELF a flag bot
+    // detectors look for — so we drop it and pass only the container essentials.
+    // In vanilla mode we keep the hand-rolled hardening (best we can do without
+    // the stealth patches).
+    args: stealth
+      ? ["--no-sandbox", "--disable-dev-shm-usage"]
+      : [
+          "--disable-blink-features=AutomationControlled",
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+        ],
   });
   const withState = opts.withStorageState ?? true;
   const context = await browser.newContext({
@@ -73,21 +102,26 @@ export async function openAuthedContext(
         ? (account.cookies as Awaited<ReturnType<BrowserContext["storageState"]>>)
         : undefined,
     viewport: { width: 1366, height: 900 },
-    // Look like a normal desktop Chrome rather than headless: a real UA, a
-    // locale/timezone, and a device scale. These reduce the headless fingerprint
-    // Cloudflare scores against.
-    userAgent: e.HEYGEN_USER_AGENT,
+    // In stealth mode, do NOT override the UA: patchright ships a consistent,
+    // non-headless UA + matching client hints, and a mismatched manual UA is a
+    // detectable inconsistency. In vanilla mode we still spoof a desktop UA to
+    // soften the headless fingerprint.
+    ...(stealth ? {} : { userAgent: e.HEYGEN_USER_AGENT }),
     locale: "en-US",
     timezoneId: "America/New_York",
     deviceScaleFactor: 1,
   });
-  // Mask the residual automation tells before any page script runs.
-  await context.addInitScript(() => {
-    // navigator.webdriver -> undefined
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    // A plausible plugins/languages surface (headless reports empty).
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-  });
+  // The manual navigator.webdriver / languages masking is only for vanilla mode.
+  // patchright patches these at the engine level; re-defining them from an init
+  // script creates a detectable override and would UNDO the stealth, so skip it.
+  if (!stealth) {
+    await context.addInitScript(() => {
+      // navigator.webdriver -> undefined
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      // A plausible plugins/languages surface (headless reports empty).
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    });
+  }
   context.setDefaultTimeout(e.HEYGEN_NAV_TIMEOUT_MS);
   return { browser, context };
 }
