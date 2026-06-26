@@ -33,6 +33,14 @@ const GeminiSegmentSchema = z.object({
   // block's spoken window in the word timings.
   script: z.string().min(1),
   imagePrompt: z.string().optional().default(""),
+  // A SECOND, genuinely DIFFERENT scene for the same sentence. A long sentence
+  // (> SYNTHETIC_BLOCK_SPLIT_THRESHOLD) is covered by TWO visuals; without a
+  // distinct prompt the second one reused imagePrompt + a weak "different angle"
+  // suffix and nano-banana drew a near-clone. imagePrompt2 lets Gemini describe
+  // a different subject / moment / detail OF THE SAME sentence so the two
+  // visuals don't look like duplicates. Only used when the block actually splits
+  // (short blocks ignore it); empty for avatar blocks.
+  imagePrompt2: z.string().optional().default(""),
   animationPrompt: z.string().optional().default(""),
 });
 const GeminiResponseSchema = z.object({
@@ -52,10 +60,15 @@ export interface PlannedSegment {
   duration: number;
   script: string;
   imagePrompt: string | null;
+  // A distinct second scene for the SAME sentence, used as the second visual's
+  // prompt when a long sentence is split (see splitByDuration). Null/undefined
+  // when Gemini didn't supply one — then the second visual falls back to varying
+  // imagePrompt via the secondVisual nudge.
+  imagePrompt2?: string | null;
   animationPrompt: string | null;
   // True for the SECOND visual attached to a long sentence (see
-  // splitByDuration). Both visuals share the full sentence + prompt; this flag
-  // tells the persist step to nudge the second one to a different
+  // splitByDuration). The second visual prefers imagePrompt2; if that's absent
+  // this flag tells the persist step to nudge imagePrompt to a different
   // composition/angle so the two frames aren't identical.
   secondVisual?: boolean;
 }
@@ -70,7 +83,13 @@ const SINGLE_SUBJECT_RULE =
   "whole frame. NEVER describe a collage, split-screen, grid, diptych, side-by-" +
   "side comparison, before/after, or multiple separate scenes in one image, and " +
   "NEVER ask for any text, caption, label, sign, calendar, or written words in " +
-  "the picture. One block = one clean single photo of one subject.";
+  "the picture. One block = one clean single photo of one subject. " +
+  "SCOPE: this rule governs the CONTENT of one generated still only — it does " +
+  "NOT discourage the 'split_2' blockType. split_2 is a player-side LAYOUT " +
+  "(a talking presenter beside a separate illustrative still, composited at " +
+  "render time), NOT a collage drawn inside one image, so keep choosing split_2 " +
+  "whenever the narration calls for it; its imagePrompt still follows this rule " +
+  "(one clean single-subject still for the illustrative half).";
 
 // Object-first B-roll rule (client requirement 2026-06). The reference channel
 // reads as the creator filming his OWN garden, not a stock library: when the
@@ -161,6 +180,18 @@ function buildPrompt(transcript: string): string {
     "the subject) — do NOT leave imagePrompt empty and do NOT fall back to the",
     "spoken words. An empty imagePrompt is INVALID output.",
     "",
+    "SECOND VISUAL — also write an `imagePrompt2` for EVERY image/ai_clip block.",
+    "A long sentence is shown with TWO visuals, so imagePrompt2 is a SECOND,",
+    "genuinely DIFFERENT picture of the SAME sentence — a different subject, a",
+    "different moment, or a different detail of this same thought (e.g. if",
+    "imagePrompt shows a close-up of cracked soil, imagePrompt2 might show a dead",
+    "earthworm in that soil, or a wide shot of the bare patch). It MUST NOT be the",
+    "same scene as imagePrompt with only a reworded angle — make it a DISTINCT",
+    "shot so the two visuals never look like duplicates. It follows ALL the same",
+    "rules as imagePrompt (picture-not-narration, single-subject, B-roll objects,",
+    "amateur look). If you genuinely cannot think of a second distinct on-topic",
+    "scene, you may leave it empty and the system will vary the first one.",
+    "",
     SINGLE_SUBJECT_RULE,
     "",
     BROLL_OBJECT_RULE,
@@ -181,7 +212,7 @@ function buildPrompt(transcript: string): string {
     "right across the scene, otherwise still' or 'slow push-in, scene static').",
     "avatar blocks need no prompts.",
     "",
-    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","animationPrompt"}]}',
+    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","imagePrompt2","animationPrompt"}]}',
     "",
     "TRANSCRIPT:",
     transcript.trim(),
@@ -397,6 +428,7 @@ function mk(
     duration: Math.max(0.5, endTime - startTime),
     script: s.script.trim(),
     imagePrompt: isVisual ? (s.imagePrompt?.trim() || null) : null,
+    imagePrompt2: isVisual ? (s.imagePrompt2?.trim() || null) : null,
     animationPrompt: s.blockType === "ai_clip" ? (s.animationPrompt?.trim() || null) : null,
   };
 }
@@ -586,9 +618,11 @@ export function coalesceAvatarSegments(segs: PlannedSegment[]): {
 //       * split_2 sentence  -> left to the avatar flow (a talking presenter
 //         holds the whole sentence); not time-split here.
 //
-// Both pieces keep the parent's script + imagePrompt. The SECOND piece is
-// flagged (metadata.secondVisual) so the persist step / image generator can
-// nudge it to a different composition rather than producing a duplicate frame.
+// Both pieces keep the parent's script. The SECOND piece shows a DIFFERENT
+// scene: it uses Gemini's distinct imagePrompt2 when present (a genuinely
+// different subject/moment of the same sentence), and only falls back to the
+// secondVisual "different angle" nudge on imagePrompt when imagePrompt2 is
+// absent — so the two visuals don't render as duplicate frames.
 //
 // 'avatar' / 'split_2' blocks are NEVER time-split: the talking head holds for
 // the whole sentence and is generated by HeyGen. `position` is reassigned by
@@ -606,43 +640,53 @@ export function splitByDuration(
   // so we never fragment it further than first-half / second-half.
   const mid = seg.startTime + dur / 2;
 
+  // The second visual prefers Gemini's distinct imagePrompt2 (a genuinely
+  // different scene of the same sentence). When present we swap it into the
+  // second piece's imagePrompt and DON'T set secondVisual — no weak "different
+  // angle" suffix is needed because the scene is already different. Only when
+  // imagePrompt2 is missing do we fall back to flagging secondVisual so persist
+  // appends the variation nudge to the (reused) first prompt.
+  const applySecondScene = (piece: PlannedSegment): PlannedSegment =>
+    seg.imagePrompt2
+      ? { ...piece, imagePrompt: seg.imagePrompt2, secondVisual: false }
+      : { ...piece, secondVisual: true };
+
   if (seg.blockType === "ai_clip") {
     // Clip first (it snaps to an LTX tier at generation time), image fills the
     // remainder. The clip piece keeps its animationPrompt; the fill image drops
-    // it (an image has no motion) and is marked as the second visual.
+    // it (an image has no motion) and shows the distinct second scene.
     const clipPiece: PlannedSegment = {
       ...seg,
       startTime: seg.startTime,
       endTime: mid,
       duration: Math.max(0.5, mid - seg.startTime),
     };
-    const fillImage: PlannedSegment = {
+    const fillImage: PlannedSegment = applySecondScene({
       ...seg,
       blockType: "image",
       animationPrompt: null,
       startTime: mid,
       endTime: seg.endTime,
       duration: Math.max(0.5, seg.endTime - mid),
-      secondVisual: true,
-    };
+    });
     return [clipPiece, fillImage];
   }
 
-  // image: two stills, each holding half the sentence, both from the full
-  // sentence. The second is flagged so it gets a different composition/angle.
+  // image: two stills, each holding half the sentence. The first uses
+  // imagePrompt; the second uses the distinct second scene (imagePrompt2, or a
+  // varied first prompt as fallback).
   const first: PlannedSegment = {
     ...seg,
     startTime: seg.startTime,
     endTime: mid,
     duration: Math.max(0.5, mid - seg.startTime),
   };
-  const second: PlannedSegment = {
+  const second: PlannedSegment = applySecondScene({
     ...seg,
     startTime: mid,
     endTime: seg.endTime,
     duration: Math.max(0.5, seg.endTime - mid),
-    secondVisual: true,
-  };
+  });
   return [first, second];
 }
 

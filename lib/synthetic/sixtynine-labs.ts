@@ -126,10 +126,15 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
   // 2) Poll status until COMPLETED (or a terminal failure / timeout).
   const deadline = Date.now() + c.ttsPollTimeoutMs;
   while (Date.now() < deadline) {
-    const statusRes = await fetchOrThrow(`${c.base}/api/v1/tts/status/${jobId}`, {
-      headers: authOnly,
-      timeoutMs: 30_000,
-    });
+    // Wrap the poll in withHttpRetry: 69labs rate-limits the status endpoint by
+    // request rate and returns 429 TOO_MANY_REQUESTS under load. A bare poll
+    // would fail the whole job on a single 429; retry rides it out with backoff.
+    const statusRes = await withHttpRetry("69labs.tts.status", () =>
+      fetchOrThrow(`${c.base}/api/v1/tts/status/${jobId}`, {
+        headers: authOnly,
+        timeoutMs: 30_000,
+      }),
+    );
     const st = (await statusRes.json()) as TtsStatusResponse;
     if (st.status === "COMPLETED") break;
     if (st.status === "FAILED" || st.status === "CANCELLED") {
@@ -217,12 +222,24 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
   if (!jobId) throw new Error("69labs image: submit returned no job id");
 
   // 2) Poll status until COMPLETED (or a terminal failure / timeout).
+  //
+  // The status GET does NOT count against the generation-concurrency cap, but
+  // 69labs ALSO rate-limits this endpoint by REQUEST RATE and returns 429
+  // {"error":"Too many requests","code":"TOO_MANY_REQUESTS"} when too many polls
+  // arrive per minute. With several images in flight — each polling on its own
+  // timer — plus TTS polling, a fixed 1s cadence blows past that budget. So:
+  //   - wrap each poll in withHttpRetry so a 429/5xx/network blip is ridden out
+  //     with backoff instead of failing the whole segment, and
+  //   - use a 2s base cadence (up from 1s) to stay under the rate budget.
   const deadline = Date.now() + c.imagePollTimeoutMs;
+  const pollIntervalMs = 2000;
   while (Date.now() < deadline) {
-    const statusRes = await fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
-      headers: authOnly,
-      timeoutMs: 30_000,
-    });
+    const statusRes = await withHttpRetry("69labs.image.status", () =>
+      fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
+        headers: authOnly,
+        timeoutMs: 30_000,
+      }),
+    );
     const st = (await statusRes.json()) as ImageStatusResponse;
     if (st.status === "COMPLETED") break;
     if (st.status === "FAILED" || st.status === "CANCELLED") {
@@ -231,10 +248,7 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
     if (st.status === "CENSORED") {
       throw new Error(`69labs image: CENSORED (job ${jobId}) — edit the prompt and retry`);
     }
-    // Poll every 1s (was 2s): a status GET is cheap and doesn't count against the
-    // generation concurrency cap, so a tighter interval shaves up to ~1s of dead
-    // wait per image off the time between "done on 69labs" and "we notice".
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
   if (Date.now() >= deadline) throw new Error(`69labs image: poll timed out (job ${jobId})`);
 
