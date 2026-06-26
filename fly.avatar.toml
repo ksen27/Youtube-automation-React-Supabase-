@@ -38,6 +38,21 @@ primary_region = 'lhr'
   # logout — Cloudflare/HeyGen can still revoke a session on their side, so rare
   # logouts remain possible (mitigate with multiple connected accounts).
   HEYGEN_REVERIFY_AFTER_MINUTES = "9999"
+  # How long verifyAuthenticated waits for HeyGen's authed nav marker before
+  # judging the session expired. Measured 2026-06-26: through the residential
+  # proxy the authed marker renders at ~46s — right at the old 45s default, so a
+  # still-VALID session timed out, was flagged needs_reauth, and emptied the
+  # single-account pool ("no available accounts" on the very first job of a
+  # batch). 90s sits comfortably above real proxy latency.
+  HEYGEN_AUTH_MARKER_TIMEOUT_MS = "90000"
+  # Recycle the warm headless browser after this many renders. Observed
+  # 2026-06-26: a headless session renders exactly 2 avatars, then Cloudflare
+  # flags it and serves a bot challenge on every /avatar load — the composer
+  # comes up blank ("blank_composer") forever and the page-only rebuild can't
+  # recover (the SESSION is flagged, not the page). Rebuilding the whole browser
+  # to a FRESH fingerprint before the 3rd render avoids the wall. Tune down if
+  # the wall moves earlier, up if a fresh session survives more renders.
+  HEYGEN_MAX_RENDERS_PER_SESSION = "2"
   # Local scratch for downloads/screenshots (ephemeral is fine — no resume
   # cache is needed for avatar jobs the way renders need /data).
   TMP_DIR = "/tmp/work"

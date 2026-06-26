@@ -456,8 +456,12 @@ const ServerEnvSchema = z.object({
   // How long verifyAuthenticated waits for the authed/sign-in marker to render
   // before judging the session. The heavy HeyGen SPA renders its nav at ~14.5s
   // through a residential proxy — the old hardcoded 15s caused FALSE expiries
-  // (a valid session timed out and got flagged needs_reauth). Default 45s.
-  HEYGEN_AUTH_MARKER_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
+  // (a valid session timed out and got flagged needs_reauth). The 45s default
+  // was ALSO too tight: measured 2026-06-26 the authed marker took ~46s through
+  // the residential proxy, so a still-valid session got mis-judged "expired" and
+  // emptied the single-account pool ("no available accounts"). Default 90s to
+  // sit comfortably above real proxy latency. Bump if real loads exceed it.
+  HEYGEN_AUTH_MARKER_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   // How long an avatar render may take inside HeyGen before we give up (ms).
   HEYGEN_RENDER_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   // fail_count threshold past which an account is auto-disabled (taken out of
@@ -494,6 +498,15 @@ const ServerEnvSchema = z.object({
   // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
   // just spaces serial jobs apart.
   HEYGEN_JOB_SPACING_SECONDS: z.coerce.number().int().nonnegative().default(20),
+  // How many renders the warm headless browser may drive before it is fully
+  // torn down and rebuilt FRESH from stored cookies. Observed 2026-06-26 in
+  // production: a headless session reliably renders exactly 2 avatars, then
+  // Cloudflare flags it and serves a bot challenge on every subsequent /avatar
+  // load — the composer comes up blank ("blank_composer") forever and the
+  // page-only rebuild can't recover it (the SESSION is flagged, not just the
+  // page). Recycling the whole browser BEFORE the render that would hit the wall
+  // resets the fingerprint Cloudflare scores against. 0 disables recycling.
+  HEYGEN_MAX_RENDERS_PER_SESSION: z.coerce.number().int().nonnegative().default(2),
   // Minutes between session refreshes for `npm run heygen:keepalive --watch`.
   // Keep it below HeyGen's idle-session TTL so the sliding window never lapses
   // and a single account stays logged in across bursts and quiet periods.

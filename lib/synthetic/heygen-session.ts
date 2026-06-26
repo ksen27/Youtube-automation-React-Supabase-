@@ -46,6 +46,12 @@ interface WarmSession {
   // (the cause of the slow ~minutes-to-start). null until first use / after a
   // crash forces a rebuild.
   jobPage: Page | null;
+  // How many renders this warm browser has driven. After
+  // HEYGEN_MAX_RENDERS_PER_SESSION renders the whole browser is recycled (fresh
+  // fingerprint) BEFORE the next render, so Cloudflare's per-session activity
+  // heuristic never trips into the blank-composer challenge. See
+  // HEYGEN_MAX_RENDERS_PER_SESSION in lib/env.ts for the why.
+  rendersServed: number;
 }
 
 let current: WarmSession | null = null;
@@ -88,7 +94,14 @@ async function launch(account: DecryptedAccount): Promise<WarmSession> {
     // created in acquireJobPage). Closing this keeps the context lean.
     await verifyPage.close().catch(() => {});
   }
-  return { browser, context, accountId: account.id, verifiedAtMs: Date.now(), jobPage: null };
+  return {
+    browser,
+    context,
+    accountId: account.id,
+    verifiedAtMs: Date.now(),
+    jobPage: null,
+    rendersServed: 0,
+  };
 }
 
 /**
@@ -111,6 +124,26 @@ export async function acquireWarmSession(account: DecryptedAccount): Promise<Bro
 
   // Different account than the one we hold => rotation; rebuild.
   if (current && current.accountId !== account.id) {
+    await disposeCurrent();
+  }
+
+  // Render-cap recycle: a warm headless browser only survives a couple of
+  // renders before Cloudflare flags it and serves the blank-composer challenge
+  // on every /avatar load (observed: exactly 2 renders, then it walls). Tear the
+  // whole browser down and rebuild a FRESH one from stored cookies BEFORE the
+  // render that would otherwise hit the wall. A fresh browser = a fresh
+  // fingerprint, resetting the heuristic. The cap (0 disables) is env-driven.
+  const maxRenders = env().HEYGEN_MAX_RENDERS_PER_SESSION;
+  if (current && current.accountId === account.id && maxRenders > 0 && current.rendersServed >= maxRenders) {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "heygen.session.recycle",
+        accountId: account.id,
+        rendersServed: current.rendersServed,
+        maxRenders,
+      }),
+    );
     await disposeCurrent();
   }
 
@@ -211,6 +244,17 @@ export function hasWarmSession(): boolean {
 }
 
 /**
+ * Count one completed render against the warm session's render budget. The
+ * caller invokes this AFTER a successful generation so the next acquire can
+ * recycle the browser once it has served HEYGEN_MAX_RENDERS_PER_SESSION renders
+ * — before Cloudflare flags the session into the blank-composer challenge. No-op
+ * if no session is held (e.g. it was torn down on failure).
+ */
+export function recordRenderServed(): void {
+  if (current) current.rendersServed += 1;
+}
+
+/**
  * The account id of the currently-held warm session, or null. The keep-alive
  * sweep uses this to SKIP refreshing the warm account: that account already has
  * a live, in-use browser session, and opening a SECOND concurrent browser to
@@ -219,4 +263,30 @@ export function hasWarmSession(): boolean {
  */
 export function warmAccountId(): string | null {
   return current?.accountId ?? null;
+}
+
+// Count of avatar renders currently in flight. The keep-alive sweep MUST NOT
+// open a second concurrent HeyGen browser while a render is running: two live
+// sessions for the same account from the same IP is exactly the activity that
+// trips Cloudflare into the blank-composer / page-wipe challenge. The old
+// `skipAccountId: warmAccountId()` guard was insufficient on a single-account
+// pool — between/just-before jobs warmAccountId() is null, so the sweep would
+// refresh the ONLY account right as a render started. This counter is the
+// authoritative "a job is active" signal, independent of whether the warm
+// session object exists yet.
+let activeRenders = 0;
+
+/** Mark an avatar render as started — the keep-alive sweep will skip while >0. */
+export function beginRender(): void {
+  activeRenders += 1;
+}
+
+/** Mark an avatar render as finished (success OR failure). Never goes negative. */
+export function endRender(): void {
+  activeRenders = Math.max(0, activeRenders - 1);
+}
+
+/** True while at least one avatar render is in flight. */
+export function isRenderActive(): boolean {
+  return activeRenders > 0;
 }

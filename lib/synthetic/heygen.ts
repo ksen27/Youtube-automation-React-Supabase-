@@ -20,6 +20,7 @@ import {
 import {
   acquireJobPage,
   invalidateWarmSession,
+  recordRenderServed,
 } from "@/lib/synthetic/heygen-session";
 import {
   HeygenError,
@@ -960,6 +961,10 @@ async function attemptOnAccount(
     // reload.
     await saveCookies(account.id, await context.storageState()).catch(() => {});
     await recordSuccess(account.id);
+    // Count this render against the warm browser's budget. Once it reaches
+    // HEYGEN_MAX_RENDERS_PER_SESSION the NEXT acquire recycles the browser to a
+    // fresh fingerprint, BEFORE Cloudflare flags it into the blank-composer wall.
+    recordRenderServed();
 
     // Output length. For audio-driven renders the render length equals the
     // uploaded audio, so use its known duration; otherwise fall back to the

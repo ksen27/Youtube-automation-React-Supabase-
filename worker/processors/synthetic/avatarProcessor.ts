@@ -6,6 +6,7 @@ import type { AvatarJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
+import { beginRender, endRender } from "@/lib/synthetic/heygen-session";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -233,21 +234,30 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   }
 
   try {
-    const result = await generateAvatar(
-      {
-        projectId,
-        segmentId,
-        jobId: mediaJobId,
-        avatarImageUrl: project.avatar_image_url as string,
-        script: seg.script ?? "",
-        audioFilePath: audio?.path,
-        audioDurationSeconds: audio?.durationSeconds,
-        // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
-        // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
-        aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
-      },
-      imageBytes,
-    );
+    // Mark a render in flight so the keep-alive sweep won't open a second
+    // concurrent HeyGen browser on top of it (the Cloudflare page-wipe trigger).
+    // Wrapped in try/finally so the flag clears on success AND failure.
+    beginRender();
+    let result;
+    try {
+      result = await generateAvatar(
+        {
+          projectId,
+          segmentId,
+          jobId: mediaJobId,
+          avatarImageUrl: project.avatar_image_url as string,
+          script: seg.script ?? "",
+          audioFilePath: audio?.path,
+          audioDurationSeconds: audio?.durationSeconds,
+          // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
+          // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
+          aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
+        },
+        imageBytes,
+      );
+    } finally {
+      endRender();
+    }
     // For split_2 the avatar is the LEFT video; the right still is set by the
     // image-gen processor. video_url holds the avatar mp4 either way.
     // Clear any error left by a prior attempt or a premature stall-sweep — a
