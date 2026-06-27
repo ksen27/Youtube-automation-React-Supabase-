@@ -370,6 +370,15 @@ const ServerEnvSchema = z.object({
   // poll GET /api/v1/tts/status/:jobId -> GET /api/v1/tts/download/:jobId.
   // Base URL has NO version suffix here; route paths include /api/v1/...
   SIXTYNINE_LABS_API_KEY: z.string().optional(),
+  // Optional BACKUP image key. Used ONLY for image generation, and ONLY as a
+  // failover: when the primary key returns a permanent auth 403 ("Access denied"
+  // / FORBIDDEN — a revoked/blocked/expired key, NOT the transient "concurrent
+  // limit reached" 403 which is retried on the same key), the image submit
+  // retries once on this key instead of failing the segment. The two keys are
+  // never used concurrently, so the existing per-process concurrency cap
+  // (SIXTYNINE_IMAGE_CONCURRENCY) still protects each key's tier limit unchanged.
+  // Leave empty to keep single-key behavior.
+  SIXTYNINE_LABS_API_KEY_BACKUP: z.string().optional(),
   SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://69labs.vip"),
   // TTS voiceProvider: elevenlabs | edgetts | minimax (wire-level value).
   SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),
@@ -516,15 +525,22 @@ const ServerEnvSchema = z.object({
   // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
   // just spaces serial jobs apart.
   HEYGEN_JOB_SPACING_SECONDS: z.coerce.number().int().nonnegative().default(20),
-  // How many renders the warm headless browser may drive before it is fully
-  // torn down and rebuilt FRESH from stored cookies. Observed 2026-06-26 in
-  // production: a headless session reliably renders exactly 2 avatars, then
-  // Cloudflare flags it and serves a bot challenge on every subsequent /avatar
-  // load — the composer comes up blank ("blank_composer") forever and the
-  // page-only rebuild can't recover it (the SESSION is flagged, not just the
-  // page). Recycling the whole browser BEFORE the render that would hit the wall
-  // resets the fingerprint Cloudflare scores against. 0 disables recycling.
-  HEYGEN_MAX_RENDERS_PER_SESSION: z.coerce.number().int().nonnegative().default(2),
+  // BACKSTOP cap on how many renders the warm headless browser may drive before
+  // it is preemptively torn down and rebuilt FRESH from stored cookies. As of
+  // the health-based recycling refactor (lib/synthetic/heygen-health.ts) this is
+  // NO LONGER the primary recycle trigger — a browser that goes bad (blank
+  // composer / Cloudflare wall, failure streak, crash, disconnect) is recycled
+  // by HEALTH the moment it degrades, which is faster and avoids re-driving a
+  // broken session. The cap remains as a PREEMPTIVE safety net for the happy
+  // path: production (2026-06-26) showed a healthy headless session still gets
+  // Cloudflare-flagged after a number of renders and then walls every /avatar
+  // load (the SESSION is flagged, not just the page; a page-only rebuild can't
+  // recover it). Recycling BEFORE that point keeps the happy path from ever
+  // hitting the wall. Set it just above the observed safe render count so
+  // healthy browsers stay warm longer (the speed win) while never reaching the
+  // wall; health catches anything that degrades earlier. 0 disables the cap and
+  // relies on health alone.
+  HEYGEN_MAX_RENDERS_PER_SESSION: z.coerce.number().int().nonnegative().default(6),
   // Minutes between session refreshes for `npm run heygen:keepalive --watch`.
   // Keep it below HeyGen's idle-session TTL so the sliding window never lapses
   // and a single account stays logged in across bursts and quiet periods.

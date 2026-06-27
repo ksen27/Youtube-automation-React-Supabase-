@@ -21,7 +21,9 @@ import {
   acquireJobPage,
   invalidateWarmSession,
   recordRenderServed,
+  recordRenderFailure,
 } from "@/lib/synthetic/heygen-session";
+import { inspectPage } from "@/lib/synthetic/heygen-health";
 import {
   HeygenError,
   classifyHeygenFailure,
@@ -594,6 +596,20 @@ async function attemptOnAccount(
     // reload — not a cold load — but it still resets any photo/script/audio the
     // previous render left behind. The avatar composer lives at /avatar.
     await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
+    // FAST-FAIL (Objective #5): before the long composer wait, do a cheap ~1-2s
+    // inspection. A Cloudflare challenge body, a crashed page, or a blank SPA
+    // root is unmistakably broken — fail it NOW as blank_composer instead of
+    // burning the full HEYGEN_SETUP_TIMEOUT_MS waiting for a script field that
+    // will never appear. The catch below tears the warm session down and the
+    // next attempt rebuilds fresh. A merely-slow page returns broken=false and
+    // falls through to the normal element wait, so this never false-fails.
+    const fast = await inspectPage(p);
+    if (fast.broken) {
+      throw new HeygenError(
+        "blank_composer",
+        `heygen: avatar composer unusable (fast-fail: ${fast.reason})`,
+      );
+    }
     try {
       await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
     } catch (err) {
@@ -985,9 +1001,11 @@ async function attemptOnAccount(
     // reload.
     await saveCookies(account.id, await context.storageState()).catch(() => {});
     await recordSuccess(account.id);
-    // Count this render against the warm browser's budget. Once it reaches
-    // HEYGEN_MAX_RENDERS_PER_SESSION the NEXT acquire recycles the browser to a
-    // fresh fingerprint, BEFORE Cloudflare flags it into the blank-composer wall.
+    // Mark this render a success: clears the warm browser's failure streak
+    // (keeps a healthy browser warm) and counts it against the backstop render
+    // cap. Once the cap is reached — or health degrades earlier — the NEXT
+    // acquire recycles the browser to a fresh fingerprint before Cloudflare walls
+    // it into a blank composer.
     recordRenderServed();
 
     // Output length. For audio-driven renders the render length equals the
@@ -1017,6 +1035,15 @@ async function attemptOnAccount(
       err instanceof HeygenError
         ? err
         : new HeygenError(klass, (err as Error)?.message ?? "heygen: unknown failure", err);
+
+    // BROWSER-health bookkeeping (Objective #4/#6): record this failure against
+    // the warm browser's health BEFORE we decide account disposition. A
+    // blank_composer flips the browser unhealthy at once; other classes after a
+    // streak. The next acquireWarmSession() recycles the browser if so. This is
+    // independent of the ACCOUNT disposition applied in generateAvatar() — a
+    // browser problem recycles the browser; an account problem rotates the
+    // account.
+    recordRenderFailure(typed.klass);
 
     // Spec E: full diagnostics on every failure (url, title, screenshot, HTML).
     await captureDiagnostics(page, input.jobId, "error");

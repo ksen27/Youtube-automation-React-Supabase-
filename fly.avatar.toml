@@ -18,6 +18,15 @@
 #     SECRET_BOX_KEY=... HEYGEN_PROXIES=...
 # (REDIS_URL must point at the celebrity worker's public Redis — that's the
 #  shared queue both engines use.)
+#
+# OPTIONAL secret — backup 69labs image key (failover only):
+#   fly secrets set -c fly.avatar.toml SIXTYNINE_LABS_API_KEY_BACKUP=...
+# Used ONLY for image generation, and ONLY when the primary 69labs key returns a
+# permanent auth 403 ("Access denied" / FORBIDDEN — a revoked/blocked/expired
+# key). The image submit then retries once on this backup key instead of failing
+# the segment. The two keys are used one-at-a-time (never concurrently), so the
+# SIXTYNINE_IMAGE_CONCURRENCY cap still protects each key's tier limit. Omit to
+# keep single-key behavior. Like all keys it is a SECRET — do NOT put it in [env].
 
 app = 'video-automation-avatar-worker'
 primary_region = 'lhr'
@@ -45,14 +54,18 @@ primary_region = 'lhr'
   # single-account pool ("no available accounts" on the very first job of a
   # batch). 90s sits comfortably above real proxy latency.
   HEYGEN_AUTH_MARKER_TIMEOUT_MS = "90000"
-  # Recycle the warm headless browser after this many renders. Observed
-  # 2026-06-26: a headless session renders exactly 2 avatars, then Cloudflare
-  # flags it and serves a bot challenge on every /avatar load — the composer
-  # comes up blank ("blank_composer") forever and the page-only rebuild can't
-  # recover (the SESSION is flagged, not the page). Rebuilding the whole browser
-  # to a FRESH fingerprint before the 3rd render avoids the wall. Tune down if
-  # the wall moves earlier, up if a fresh session survives more renders.
-  HEYGEN_MAX_RENDERS_PER_SESSION = "2"
+  # BACKSTOP cap on warm-browser reuse. Since the health-based recycling refactor
+  # (lib/synthetic/heygen-health.ts) a browser that goes bad — blank composer /
+  # Cloudflare wall, failure streak, crash, disconnect — is recycled by HEALTH
+  # the moment it degrades, so this is no longer the primary trigger. It stays as
+  # a PREEMPTIVE safety net: a healthy headless session still gets Cloudflare-
+  # flagged after a number of renders and then walls every /avatar load (the
+  # SESSION is flagged, not the page; a page-only rebuild can't recover it).
+  # Recycling before that point keeps the happy path off the wall. Raised 2 -> 6
+  # so healthy browsers stay warm longer (the speed win) while health catches any
+  # that degrade earlier. Tune down if the wall is hit before health recycles; 0
+  # disables the cap and relies on health alone.
+  HEYGEN_MAX_RENDERS_PER_SESSION = "6"
   # Use patchright (stealth-patched Chromium) instead of vanilla Playwright.
   # Vanilla headless Chromium intermittently fails Cloudflare's bot challenge on
   # /home and /avatar (blank_composer in bursts, session + IP both healthy).

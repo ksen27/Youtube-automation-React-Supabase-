@@ -3,6 +3,25 @@ import { getEnv } from "@/lib/env";
 import { openAuthedContext, verifyAuthenticated } from "@/lib/synthetic/heygen-auth";
 import { HeygenError } from "@/lib/synthetic/heygen-errors";
 import type { DecryptedAccount } from "@/lib/synthetic/heygen-accounts";
+import {
+  type BrowserHealth,
+  newHealth,
+  isHealthy,
+  markSuccess,
+  markFailure,
+  markDisconnected,
+  markPageError,
+} from "@/lib/synthetic/heygen-health";
+
+// Structured, single-line lifecycle logging for the warm browser (Objective #9).
+// One helper so every browser-lifecycle event reads the same and is greppable.
+//   created | reused | health_updated | unhealthy | recycled
+//   composer_recovered | recovery_succeeded | recovery_failed
+function logSession(event: string, extra: Record<string, unknown> = {}): void {
+  console.log(
+    JSON.stringify({ ts: new Date().toISOString(), msg: `heygen.session.${event}`, ...extra }),
+  );
+}
 
 function baseUrl() {
   return getEnv().HEYGEN_BASE_URL;
@@ -46,12 +65,15 @@ interface WarmSession {
   // (the cause of the slow ~minutes-to-start). null until first use / after a
   // crash forces a rebuild.
   jobPage: Page | null;
-  // How many renders this warm browser has driven. After
-  // HEYGEN_MAX_RENDERS_PER_SESSION renders the whole browser is recycled (fresh
-  // fingerprint) BEFORE the next render, so Cloudflare's per-session activity
-  // heuristic never trips into the blank-composer challenge. See
+  // How many renders this warm browser has driven. The render count is now a
+  // BACKSTOP cap, not the primary recycle trigger: HEYGEN_MAX_RENDERS_PER_SESSION
+  // recycles the browser BEFORE it reaches the Cloudflare blank-composer wall on
+  // the happy path, while `health` (below) recycles EARLIER if the browser goes
+  // bad. 0 disables the cap and relies on health alone. See
   // HEYGEN_MAX_RENDERS_PER_SESSION in lib/env.ts for the why.
   rendersServed: number;
+  // Continuous health for this browser (Objective #4). Recycle when unhealthy.
+  health: BrowserHealth;
 }
 
 let current: WarmSession | null = null;
@@ -78,6 +100,14 @@ async function disposeCurrent(): Promise<void> {
 // caller's rotation/needs_reauth path handles it exactly as before.
 async function launch(account: DecryptedAccount): Promise<WarmSession> {
   const { browser, context } = await openAuthedContext(account);
+  const health = newHealth();
+  // Browser-disconnected event (Objective #4): a crashed/evicted browser must
+  // be recycled on the next acquire, not re-driven. Mark health; the acquire
+  // path reads isHealthy() and rebuilds.
+  browser.on("disconnected", () => {
+    markDisconnected(health);
+    logSession("unhealthy", { accountId: account.id, reason: "browser_disconnected" });
+  });
   const verifyPage = await context.newPage();
   try {
     const verdict = await verifyAuthenticated(verifyPage);
@@ -94,6 +124,7 @@ async function launch(account: DecryptedAccount): Promise<WarmSession> {
     // created in acquireJobPage). Closing this keeps the context lean.
     await verifyPage.close().catch(() => {});
   }
+  logSession("created", { accountId: account.id });
   return {
     browser,
     context,
@@ -101,6 +132,7 @@ async function launch(account: DecryptedAccount): Promise<WarmSession> {
     verifiedAtMs: Date.now(),
     jobPage: null,
     rendersServed: 0,
+    health,
   };
 }
 
@@ -127,30 +159,47 @@ export async function acquireWarmSession(account: DecryptedAccount): Promise<Bro
     await disposeCurrent();
   }
 
-  // Render-cap recycle: a warm headless browser only survives a couple of
-  // renders before Cloudflare flags it and serves the blank-composer challenge
-  // on every /avatar load (observed: exactly 2 renders, then it walls). Tear the
-  // whole browser down and rebuild a FRESH one from stored cookies BEFORE the
-  // render that would otherwise hit the wall. A fresh browser = a fresh
-  // fingerprint, resetting the heuristic. The cap (0 disables) is env-driven.
+  // Health-OR-cap recycle (Objectives #1, #4). Two complementary triggers:
+  //
+  //   1. HEALTH (primary, reactive): the browser went bad — a streak of failed
+  //      renders, a blank composer (Cloudflare wall), a page crash, or the
+  //      browser disconnected. Recycle immediately so we don't re-drive a known-
+  //      broken session and burn another full attempt at it.
+  //
+  //   2. RENDER CAP (backstop, preemptive): a healthy headless session still
+  //      gets Cloudflare-flagged after a number of renders and then walls every
+  //      load. Recycling BEFORE that point keeps the happy path from ever hitting
+  //      the wall. This is why the cap survives the move to health-based
+  //      recycling — health reacts AFTER a wall; the cap avoids reaching it. 0
+  //      disables the cap and relies on health alone.
+  //
+  // Either trigger tears the whole browser down and rebuilds a FRESH one from
+  // stored cookies (fresh fingerprint, resetting the heuristic).
   const maxRenders = env().HEYGEN_MAX_RENDERS_PER_SESSION;
-  if (current && current.accountId === account.id && maxRenders > 0 && current.rendersServed >= maxRenders) {
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        msg: "heygen.session.recycle",
+  if (current && current.accountId === account.id) {
+    const unhealthy = !isHealthy(current.health);
+    const capReached = maxRenders > 0 && current.rendersServed >= maxRenders;
+    if (unhealthy || capReached) {
+      logSession("recycled", {
         accountId: account.id,
+        reason: unhealthy ? "unhealthy" : "render_cap",
         rendersServed: current.rendersServed,
         maxRenders,
-      }),
-    );
-    await disposeCurrent();
+        health: current.health,
+      });
+      await disposeCurrent();
+    }
   }
 
   // Warm + same account + fresh enough => reuse with no /home hit.
   if (current && current.accountId === account.id) {
     const ageMs = Date.now() - current.verifiedAtMs;
     if (ageMs <= reverifyAfterMs()) {
+      logSession("reused", {
+        accountId: account.id,
+        rendersServed: current.rendersServed,
+        consecutiveFailures: current.health.consecutiveFailures,
+      });
       return current.context;
     }
     // Stale: re-verify once on a throwaway page, refresh the stamp, keep warm.
@@ -216,6 +265,16 @@ export async function acquireJobPage(
   // Recreate the warm page if it's missing or was closed (crash / prior teardown).
   if (!session.jobPage || session.jobPage.isClosed()) {
     session.jobPage = await context.newPage();
+    // Page-level health listeners (Objective #4/#5): a JS pageerror or a hard
+    // page crash both feed the browser's health so a degrading page is recycled
+    // rather than re-driven. A crash is treated as a failure tick immediately.
+    const sess = session;
+    session.jobPage.on("pageerror", () => markPageError(sess.health));
+    session.jobPage.on("crash", () => {
+      markPageError(sess.health);
+      markFailure(sess.health, "blank_composer");
+      logSession("unhealthy", { accountId: sess.accountId, reason: "page_crash" });
+    });
     await session.jobPage
       .goto(`${baseUrl()}/avatar`, { waitUntil: "commit" })
       .catch(() => {});
@@ -228,6 +287,10 @@ export async function acquireJobPage(
       await session.jobPage
         .goto(`${baseUrl()}/avatar`, { waitUntil: "commit" })
         .catch(() => {});
+      logSession("composer_recovered", {
+        accountId: session.accountId,
+        note: "warm page had drifted off /avatar; re-navigated",
+      });
     }
   }
   return { page: session.jobPage, context };
@@ -244,14 +307,58 @@ export function hasWarmSession(): boolean {
 }
 
 /**
- * Count one completed render against the warm session's render budget. The
- * caller invokes this AFTER a successful generation so the next acquire can
- * recycle the browser once it has served HEYGEN_MAX_RENDERS_PER_SESSION renders
- * — before Cloudflare flags the session into the blank-composer challenge. No-op
- * if no session is held (e.g. it was torn down on failure).
+ * Count one completed render against the warm session's render budget AND mark
+ * the browser's health as a success (clears the failure streak). The caller
+ * invokes this AFTER a successful generation: the count feeds the backstop cap
+ * (recycle before the Cloudflare wall) and the health success keeps a
+ * still-healthy browser warm for the next job. No-op if no session is held
+ * (e.g. it was torn down on failure).
  */
 export function recordRenderServed(): void {
-  if (current) current.rendersServed += 1;
+  if (!current) return;
+  current.rendersServed += 1;
+  markSuccess(current.health);
+  logSession("health_updated", {
+    accountId: current.accountId,
+    outcome: "success",
+    rendersServed: current.rendersServed,
+    health: current.health,
+  });
+}
+
+/**
+ * Record a FAILED render against the warm browser's health (Objective #4/#6).
+ * `klass` is the classified failure (heygen-errors) — a blank_composer flips the
+ * browser unhealthy at once (the Cloudflare wall is sticky on a flagged
+ * session); other classes flip it after a short streak. This is a BROWSER-level
+ * signal only; ACCOUNT disposition (cooldown/reauth/rotate) is decided
+ * separately in generateAvatar(), keeping the two systems independent. The next
+ * acquireWarmSession() recycles the browser if this made it unhealthy. No-op if
+ * no session is held.
+ */
+export function recordRenderFailure(klass: string): void {
+  if (!current) return;
+  markFailure(current.health, klass);
+  logSession("health_updated", {
+    accountId: current.accountId,
+    outcome: "failure",
+    klass,
+    healthy: isHealthy(current.health),
+    health: current.health,
+  });
+  if (!isHealthy(current.health)) {
+    logSession("unhealthy", {
+      accountId: current.accountId,
+      reason: "render_failure",
+      klass,
+      consecutiveFailures: current.health.consecutiveFailures,
+    });
+  }
+}
+
+/** The current warm browser's health snapshot, or null if none is held. */
+export function currentHealth(): BrowserHealth | null {
+  return current ? { ...current.health } : null;
 }
 
 /**

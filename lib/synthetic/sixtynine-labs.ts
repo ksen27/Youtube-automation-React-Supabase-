@@ -1,5 +1,5 @@
 import { getEnv } from "@/lib/env";
-import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
+import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
 
 // 69labs provider: TTS voiceover + nano-banana image generation.
@@ -51,6 +51,9 @@ function cfg() {
   }
   return {
     key: env.SIXTYNINE_LABS_API_KEY,
+    // Optional backup image key — used only as a failover in generateImage()
+    // when the primary returns a permanent auth 403. null when unconfigured.
+    backupImageKey: env.SIXTYNINE_LABS_API_KEY_BACKUP || null,
     base: env.SIXTYNINE_LABS_BASE_URL.replace(/\/$/, ""),
     ttsProvider: env.SIXTYNINE_LABS_TTS_PROVIDER,
     ttsModel: env.SIXTYNINE_LABS_TTS_MODEL,
@@ -189,11 +192,16 @@ interface ImageStatusResponse {
   status: ImageStatus;
 }
 
-// Internal: one nano-banana attempt. Returns the image bytes + content type.
-async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer; contentType: string }> {
+// Internal: one nano-banana attempt with a SPECIFIC api key. Returns the image
+// bytes + content type. The key is passed in (not read from cfg) so generateImage
+// can re-run this on the backup key when the primary hits a permanent auth 403.
+async function generateNanoBananaImage(
+  prompt: string,
+  key: string,
+): Promise<{ image: Buffer; contentType: string }> {
   const c = cfg();
-  const authJson = { Authorization: `Bearer ${c.key}`, "Content-Type": "application/json" };
-  const authOnly = { Authorization: `Bearer ${c.key}` };
+  const authJson = { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
+  const authOnly = { Authorization: `Bearer ${key}` };
 
   // 1) Submit the job. 16:9 to match the synthetic canvas; the renderer handles
   // any cropping/letterboxing, so we request a wide aspect ratio.
@@ -271,26 +279,56 @@ async function generateNanoBananaImage(prompt: string): Promise<{ image: Buffer;
  * STYLE_PROMPT is appended here so every caller gets the consistent look.
  *
  * 69labs is the ONLY image provider — there is no cross-provider fallback. Safe
- * multi-image generation comes from two mechanisms, NOT a fallback:
+ * multi-image generation comes from three mechanisms, NOT a cross-provider one:
  *   1. The global image slot below caps total in-flight 69labs jobs under the
  *      provider's per-tier concurrent limit (1–4 by subscription;
  *      SIXTYNINE_IMAGE_CONCURRENCY default 3), so a burst of segments queues
  *      instead of earning a 403 / a 503 cooldown.
  *   2. generateNanoBananaImage's withHttpRetry rides out transient 503 "service
- *      unavailable" / 403 "concurrent limit" spikes with exponential backoff.
- * When 69labs is genuinely down past the retry budget, the call throws — the
- * caller (image processor) lets BullMQ retry the whole job, and the segment can
- * be re-run from the UI once 69labs recovers. The chosen provider is returned
- * for cost attribution (always "sixtynine_image").
+ *      unavailable" / 403 "concurrent limit" spikes with exponential backoff on
+ *      the SAME key.
+ *   3. BACKUP-KEY FAILOVER: when the PRIMARY key returns a PERMANENT auth 403
+ *      ("Access denied" / FORBIDDEN — a revoked/blocked/expired key, the failure
+ *      that stalled a whole run when the single key died), and a backup key is
+ *      configured (SIXTYNINE_LABS_API_KEY_BACKUP), the attempt is re-run once on
+ *      the backup. The keys are used one-at-a-time (primary first, backup only on
+ *      that specific failure), so the concurrency cap above still protects each
+ *      key's tier limit — no per-key accounting needed. The transient
+ *      concurrent-limit 403 is NOT treated as failover-worthy (mechanism 2 rides
+ *      it out on the same key), so a busy primary doesn't needlessly burn the
+ *      backup.
+ * When BOTH keys are down past the retry budget, the call throws — the caller
+ * (image processor) lets BullMQ retry the whole job, and the segment can be
+ * re-run from the UI once 69labs recovers. The chosen provider is returned for
+ * cost attribution (always "sixtynine_image").
  */
 export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
+  const c = cfg();
   const prompt = withStylePrompt(basePrompt);
   // Hold a global image slot for the whole submit→poll→download so total
   // in-flight 69labs image work stays under the provider's concurrent cap.
   await acquireImageSlot(getEnv().SIXTYNINE_IMAGE_CONCURRENCY);
   try {
-    const { image, contentType } = await generateNanoBananaImage(prompt);
-    return { image, contentType, provider: "sixtynine_image" };
+    try {
+      const { image, contentType } = await generateNanoBananaImage(prompt, c.key as string);
+      return { image, contentType, provider: "sixtynine_image" };
+    } catch (err) {
+      // Primary key hit a permanent auth 403 and a backup is configured: fail
+      // over to it once. Any other error (transient, poll timeout, censored,
+      // etc.) propagates unchanged — only a dead PRIMARY KEY warrants the backup.
+      if (c.backupImageKey && isAuthForbidden(err)) {
+        console.warn(
+          JSON.stringify({
+            msg: "69labs.image.key_failover",
+            note: "primary image key returned a permanent auth 403; retrying on backup key",
+            err: (err as Error).message?.slice(0, 200),
+          }),
+        );
+        const { image, contentType } = await generateNanoBananaImage(prompt, c.backupImageKey);
+        return { image, contentType, provider: "sixtynine_image" };
+      }
+      throw err;
+    }
   } finally {
     releaseImageSlot();
   }

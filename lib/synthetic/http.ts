@@ -33,6 +33,20 @@ export function isRetryableHttp(err: unknown): boolean {
   return /ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|fetch failed|network|timeout/i.test(m);
 }
 
+// True for a PERMANENT auth 403 — a revoked/blocked/expired key (69labs:
+// {"error":"Access denied","code":"FORBIDDEN"}) — as opposed to the transient
+// "concurrent image generation limit reached" 403, which isRetryableHttp()
+// already rides out on the SAME key. The image generator uses this to decide
+// when to fail OVER to the backup key (a dead key won't recover by retrying it).
+export function isAuthForbidden(err: unknown): boolean {
+  if (!(err instanceof HttpError)) return false;
+  if (err.status !== 403) return false;
+  const text = err.body ?? err.message;
+  // The concurrent-limit 403 is transient (retry same key); everything else at
+  // 403 is treated as a permanent auth failure worth failing over.
+  return !/concurrent.*limit reached/i.test(text);
+}
+
 export async function withHttpRetry<T>(
   label: string,
   fn: () => Promise<T>,
@@ -48,7 +62,6 @@ export async function withHttpRetry<T>(
       lastErr = e;
       if (i === attempts - 1 || !isRetryableHttp(e)) throw e;
       const delay = Math.round(baseMs * Math.pow(3, i) * (0.5 + Math.random()));
-      // eslint-disable-next-line no-console
       console.warn(JSON.stringify({
         msg: "synthetic.http.retry",
         op: label,
