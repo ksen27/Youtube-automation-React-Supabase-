@@ -450,9 +450,15 @@ const ServerEnvSchema = z.object({
   // code reused HEYGEN_NAV_TIMEOUT_MS (120s) for these, so a single slow/stale
   // selector stalled the job up to 2 min EACH and they stacked to ~6 min before
   // generation even started. A tighter budget fails a genuinely slow run fast so
-  // it retries (or rotates) instead of hanging. Default 45s — generous for the
-  // heavy SPA over a proxy, far below the old 120s. Bump if real loads exceed it.
-  HEYGEN_SETUP_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
+  // it retries (or rotates) instead of hanging.
+  //
+  // Raised to 90s (was 45s) on 2026-06-26: with patchright (stealth) the
+  // composer reliably LOADS — diagnostics caught the fully-rendered /avatar page
+  // with the script field present — but it took ~70-90s to paint through the
+  // proxy, JUST past the 45s budget, so waitFirstVisible(scriptField) timed out
+  // and threw a FALSE `blank_composer` on a page that was actually fine. 90s sits
+  // above the real paint time. Bump further if real loads exceed it.
+  HEYGEN_SETUP_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   // How long verifyAuthenticated waits for the authed/sign-in marker to render
   // before judging the session. The heavy HeyGen SPA renders its nav at ~14.5s
   // through a residential proxy — the old hardcoded 15s caused FALSE expiries

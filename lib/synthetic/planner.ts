@@ -33,6 +33,11 @@ const GeminiSegmentSchema = z.object({
   // block's spoken window in the word timings.
   script: z.string().min(1),
   imagePrompt: z.string().optional().default(""),
+  // The shot type / framing for this block's still, rotated across the video so
+  // consecutive images don't all read as the same "hands-in-the-dirt close-up".
+  // Drives real visual VARIETY (scale + angle) on top of the subject change. See
+  // SHOT_TYPES / the shot-variety rule. Empty -> generation adds no shot hint.
+  shotType: z.string().optional().default(""),
   // A SECOND, genuinely DIFFERENT scene for the same sentence. A long sentence
   // (> SYNTHETIC_BLOCK_SPLIT_THRESHOLD) is covered by TWO visuals; without a
   // distinct prompt the second one reused imagePrompt + a weak "different angle"
@@ -41,6 +46,9 @@ const GeminiSegmentSchema = z.object({
   // visuals don't look like duplicates. Only used when the block actually splits
   // (short blocks ignore it); empty for avatar blocks.
   imagePrompt2: z.string().optional().default(""),
+  // Shot type for the SECOND visual — different from shotType so the two frames
+  // of a split sentence differ in framing as well as subject.
+  shotType2: z.string().optional().default(""),
   animationPrompt: z.string().optional().default(""),
 });
 const GeminiResponseSchema = z.object({
@@ -60,11 +68,17 @@ export interface PlannedSegment {
   duration: number;
   script: string;
   imagePrompt: string | null;
+  // Shot type / framing hint for this block's still (e.g. "macro close-up",
+  // "wide establishing shot", "product shot"). Rotated across blocks for visual
+  // variety; folded into the composed image_prompt at persist time.
+  shotType?: string | null;
   // A distinct second scene for the SAME sentence, used as the second visual's
   // prompt when a long sentence is split (see splitByDuration). Null/undefined
   // when Gemini didn't supply one — then the second visual falls back to varying
   // imagePrompt via the secondVisual nudge.
   imagePrompt2?: string | null;
+  // Shot type for the SECOND visual (paired with imagePrompt2).
+  shotType2?: string | null;
   animationPrompt: string | null;
   // True for the SECOND visual attached to a long sentence (see
   // splitByDuration). The second visual prefers imagePrompt2; if that's absent
@@ -129,6 +143,44 @@ const AMATEUR_LOOK_RULE =
   "Just describe the real subject and setting plainly; the camera look is added " +
   "separately.";
 
+// Shot-variety rule (client variety fix 2026-06). The footage all looked the
+// same — every still was a close-up of hands in soil — because the prompts
+// changed the SUBJECT but never the FRAMING. Each block now picks a `shotType`
+// (scale + angle) and consecutive blocks MUST differ, so the video reads as a
+// varied edit instead of one repeated shot. shotType describes only camera
+// distance/angle, NOT subject and NOT camera-look styling.
+const SHOT_TYPES =
+  "extreme close-up / macro detail · close-up · medium shot · wide / " +
+  "establishing shot · top-down (overhead) shot · low-angle ground-level shot · " +
+  "over-the-shoulder shot · product shot (an object presented on a surface)";
+const SHOT_VARIETY_RULE =
+  "SHOT VARIETY (critical, client requirement): vary the FRAMING across blocks so " +
+  "the video is not the same shot over and over. For EVERY image/ai_clip block " +
+  "pick a `shotType` from: " + SHOT_TYPES + ". Do NOT use the same shotType on " +
+  "two consecutive blocks, and across any run of 4-5 blocks use several DIFFERENT " +
+  "shot types — mix scales (some macro, some wide, some overhead) and angles. " +
+  "Specifically STOP defaulting every block to a close-up of hands in soil: only " +
+  "a minority of blocks should be hands-in-the-dirt. When a long sentence splits " +
+  "into two visuals, give `shotType2` a DIFFERENT framing from `shotType` so the " +
+  "two frames don't match. shotType is camera distance/angle ONLY — never put " +
+  "subject or film-look words in it.";
+
+// Product / brand exception (client requirement 2026-06, signed off to relax the
+// blanket no-text / no-logo ban for product lines ONLY). When the narration is
+// genuinely about a specific PRODUCT or BRAND — a bag of rice bran (nuka), a
+// fertilizer product, a named amendment — the client WANTS that product shown:
+// its packaging, label, or a brand/company logo may appear. This overrides the
+// otherwise-blanket "NO text / NO logo / NO label" rule for that one block only;
+// every NON-product block still follows the no-text rule strictly.
+const PRODUCT_BRAND_RULE =
+  "PRODUCT / BRAND LINES (client requirement): when the narration is genuinely " +
+  "about a specific product or brand (e.g. a bag of rice bran / nuka, a bottle or " +
+  "bag of fertilizer, a named soil amendment), SHOW THAT PRODUCT as the single " +
+  "subject — its packaging or label, or a fertilizer brand/company logo, IS " +
+  "allowed and wanted here (prefer a 'product shot' shotType). This is the ONLY " +
+  "case where text/labels/logos are permitted. For every other (non-product) " +
+  "line keep the strict no-text, no-label, no-logo rule.";
+
 function buildPrompt(transcript: string): string {
   return [
     "You are a video director planning the visual track for an AI-generated",
@@ -156,11 +208,14 @@ function buildPrompt(transcript: string): string {
     "visual for the COMPLETE thought instead of a fragment.",
     "",
     "FIRST, read the WHOLE transcript and write a single `basePrompt`: the",
-    "video's recurring visual world — the main recurring subjects, the setting /",
-    "location type, the era, and the overall mood. This is a shared style bible",
-    "that every block builds on; it is prepended to each block's imagePrompt",
-    "automatically, so describe the constants here, NOT any one moment. Do NOT",
-    "include camera or film-grain styling — that is appended separately.",
+    "video's recurring visual world — the SETTING / location type, the era, and",
+    "the overall mood ONLY. This is a shared style bible that every block builds",
+    "on, added as trailing context to each block. Keep it SHORT (one sentence).",
+    "Do NOT bake in a fixed framing or composition (do NOT say 'close-up' or",
+    "'hands-in-the-dirt shots' here) and do NOT name one specific subject — the",
+    "framing comes from each block's shotType and the subject from each block's",
+    "imagePrompt, both of which MUST vary block to block. Do NOT include camera or",
+    "film-grain styling — that is appended separately.",
     "",
     "THEN segment the transcript. For EVERY image/ai_clip/split_2 block, write a",
     "concrete `imagePrompt`: ONLY the scene-specific detail for THIS block (the",
@@ -189,12 +244,17 @@ function buildPrompt(transcript: string): string {
     "same scene as imagePrompt with only a reworded angle — make it a DISTINCT",
     "shot so the two visuals never look like duplicates. It follows ALL the same",
     "rules as imagePrompt (picture-not-narration, single-subject, B-roll objects,",
-    "amateur look). If you genuinely cannot think of a second distinct on-topic",
-    "scene, you may leave it empty and the system will vary the first one.",
+    "amateur look) and gets its own `shotType2` with a DIFFERENT framing than",
+    "shotType. If you genuinely cannot think of a second distinct on-topic scene,",
+    "you may leave it empty and the system will vary the first one.",
     "",
     SINGLE_SUBJECT_RULE,
     "",
     BROLL_OBJECT_RULE,
+    "",
+    SHOT_VARIETY_RULE,
+    "",
+    PRODUCT_BRAND_RULE,
     "",
     AMATEUR_LOOK_RULE,
     "",
@@ -212,7 +272,7 @@ function buildPrompt(transcript: string): string {
     "right across the scene, otherwise still' or 'slow push-in, scene static').",
     "avatar blocks need no prompts.",
     "",
-    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","imagePrompt2","animationPrompt"}]}',
+    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}',
     "",
     "TRANSCRIPT:",
     transcript.trim(),
@@ -246,11 +306,17 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
     "",
     BROLL_OBJECT_RULE,
     "",
+    "Also pick a `shotType` (camera framing) from: " + SHOT_TYPES + ". Choose one",
+    "that fits this line's subject; it is camera distance/angle ONLY, no subject or",
+    "film-look words.",
+    "",
+    PRODUCT_BRAND_RULE,
+    "",
     AMATEUR_LOOK_RULE,
     "",
     wantsAnimation
-      ? 'Respond ONLY with JSON: {"imagePrompt","animationPrompt"}  (animationPrompt = GENTLE camera motion over an otherwise still scene: a slow horizontal pan or slow push-in, NOT dramatic action or eventful motion).'
-      : 'Respond ONLY with JSON: {"imagePrompt"}',
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = GENTLE camera motion over an otherwise still scene: a slow horizontal pan or slow push-in, NOT dramatic action or eventful motion).'
+      : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
     "",
@@ -261,6 +327,7 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
 
 const SingleSegmentSchema = z.object({
   imagePrompt: z.string().min(1),
+  shotType: z.string().optional().default(""),
   animationPrompt: z.string().optional().default(""),
 });
 
@@ -317,7 +384,9 @@ export async function regenerateSegmentPrompt(input: {
   return {
     // Compose the base in front exactly like persist does, so the stored prompt
     // carries the recurring world (composePrompt is the same helper).
-    imagePrompt: composePrompt(basePrompt, safe.data.imagePrompt.trim()) ?? safe.data.imagePrompt.trim(),
+    imagePrompt:
+      composePrompt(basePrompt, safe.data.imagePrompt.trim(), safe.data.shotType?.trim() || null) ??
+      safe.data.imagePrompt.trim(),
     animationPrompt: blockType === "ai_clip" ? (safe.data.animationPrompt?.trim() || null) : null,
   };
 }
@@ -391,15 +460,26 @@ function alignSegments(
 // continuous. STYLE_PROMPT (the camera/grain look) is still appended separately
 // at generation time. Returns the block prompt unchanged when there's no base,
 // and the base alone when the block has no specific prompt.
-function composePrompt(basePrompt: string, blockPrompt: string | null): string | null {
+// Subject-first ordering (client variety fix): image models weight the FRONT of
+// the prompt most, so leading every prompt with the long shared basePrompt made
+// the model lock onto the same recurring world ("hands-in-the-dirt garden") and
+// IGNORE the short per-line subject — every still came out looking the same. We
+// now lead with the block's SHOT TYPE + scene-specific prompt (the thing that
+// actually varies) and append the basePrompt as a trailing setting/mood clause,
+// so the subject and framing dominate and the world is context, not the lede.
+function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?: string | null): string | null {
   const base = basePrompt.trim();
   const block = (blockPrompt ?? "").trim();
-  if (!base) return block || null;
-  if (!block) return base;
-  // Avoid a duplicated base if a block prompt already starts with it (e.g. an
-  // edited row re-run through the planner).
-  if (block.toLowerCase().startsWith(base.toLowerCase())) return block;
-  return `${base.replace(/[.\s]+$/, "")}. ${block}`;
+  const shot = (shotType ?? "").trim();
+  // Lead with the shot type when present, then the scene-specific subject.
+  const lead = [shot, block].filter(Boolean).join(": ");
+  if (!base) return lead || null;
+  if (!lead) return base;
+  // Avoid a duplicated base if a block prompt already contains it (e.g. an edited
+  // row re-run through the planner).
+  if (lead.toLowerCase().includes(base.toLowerCase())) return lead;
+  // Subject/shot first; world as trailing context.
+  return `${lead.replace(/[.\s]+$/, "")}. Setting: ${base.replace(/[.\s]+$/, "")}.`;
 }
 
 // The second visual covering a long sentence shows the SAME moment from a
@@ -428,7 +508,9 @@ function mk(
     duration: Math.max(0.5, endTime - startTime),
     script: s.script.trim(),
     imagePrompt: isVisual ? (s.imagePrompt?.trim() || null) : null,
+    shotType: isVisual ? (s.shotType?.trim() || null) : null,
     imagePrompt2: isVisual ? (s.imagePrompt2?.trim() || null) : null,
+    shotType2: isVisual ? (s.shotType2?.trim() || null) : null,
     animationPrompt: s.blockType === "ai_clip" ? (s.animationPrompt?.trim() || null) : null,
   };
 }
@@ -648,7 +730,7 @@ export function splitByDuration(
   // appends the variation nudge to the (reused) first prompt.
   const applySecondScene = (piece: PlannedSegment): PlannedSegment =>
     seg.imagePrompt2
-      ? { ...piece, imagePrompt: seg.imagePrompt2, secondVisual: false }
+      ? { ...piece, imagePrompt: seg.imagePrompt2, shotType: seg.shotType2 ?? seg.shotType, secondVisual: false }
       : { ...piece, secondVisual: true };
 
   if (seg.blockType === "ai_clip") {
@@ -968,7 +1050,7 @@ export async function buildSyntheticTimeline(input: {
     image_prompt:
       p.blockType === "avatar"
         ? null
-        : composePrompt(basePrompt, secondVisualPrompt(p.imagePrompt, p.secondVisual)),
+        : composePrompt(basePrompt, secondVisualPrompt(p.imagePrompt, p.secondVisual), p.shotType),
     animation_prompt: p.animationPrompt,
     // Stash the video's recurring world on every row so the image processors
     // have a LAST-RESORT visual prompt that is on-topic — never the spoken

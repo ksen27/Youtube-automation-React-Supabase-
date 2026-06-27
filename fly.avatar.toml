@@ -59,6 +59,11 @@ primary_region = 'lhr'
   # patchright removes the CDP/headless tells the hand-rolled init scripts can't.
   # Requires `npx patchright install chromium` in the image (see Dockerfile.worker).
   HEYGEN_USE_STEALTH = "true"
+  # Per-step composer/upload selector budget. With stealth the /avatar composer
+  # LOADS fine but paints in ~70-90s through the proxy — past the old 45s default
+  # — so the scriptField wait timed out and threw a FALSE blank_composer on a page
+  # that was actually rendered. 90s covers the real paint time.
+  HEYGEN_SETUP_TIMEOUT_MS = "90000"
   # Local scratch for downloads/screenshots (ephemeral is fine — no resume
   # cache is needed for avatar jobs the way renders need /data).
   TMP_DIR = "/tmp/work"

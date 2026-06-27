@@ -41,18 +41,46 @@ export const STYLE_PROMPT =
   // Client requirement (2026-06): every still must be ONE single full-frame
   // photo of ONE subject — nano-banana was drawing multi-subject COLLAGES
   // (e.g. a calendar next to a garden path) that read as a "split image" in
-  // the right half of split_2 blocks, and was burning TEXT/captions/numbers
-  // into frames (e.g. calendar dates, "cook rice"). Both are forbidden here.
+  // the right half of split_2 blocks. The collage ban is unconditional; the
+  // TEXT/label/logo ban is split out below so product lines can opt out.
   "A SINGLE photograph of ONE subject filling the whole frame — NOT a collage, " +
   "NOT a split-screen, NOT a grid, NOT a diptych or triptych, NOT multiple " +
-  "panels or side-by-side images, NO borders or dividing lines between scenes. " +
+  "panels or side-by-side images, NO borders or dividing lines between scenes.";
+
+// The no-text / no-logo ban, split OUT of STYLE_PROMPT so it can be suppressed
+// for product/brand lines (client sign-off 2026-06 to relax the blanket ban).
+// nano-banana otherwise burns stray TEXT/captions/numbers (calendar dates,
+// "cook rice") into frames, so this stays on for every NON-product still.
+const NO_TEXT_RULE =
   "Absolutely NO text, NO captions, NO subtitles, NO letters, NO numbers, " +
   "NO words, NO watermark, NO logo, NO signage, NO calendar, NO labels of any kind.";
 
-/** Append the mandatory style prompt to a base image prompt. */
+// When a product line opts out of the text ban we still don't want a wall of
+// stray text — only the product's own real packaging/label/logo, nothing else.
+const PRODUCT_TEXT_RULE =
+  "The product's real packaging, label, or brand/company logo MAY appear ON the " +
+  "product itself (this is a product shot). Do NOT add any OTHER text, captions, " +
+  "subtitles, watermarks, or unrelated signage anywhere else in the frame.";
+
+// Heuristic: a composed prompt is a "product line" when it asks to show a
+// product / packaging / label / logo (the planner's PRODUCT_BRAND_RULE leads
+// these with a "product shot" shotType and names the packaging). We key off the
+// prompt text so no extra column has to thread from planner → processor.
+const PRODUCT_LINE_RE = /\b(product shot|packaging|label|logo|brand|bag of|bottle of)\b/i;
+export function isProductPrompt(prompt: string): boolean {
+  return PRODUCT_LINE_RE.test(prompt);
+}
+
+/**
+ * Append the mandatory style prompt to a base image prompt. For product/brand
+ * lines (isProductPrompt) the blanket no-text ban is swapped for the narrower
+ * PRODUCT_TEXT_RULE so the product's own label/logo can show; every other still
+ * keeps the strict no-text ban.
+ */
 export function withStylePrompt(basePrompt: string): string {
   const base = basePrompt.trim().replace(/[.,\s]+$/, "");
-  return `${base}. ${STYLE_PROMPT}`;
+  const textRule = isProductPrompt(base) ? PRODUCT_TEXT_RULE : NO_TEXT_RULE;
+  return `${base}. ${STYLE_PROMPT} ${textRule}`;
 }
 
 // Output canvas for the synthetic engine (matches the sourced render).

@@ -167,11 +167,25 @@ async function uploadAudioTrack(
   // after the click it returned false before the modal animated in, falsely
   // reporting "modal did not open" even though it opened a beat later. waitFor
   // actually polls up to the timeout.
-  await clickFirstVisible(audioUploadTrigger(page), timeoutMs, "audio upload button");
+  // The trigger click can land on a not-yet-settled page (esp. the first segment
+  // after a session.recycle, where the SPA is still painting through the proxy):
+  // the click is consumed but the modal never animates in, and a single wait then
+  // false-fails "modal did not open" — burning the whole ~4min attempt before the
+  // rotate. Re-click + re-wait a few times so a slow/settling page recovers in
+  // place instead of throwing. Each wait is short; the loop is the real budget.
   const heading = audioModalHeading(page).locator("visible=true").first();
-  try {
-    await heading.waitFor({ state: "visible", timeout: 15_000 });
-  } catch {
+  let modalOpen = false;
+  for (let attempt = 0; attempt < 3 && !modalOpen; attempt++) {
+    await clickFirstVisible(audioUploadTrigger(page), timeoutMs, "audio upload button").catch(() => {});
+    try {
+      await heading.waitFor({ state: "visible", timeout: 15_000 });
+      modalOpen = true;
+    } catch {
+      // not open yet — let the page settle, then re-click the trigger
+      await page.waitForTimeout(2_000);
+    }
+  }
+  if (!modalOpen) {
     throw new HeygenError("ui_changed", "heygen: Upload Audio modal did not open");
   }
 
@@ -205,7 +219,11 @@ async function uploadAudioTrack(
   // commit directly) by falling through to the close check.
   const confirmHeading = audioConfirmHeading(page).locator("visible=true").first();
   const confirmBtn = audioConfirmButton(page).locator("visible=true").first();
-  await confirmHeading.waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
+  // The confirm MODAL itself paints slowly through the stealth+proxy path (same
+  // ~70-90s SPA paint that pushed the composer past its old budget), so give the
+  // heading a wait aligned with the setup budget (timeoutMs ==
+  // HEYGEN_SETUP_TIMEOUT_MS, passed by the caller) rather than a fixed 30s.
+  await confirmHeading.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {});
   // The "Add audio" button stays disabled until HeyGen finishes PROCESSING the
   // uploaded track (it has to decode the file and load its duration into the
   // preview player). That processing time scales with the audio LENGTH: a 3s clip
@@ -216,8 +234,14 @@ async function uploadAudioTrack(
   // until the stall-sweeper killed it. So budget the poll by duration: a generous
   // floor for short clips, growing ~6× the audio length, capped so a genuinely
   // stuck modal still fails in bounded time.
+  //
+  // Floor raised 45s -> 90s on 2026-06-26: with stealth, a SHORT clip
+  // (segment e1176845, ~$0.10 render) still false-failed "Add audio never
+  // clickable" at 45s because the whole modal paints slowly through the proxy —
+  // it then rotated and succeeded, wasting a ~4min attempt. 90s floor covers the
+  // slow paint; the 180s cap still bounds a genuinely stuck modal.
   const dur = Number.isFinite(audioDurationSeconds) ? Math.max(0, audioDurationSeconds as number) : 0;
-  const confirmBudgetMs = Math.min(180_000, Math.max(45_000, Math.round(dur * 6_000)));
+  const confirmBudgetMs = Math.min(180_000, Math.max(90_000, Math.round(dur * 6_000)));
   const perPollMs = 3_000;
   const maxPolls = Math.ceil(confirmBudgetMs / (perPollMs + 4_000));
   let committed = false;
