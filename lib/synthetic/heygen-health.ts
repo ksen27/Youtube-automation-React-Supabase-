@@ -123,17 +123,26 @@ export interface FastFailResult {
 }
 
 /**
- * Cheap, bounded inspection of the warm composer page. Call BEFORE the long
- * composer wait so an obviously-walled page fails in ~1-2s instead of burning
- * the full HEYGEN_SETUP_TIMEOUT_MS. Never throws.
+ * Cheap, bounded inspection used to distinguish a genuinely WALLED page from a
+ * merely SLOW one — call this ONLY after a short grace wait for the composer has
+ * already lapsed (see heygen.ts). It must NOT be called immediately after a
+ * `goto(...commit)`: a fresh page is momentarily blank before it paints, and
+ * treating that as broken false-fails legitimate loads into a recycle loop.
+ *
+ * We only return broken=true on HIGH-CONFIDENCE signals — a closed/crashed page
+ * or a Cloudflare challenge body — so a slow-but-fine SPA is never mistaken for
+ * a wall (the caller then falls through to the full patient composer wait). The
+ * old "empty body => broken" heuristic was REMOVED: it fired on still-hydrating
+ * fresh pages. "Blank composer" is now proven by the grace wait lapsing AND a
+ * positive wall signal here, not by body emptiness alone. Never throws.
  */
 export async function inspectPage(page: Page): Promise<FastFailResult> {
   // Closed/crashed page — nothing to wait for.
   if (page.isClosed()) return { broken: true, reason: "page is closed/crashed" };
 
-  // Read a small slice of the body text with a TIGHT timeout. If even this can't
-  // resolve quickly the page is wedged, but we don't over-claim: only a positive
-  // Cloudflare signature or a truly empty root counts as broken.
+  // Read a small slice of the body text with a TIGHT timeout, looking ONLY for a
+  // positive Cloudflare challenge signature. Anything else (slow paint, partial
+  // hydration) is NOT treated as broken — defer to the caller's full wait.
   let bodyText = "";
   try {
     bodyText = (await page.locator("body").innerText({ timeout: 1500 }).catch(() => "")) ?? "";
@@ -143,16 +152,6 @@ export async function inspectPage(page: Page): Promise<FastFailResult> {
 
   if (CLOUDFLARE_TEXT.test(bodyText)) {
     return { broken: true, reason: "cloudflare challenge page detected" };
-  }
-
-  // A genuinely BLANK composer: the SPA root has essentially no rendered text.
-  // HeyGen's real composer always paints chrome (nav, buttons, labels) within a
-  // second of commit; an empty-ish body after the page has had a moment is the
-  // blank-composer wall. Guard with a low threshold so a slow paint isn't
-  // mistaken for blank — the caller still runs the full element wait when we
-  // return null.
-  if (bodyText.trim().length < 20) {
-    return { broken: true, reason: "blank composer (empty page body)" };
   }
 
   return { broken: false, reason: null };

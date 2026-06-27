@@ -596,22 +596,39 @@ async function attemptOnAccount(
     // reload — not a cold load — but it still resets any photo/script/audio the
     // previous render left behind. The avatar composer lives at /avatar.
     await p.goto(`${e.HEYGEN_BASE_URL}/avatar`, { waitUntil: "commit" }).catch(() => {});
-    // FAST-FAIL (Objective #5): before the long composer wait, do a cheap ~1-2s
-    // inspection. A Cloudflare challenge body, a crashed page, or a blank SPA
-    // root is unmistakably broken — fail it NOW as blank_composer instead of
-    // burning the full HEYGEN_SETUP_TIMEOUT_MS waiting for a script field that
-    // will never appear. The catch below tears the warm session down and the
-    // next attempt rebuilds fresh. A merely-slow page returns broken=false and
-    // falls through to the normal element wait, so this never false-fails.
-    const fast = await inspectPage(p);
-    if (fast.broken) {
-      throw new HeygenError(
-        "blank_composer",
-        `heygen: avatar composer unusable (fast-fail: ${fast.reason})`,
-      );
+    // Wait for the composer's script field, the readiness signal. FAST-FAIL
+    // (Objective #5) is layered correctly here: we do NOT pre-empt the load —
+    // `goto(...commit)` returns before ANY content paints, so a fresh page is
+    // ALWAYS momentarily blank, and inspecting it then false-failed legitimate
+    // loads (observed: brand-new sessions killed ~3s after launch in a recycle
+    // loop). Instead we give the field a SHORT grace wait first; only if that
+    // lapses do we inspect the page to decide whether it's genuinely WALLED
+    // (Cloudflare/crash -> fail now, ~seconds) or merely SLOW (fall through to
+    // the full HEYGEN_SETUP_TIMEOUT_MS wait). The grace wait is the happy path;
+    // the inspection only gates the slow/broken branch.
+    const graceMs = Math.min(e.HEYGEN_SETUP_TIMEOUT_MS, 12_000);
+    const composerReadyFast = await scriptField(p)
+      .locator("visible=true")
+      .first()
+      .waitFor({ state: "visible", timeout: graceMs })
+      .then(() => true)
+      .catch(() => false);
+    if (!composerReadyFast) {
+      // Grace lapsed — is the page WALLED, or just slow? Inspect now (cheap).
+      const fast = await inspectPage(p);
+      if (fast.broken) {
+        throw new HeygenError(
+          "blank_composer",
+          `heygen: avatar composer unusable (fast-fail: ${fast.reason})`,
+        );
+      }
     }
     try {
-      await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
+      // Already confirmed ready on the happy path; otherwise this is the full
+      // patient wait for a slow-but-fine composer (page wasn't walled above).
+      if (!composerReadyFast) {
+        await waitFirstVisible(scriptField(p), e.HEYGEN_SETUP_TIMEOUT_MS, "avatar composer");
+      }
     } catch (err) {
       // The composer never rendered — the /avatar SPA came up BLANK (observed:
       // empty toolbar HTML, no script field). This is almost always the WARM PAGE
