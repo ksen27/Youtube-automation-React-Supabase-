@@ -45,14 +45,18 @@ export async function processImageToVideoJob(
   // stashed by the planner) so the still is on-topic.
   const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
   const imagePrompt = (seg.image_prompt?.trim() || basePrompt).trim();
-  // Default to the client's preferred look: a gentle camera move over an
-  // otherwise still scene (slow pan / slow push-in), NOT eventful motion. Add a
-  // real-phone-footage cue so the clip keeps the slightly low-fi handheld feel of
-  // the source still instead of a smooth, pristine AI render.
+  // Default to the client's preferred look. Client feedback (2026-06-28): the
+  // earlier pan-across-scene with "shake / motion blur" cues read as a SUDDEN
+  // movement that BLURRED the footage — they want motion so subtle it is barely
+  // perceptible, like the reference channels. So: an extremely slow, very slight
+  // push-in over an otherwise frozen scene, no panning, and NO blur/shake cues
+  // (those were literally producing the blur they objected to). Keep the low-fi
+  // grain so the clip still matches the source still's texture.
   const animationPrompt = (
     seg.animation_prompt ??
-    "Slow horizontal camera pan left to right across the scene, the scene itself static, gentle and steady, " +
-      "handheld real phone footage with subtle natural shake and minor motion blur, slightly low quality and grainy, not smooth or cinematic"
+    "Extremely slow, very slight camera push-in over an otherwise completely still, frozen scene. " +
+      "The movement is minimal and barely perceptible — no panning, no sudden motion, no shake, no motion blur. " +
+      "Steady and locked-off. Slightly low quality and grainy like real phone footage, not smooth or cinematic."
   ).trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 

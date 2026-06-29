@@ -639,7 +639,10 @@ const ServerEnvSchema = z.object({
   // Defaults = "moderate" on the tuning ladder (client-picked 2026-06): clearly
   // low-fi and matching the reference's grain/softness while still reading as a
   // real photo, not a damaged one. Earlier defaults were too weak to see.
-  SYNTHETIC_DEGRADE_ENABLED: z.coerce.boolean().default(true),
+  // Disabled (client 2026-06-29): client wants the ORIGINAL screen quality in
+  // the avatar video — no low-fi degrade. Off by default for both image + video
+  // degrade; re-enable per-env if the vlog look is wanted again.
+  SYNTHETIC_DEGRADE_ENABLED: z.coerce.boolean().default(false),
   SYNTHETIC_DEGRADE_BLUR_SIGMA: z.coerce.number().nonnegative().default(0.8),
   SYNTHETIC_DEGRADE_IMAGE_NOISE: z.coerce.number().nonnegative().default(22),
   SYNTHETIC_DEGRADE_IMAGE_JPEG_QUALITY: z.coerce.number().int().min(1).max(100).default(60),
