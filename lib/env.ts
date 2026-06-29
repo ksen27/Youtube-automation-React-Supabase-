@@ -614,6 +614,17 @@ const ServerEnvSchema = z.object({
   // LTX.
   SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
   SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
+  // Minimum on-screen hold for a single visual block (client feedback 2026-06:
+  // "the image switches are too often / only one second in between — slow
+  // everything down, make it ~5-6s"). The synthetic timeline pins each visual
+  // to its sentence's spoken window, so a short sentence yields a ~1-2s flash;
+  // live data showed ~50-65% of visual blocks under 5s in long runs. The
+  // planner's merge-short pass (mergeShortVisualSegments) absorbs consecutive
+  // SHORT same-type visual blocks into one held visual until it reaches this
+  // minimum, capped at SYNTHETIC_BLOCK_SPLIT_THRESHOLD so a merged ai_clip
+  // stays inside LTX's animatable range. avatar blocks are exempt. Set to 0 to
+  // disable the merge entirely (back to one-visual-per-sentence pacing).
+  SYNTHETIC_BLOCK_MIN_HOLD: z.coerce.number().nonnegative().default(5),
   // Clip-heavy intro (client requirement 2026-06). The reference channel opens
   // with mostly MOVING footage and shifts to still images later to save credits.
   // Any 'image' block whose spoken window STARTS before this many seconds is

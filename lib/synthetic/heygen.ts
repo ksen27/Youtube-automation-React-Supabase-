@@ -225,11 +225,17 @@ async function uploadAudioTrack(
   // commit directly) by falling through to the close check.
   const confirmHeading = audioConfirmHeading(page).locator("visible=true").first();
   const confirmBtn = audioConfirmButton(page).locator("visible=true").first();
-  // The confirm MODAL itself paints slowly through the stealth+proxy path (same
-  // ~70-90s SPA paint that pushed the composer past its old budget), so give the
-  // heading a wait aligned with the setup budget (timeoutMs ==
-  // HEYGEN_SETUP_TIMEOUT_MS, passed by the caller) rather than a fixed 30s.
-  await confirmHeading.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {});
+  // Wait for the Confirm-Audio modal to appear — BUT race it against the audio
+  // already being attached (the Upload-Audio modal closing). On the fast-attach
+  // build the Confirm modal never appears at all; blocking the full setup budget
+  // (timeoutMs, up to 90s) for a heading that will never show needlessly stalled
+  // every such job. So resolve as soon as EITHER the Confirm heading shows OR the
+  // Upload heading is gone (audio committed directly). The commit loop below then
+  // detects the already-committed state via modalsGone() and returns immediately.
+  await Promise.race([
+    confirmHeading.waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {}),
+    audioModalHeading(page).first().waitFor({ state: "hidden", timeout: timeoutMs }).catch(() => {}),
+  ]);
   // The "Add audio" button stays disabled until HeyGen finishes PROCESSING the
   // uploaded track (it has to decode the file and load its duration into the
   // preview player). That processing time scales with the audio LENGTH: a 3s clip
@@ -269,9 +275,37 @@ async function uploadAudioTrack(
   // instantly and leaned on click()'s implicit enabled-wait; polling isEnabled()
   // explicitly makes "still processing" vs "stuck" observable and avoids firing a
   // click into a disabled button.
+  // ALREADY-COMMITTED detection (added 2026-06-29). Some HeyGen builds — and the
+  // common fast-decode case for a SHORT clip — attach the audio DIRECTLY without
+  // ever surfacing a separate, persistent "Confirm Audio" modal with a clickable
+  // "Add audio" button: the file is picked, the track lands in the Script panel,
+  // and there is no button left to click. The old loop kept polling for a
+  // "Add audio" button that no longer exists, exhausted the whole 120-240s budget,
+  // and threw "'Add audio' confirm button never became clickable" — a FALSE
+  // failure (the audio was already attached; see the segment 6a1f54f2 error
+  // screenshot: audio track present in the Script panel, NO modal, NO button).
+  // So before/while hunting the button, treat "both upload modals gone" as
+  // success: if neither the Upload-Audio heading nor the Confirm-Audio heading is
+  // visible, the audio has already committed to the composer.
+  const modalsGone = async (): Promise<boolean> => {
+    const uploadVisible = await isVisible(audioModalHeading(page), 500);
+    const confirmVisible = await isVisible(audioConfirmHeading(page), 500);
+    return !uploadVisible && !confirmVisible;
+  };
+
   let committed = false;
+  // If the audio attached instantly (no lingering modal), we're already done.
+  if (await modalsGone()) {
+    committed = true;
+  }
   for (let i = 0; i < maxPolls && !committed; i++) {
     try {
+      // If the modal(s) closed since the last poll, the audio committed — done.
+      // (Handles the fast-attach build where no clickable button ever appears.)
+      if (await modalsGone()) {
+        committed = true;
+        break;
+      }
       // Re-resolve the button each poll: .first() is evaluated lazily, so a modal
       // that finished painting between polls is picked up without a stale handle.
       const btn = confirmBtn;
@@ -295,6 +329,14 @@ async function uploadAudioTrack(
         await page.waitForTimeout(perPollMs);
       }
     } catch {
+      // The button wasn't visible this round. That's the EXPECTED state for the
+      // fast-attach build (no button at all) — so re-check the modals-gone signal
+      // before sleeping, otherwise we'd burn the whole budget waiting for a button
+      // that will never appear on an already-committed composer.
+      if (await modalsGone()) {
+        committed = true;
+        break;
+      }
       await page.waitForTimeout(perPollMs);
     }
   }

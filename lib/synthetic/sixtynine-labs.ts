@@ -19,7 +19,7 @@ import { withStylePrompt } from "@/lib/synthetic/constants";
 // BullMQ concurrency, so their combined in-flight count can blow past 69labs'
 // real per-account limit and earn a 403 / a 503 cooldown. 69labs allows only
 // 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER, and exceeding the
-// tier ceiling triggers cooldowns — see SIXTYNINE_IMAGE_CONCURRENCY (default 3).
+// tier ceiling triggers cooldowns — see SIXTYNINE_IMAGE_CONCURRENCY (default 4).
 // This semaphore caps the TOTAL in-flight image generations for THIS worker
 // process below that limit; excess callers await a freed slot (FIFO). Scope is
 // per-process — correct here because the burst that triggered the 403 came from
@@ -279,11 +279,22 @@ async function generateNanoBananaImage(
   const deadline = Date.now() + c.imagePollTimeoutMs;
   const pollIntervalMs = 2000;
   while (Date.now() < deadline) {
+    // CRITICAL: a 429 on the STATUS endpoint must NOT fail a job that is still
+    // generating. The status GET is rate-limited by request rate (separate from
+    // the generation-concurrency cap), and with several jobs polling at once —
+    // each also paying the backup-key failover round-trip — the combined poll
+    // rate trips 429 {"code":"TOO_MANY_REQUESTS"}. The default 3-attempt retry
+    // budget (~5s) gave up while the image was fine, BullMQ resubmitted a NEW
+    // 69labs job, and the abandoned one kept holding a slot → the phantom
+    // "concurrent limit reached (7)". So give the poll a budget that rides out
+    // 429 for most of the poll window (8 attempts ≈ 1+3+9+27...s of backoff)
+    // instead of failing a healthy generation on a transient rate-limit.
     const statusRes = await withHttpRetry("69labs.image.status", () =>
       fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
         headers: authOnly,
         timeoutMs: 30_000,
       }),
+      { attempts: 8, baseMs: 1000 },
     );
     const st = (await statusRes.json()) as ImageStatusResponse;
     if (st.status === "COMPLETED") break;
@@ -293,7 +304,9 @@ async function generateNanoBananaImage(
     if (st.status === "CENSORED") {
       throw new Error(`69labs image: CENSORED (job ${jobId}) — edit the prompt and retry`);
     }
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    // Jitter the cadence (±50%) so concurrent jobs don't lock-step their status
+    // calls into a synchronized burst that trips the request-rate 429.
+    await new Promise((r) => setTimeout(r, Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5))));
   }
   if (Date.now() >= deadline) throw new Error(`69labs image: poll timed out (job ${jobId})`);
 
@@ -319,7 +332,7 @@ async function generateNanoBananaImage(
  * multi-image generation comes from three mechanisms, NOT a cross-provider one:
  *   1. The global image slot below caps total in-flight 69labs jobs under the
  *      provider's per-tier concurrent limit (1–4 by subscription;
- *      SIXTYNINE_IMAGE_CONCURRENCY default 3), so a burst of segments queues
+ *      SIXTYNINE_IMAGE_CONCURRENCY default 4), so a burst of segments queues
  *      instead of earning a 403 / a 503 cooldown.
  *   2. generateNanoBananaImage's withHttpRetry rides out transient 503 "service
  *      unavailable" / 403 "concurrent limit" spikes with exponential backoff on

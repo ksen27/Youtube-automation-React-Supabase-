@@ -85,6 +85,11 @@ export interface PlannedSegment {
   // this flag tells the persist step to nudge imagePrompt to a different
   // composition/angle so the two frames aren't identical.
   secondVisual?: boolean;
+  // True when this block absorbed a following short sentence
+  // (mergeShortVisualSegments). Its script now covers MULTIPLE sentences but
+  // its imagePrompt is still the first sentence's, so the planner regenerates
+  // one combined imagePrompt for the merged script before persist.
+  needsPromptRegen?: boolean;
 }
 
 // Shared single-subject / no-text rule (client requirement 2026-06). Used by
@@ -626,6 +631,166 @@ function snapToSpace(text: string, idx: number): number {
   return idx - left <= right - idx ? left : right;
 }
 
+// Avatar parts are capped at 1 min by the content rules (well under HeyGen Pro's
+// 5-min limit). Shared by coalesceAvatarSegments (which LOGS a warning if a
+// merged avatar passage ever exceeds it) and mergeOrphansIntoAvatar (which
+// SKIPS absorbing an orphan that would push the avatar over the cap).
+const AVATAR_PART_MAX_SECONDS = 60;
+
+// Merge consecutive SHORT visual segments so no single image/clip flashes by in
+// ~1-2s (client feedback 2026-06: "the image switches are too often / only one
+// second in between — slow everything down, make it ~5-6s").
+//
+// The synthetic timeline pins every block to its sentence's real spoken window
+// (alignSegments). A short sentence therefore yields a short visual: live data
+// showed ~50-65% of visual blocks under 5s, in long runs of back-to-back
+// flashes. The duration-split pass only ever ADDS switches (it carves LONG
+// sentences into two), so nothing upstream slows the short-sentence case — that
+// is what this pass fixes.
+//
+// Rule: walk the timeline and, whenever a SHORT image/ai_clip block (shorter
+// than SYNTHETIC_BLOCK_MIN_HOLD) sits next to a same-type image/ai_clip block,
+// merge it INTO the previous block — concatenating the script and extending the
+// spoken window to cover both. The trigger is EITHER block being under the
+// minimum, so a short block also merges back into a previous block that is
+// ALREADY at/above the minimum (the goal is "no visual under the minimum", not
+// "grow until reached"). Merging stops at a non-mergeable block (avatar /
+// split_2 / type change) or when it would exceed the split threshold (keeps a
+// merged ai_clip inside LTX's animatable range); a short block the cap can't
+// absorb is left as a rare orphan.
+//
+// Per client direction (2026-06): a SHORT sentence merges into the PREVIOUS
+// sentence so the two render as ONE visual instead of two flashes. Because the
+// merged block now covers BOTH sentences' narration, its visual must reflect
+// the COMBINED thought — so we flag every merged block (`needsPromptRegen`) and
+// the planner regenerates one combined imagePrompt for the merged script before
+// persist. (The old hold-extension behaviour lingered the FIRST sentence's
+// image over the second sentence's words, which mismatched the narration.)
+//
+// ONLY 'image' and 'ai_clip' merge, but they merge ACROSS types (client
+// direction 2026-06: a short sentence must never stay a flash, even when its
+// neighbor is the other visual type). When an image and an ai_clip merge, the
+// result is an 'ai_clip' if EITHER side was a clip — preserving motion for the
+// clip-heavy intro — and the planner then regenerates a combined prompt
+// (including an animationPrompt for the now-clip block). 'avatar' and 'split_2'
+// are explicitly NEVER merged: avatar parts are atomic HeyGen renders handled
+// by coalesceAvatarSegments, and split_2 is a presenter-beside-still layout
+// that holds its whole sentence. Both act as run boundaries.
+const MERGEABLE_VISUAL_TYPES = new Set<SyntheticBlockType>(["image", "ai_clip"]);
+export function mergeShortVisualSegments(
+  segs: PlannedSegment[],
+  minHoldSeconds: number,
+  maxHoldSeconds: number,
+): { segments: PlannedSegment[]; merged: number } {
+  const out: PlannedSegment[] = [];
+  let merged = 0;
+  for (const seg of segs) {
+    const prev = out[out.length - 1];
+    const mergeable =
+      prev != null &&
+      MERGEABLE_VISUAL_TYPES.has(prev.blockType) &&
+      MERGEABLE_VISUAL_TYPES.has(seg.blockType);
+    // Merge when EITHER block is under the minimum hold — the goal is "no visual
+    // under the minimum", not "grow blocks until they reach it". So a SHORT
+    // block (seg) merges back into the previous same-type block even if that
+    // block is already >= the minimum (e.g. a 6s image followed by a 1s "She's
+    // right." flash → one 7s image), and a still-short open block keeps
+    // absorbing following blocks. Both paths are gated by the max-hold cap so a
+    // merged ai_clip stays inside LTX's single-generation range and an image
+    // never becomes an over-long static hold. When the cap blocks the merge the
+    // short block is left as-is (a rare unavoidable orphan).
+    if (
+      mergeable &&
+      (seg.duration < minHoldSeconds || prev!.duration < minHoldSeconds) &&
+      seg.endTime - prev!.startTime <= maxHoldSeconds
+    ) {
+      prev!.script = `${prev!.script} ${seg.script}`.replace(/\s+/g, " ").trim();
+      prev!.endTime = seg.endTime;
+      prev!.duration = Math.max(0.5, prev!.endTime - prev!.startTime);
+      // Cross-type merge: if EITHER side was an ai_clip the merged block is an
+      // ai_clip (preserve motion); only two stills stay an image. The combined
+      // prompt regen below (re)derives the animationPrompt for a clip result.
+      if (prev!.blockType === "ai_clip" || seg.blockType === "ai_clip") {
+        prev!.blockType = "ai_clip";
+      }
+      // The merged block now covers two sentences — its stored prompt is the
+      // FIRST sentence's only, so mark it for a combined-prompt regen.
+      prev!.needsPromptRegen = true;
+      merged++;
+      continue;
+    }
+    out.push({ ...seg });
+  }
+
+  // Avatar-fallback pass (client direction 2026-06). A SHORT image/ai_clip that
+  // still has NO mergeable visual neighbor after the pass above (e.g. one
+  // stranded between a split_2 and an avatar) is absorbed into an ADJACENT
+  // AVATAR block instead of staying a ~1-2s flash. We prefer a visual merge
+  // first (handled above); only true orphans reach here.
+  //
+  // Mechanic: an avatar block is an atomic HeyGen render lip-synced to a SLICE
+  // of master_voiceover.mp3 over its [startTime, endTime) window. The master
+  // voiceover already contains the orphan's spoken words in that time range, so
+  // we just EXTEND the avatar's window to cover the orphan (start back for an
+  // orphan before the avatar, end forward for one after) — the re-sliced audio
+  // then includes the orphan's line and the talking head speaks it. No new
+  // visual is generated. We also append the orphan's text to the avatar script
+  // so the editor row mirrors what's spoken. split_2 is still NEVER a target
+  // (two render paths) — an orphan next to only a split_2 stays as-is.
+  const avMerged = mergeOrphansIntoAvatar(out, minHoldSeconds);
+  merged += avMerged;
+  return { segments: out, merged };
+}
+
+// Absorb SHORT visual orphans (image/ai_clip under the min hold with no
+// mergeable visual neighbor) into an adjacent avatar block, extending the
+// avatar's spoken window to cover the orphan. Mutates `segs` in place by
+// removing absorbed orphans, and returns how many were absorbed.
+//
+// Direction: prefer the PREVIOUS block (extend its endTime forward to the
+// orphan's end) so the avatar that just finished talking simply keeps talking
+// through the short line; otherwise the NEXT block (extend its startTime back to
+// the orphan's start). split_2 is never a target. We respect the avatar 60s cap
+// — an absorb that would push the avatar over the cap is skipped (the orphan
+// stays, a rare case). The orphan's script is appended (prev) or prepended
+// (next) to the avatar so the editor row mirrors the spoken audio.
+function mergeOrphansIntoAvatar(segs: PlannedSegment[], minHoldSeconds: number): number {
+  let absorbed = 0;
+  let i = 0;
+  while (i < segs.length) {
+    const seg = segs[i];
+    const isShortVisual =
+      MERGEABLE_VISUAL_TYPES.has(seg.blockType) && seg.duration < minHoldSeconds;
+    if (!isShortVisual) { i++; continue; }
+    const prev = segs[i - 1];
+    const next = segs[i + 1];
+    const prevAvatarOk =
+      prev?.blockType === "avatar" &&
+      seg.endTime - prev.startTime <= AVATAR_PART_MAX_SECONDS;
+    const nextAvatarOk =
+      next?.blockType === "avatar" &&
+      next.endTime - seg.startTime <= AVATAR_PART_MAX_SECONDS;
+    if (prevAvatarOk) {
+      prev.script = `${prev.script} ${seg.script}`.replace(/\s+/g, " ").trim();
+      prev.endTime = seg.endTime;
+      prev.duration = Math.max(0.5, prev.endTime - prev.startTime);
+      segs.splice(i, 1); // remove the orphan; do not advance i
+      absorbed++;
+      continue;
+    }
+    if (nextAvatarOk) {
+      next.script = `${seg.script} ${next.script}`.replace(/\s+/g, " ").trim();
+      next.startTime = seg.startTime;
+      next.duration = Math.max(0.5, next.endTime - next.startTime);
+      segs.splice(i, 1); // remove the orphan; the avatar shifts to index i
+      absorbed++;
+      continue;
+    }
+    i++;
+  }
+  return absorbed;
+}
+
 // Coalesce CONTIGUOUS avatar segments into one atomic avatar "part".
 //
 // The audio-driven HeyGen flow treats one Google-Doc avatar passage as a SINGLE
@@ -642,12 +807,10 @@ function snapToSpace(text: string, idx: number): number {
 // merged row's spoken window [startTime, endTime) is what the avatar processor
 // slices out of master_voiceover.mp3 and uploads to HeyGen.
 //
-// Non-avatar segments pass through untouched. avatar parts are capped at 1 min
-// by the content rules (well under HeyGen Pro's 5-min limit); we LOG a warning
-// if a merged part ever exceeds the cap rather than splitting, since by
-// agreement it never should — the log surfaces a content-rule violation instead
-// of silently producing an over-length HeyGen request.
-const AVATAR_PART_MAX_SECONDS = 60;
+// Non-avatar segments pass through untouched. We LOG a warning if a merged part
+// ever exceeds AVATAR_PART_MAX_SECONDS rather than splitting, since by agreement
+// it never should — the log surfaces a content-rule violation instead of
+// silently producing an over-length HeyGen request.
 export function coalesceAvatarSegments(segs: PlannedSegment[]): {
   segments: PlannedSegment[];
   merged: number;
@@ -1028,6 +1191,68 @@ export async function buildSyntheticTimeline(input: {
         segmentsAfter: out.length,
       });
       planned = out;
+    }
+  }
+
+  // Merge-short-visuals pass (client feedback 2026-06: image switches too often,
+  // ~1s between — slow everything down to ~5-6s). Runs LAST of the timeline
+  // passes so it is the final word on pacing: a SHORT image/ai_clip sentence is
+  // merged INTO the previous same-type sentence so the two render as ONE visual
+  // instead of two flashes, until each merged block reaches the minimum hold.
+  // avatar and split_2 blocks are never merged. Each merged block now covers two
+  // sentences, so we regenerate ONE combined imagePrompt for its merged script
+  // (the stored prompt was the first sentence's only). Renumber positions
+  // afterward so they stay 0..n-1.
+  {
+    const minHold = getEnv().SYNTHETIC_BLOCK_MIN_HOLD;
+    const maxHold = getEnv().SYNTHETIC_BLOCK_SPLIT_THRESHOLD;
+    if (minHold > 0) {
+      const before = planned.length;
+      const { segments, merged } = mergeShortVisualSegments(planned, minHold, maxHold);
+      if (merged > 0) {
+        // Regenerate one combined imagePrompt per merged block so the visual
+        // reflects BOTH sentences, not just the first. We reuse the same
+        // single-block regenerator the review screen uses. A regen failure is
+        // non-fatal: we keep the first sentence's prompt (already on the row)
+        // rather than failing the whole plan — the merge's pacing win still
+        // lands, only that one block's prompt is sub-optimal.
+        let regenerated = 0;
+        let regenFailed = 0;
+        for (const p of segments) {
+          if (!p.needsPromptRegen || p.blockType === "avatar") continue;
+          try {
+            const r = await regenerateSegmentPrompt({
+              projectId,
+              jobId,
+              script: p.script,
+              basePrompt,
+              blockType: p.blockType,
+            });
+            // regenerateSegmentPrompt returns a prompt already composed WITH the
+            // base in front and the shot folded in, so clear shotType and the
+            // second-visual nudge — persist's composePrompt sees the base
+            // already present and passes it through unchanged.
+            p.imagePrompt = r.imagePrompt;
+            p.shotType = null;
+            p.secondVisual = false;
+            if (p.blockType === "ai_clip") p.animationPrompt = r.animationPrompt;
+            regenerated++;
+          } catch {
+            regenFailed++;
+          }
+        }
+        segments.forEach((p, i) => { p.position = i; });
+        planned = segments;
+        await logJob({ projectId, jobId }, "synthetic.plan.merge_short_visuals", {
+          minHoldSeconds: minHold,
+          maxHoldSeconds: maxHold,
+          blocksMerged: merged,
+          promptsRegenerated: regenerated,
+          promptRegenFailed: regenFailed,
+          segmentsBefore: before,
+          segmentsAfter: planned.length,
+        });
+      }
     }
   }
 
