@@ -51,9 +51,10 @@ function cfg() {
   }
   return {
     key: env.SIXTYNINE_LABS_API_KEY,
-    // Optional backup image key — used only as a failover in generateImage()
-    // when the primary returns a permanent auth 403. null when unconfigured.
-    backupImageKey: env.SIXTYNINE_LABS_API_KEY_BACKUP || null,
+    // Optional backup key — used only as a failover (in generateImage() and
+    // generateVoice()) when the primary returns a permanent auth 403. The SAME
+    // key serves both TTS and image lanes. null when unconfigured.
+    backupKey: env.SIXTYNINE_LABS_API_KEY_BACKUP || null,
     base: env.SIXTYNINE_LABS_BASE_URL.replace(/\/$/, ""),
     ttsProvider: env.SIXTYNINE_LABS_TTS_PROVIDER,
     ttsModel: env.SIXTYNINE_LABS_TTS_MODEL,
@@ -100,14 +101,17 @@ interface TtsStatusResponse {
   blockedChunks?: Array<{ index: number; text: string }>;
 }
 
-/** Generate a voiceover MP3 from transcript text via the 69labs job API. */
-export async function generateVoice(input: GenerateVoiceInput): Promise<GenerateVoiceResult> {
-  const c = cfg();
-  const text = input.text.trim();
-  if (!text) throw new Error("generateVoice: empty text");
-
-  const authJson = { Authorization: `Bearer ${c.key}`, "Content-Type": "application/json" };
-  const authOnly = { Authorization: `Bearer ${c.key}` };
+// Internal: one TTS run (submit→poll→download) with a SPECIFIC api key. The key
+// is passed in (not read from cfg) so generateVoice can re-run this on the backup
+// key when the primary hits a permanent auth 403 — mirroring generateImage.
+async function generateVoiceWithKey(
+  c: ReturnType<typeof cfg>,
+  text: string,
+  voiceId: string | undefined,
+  key: string,
+): Promise<GenerateVoiceResult> {
+  const authJson = { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
+  const authOnly = { Authorization: `Bearer ${key}` };
 
   // 1) Submit the job.
   const submit = await withHttpRetry("69labs.tts.submit", () =>
@@ -116,7 +120,7 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
       headers: authJson,
       body: JSON.stringify({
         text,
-        voiceId: input.voiceId || c.defaultVoice,
+        voiceId: voiceId || c.defaultVoice,
         voiceProvider: c.ttsProvider,
         modelId: c.ttsModel,
       }),
@@ -166,6 +170,39 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
     contentType: dl.headers.get("content-type") || "audio/mpeg",
     chars: text.length,
   };
+}
+
+/**
+ * Generate a voiceover MP3 from transcript text via the 69labs job API.
+ *
+ * BACKUP-KEY FAILOVER (mirrors generateImage): when the PRIMARY key returns a
+ * PERMANENT auth 403 ("Access denied" / FORBIDDEN — a revoked/blocked/expired
+ * key) and a backup key is configured (SIXTYNINE_LABS_API_KEY_BACKUP), the run
+ * is retried once on the backup. The same env var serves both TTS and image
+ * lanes. Any other error (transient, poll timeout, censored, etc.) propagates
+ * unchanged — only a dead PRIMARY KEY warrants the backup. When BOTH keys are
+ * down past the retry budget, the call throws and the job processor retries.
+ */
+export async function generateVoice(input: GenerateVoiceInput): Promise<GenerateVoiceResult> {
+  const c = cfg();
+  const text = input.text.trim();
+  if (!text) throw new Error("generateVoice: empty text");
+
+  try {
+    return await generateVoiceWithKey(c, text, input.voiceId, c.key as string);
+  } catch (err) {
+    if (c.backupKey && isAuthForbidden(err)) {
+      console.warn(
+        JSON.stringify({
+          msg: "69labs.tts.key_failover",
+          note: "primary tts key returned a permanent auth 403; retrying on backup key",
+          err: (err as Error).message?.slice(0, 200),
+        }),
+      );
+      return await generateVoiceWithKey(c, text, input.voiceId, c.backupKey);
+    }
+    throw err;
+  }
 }
 
 // NOTE: 69labs has no documented voice-catalog endpoint — a voice is referenced
@@ -316,7 +353,7 @@ export async function generateImage(basePrompt: string): Promise<GenerateImageRe
       // Primary key hit a permanent auth 403 and a backup is configured: fail
       // over to it once. Any other error (transient, poll timeout, censored,
       // etc.) propagates unchanged — only a dead PRIMARY KEY warrants the backup.
-      if (c.backupImageKey && isAuthForbidden(err)) {
+      if (c.backupKey && isAuthForbidden(err)) {
         console.warn(
           JSON.stringify({
             msg: "69labs.image.key_failover",
@@ -324,7 +361,7 @@ export async function generateImage(basePrompt: string): Promise<GenerateImageRe
             err: (err as Error).message?.slice(0, 200),
           }),
         );
-        const { image, contentType } = await generateNanoBananaImage(prompt, c.backupImageKey);
+        const { image, contentType } = await generateNanoBananaImage(prompt, c.backupKey);
         return { image, contentType, provider: "sixtynine_image" };
       }
       throw err;

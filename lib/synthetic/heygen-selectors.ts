@@ -379,15 +379,31 @@ export function audioFileInput(page: Page): Locator {
 // shows the uploaded track + its duration, with "Back" and "Add audio" actions).
 // Verified 2026-06-20: the commit button reads "Add audio" — so we match that
 // explicitly (a bare /^add$/ missed it and left the modal open, blocking the
-// composer so Generate never enabled). Other label variants kept for resilience
-// across HeyGen builds. Page-scoped (no dialog role).
+// composer so Generate never enabled).
+//
+// SCOPED TO THE DIALOG (2026-06-29): previously this was page-scoped with a broad
+// /add audio|^add$|^save$|.../ regex. That intermittently matched the WRONG button
+// — a stale modal/button elsewhere in the DOM, picked by .first() in DOM order —
+// so the click "succeeded" without committing the audio. The run then degraded to
+// the HeyGen-TTS script path, producing a clip with the WRONG (non-69labs) audio.
+// Scoping to the role=dialog Confirm-Audio modal AND leading the regex with the
+// exact "Add audio" label removes that ambiguity: only the real commit button in
+// the open modal can match. The broad fallbacks are kept but ONLY inside the
+// dialog, so they can no longer match a button on the composer behind the modal.
 //
 // NOTE: deliberately does NOT match "Upload" — that's the trigger button still on
 // the composer; clicking it would re-open the modal instead of committing.
 export function audioConfirmButton(page: Page): Locator {
-  return page.getByRole("button", {
-    name: /add audio|^use$|^add$|^confirm$|^done$|^select$|^apply$|^save$/i,
-  });
+  // Scope to the Confirm-Audio dialog when one is present (the normal flow); fall
+  // back to page scope only if HeyGen renders the confirm step without a dialog
+  // role, so older/edge builds still work.
+  const dialog = page.getByRole("dialog").filter({ has: page.getByText(/^confirm audio$/i) });
+  const name = /^add audio$|^use$|^add$|^confirm$|^done$|^select$|^apply$|^save$/i;
+  const inDialog = dialog.getByRole("button", { name });
+  // .or() yields a locator that resolves to the dialog-scoped button when the
+  // dialog exists, else the page-scoped one. The caller still filters to visible
+  // + enabled before clicking.
+  return inDialog.or(page.getByRole("button", { name }));
 }
 
 // The "Confirm Audio" review modal heading (the 2nd step, after file pick). Used

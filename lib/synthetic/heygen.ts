@@ -177,7 +177,11 @@ async function uploadAudioTrack(
   // place instead of throwing. Each wait is short; the loop is the real budget.
   const heading = audioModalHeading(page).locator("visible=true").first();
   let modalOpen = false;
-  for (let attempt = 0; attempt < 3 && !modalOpen; attempt++) {
+  // 4 attempts (was 3): right after a session recycle the SPA paints slowly
+  // through the stealth+proxy path, and the first click or two can land before
+  // the modal animates in. The extra re-click cheaply recovers that case in
+  // place instead of throwing "modal did not open" and burning the attempt.
+  for (let attempt = 0; attempt < 4 && !modalOpen; attempt++) {
     await clickFirstVisible(audioUploadTrigger(page), timeoutMs, "audio upload button").catch(() => {});
     try {
       await heading.waitFor({ state: "visible", timeout: 15_000 });
@@ -240,18 +244,56 @@ async function uploadAudioTrack(
   // Floor raised 45s -> 90s on 2026-06-26: with stealth, a SHORT clip
   // (segment e1176845, ~$0.10 render) still false-failed "Add audio never
   // clickable" at 45s because the whole modal paints slowly through the proxy —
-  // it then rotated and succeeded, wasting a ~4min attempt. 90s floor covers the
-  // slow paint; the 180s cap still bounds a genuinely stuck modal.
+  // it then rotated and succeeded, wasting a ~4min attempt.
+  // Floor raised 90s -> 120s and cap 180s -> 240s on 2026-06-29: the observed
+  // false-fail ("'Add audio' confirm button never became clickable", segment
+  // e1176845) still hit the 90s floor right after a recycle, where the whole
+  // modal paints especially slowly. Degrading to the script path there shipped
+  // WRONG (HeyGen TTS) audio. A more generous floor lets the correct-audio
+  // commit finish; the 240s cap still bounds a genuinely stuck modal.
   const dur = Number.isFinite(audioDurationSeconds) ? Math.max(0, audioDurationSeconds as number) : 0;
-  const confirmBudgetMs = Math.min(180_000, Math.max(90_000, Math.round(dur * 6_000)));
+  const confirmBudgetMs = Math.min(240_000, Math.max(120_000, Math.round(dur * 6_000)));
   const perPollMs = 3_000;
   const maxPolls = Math.ceil(confirmBudgetMs / (perPollMs + 4_000));
+  // Commit + VERIFY (hardened 2026-06-29). The old loop set committed=true as soon
+  // as click() returned — but a click that landed on a stale/wrong button (the old
+  // broad page-scoped selector) returned fine WITHOUT closing the modal, so we
+  // proceeded with the audio never attached and later degraded to HeyGen TTS =
+  // WRONG audio on the clip. Now a poll counts as committed ONLY when the Confirm
+  // Audio modal actually CLOSES after the click. If it doesn't, we keep polling
+  // (re-finding the button each iteration) until the budget runs out — so an
+  // intermittent mis-click self-heals instead of silently producing wrong audio.
+  //
+  // We also gate the click on isEnabled(): the button is VISIBLE the whole time
+  // but DISABLED while HeyGen decodes the track. Waiting on "visible" returned
+  // instantly and leaned on click()'s implicit enabled-wait; polling isEnabled()
+  // explicitly makes "still processing" vs "stuck" observable and avoids firing a
+  // click into a disabled button.
   let committed = false;
   for (let i = 0; i < maxPolls && !committed; i++) {
     try {
-      await confirmBtn.waitFor({ state: "visible", timeout: 4000 });
-      await confirmBtn.click({ timeout: 6000 });
-      committed = true;
+      // Re-resolve the button each poll: .first() is evaluated lazily, so a modal
+      // that finished painting between polls is picked up without a stale handle.
+      const btn = confirmBtn;
+      await btn.waitFor({ state: "visible", timeout: 4000 });
+      if (!(await btn.isEnabled())) {
+        // Track still decoding — not stuck. Wait and re-poll.
+        await page.waitForTimeout(perPollMs);
+        continue;
+      }
+      await btn.click({ timeout: 6000 });
+      // Verify the click actually committed: the Confirm Audio modal must close.
+      // If it lingers, the click hit the wrong element (or didn't register) — do
+      // NOT mark committed; loop and try again.
+      const closed = await confirmHeading
+        .waitFor({ state: "hidden", timeout: 6000 })
+        .then(() => true)
+        .catch(() => false);
+      if (closed) {
+        committed = true;
+      } else {
+        await page.waitForTimeout(perPollMs);
+      }
     } catch {
       await page.waitForTimeout(perPollMs);
     }
@@ -261,8 +303,9 @@ async function uploadAudioTrack(
   }
 
   // 5) Both modals must be gone for the audio to be committed to the composer.
-  // Wait for the Upload/Confirm headings to disappear; if either lingers the
-  // audio didn't attach and Generate would stay disabled.
+  // The Confirm heading was already verified hidden inside the commit loop; here
+  // we also clear the Upload modal heading and do a final guard against either
+  // modal lingering (which would leave the audio unattached and Generate disabled).
   await heading.waitFor({ state: "hidden", timeout: 30_000 }).catch(() => {});
   await confirmHeading.waitFor({ state: "hidden", timeout: 15_000 }).catch(() => {});
   if (await isVisible(audioConfirmHeading(page), 1000)) {
@@ -1134,22 +1177,24 @@ export async function generateAvatar(
   }
 
   let lastErr: unknown;
-  // Once an audio-upload step has failed, drive subsequent retries via the script
-  // path. Critical for a SINGLE-account pool: applyDisposition hands back the SAME
-  // account (nothing else to rotate to), so re-uploading the same long audio would
-  // fail identically every time and loop until the stall-sweeper kills the job.
-  // Falling back to HeyGen's TTS still produces a video.
-  let forceScriptPath = false;
+  // NEVER degrade an audio-driven job to the script (HeyGen TTS) path. The audio
+  // path attaches the sliced 69labs voiceover so the render carries the CORRECT
+  // audio; the script path speaks HeyGen's own TTS = WRONG audio on the clip,
+  // which is UNUSABLE and still burns a HeyGen credit. The client made clear that
+  // a wrong-audio render is worse than no render (wasted credit, unusable output).
+  //
+  // So an audio-upload failure is treated like any other failure: we ROTATE to a
+  // fresh account and retry the SAME audio path (a fresh session usually uploads
+  // the same audio cleanly). If every account's fresh session still fails the
+  // upload, we throw — the job hard-fails and no credit is spent on a wrong-audio
+  // render. `forceScriptPath` is left false on every attempt for audio-driven
+  // jobs; it stays available only for genuinely script-only inputs (no
+  // audioFilePath), which were never audio-driven to begin with.
   for (let i = 0; i < maxAccounts; i++) {
     try {
-      return await attemptOnAccount(account, input, imageBytes, forceScriptPath);
+      return await attemptOnAccount(account, input, imageBytes, false);
     } catch (err) {
       lastErr = err;
-      // An "Add audio"/upload failure is the one case where retrying with the same
-      // audio is futile — degrade to the script path on the next attempt.
-      if (input.audioFilePath && /add audio|audio file chooser|Confirm Audio|Upload Audio/i.test((err as Error)?.message ?? "")) {
-        forceScriptPath = true;
-      }
       const next = await applyDisposition(
         account.id,
         dispositionOf(err),
