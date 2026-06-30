@@ -141,6 +141,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // avatar / ai_clip carry a generated mp4 on video_url (a degraded ai_clip
     // may have only image_url, in which case it renders as a held still).
     if ((it.type === "avatar" || it.type === "ai_clip") && (it.video_url || it.image_url)) return true;
+    // Sales-pitch video (migration 0025): user-uploaded mp4 on video_url,
+    // inserted near 3:00. Renders as a full-motion video segment that KEEPS its
+    // own audio (the narration pauses over it — see the audio splice below).
+    if (it.type === "pitch_video" && it.video_url) return true;
     // Split-screen blocks. Sourced split: left+right are both stills
     // (image_url + metadata.right_image_url). Synthetic split: avatar VIDEO on
     // video_url + still on right_image_url. Renderable when a usable pair
@@ -326,6 +330,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     if (it?.clip_id) return true;
     // Synthetic avatar / ai_clip blocks render as full-motion video segments.
     if ((it?.type === "avatar" || it?.type === "ai_clip") && it?.video_url) return true;
+    // The sales-pitch video is also a full-motion video segment.
+    if (it?.type === "pitch_video" && it?.video_url) return true;
     return false;
   };
   // SFX cues should only land on REAL photo→photo dissolves, not on
@@ -508,6 +514,47 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           await safeUnlink(leftLocal);
           await safeUnlink(rightLocal);
         }
+      } else if (it.type === "pitch_video" && it.video_url) {
+        // SALES-PITCH video (migration 0025). Unlike avatar/ai_clip blocks,
+        // this is NOT cut to a narration window — its duration IS its own
+        // length, and it KEEPS its audio (extracted and spliced into the
+        // master track below so the narration pauses over it). We download,
+        // probe the real length, and normalize to the output canvas at the
+        // SHARED encode settings (required for the -c:v copy concat fast path),
+        // holding the audio through normalize so the splice has something to
+        // extract. Headroom is added toward image neighbors so the dip-to-black
+        // transition has frames to consume, same as any video block.
+        const headLeft = headroomFor(i - 1);
+        const headRight = headroomFor(i + 1);
+        const localPre = path.join(tmp, `pitch_${idx}.mp4`);
+        try {
+          await downloadHttp(it.video_url as string, localPre);
+          let pitchDur = Number(it.duration) || 0;
+          try { const p = await probeFile(localPre); if (p.durationSeconds > 0) pitchDur = p.durationSeconds; } catch { /* fall back to row duration */ }
+          // Normalize to the canvas, keeping audio. We pin to the probed length
+          // + headroom so the slot matches what the audio splice expects.
+          const renderDur = pitchDur + headLeft + headRight;
+          await normalizeClip({
+            inputPath: localPre, outputPath: out,
+            width: outW, height: outH, fps: 30,
+            keepAudio: true, vcodecArgs: vcodec,
+            pinDurationSeconds: renderDur,
+          });
+          slots[i] = out;
+          let actualDur = renderDur;
+          try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = p.durationSeconds; } catch { /* keep renderDur */ }
+          slotDurations[i] = actualDur;
+          slotContentDurations[i] = Math.max(0.1, actualDur - headLeft - headRight);
+          await logJob({ projectId, jobId: mediaJobId }, "render.pitch_video.rendered", {
+            idx: i,
+            probedSeconds: Math.round(pitchDur * 100) / 100,
+            renderedSeconds: Math.round(actualDur * 100) / 100,
+          });
+        } catch (e) {
+          await logJob({ projectId, jobId: mediaJobId }, "render.pitch_video.failed", { idx: i, url: it.video_url, err: (e as Error).message });
+        } finally {
+          await safeUnlink(localPre);
+        }
       } else if (it.type === "avatar" || it.type === "ai_clip") {
         // SYNTHETIC full-frame video block. avatar = HeyGen talking head;
         // ai_clip = fal.ai animated clip. Either is a no-audio mp4 on video_url
@@ -549,7 +596,17 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             // and voiceover stay in sync, audio is never cut. A gross shortfall
             // (a long frozen face) is logged for regeneration on the review
             // screen rather than silently shipped.
-            if (renderDur - actualDur > 0.2) {
+            //
+            // The threshold MUST stay tiny. A per-block tolerance of 0.2s used to
+            // sit here, but on a 303-block avatar render ~74 ai_clip blocks came
+            // back short by 0.12-0.17s each — each just UNDER 0.2s, so none were
+            // padded and the shortfalls compounded to -2.25s of video drift
+            // (post_validation driftMs -2452, passed:false). Below the audio, the
+            // final mux clips the voiceover tail and every avatar part's lips
+            // finish ahead of its words. Pad on any shortfall past one frame
+            // (~33ms at 30fps): padVideoToLength pins to exact renderDur, so
+            // filling even a 40ms gap is free and keeps cumulative drift at zero.
+            if (renderDur - actualDur > 0.034) {
               const padOut = path.join(tmp, `synvid_pad_${idx}.mp4`);
               try {
                 await padVideoToLength({ inputPath: out, outputPath: padOut, targetSeconds: renderDur, fps: 30, vcodecArgs: vcodec });
@@ -2009,11 +2066,26 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     // When no forced clips carry their own audio, this whole pass is a
     // no-op and the original voiceover path goes through unchanged.
     let voiceoverForConcat = voiceoverLocal;
-    if (voiceoverLocal && MID_TIMELINE_FORCED_CLIP_AUDIO_ENABLED) {
+    // A timeline segment carries its OWN audio (and pauses the narration over
+    // it) in two cases: a mid-timeline forced doc clip (currently disabled via
+    // MID_TIMELINE_FORCED_CLIP_AUDIO_ENABLED) OR a sales-pitch video block
+    // (always on — that's the whole point of the pitch insertion). The splice
+    // pass below handles both; it runs whenever at least one such block exists.
+    const isOwnAudioBlock = (it: { type?: string; metadata?: unknown; video_url?: string | null }): boolean => {
+      if (it.type === "pitch_video" && it.video_url) return true;
+      if (MID_TIMELINE_FORCED_CLIP_AUDIO_ENABLED && it.type === "footage") {
+        const meta = (it.metadata ?? {}) as Record<string, unknown>;
+        const fc = meta.forced_clip as { youtube_url?: string } | undefined;
+        if (fc?.youtube_url) return true;
+      }
+      return false;
+    };
+    const hasOwnAudioBlocks = renderable.some((it) => isOwnAudioBlock(it as { type?: string; metadata?: unknown; video_url?: string | null }));
+    if (voiceoverLocal && hasOwnAudioBlocks) {
       type ForcedAudio = {
         timelinePos: number;     // start time within the video timeline
-        videoDuration: number;   // forced clip's actual rendered duration
-        voPos: number;           // start time within the voiceover (excludes prior forced clips)
+        videoDuration: number;   // own-audio clip's actual rendered duration
+        voPos: number;           // start time within the voiceover (excludes prior own-audio clips)
         slotPath: string;        // rendered MP4 slot containing audio
       };
       const forcedAudioItems: ForcedAudio[] = [];
@@ -2021,11 +2093,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       let voPos = 0;
       for (let i = 0; i < renderable.length; i++) {
         const it = renderable[i];
-        const meta = (it.metadata ?? {}) as Record<string, unknown>;
-        const fc = meta.forced_clip as { youtube_url?: string } | undefined;
         const slotDur = slotDurations[i] ?? Number(it.duration ?? 0);
         const slotPath = slots[i];
-        if (it.type === "footage" && fc?.youtube_url && slotPath) {
+        if (isOwnAudioBlock(it as { type?: string; metadata?: unknown; video_url?: string | null }) && slotPath) {
           forcedAudioItems.push({
             timelinePos: tlPos,
             videoDuration: slotDur,

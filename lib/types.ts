@@ -106,6 +106,10 @@ export interface Project {
   aspect_ratio: AspectRatio;
   voiceover_source: VoiceoverSource | null;
   tts_voice_id: string | null;
+  // --- sales-pitch video insertion (migration 0025; synthetic-only) ---
+  pitch_video_url: string | null;
+  pitch_video_duration_seconds: number | null;
+  pitch_video_insert_seconds: number;
   created_at: string;
   updated_at: string;
 }

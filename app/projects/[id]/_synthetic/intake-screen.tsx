@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { uploadVoiceoverDirect } from "@/lib/client/upload-voiceover";
+import { uploadPitchVideoDirect } from "@/lib/client/upload-pitch-video";
 import type { SyntheticResp } from "./types";
 
 
@@ -31,8 +32,10 @@ export function SyntheticIntakeScreen({
   const [voiceId, setVoiceId] = useState(p.tts_voice_id ?? "");
   const [error, setError] = useState<string | null>(null);
   const [voPct, setVoPct] = useState<number | null>(null);
+  const [pitchPct, setPitchPct] = useState<number | null>(null);
   const voInput = useRef<HTMLInputElement>(null);
   const avatarInput = useRef<HTMLInputElement>(null);
+  const pitchInput = useRef<HTMLInputElement>(null);
 
   const voicesQ = useQuery<{ configured: boolean }>({
     queryKey: ["synthetic-voices"],
@@ -78,6 +81,31 @@ export function SyntheticIntakeScreen({
     onError: (e) => setError((e as Error).message),
   });
 
+  // Sales-pitch video: uploaded direct to R2, inserted near the 3:00 mark of
+  // the final render (snapped to the nearest segment boundary). Plays its own
+  // audio while the narration pauses, then narration resumes.
+  const uploadPitch = useMutation({
+    mutationFn: async (file: File) => {
+      setPitchPct(0);
+      try {
+        return await uploadPitchVideoDirect(projectId, file, (l, t) => setPitchPct(t > 0 ? Math.round((l / t) * 100) : null));
+      } finally {
+        setPitchPct(null);
+      }
+    },
+    onSuccess: onChange,
+    onError: (e) => setError((e as Error).message),
+  });
+
+  const removePitch = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/pitch-video`, { method: "DELETE" });
+      if (!r.ok) throw new Error((await r.json()).error ?? `remove failed (${r.status})`);
+    },
+    onSuccess: onChange,
+    onError: (e) => setError((e as Error).message),
+  });
+
   // BUILD PLAN: voiceover -> alignment -> planner, then STOP at the review gate.
   const buildPlan = useMutation({
     mutationFn: async () => {
@@ -95,6 +123,8 @@ export function SyntheticIntakeScreen({
   const hasDoc = !!p.transcript && p.transcript.trim().length > 0;
   const hasVoiceover = !!p.voiceover_url;
   const hasAvatar = !!p.avatar_image_url;
+  const hasPitch = !!p.pitch_video_url;
+  const pitchInsertSeconds = p.pitch_video_insert_seconds ?? 180;
   const markCount = p.avatar_mark_ranges?.length ?? 0;
   const hasInput = hasVoiceover || hasDoc; // need a script (doc) or an uploaded voiceover
   const canBuild = hasAvatar && hasInput && !buildPlan.isPending;
@@ -198,6 +228,46 @@ export function SyntheticIntakeScreen({
         </CardContent>
       </Card>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>3 · Sales pitch video <span className="text-fg-subtle font-normal">(optional)</span></CardTitle>
+          <CardDescription>
+            Inserted near the {fmtClock(pitchInsertSeconds)} mark of the final video (snapped to the nearest scene so it
+            never cuts an avatar mid-sentence). The narration pauses while it plays its own audio, then resumes —
+            everything after the insertion point shifts later.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <input
+            ref={pitchInput}
+            type="file"
+            accept="video/*"
+            className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadPitch.mutate(f); }}
+          />
+          <div className="flex items-center gap-3">
+            <Button type="button" variant="soft" size="sm" onClick={() => pitchInput.current?.click()} disabled={uploadPitch.isPending}>
+              <Upload className="h-4 w-4" /> {hasPitch ? "Replace pitch video" : "Upload pitch video"}
+            </Button>
+            {pitchPct != null && <span className="text-xs text-fg-muted tabular-nums">{pitchPct}%</span>}
+            {hasPitch && !uploadPitch.isPending && (
+              <>
+                <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+                  <Check className="h-3.5 w-3.5" /> Pitch video ready
+                  {p.pitch_video_duration_seconds ? <span className="text-fg-subtle">· {fmtClock(p.pitch_video_duration_seconds)}</span> : null}
+                </span>
+                <Button type="button" variant="ghost" size="sm" onClick={() => removePitch.mutate()} disabled={removePitch.isPending}>
+                  Remove
+                </Button>
+              </>
+            )}
+          </div>
+          {hasPitch && (
+            <video src={p.pitch_video_url!} controls className="w-full max-w-md rounded-[10px] border border-border bg-bg-elevated" />
+          )}
+        </CardContent>
+      </Card>
+
       <div className="flex items-center gap-3">
         <Button type="button" variant="gradient" size="lg" disabled={!canBuild} onClick={() => buildPlan.mutate()}>
           <Sparkles className="h-4 w-4" />
@@ -213,4 +283,12 @@ export function SyntheticIntakeScreen({
       </p>
     </div>
   );
+}
+
+// Seconds -> "m:ss" for the pitch-insert label and duration chip.
+function fmtClock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
 }

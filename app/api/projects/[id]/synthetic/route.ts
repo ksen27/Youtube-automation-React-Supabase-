@@ -18,7 +18,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
 
   const [projectRes, mediaRes, segmentsRes] = await Promise.all([
     sb.from("projects")
-      .select("id, title, engine, status, voiceover_url, voiceover_duration_seconds, avatar_image_url, voiceover_source, tts_voice_id, transcript, script_doc_url, avatar_mark_ranges")
+      .select("id, title, engine, status, voiceover_url, voiceover_duration_seconds, avatar_image_url, voiceover_source, tts_voice_id, transcript, script_doc_url, avatar_mark_ranges, pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
       .eq("id", id).single(),
     sb.from("media_jobs")
       .select("id, type, status, progress, attempts, error, metadata, created_at, updated_at")

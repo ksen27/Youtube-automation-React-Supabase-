@@ -242,6 +242,12 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
       await sb.from("timeline_items").update({ position: i }).eq("id", ordered[i].id);
     }
   }
+  // Insert / reconcile the sales-pitch video block (if the project has one).
+  // Runs unconditionally — even on a reconcile pass that materialized nothing
+  // new — so the pitch row appears once all segments are ready regardless of
+  // which finalize call drains the project. Idempotent + boundary-snapped.
+  await ensurePitchTimelineItem(projectId);
+
   await setProjectStatus(projectId, "ready_for_review");
 
   // Coarse project cost summary, reconstructed from the READY segment rows
@@ -267,6 +273,132 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     failed: all.filter((s) => s.status === "failed").length,
     costUsdEstimate: Number(totalUsd.toFixed(2)),
     costByBlockType: byType,
+  });
+}
+
+// Metadata flag stamped on the single sales-pitch timeline_item so we can find
+// (and not duplicate) it across finalize re-runs. The row has no
+// synthetic_segment_id, so this is its only stable identity.
+const PITCH_TIMELINE_FLAG = "pitch_video";
+
+/**
+ * Insert (or re-position) the sales-pitch video as a single timeline_item near
+ * the project's pitch_video_insert_seconds mark, SNAPPED to the nearest segment
+ * boundary so it never cuts an avatar part mid-sentence.
+ *
+ * Idempotent: keyed on metadata.kind === 'pitch_video', so repeated finalize
+ * calls update the one row rather than inserting duplicates. After placing the
+ * pitch row it renumbers EVERY timeline row (synthetic segments + the pitch row)
+ * to contiguous integer positions in timeline order, since the pitch row carries
+ * no synthetic_segment_id and is therefore invisible to the segment-only
+ * renumber in maybeFinalizeSynthetic.
+ *
+ * The pitch block is non-voiceover-bearing: it consumes video time but the
+ * narration pauses over it (handled in the render route's duration guard +
+ * renderProcessor's audio splice). Its duration is the probed/uploaded length,
+ * falling back to 0 only when unknown (the render worker re-probes the real
+ * file regardless).
+ */
+export async function ensurePitchTimelineItem(projectId: string): Promise<void> {
+  const sb = getServerSupabase();
+
+  const { data: proj } = await sb
+    .from("projects")
+    .select("pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
+    .eq("id", projectId)
+    .single();
+  if (!proj?.pitch_video_url) return; // no pitch video on this project
+
+  const insertAt = Number(proj.pitch_video_insert_seconds);
+  const insertSeconds = Number.isFinite(insertAt) && insertAt > 0 ? insertAt : 180;
+  const pitchDuration = Number(proj.pitch_video_duration_seconds) || 0;
+
+  // Pull current synthetic timeline rows in order. We rebuild their start_times
+  // from the durations rather than trusting the (planner-relative) start_time
+  // column, because the renderer's effective cut is duration-driven.
+  const { data: rowsRaw } = await sb
+    .from("timeline_items")
+    .select("id, position, duration, synthetic_segment_id, metadata")
+    .eq("project_id", projectId)
+    .order("position", { ascending: true });
+  const rows = rowsRaw ?? [];
+
+  // Separate the segment rows (everything with a segment id) from any existing
+  // pitch row. We re-place the pitch row among the segment rows below.
+  const segmentRows = rows.filter((r) => !!r.synthetic_segment_id);
+  const existingPitch = rows.find(
+    (r) => ((r.metadata ?? {}) as Record<string, unknown>).kind === PITCH_TIMELINE_FLAG,
+  );
+  if (segmentRows.length === 0) return; // nothing to anchor against yet
+
+  // Cumulative start time of each segment row; snap to the boundary whose start
+  // is nearest to insertSeconds. boundaryIndex is the number of segment rows
+  // that play BEFORE the pitch (so the pitch row sits between segmentRows[bi-1]
+  // and segmentRows[bi]).
+  let cum = 0;
+  let boundaryIndex = segmentRows.length; // default: append after the last row
+  let bestDelta = Infinity;
+  for (let i = 0; i < segmentRows.length; i++) {
+    const delta = Math.abs(cum - insertSeconds);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      boundaryIndex = i;
+    }
+    cum += Number(segmentRows[i].duration) || 0;
+  }
+  // Also consider the very end boundary (after the last row) — covers the rare
+  // case the whole video is barely longer than insertSeconds.
+  if (Math.abs(cum - insertSeconds) < bestDelta) {
+    boundaryIndex = segmentRows.length;
+  }
+
+  // Upsert the pitch row.
+  const pitchPayload = {
+    project_id: projectId,
+    type: PITCH_TIMELINE_FLAG,
+    position: 0, // set by the renumber below
+    start_time: insertSeconds,
+    duration: pitchDuration,
+    script_text: null,
+    image_url: null,
+    video_url: proj.pitch_video_url,
+    right_image_url: null,
+    approved: true, // not a per-row reviewed asset; pre-approved like the intro
+    synthetic_segment_id: null,
+    metadata: { kind: PITCH_TIMELINE_FLAG, insert_seconds: insertSeconds },
+  };
+  let pitchId: string | null = existingPitch?.id ?? null;
+  if (existingPitch) {
+    await sb.from("timeline_items").update(pitchPayload).eq("id", existingPitch.id);
+  } else {
+    const { data: inserted, error } = await sb
+      .from("timeline_items")
+      .insert(pitchPayload)
+      .select("id")
+      .single();
+    if (error) throw new Error(`ensurePitchTimelineItem insert: ${error.message}`);
+    pitchId = inserted?.id ?? null;
+  }
+
+  // Renumber every row to contiguous integers in timeline order, splicing the
+  // pitch row in at boundaryIndex. Segment rows keep their relative order.
+  const orderedIds: string[] = [];
+  for (let i = 0; i < segmentRows.length; i++) {
+    if (i === boundaryIndex && pitchId) orderedIds.push(pitchId);
+    orderedIds.push(segmentRows[i].id as string);
+  }
+  if (boundaryIndex >= segmentRows.length && pitchId) orderedIds.push(pitchId);
+
+  for (let i = 0; i < orderedIds.length; i++) {
+    await sb.from("timeline_items").update({ position: i }).eq("id", orderedIds[i]);
+  }
+
+  await logJob({ projectId }, "synthetic.pitch_video.placed", {
+    insertSeconds,
+    snappedBoundaryIndex: boundaryIndex,
+    snapDeltaSeconds: Math.round(bestDelta * 100) / 100,
+    pitchDurationSeconds: pitchDuration,
+    totalRows: orderedIds.length,
   });
 }
 

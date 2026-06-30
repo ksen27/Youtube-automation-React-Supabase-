@@ -37,7 +37,11 @@ const DURATION_BEARING_TYPES = new Set([
 // Synthetic block types render as visible segments without a clip_id (their
 // asset lives on video_url/image_url, set by the synthetic processors). They
 // count as renderable the same way footage/image do for the sourced engine.
-const SYNTHETIC_RENDERABLE_TYPES = new Set(["avatar", "ai_clip", "image", "split_2"]);
+// pitch_video is the user-uploaded sales-pitch clip inserted near 3:00; it
+// renders as a video segment but is NOT in DURATION_BEARING_TYPES because it
+// plays its own audio while the narration pauses (it consumes video time, not
+// voiceover time — same exclusion the intro pre-roll gets).
+const SYNTHETIC_RENDERABLE_TYPES = new Set(["avatar", "ai_clip", "image", "split_2", "pitch_video"]);
 
 const VALIDATION_FAILED_MSG =
   "Timeline duration must match voiceover.";

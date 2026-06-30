@@ -89,20 +89,28 @@ primary_region = 'lhr'
 [build]
   dockerfile = 'Dockerfile.worker'
 
-# Avatar work is Playwright + HTTP (image/video/TTS provider calls), not heavy
-# multi-core FFmpeg, so a much smaller VM than the render worker suffices.
-# Chromium needs a couple of GB of RAM. 4gb was NOT enough: headless Chromium +
-# the heavy HeyGen SPA spiked past it and the OS SIGTERM-killed the browser after
-# ~1 render (logs: browser_disconnected -> "Reaped child process ... SIGTERM"),
-# forcing a full ~3-6 min cold rebuild every render and defeating the warm-session
-# reuse (HEYGEN_MAX_RENDERS_PER_SESSION). 8gb gives headroom so the browser
-# survives across renders — and, with the per-account session pool, lets several
-# warm browsers (one per parallel HeyGen account) coexist without OOM.
-# NOTE: 8gb requires shared-cpu-4x — shared-cpu-2x is capped at 4096 MiB by Fly,
-# so pairing it with memory='8gb' fails with "cannot exceed 4096 MiB".
+# This worker does TWO kinds of work now: HeyGen/Playwright avatar generation
+# (Chromium-bound) AND synthetic RENDER jobs (it serves the render queue — see
+# RENDER_CACHE_DIR note above). Render is CPU-bound: every clip is a libx264
+# normalize pass and every image/video boundary is an xfade re-encode, run in
+# RENDER_PIPELINE_CONCURRENCY parallel lanes. shared-cpu-4x was too slow for that
+# — shared cores get throttled under sustained 100% encode load, so avatar-engine
+# renders ran far slower than the celebrity worker (performance-8x). Matched to
+# the celebrity render VM so render throughput is the same on both engines.
+#
+# Chromium also needs the headroom: 4gb SIGTERM-killed the browser after ~1
+# render (browser_disconnected -> "Reaped child process ... SIGTERM"); 16gb gives
+# ample room for the HeyGen SPA plus several warm per-account browsers.
+#
+# IMPORTANT: the render concurrency knobs are Fly SECRETS (they override [env]),
+# so the bigger VM alone does nothing until they are set to use the 8 cores —
+# mirror the celebrity worker:
+#   fly secrets set RENDER_PIPELINE_CONCURRENCY=4 FFMPEG_THREADS=2 \
+#     --app video-automation-avatar-worker
+# (4 lanes x 2 threads = 8 vCPUs — the rule of thumb from lib/env.ts.)
 [[vm]]
-  size = 'shared-cpu-4x'
-  memory = '8gb'
+  size = 'performance-8x'
+  memory = '16gb'
 
 # Persistent volume for the synthetic render resume cache (RENDER_CACHE_DIR =
 # /data/render-cache). Mirrors the celebrity worker's worker_data mount so an
