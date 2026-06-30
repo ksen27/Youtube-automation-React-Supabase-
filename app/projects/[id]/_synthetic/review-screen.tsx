@@ -212,6 +212,36 @@ export function SyntheticReviewScreen({
         </Card>
       )}
 
+      {/* Sales-pitch video (read-only). Not a planned segment — it's spliced
+          into the timeline at render time near the insert mark, with the
+          narration pausing over it. Shown here so the user can see/confirm it's
+          included and where it lands. Edit/remove it back on the Intake step. */}
+      {resp.project.pitch_video_url && (
+        <Card className="border-brand-300/40">
+          <CardContent className="p-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="flex items-center gap-2 sm:w-56 shrink-0">
+              <Film className="h-4 w-4 text-brand-300 shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium">Sales pitch video</p>
+                <p className="text-[11px] text-fg-subtle">
+                  Inserted at ~{fmtClock(resp.project.pitch_video_insert_seconds ?? 180)}
+                  {resp.project.pitch_video_duration_seconds
+                    ? ` · ${fmtClock(resp.project.pitch_video_duration_seconds)} long`
+                    : ""}
+                  {" "}· narration pauses, plays its own audio
+                </p>
+              </div>
+            </div>
+            <video
+              src={resp.project.pitch_video_url}
+              controls
+              preload="metadata"
+              className="w-full max-w-sm rounded-[10px] border border-border bg-black"
+            />
+          </CardContent>
+        </Card>
+      )}
+
       <div className="space-y-3">
         {segs.map((s) => (
           <SegmentRow key={s.id} projectId={projectId} segment={s} onChange={onChange} />
@@ -223,6 +253,12 @@ export function SyntheticReviewScreen({
 
 function thumbUrl(s: SyntheticSegmentRow): string | null {
   return s.image_url ?? s.right_image_url ?? null;
+}
+
+// Seconds -> "m:ss" for the pitch-video card.
+function fmtClock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 // One previous-version tile in a segment's history: a thumbnail (image) or a

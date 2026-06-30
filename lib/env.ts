@@ -665,6 +665,15 @@ const ServerEnvSchema = z.object({
   // this cutoff blocks keep whatever type Gemini chose (stills dominate, cheaper).
   // 0 disables the promotion entirely.
   SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(180),
+  // split_2 cap (client feedback 2026-06: "too many split_2 parts, I don't want
+  // many split_2 part video"). split_2 (a talking presenter beside an
+  // illustrative still) is chosen freely by Gemini and routinely overruns — one
+  // 115-block plan came back with 50 split_2 (~43%). This caps split_2 at this
+  // FRACTION of total blocks; the excess (lowest-priority first) is demoted to a
+  // plain 'image'. Default 0.12 keeps a sprinkle (~1 in 8) and kills the flood.
+  // Set to 0 to demote EVERY split_2 to image (no presenter-beside-image layout);
+  // set to 1 to disable the cap (back to Gemini's unrestricted choice).
+  SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.12),
   // Low-fi "vlogging" degrade (client requirement 2026-06). The reference channel
   // looks REAL precisely because its footage is slightly LOW QUALITY — grainy,
   // soft, compressed, like a real phone vlog. Our generations come out too clean

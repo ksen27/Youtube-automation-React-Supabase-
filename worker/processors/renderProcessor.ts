@@ -2238,6 +2238,66 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     await setMediaJob(mediaJobId, { progress: 85 });
     await sb.from("render_jobs").update({ progress: 85 }).eq("id", renderJobId);
 
+    // 4a-pre-pin) Final total-length pin (synthetic). The concat does -c:v copy,
+    // so the VIDEO length is just the sum of the concatenated segment frames; it
+    // gets no -t. Each segment is a whole number of frames, so any block whose
+    // planned duration falls between frame boundaries lands up to ~1 frame
+    // (~16ms) short. tpad in the per-block pad-up can't fix sub-frame shortfalls
+    // (it can only add WHOLE cloned frames past a >1-frame gap), so on a 303-block
+    // avatar render ~59 blocks each ~9-33ms short summed to -510ms of video drift
+    // and the final file came back -758ms under the voiceover (post_validation
+    // passed:false) even after the per-block 0.034s threshold fix. Below the
+    // audio, the concat's `-t`/apad pins the audio to the SHORT video length and
+    // the narration tail is clipped, so every avatar part's lips finish ahead of
+    // its words.
+    //
+    // The fix is to absorb the residual once, here: hold the assembled video's
+    // last frame up to totalVideoDurationSeconds — the exact length the concat
+    // already pinned the AUDIO to (intro + all merged slots + own-audio blocks).
+    // Video and audio then match to the millisecond regardless of per-block
+    // frame quantization. The held frame lands on the outro (sub-second, silent),
+    // so it's invisible. Best-effort: on any failure we keep the un-pinned
+    // finalLocal rather than block the render. PERFORMANCE_MODE included — this is
+    // a correctness pin, not an effect.
+    if (isSyntheticRender && totalVideoDurationSeconds > 0) {
+      try {
+        const concatProbe = await probeFile(finalLocal);
+        const videoLen = concatProbe.durationSeconds;
+        const shortfall = totalVideoDurationSeconds - videoLen;
+        // Only pad a real shortfall past one frame; never trim (the audio is
+        // already pinned to totalVideoDurationSeconds, so a fractionally-long
+        // video is harmless and trimming risks cutting a real last frame).
+        if (videoLen > 0 && shortfall > 0.034) {
+          const pinnedLocal = path.join(tmp, `final_pinned_${projectId}.mp4`);
+          await padVideoToLength({
+            inputPath: finalLocal,
+            outputPath: pinnedLocal,
+            targetSeconds: totalVideoDurationSeconds,
+            fps: 30,
+            vcodecArgs: vcodec,
+          });
+          await safeUnlink(finalLocal);
+          finalLocal = pinnedLocal;
+          await logJob({ projectId, jobId: mediaJobId }, "render.final_length_pin", {
+            concatVideoSeconds: Math.round(videoLen * 1000) / 1000,
+            targetSeconds: Math.round(totalVideoDurationSeconds * 1000) / 1000,
+            shortfallMs: Math.round(shortfall * 1000),
+            note: "held last frame to match audio length; absorbs residual per-block frame-quantization drift",
+          });
+        } else {
+          await logJob({ projectId, jobId: mediaJobId }, "render.final_length_pin.skipped", {
+            concatVideoSeconds: Math.round(videoLen * 1000) / 1000,
+            targetSeconds: Math.round(totalVideoDurationSeconds * 1000) / 1000,
+            shortfallMs: Math.round(shortfall * 1000),
+            note: shortfall <= 0.034 ? "within one frame; no pin needed" : "video not shorter than target",
+          });
+        }
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId },
+          "render.final_length_pin.failed", { err: (e as Error).message });
+      }
+    }
+
     // 4a-pre0) Low-fi "vlogging" video degrade (best-effort, synthetic only).
     // One re-encode pass over the finished video that lowers TEXTURE quality
     // (grain + slight softness + stronger compression) so the footage reads as

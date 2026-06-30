@@ -201,7 +201,11 @@ function buildPrompt(transcript: string): string {
     "  - image  : explanations / factual exposition best shown with a still.",
     "  - ai_clip: action or dynamic scenes that benefit from motion.",
     "  - split_2: mixed explanation where a talking presenter AND an",
-    "             illustrative image should appear together.",
+    "             illustrative image should appear together. Use this SPARINGLY",
+    "             (client requirement) — only a small handful of blocks in the",
+    "             whole video, reserved for the few moments a presenter genuinely",
+    "             needs to appear beside an illustration. Do NOT default to it;",
+    "             prefer plain image / ai_clip for ordinary explanatory lines.",
     "",
     "Block sizing — ONE SENTENCE = ONE BLOCK. Each block's `script` MUST be a",
     "WHOLE sentence (or a few short, tightly-related sentences). NEVER break a",
@@ -1093,6 +1097,47 @@ function applyMark(seg: PlannedSegment, marked: boolean, basePrompt: string): Pl
   return seg;
 }
 
+// Cap the number of split_2 blocks (client feedback 2026-06: "too many split_2
+// parts"). Gemini chooses split_2 freely and overuses it (a 115-block plan came
+// back 50 split_2). split_2 is a presenter-beside-still LAYOUT, not a content
+// type, so an over-chosen one is safely DEMOTED to a plain 'image' covering the
+// same sentence — its imagePrompt already describes a single-subject still (the
+// illustrative half), which is exactly what an image block needs.
+//
+// Policy: keep at most `maxFraction` of total blocks as split_2 (at least 1 when
+// any exist and the fraction is > 0), KEEPING the earliest in timeline order and
+// demoting the rest. Earliest-kept gives an even early sprinkle rather than a
+// late clump. A demoted block keeps its script + imagePrompt and just changes
+// type (animationPrompt stays null — image has no motion). Mutates nothing;
+// returns a new array. position is reassigned by the caller if needed.
+export function capSplit2Blocks(
+  segs: PlannedSegment[],
+  maxFraction: number,
+): { segments: PlannedSegment[]; demoted: number } {
+  if (maxFraction >= 1) return { segments: segs, demoted: 0 };
+  const split2Count = segs.filter((s) => s.blockType === "split_2").length;
+  if (split2Count === 0) return { segments: segs, demoted: 0 };
+  // Allowed count: floor(total * fraction), but keep at least 1 split_2 when the
+  // fraction is non-zero and Gemini wanted any (so a small video still gets one).
+  const allowed = maxFraction <= 0 ? 0 : Math.max(1, Math.floor(segs.length * maxFraction));
+  if (split2Count <= allowed) return { segments: segs, demoted: 0 };
+
+  let kept = 0;
+  let demoted = 0;
+  const out = segs.map((s) => {
+    if (s.blockType !== "split_2") return s;
+    if (kept < allowed) {
+      kept++;
+      return s;
+    }
+    demoted++;
+    // Demote to a single-subject still. imagePrompt/shotType already describe the
+    // illustrative half — reuse them verbatim. No motion on an image.
+    return { ...s, blockType: "image" as SyntheticBlockType, animationPrompt: null };
+  });
+  return { segments: out, demoted };
+}
+
 type RawSegment = z.infer<typeof GeminiSegmentSchema>;
 
 // Salvage a segments array from a response that JSON.parse rejected because it
@@ -1385,6 +1430,29 @@ export async function buildSyntheticTimeline(input: {
         segmentsAfter: planned.length,
         partsMerged: merged,
         overLengthParts,
+      });
+    }
+  }
+
+  // split_2 cap pass (client feedback 2026-06: "too many split_2 parts"). Gemini
+  // over-chooses split_2; demote the excess to plain 'image' so only a small
+  // share remains. Runs AFTER avatar-marking/coalescing (a doc-marked avatar is
+  // never a split_2, so it's untouched) and BEFORE the clip-heavy + duration
+  // passes (so a demoted image can still be promoted to ai_clip in the intro and
+  // carved by duration-split like any other image).
+  {
+    const maxFraction = getEnv().SYNTHETIC_SPLIT2_MAX_FRACTION;
+    const before = planned.filter((p) => p.blockType === "split_2").length;
+    const { segments, demoted } = capSplit2Blocks(planned, maxFraction);
+    if (demoted > 0) {
+      segments.forEach((p, i) => { p.position = i; });
+      planned = segments;
+      await logJob({ projectId, jobId }, "synthetic.plan.split2_cap", {
+        maxFraction,
+        split2Before: before,
+        split2After: before - demoted,
+        demotedToImage: demoted,
+        totalBlocks: planned.length,
       });
     }
   }
