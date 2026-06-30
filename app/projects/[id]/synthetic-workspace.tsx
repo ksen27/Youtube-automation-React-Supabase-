@@ -113,7 +113,14 @@ export function SyntheticWorkspace({ projectId }: { projectId: string }) {
     >
       {phase === "intake" && <SyntheticIntakeScreen projectId={projectId} resp={resp} onChange={refetch} />}
       {phase === "progress" && <SyntheticProgressScreen projectId={projectId} resp={resp} onChange={refetch} />}
-      {phase === "review" && <SyntheticReviewScreen projectId={projectId} resp={resp} onChange={refetch} />}
+      {phase === "review" && (
+        <SyntheticReviewScreen
+          projectId={projectId}
+          resp={resp}
+          onChange={refetch}
+          onGoToRender={() => setOverride("render")}
+        />
+      )}
       {phase === "render" && <SyntheticRenderScreen projectId={projectId} resp={resp} onChange={refetch} />}
     </WorkspaceLayout>
   );

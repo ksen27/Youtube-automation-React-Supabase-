@@ -127,6 +127,27 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     "id" | "block_type" | "status" | "position" | "start_time" | "duration" | "script" | "image_url" | "video_url" | "right_image_url" | "provider">>;
   if (all.length === 0) return;
 
+  // Never demote a project that has already advanced PAST review. finalize runs
+  // on every asset finish AND on the 5-min reconcile sweep, and its terminal
+  // write (line below) is an unconditional setProjectStatus(..., "ready_for_review").
+  // Once the user has clicked Render, the project moves to "rendering" and then
+  // the render worker sets "completed"/"failed". A finalize firing after that —
+  // e.g. the reconcile sweep, which still sees all segments ready — would clobber
+  // "completed" back to "ready_for_review" (observed: project flipped completed ->
+  // ready_for_review seconds after a successful render). The segments are already
+  // materialized by then, so there is nothing left to finalize; bail out.
+  const { data: proj } = await sb
+    .from("projects")
+    .select("status")
+    .eq("id", projectId)
+    .single();
+  const POST_REVIEW: ReadonlySet<ProjectStatus> = new Set<ProjectStatus>([
+    "rendering",
+    "completed",
+    "failed",
+  ]);
+  if (proj && POST_REVIEW.has(proj.status as ProjectStatus)) return;
+
   // Finalize ONLY when EVERY segment has reached a terminal state. A segment
   // is "still working" unless it is ready / failed / skipped — anything else
   // (pending, generating, or a transient state between a failure and its

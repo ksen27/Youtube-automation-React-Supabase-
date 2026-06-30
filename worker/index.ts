@@ -152,6 +152,11 @@ if (runSynthetic) {
   workers.push(startWorker(QUEUE_NAMES.imageGeneration,  processImageGenJob,         env.IMAGE_GEN_CONCURRENCY));
   workers.push(startWorker(QUEUE_NAMES.imageToVideo,     processImageToVideoJob,     env.IMAGE_TO_VIDEO_CONCURRENCY));
   workers.push(startWorker(QUEUE_NAMES.avatar,           processAvatarJob,           env.AVATAR_CONCURRENCY));
+  // Synthetic renders run HERE (on the avatar worker) rather than on the sourced
+  // render slot, so an avatar render and a celebrity render proceed in parallel.
+  // Concurrency 1: a render is a heavy multi-core FFmpeg job — one at a time per
+  // machine (same as the sourced render slot). The processor is shared.
+  workers.push(startWorker(QUEUE_NAMES.renderSynthetic,  processRenderJob,           1));
 }
 
 // Periodic stall sweeper — the safety net for the case where on("failed")
@@ -175,7 +180,9 @@ const SWEEP_STALE_MS = 45 * 60_000; // 45 min
 // worker can't false-kill the other engine's in-flight jobs. 'all' passes
 // undefined → sweeps everything (single-worker setup, unchanged).
 const SOURCED_TYPES = ["search", "download", "clip", "match", "render", "script_clip", "analyze"];
-const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar"];
+// "render" is in BOTH lists: the media_jobs type is "render" regardless of which
+// queue ran it, so the synthetic worker must sweep its own stalled renders too.
+const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar", "render"];
 const sweepTypes =
   role === "sourced" ? SOURCED_TYPES : role === "synthetic" ? SYNTHETIC_TYPES : undefined;
 // Orphaned-segment cutoff. A synthetic_segments row stuck "generating" past
@@ -198,9 +205,10 @@ const sweepTimer = setInterval(() => {
       })
       .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.error", err: (e as Error).message })));
   }
-  // Render-cache reaping only applies to the render worker (sourced/all); the
-  // avatar worker has no /data render cache.
-  if (!runSourced) return;
+  // Render-cache reaping applies to ANY worker that runs renders. Both roles do
+  // now: sourced renders celebrity videos, synthetic renders avatar videos on the
+  // avatar worker's own /data volume — so each must reap its own stale cache.
+  if (!runSourced && !runSynthetic) return;
   // Reap render-cache entries from abandoned/failed projects so the resume
   // cache doesn't grow unbounded on the /data volume. Live renders refresh
   // their dir mtime as they write clips, so this only removes stale orphans.

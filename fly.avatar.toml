@@ -77,9 +77,14 @@ primary_region = 'lhr'
   # — so the scriptField wait timed out and threw a FALSE blank_composer on a page
   # that was actually rendered. 90s covers the real paint time.
   HEYGEN_SETUP_TIMEOUT_MS = "90000"
-  # Local scratch for downloads/screenshots (ephemeral is fine — no resume
-  # cache is needed for avatar jobs the way renders need /data).
+  # Local scratch for downloads/screenshots (ephemeral is fine for HeyGen
+  # automation artifacts).
   TMP_DIR = "/tmp/work"
+  # This worker now ALSO serves the synthetic render queue, so it needs the
+  # per-clip resume cache on a PERSISTENT volume (see [[mounts]] below) — exactly
+  # like the celebrity worker. Without it an interrupted avatar render would
+  # re-encode all ~300 clips from scratch on restart instead of resuming.
+  RENDER_CACHE_DIR = "/data/render-cache"
 
 [build]
   dockerfile = 'Dockerfile.worker'
@@ -98,6 +103,16 @@ primary_region = 'lhr'
 [[vm]]
   size = 'shared-cpu-4x'
   memory = '8gb'
+
+# Persistent volume for the synthetic render resume cache (RENDER_CACHE_DIR =
+# /data/render-cache). Mirrors the celebrity worker's worker_data mount so an
+# interrupted avatar render resumes from its per-clip cache instead of
+# re-encoding everything. Distinct volume NAME from the celebrity app's so the
+# two apps never share storage. Create it once before first deploy:
+#   fly volumes create avatar_worker_data --size 20 --region lhr -c fly.avatar.toml
+[[mounts]]
+  source = 'avatar_worker_data'
+  destination = '/data'
 
 # NOTE on auto-stop: a BullMQ worker has no inbound HTTP port, so Fly cannot
 # auto-WAKE it from a queued Redis job (auto_start fires on inbound requests to

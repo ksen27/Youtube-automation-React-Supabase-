@@ -184,7 +184,9 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const mediaJobId = await createMediaJob({
     projectId: id, type: "render", metadata: { renderJobId: rj.id },
   });
-  await enqueueRender({ projectId: id, mediaJobId, renderJobId: rj.id });
+  // Synthetic renders go to the synthetic render queue (served by the avatar
+  // worker) so they don't queue behind a celebrity render on the sourced worker.
+  await enqueueRender({ projectId: id, mediaJobId, renderJobId: rj.id }, { synthetic: isSynthetic });
 
   return NextResponse.json({ render_job: rj, media_job_id: mediaJobId }, { status: 202 });
 }

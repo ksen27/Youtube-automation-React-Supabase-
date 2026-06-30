@@ -8,6 +8,13 @@ export const QUEUE_NAMES = {
   clip: "video-automation-clip",
   match: "video-automation-match",
   render: "video-automation-render",
+  // Synthetic (AI-avatar) renders run on a SEPARATE queue from the sourced
+  // render queue so the avatar worker can serve them on its own machine. This
+  // lets a celebrity render and an avatar render run AT THE SAME TIME instead of
+  // queuing behind the celebrity worker's single render slot. Same payload +
+  // same processor (processRenderJob) — only the queue (and thus the consuming
+  // machine) differs. Routed by engine in enqueueRender.
+  renderSynthetic: "video-automation-render-synthetic",
   // One job per script-doc marker that has a youtube_url. Runs in parallel
   // because each marker is independent (different sources, no shared
   // local-state). Lives on its own queue rather than reusing `download` so
@@ -161,8 +168,14 @@ export async function enqueueClip(data: ClipJobData) {
 export async function enqueueMatch(data: MatchJobData) {
   return getQueue<MatchJobData>(QUEUE_NAMES.match).add("match", data, { jobId: data.mediaJobId });
 }
-export async function enqueueRender(data: RenderJobData) {
-  return getQueue<RenderJobData>(QUEUE_NAMES.render).add("render", data, { jobId: data.mediaJobId });
+// `synthetic: true` routes the render to the synthetic render queue, which the
+// avatar worker serves on its own machine — so an avatar render runs in parallel
+// with a celebrity render instead of waiting behind the sourced render slot. The
+// payload and processor are identical; only the target queue differs. Defaults
+// to the sourced queue when omitted (the caller passes project.engine).
+export async function enqueueRender(data: RenderJobData, opts?: { synthetic?: boolean }) {
+  const queue = opts?.synthetic ? QUEUE_NAMES.renderSynthetic : QUEUE_NAMES.render;
+  return getQueue<RenderJobData>(queue).add("render", data, { jobId: data.mediaJobId });
 }
 export async function enqueueScriptClip(data: ScriptClipJobData) {
   return getQueue<ScriptClipJobData>(QUEUE_NAMES.scriptClip).add("script_clip", data, { jobId: data.mediaJobId });

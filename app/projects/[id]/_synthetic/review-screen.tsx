@@ -24,10 +24,15 @@ export function SyntheticReviewScreen({
   projectId,
   resp,
   onChange,
+  onGoToRender,
 }: {
   projectId: string;
   resp: SyntheticResp;
   onChange: () => void;
+  // Navigate to the render step (parent owns step routing). Used when a render
+  // is already in flight: the Render button becomes "View render" instead of
+  // POSTing a second render the route would 409 with "render already in progress".
+  onGoToRender?: () => void;
 }) {
   const segs = resp.segments ?? [];
   // Two gates share this screen:
@@ -115,6 +120,10 @@ export function SyntheticReviewScreen({
     resp.project.status === "generating_images" ||
     resp.project.status === "generating_clips" ||
     resp.project.status === "generating_avatars";
+  // A render is already running for this project. The render route refuses a
+  // second one (409 "render already in progress"), so when the user steps back
+  // here mid-render we offer navigation to the render step instead of a re-POST.
+  const isRendering = resp.project.status === "rendering";
   const generatingCount = segs.filter((s) => s.status === "generating" || s.status === "pending").length;
   const failedCount = segs.filter((s) => s.status === "failed").length;
   const allReady = segs.length > 0 && segs.every((s) => s.status === "ready" || s.status === "skipped");
@@ -133,7 +142,7 @@ export function SyntheticReviewScreen({
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-medium text-fg">
-            {isPlanGate ? "Review plan" : isGenerating ? "Generating assets" : "Review timeline"}
+            {isPlanGate ? "Review plan" : isGenerating ? "Generating assets" : isRendering ? "Rendering video" : "Review timeline"}
           </h2>
           <p className="text-xs text-fg-subtle">
             {segs.length} blocks{isPlanGate
@@ -173,6 +182,12 @@ export function SyntheticReviewScreen({
           // even if polling lapses.
           <Button type="button" variant="ghost" size="sm" onClick={onChange}>
             <RefreshCw className="h-4 w-4 animate-spin" /> Generating…
+          </Button>
+        ) : isRendering ? (
+          // A render is already in flight. Don't re-POST (the route 409s) —
+          // send the user to the render step to watch progress / download.
+          <Button type="button" variant="gradient" onClick={() => onGoToRender?.()}>
+            <Film className="h-4 w-4" /> View render
           </Button>
         ) : (
           <Button type="button" variant="gradient" disabled={!allReady || render.isPending} onClick={() => render.mutate()}>
