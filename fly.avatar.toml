@@ -86,10 +86,18 @@ primary_region = 'lhr'
 
 # Avatar work is Playwright + HTTP (image/video/TTS provider calls), not heavy
 # multi-core FFmpeg, so a much smaller VM than the render worker suffices.
-# Chromium needs a couple of GB of RAM; shared-cpu-2x / 4gb is comfortable.
+# Chromium needs a couple of GB of RAM. 4gb was NOT enough: headless Chromium +
+# the heavy HeyGen SPA spiked past it and the OS SIGTERM-killed the browser after
+# ~1 render (logs: browser_disconnected -> "Reaped child process ... SIGTERM"),
+# forcing a full ~3-6 min cold rebuild every render and defeating the warm-session
+# reuse (HEYGEN_MAX_RENDERS_PER_SESSION). 8gb gives headroom so the browser
+# survives across renders — and, with the per-account session pool, lets several
+# warm browsers (one per parallel HeyGen account) coexist without OOM.
+# NOTE: 8gb requires shared-cpu-4x — shared-cpu-2x is capped at 4096 MiB by Fly,
+# so pairing it with memory='8gb' fails with "cannot exceed 4096 MiB".
 [[vm]]
-  size = 'shared-cpu-2x'
-  memory = '4gb'
+  size = 'shared-cpu-4x'
+  memory = '8gb'
 
 # NOTE on auto-stop: a BullMQ worker has no inbound HTTP port, so Fly cannot
 # auto-WAKE it from a queued Redis job (auto_start fires on inbound requests to

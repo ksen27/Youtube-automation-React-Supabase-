@@ -6,6 +6,7 @@ import {
   enqueueAvatar,
 } from "@/lib/jobs/queue";
 import type { SyntheticSegment, ProjectStatus } from "@/lib/types";
+import { estimateSegmentCost } from "@/lib/synthetic/cost";
 
 // Shared orchestration for the synthetic asset-generation fan-out.
 //
@@ -119,11 +120,11 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
   const sb = getServerSupabase();
   const { data: segs } = await sb
     .from("synthetic_segments")
-    .select("id, block_type, status, position, start_time, duration, script, image_url, video_url, right_image_url")
+    .select("id, block_type, status, position, start_time, duration, script, image_url, video_url, right_image_url, provider")
     .eq("project_id", projectId)
     .order("position", { ascending: true });
   const all = (segs ?? []) as Array<Pick<SyntheticSegment,
-    "id" | "block_type" | "status" | "position" | "start_time" | "duration" | "script" | "image_url" | "video_url" | "right_image_url">>;
+    "id" | "block_type" | "status" | "position" | "start_time" | "duration" | "script" | "image_url" | "video_url" | "right_image_url" | "provider">>;
   if (all.length === 0) return;
 
   // Finalize ONLY when EVERY segment has reached a terminal state. A segment
@@ -147,16 +148,26 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
   // RECONCILE, don't skip: a prior finalize may have already materialized the
   // segments that were ready at the time. Rather than bail when timeline_items
   // exist, we insert only the ready segments not yet represented (keyed on
-  // metadata.synthetic_segment_id) so late-completing segments are added. This
-  // is what makes finalize idempotent AND eventually-complete instead of
-  // freezing whatever was ready first.
+  // synthetic_segment_id) so late-completing segments are added. This is what
+  // makes finalize idempotent AND eventually-complete instead of freezing
+  // whatever was ready first.
+  //
+  // The in-memory "already materialized" filter below is a fast path, NOT the
+  // guarantee: this function runs on every asset finish plus the reconcile
+  // sweep, so two finalizes can both read the existing rows before either
+  // inserts and both see a segment as missing — a read-modify-write race that
+  // previously double-inserted (459 rows / ~2896s for one 303-segment / 1932s
+  // project, which the render route rejected). The guarantee is the partial
+  // unique index timeline_items_project_segment_uq (migration 0024): the insert
+  // is an UPSERT with ignoreDuplicates, so a racing second insert of the same
+  // segment is a DB-level no-op instead of a duplicate.
   const { data: existingItems } = await sb
     .from("timeline_items")
-    .select("metadata")
+    .select("synthetic_segment_id")
     .eq("project_id", projectId);
   const alreadyMaterialized = new Set(
     (existingItems ?? [])
-      .map((it) => (it.metadata as { synthetic_segment_id?: string } | null)?.synthetic_segment_id)
+      .map((it) => it.synthetic_segment_id as string | null)
       .filter((v): v is string => !!v),
   );
 
@@ -175,10 +186,20 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     video_url: s.video_url,
     right_image_url: s.right_image_url,
     approved: false,
+    // Real column (backs the unique index) AND the metadata key, which other
+    // read paths still consult. Both carry the same id.
+    synthetic_segment_id: s.id,
     metadata: { synthetic_segment_id: s.id },
   }));
   if (rows.length > 0) {
-    const { error } = await sb.from("timeline_items").insert(rows);
+    // Upsert (not insert) so a concurrent finalize that already inserted this
+    // segment makes our row a no-op via the unique index instead of a dup.
+    const { error } = await sb
+      .from("timeline_items")
+      .upsert(rows, {
+        onConflict: "project_id,synthetic_segment_id",
+        ignoreDuplicates: true,
+      });
     if (error) throw new Error(`maybeFinalizeSynthetic materialize: ${error.message}`);
     // Renumber every synthetic row by its segment's planned position so the
     // timeline is contiguous and in order, even after a reconcile inserted late
@@ -187,12 +208,12 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     const segPos = new Map(all.map((s) => [s.id, s.position]));
     const { data: items } = await sb
       .from("timeline_items")
-      .select("id, metadata")
+      .select("id, synthetic_segment_id")
       .eq("project_id", projectId);
     const ordered = (items ?? [])
       .map((it) => ({
         id: it.id as string,
-        segId: (it.metadata as { synthetic_segment_id?: string } | null)?.synthetic_segment_id,
+        segId: it.synthetic_segment_id as string | null,
       }))
       .filter((x) => x.segId && segPos.has(x.segId))
       .sort((a, b) => (segPos.get(a.segId!) ?? 0) - (segPos.get(b.segId!) ?? 0));
@@ -201,10 +222,30 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     }
   }
   await setProjectStatus(projectId, "ready_for_review");
+
+  // Coarse project cost summary, reconstructed from the READY segment rows
+  // (block_type + provider + duration). The per-call logProviderCall lines only
+  // reach stdout, so this finalize line is the one greppable per-project total.
+  // It reflects the FINAL assets, so retries are undercounted — it's a floor on
+  // spend ("this project cost ~$X"), not an invoice. ai_clip is the big driver:
+  // a nano-banana still + an LTX-2 clip at its duration tier.
+  const byType: Record<string, { count: number; usd: number }> = {};
+  let totalUsd = 0;
+  for (const s of ready) {
+    const usd = estimateSegmentCost(s);
+    totalUsd += usd;
+    const bucket = (byType[s.block_type] ??= { count: 0, usd: 0 });
+    bucket.count += 1;
+    bucket.usd += usd;
+  }
+  for (const k of Object.keys(byType)) byType[k].usd = Number(byType[k].usd.toFixed(2));
+
   await logJob({ projectId }, "synthetic.finalize", {
     materialized: rows.length,
     alreadyPresent: alreadyMaterialized.size,
     failed: all.filter((s) => s.status === "failed").length,
+    costUsdEstimate: Number(totalUsd.toFixed(2)),
+    costByBlockType: byType,
   });
 }
 
@@ -267,6 +308,49 @@ export async function finishSegment(
 
 // Re-export so processors import job helpers from one place if they prefer.
 export { setMediaJob };
+
+// Heartbeat a segment's updated_at while a long provider call runs.
+//
+// THE PROBLEM THIS FIXES
+// ----------------------
+// sweepStalledSegments (worker/reconcile.ts) treats a 'generating' segment whose
+// updated_at predates SEGMENT_STALE_MS as dead and marks it
+// "stalled — generation did not complete". But updated_at is only bumped by the
+// synthetic_segments_touch trigger on an actual row UPDATE, and NOTHING writes the
+// segment row during the long render await (LTX-2 clip ~60-95s, HeyGen render
+// minutes). So a segment that is ALIVE and rendering goes quiet on updated_at and,
+// once a deep serial backlog pushes its total in-flight time past the cutoff, the
+// sweeper false-fails it even though generation is working. (See the band-aid in
+// avatarProcessor: "a slow-but-alive HeyGen render can complete AFTER the sweeper
+// wrote a 'stalled' error" — this removes the race instead of papering over it.)
+//
+// withSegmentHeartbeat wraps the render call and, every intervalMs, issues a
+// no-op UPDATE that fires the touch trigger so updated_at stays fresh while the
+// work is genuinely in flight. A segment that is actually stuck stops
+// heartbeating and is still swept correctly.
+export async function withSegmentHeartbeat<T>(
+  segmentId: string,
+  work: () => Promise<T>,
+  intervalMs = 60_000,
+): Promise<T> {
+  const sb = getServerSupabase();
+  const beat = setInterval(() => {
+    // Guard on status='generating' so we never resurrect a segment that finished
+    // or was swept between ticks. Best-effort: a failed beat just means this tick
+    // didn't refresh updated_at; the next one will.
+    void sb
+      .from("synthetic_segments")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("id", segmentId)
+      .eq("status", "generating")
+      .then(() => {}, () => {});
+  }, intervalMs);
+  try {
+    return await work();
+  } finally {
+    clearInterval(beat);
+  }
+}
 
 // Reset a segment for REGENERATION without losing its current asset.
 //

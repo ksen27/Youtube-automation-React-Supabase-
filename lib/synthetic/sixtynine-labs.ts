@@ -14,34 +14,89 @@ import { withStylePrompt } from "@/lib/synthetic/constants";
 // Images get the mandatory STYLE_PROMPT appended (withStylePrompt). The
 // image-to-video and avatar steps live in separate provider modules.
 
-// Process-wide gate on concurrent image generations. The image_gen,
-// image_to_video, and avatar/split_2 lanes each call generateImage on their own
-// BullMQ concurrency, so their combined in-flight count can blow past 69labs'
-// real per-account limit and earn a 403 / a 503 cooldown. 69labs allows only
-// 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER, and exceeding the
-// tier ceiling triggers cooldowns — see SIXTYNINE_IMAGE_CONCURRENCY (default 4).
-// This semaphore caps the TOTAL in-flight image generations for THIS worker
-// process below that limit; excess callers await a freed slot (FIFO). Scope is
-// per-process — correct here because the burst that triggered the 403 came from
-// one worker running all three lanes at once. With multiple worker machines the
-// cap is per-machine, so the cluster total is limit × machines: keep ONE image
-// worker (or size the cap so machines × cap stays within your tier's ceiling).
-let imageSlotsInUse = 0;
-const imageWaiters: Array<() => void> = [];
-
-async function acquireImageSlot(limit: number): Promise<void> {
-  if (imageSlotsInUse < limit) {
-    imageSlotsInUse++;
-    return;
+// PER-KEY gate on concurrent image generations. The image_gen, image_to_video,
+// and avatar/split_2 lanes each call generateImage on their own BullMQ
+// concurrency, so their combined in-flight count can blow past 69labs' real
+// per-account limit and earn a 403 / a 503 cooldown. 69labs allows only 1–4
+// concurrent generations DEPENDING ON SUBSCRIPTION TIER, and exceeding the tier
+// ceiling triggers cooldowns — see SIXTYNINE_IMAGE_CONCURRENCY (default 4).
+//
+// With a KEY POOL (two separate-account keys; see keyPool()), each key has its
+// OWN semaphore so the two accounts run their tier limits IN PARALLEL: cluster
+// concurrency is SIXTYNINE_IMAGE_CONCURRENCY × keys (e.g. 4 × 2 = 8). A single
+// global counter (the old design) would have throttled both keys to ONE tier's
+// worth of slots, throwing away the second account's capacity. Excess callers
+// await a freed slot on THAT key (FIFO).
+//
+// Scope is per-process. Correct here because the burst that triggered the 403
+// came from one worker running all three lanes at once, and we run ONE synthetic
+// worker. With multiple worker machines the cap is per-machine, so the cluster
+// total is limit × keys × machines — keep ONE synthetic worker, or size the cap
+// so machines × cap stays within each tier's ceiling.
+class KeySemaphore {
+  private inUse = 0;
+  private readonly waiters: Array<() => void> = [];
+  async acquire(limit: number): Promise<void> {
+    if (this.inUse < limit) {
+      this.inUse++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    this.inUse++;
   }
-  await new Promise<void>((resolve) => imageWaiters.push(resolve));
-  imageSlotsInUse++;
+  release(): void {
+    this.inUse--;
+    const next = this.waiters.shift();
+    if (next) next();
+  }
 }
 
-function releaseImageSlot(): void {
-  imageSlotsInUse--;
-  const next = imageWaiters.shift();
-  if (next) next();
+// One semaphore per api key, created lazily and keyed by the key string so each
+// account's in-flight image work is bounded independently.
+const imageSemaphores = new Map<string, KeySemaphore>();
+function imageSemaphoreFor(key: string): KeySemaphore {
+  let sem = imageSemaphores.get(key);
+  if (!sem) {
+    sem = new KeySemaphore();
+    imageSemaphores.set(key, sem);
+  }
+  return sem;
+}
+
+// Separate per-key semaphores for TTS. 69labs meters TTS concurrency separately
+// from image generation, so TTS gets its own slot pools (reusing the image
+// per-key cap as a conservative ceiling) rather than sharing the image counters.
+const ttsSemaphores = new Map<string, KeySemaphore>();
+function ttsSemaphoreFor(key: string): KeySemaphore {
+  let sem = ttsSemaphores.get(key);
+  if (!sem) {
+    sem = new KeySemaphore();
+    ttsSemaphores.set(key, sem);
+  }
+  return sem;
+}
+
+// The ordered key pool: primary first, then the optional second key. Empty
+// values are filtered out, so a single configured key yields a 1-element pool
+// (identical behavior to before — no parallelism, no failover target).
+function keyPool(): string[] {
+  const env = getEnv();
+  return [env.SIXTYNINE_LABS_API_KEY, env.SIXTYNINE_LABS_API_KEY_BACKUP]
+    .map((k) => (k || "").trim())
+    .filter((k): k is string => k.length > 0);
+}
+
+// Round-robin cursor for balancing new generations across the key pool. A plain
+// process-wide counter is enough: it just has to spread starts across keys, not
+// be exact. Each lane reads-then-increments, so consecutive generations start on
+// alternating keys.
+let rrCursor = 0;
+function nextKeyOrder(pool: string[]): string[] {
+  if (pool.length <= 1) return pool;
+  const start = rrCursor++ % pool.length;
+  // Return the pool rotated so index `start` is first; the rest follow as
+  // failover candidates in order.
+  return [...pool.slice(start), ...pool.slice(0, start)];
 }
 
 function cfg() {
@@ -49,12 +104,12 @@ function cfg() {
   if (!env.SIXTYNINE_LABS_API_KEY) {
     throw new Error("SIXTYNINE_LABS_API_KEY not configured (synthetic engine)");
   }
+  // NOTE: the api key(s) are NOT returned here. Key selection (round-robin +
+  // per-key failover across the pool) lives in keyPool()/nextKeyOrder() and is
+  // passed explicitly to generateNanoBananaImage / generateVoiceWithKey. cfg()
+  // only carries the non-secret request config. The check above still guarantees
+  // a primary key is configured before any generation runs.
   return {
-    key: env.SIXTYNINE_LABS_API_KEY,
-    // Optional backup key — used only as a failover (in generateImage() and
-    // generateVoice()) when the primary returns a permanent auth 403. The SAME
-    // key serves both TTS and image lanes. null when unconfigured.
-    backupKey: env.SIXTYNINE_LABS_API_KEY_BACKUP || null,
     base: env.SIXTYNINE_LABS_BASE_URL.replace(/\/$/, ""),
     ttsProvider: env.SIXTYNINE_LABS_TTS_PROVIDER,
     ttsModel: env.SIXTYNINE_LABS_TTS_MODEL,
@@ -175,34 +230,51 @@ async function generateVoiceWithKey(
 /**
  * Generate a voiceover MP3 from transcript text via the 69labs job API.
  *
- * BACKUP-KEY FAILOVER (mirrors generateImage): when the PRIMARY key returns a
+ * KEY-POOL ROUND-ROBIN + FAILOVER (mirrors generateImage): voiceover jobs are
+ * load-balanced across the key pool with per-key TTS concurrency, so two
+ * separate-account keys render in parallel. If the chosen key returns a
  * PERMANENT auth 403 ("Access denied" / FORBIDDEN — a revoked/blocked/expired
- * key) and a backup key is configured (SIXTYNINE_LABS_API_KEY_BACKUP), the run
- * is retried once on the backup. The same env var serves both TTS and image
- * lanes. Any other error (transient, poll timeout, censored, etc.) propagates
- * unchanged — only a dead PRIMARY KEY warrants the backup. When BOTH keys are
- * down past the retry budget, the call throws and the job processor retries.
+ * key), the run is retried on the next key in the pool. Any other error
+ * (transient, poll timeout, censored, etc.) propagates unchanged — only a dead
+ * key warrants hopping. When ALL keys are down past the retry budget, the call
+ * throws and the job processor retries.
  */
 export async function generateVoice(input: GenerateVoiceInput): Promise<GenerateVoiceResult> {
   const c = cfg();
   const text = input.text.trim();
   if (!text) throw new Error("generateVoice: empty text");
+  const limit = getEnv().SIXTYNINE_IMAGE_CONCURRENCY;
 
-  try {
-    return await generateVoiceWithKey(c, text, input.voiceId, c.key as string);
-  } catch (err) {
-    if (c.backupKey && isAuthForbidden(err)) {
-      console.warn(
-        JSON.stringify({
-          msg: "69labs.tts.key_failover",
-          note: "primary tts key returned a permanent auth 403; retrying on backup key",
-          err: (err as Error).message?.slice(0, 200),
-        }),
-      );
-      return await generateVoiceWithKey(c, text, input.voiceId, c.backupKey);
+  // Round-robin across the key pool with per-key concurrency, mirroring
+  // generateImage: the first key is the load-balanced choice, the rest are
+  // permanent-auth-403 failover targets. With two separate-account keys this runs
+  // voiceover jobs on both accounts in parallel.
+  const order = nextKeyOrder(keyPool());
+  let lastErr: unknown;
+  for (let i = 0; i < order.length; i++) {
+    const key = order[i];
+    await ttsSemaphoreFor(key).acquire(limit);
+    try {
+      return await generateVoiceWithKey(c, text, input.voiceId, key);
+    } catch (err) {
+      lastErr = err;
+      const hasNext = i < order.length - 1;
+      if (hasNext && isAuthForbidden(err)) {
+        console.warn(
+          JSON.stringify({
+            msg: "69labs.tts.key_failover",
+            note: "tts key returned a permanent auth 403; retrying on next key in pool",
+            err: (err as Error).message?.slice(0, 200),
+          }),
+        );
+        continue;
+      }
+      throw err;
+    } finally {
+      ttsSemaphoreFor(key).release();
     }
-    throw err;
   }
+  throw lastErr ?? new Error("generateVoice: no 69labs key configured");
 }
 
 // NOTE: 69labs has no documented voice-catalog endpoint — a voice is referenced
@@ -328,58 +400,69 @@ async function generateNanoBananaImage(
  * Generate an image from a base prompt via 69labs (nano-banana). The mandatory
  * STYLE_PROMPT is appended here so every caller gets the consistent look.
  *
- * 69labs is the ONLY image provider — there is no cross-provider fallback. Safe
- * multi-image generation comes from three mechanisms, NOT a cross-provider one:
- *   1. The global image slot below caps total in-flight 69labs jobs under the
- *      provider's per-tier concurrent limit (1–4 by subscription;
- *      SIXTYNINE_IMAGE_CONCURRENCY default 4), so a burst of segments queues
- *      instead of earning a 403 / a 503 cooldown.
+ * 69labs is the ONLY image provider — there is no cross-provider fallback. Safe,
+ * fast multi-image generation comes from three mechanisms:
+ *   1. KEY-POOL ROUND-ROBIN + PER-KEY CONCURRENCY: each configured key (a
+ *      separate account) gets its OWN slot pool (SIXTYNINE_IMAGE_CONCURRENCY per
+ *      key), and new generations alternate across keys (nextKeyOrder). So two
+ *      keys run their tier limits IN PARALLEL — a burst is bounded per account
+ *      (no 403 "concurrent limit" / 503 cooldown) while total throughput ~2×s.
+ *      A single key yields a 1-element pool: identical to the old single-key cap.
  *   2. generateNanoBananaImage's withHttpRetry rides out transient 503 "service
  *      unavailable" / 403 "concurrent limit" spikes with exponential backoff on
  *      the SAME key.
- *   3. BACKUP-KEY FAILOVER: when the PRIMARY key returns a PERMANENT auth 403
- *      ("Access denied" / FORBIDDEN — a revoked/blocked/expired key, the failure
- *      that stalled a whole run when the single key died), and a backup key is
- *      configured (SIXTYNINE_LABS_API_KEY_BACKUP), the attempt is re-run once on
- *      the backup. The keys are used one-at-a-time (primary first, backup only on
- *      that specific failure), so the concurrency cap above still protects each
- *      key's tier limit — no per-key accounting needed. The transient
- *      concurrent-limit 403 is NOT treated as failover-worthy (mechanism 2 rides
- *      it out on the same key), so a busy primary doesn't needlessly burn the
- *      backup.
- * When BOTH keys are down past the retry budget, the call throws — the caller
+ *   3. KEY FAILOVER: when the chosen key returns a PERMANENT auth 403 ("Access
+ *      denied" / FORBIDDEN — a revoked/blocked/expired key), the generation is
+ *      retried on the NEXT key in the pool. The transient concurrent-limit 403 is
+ *      NOT failover-worthy (mechanism 2 rides it out on the same key), so a busy
+ *      key doesn't needlessly hop to the other.
+ * When ALL keys are down past the retry budget, the call throws — the caller
  * (image processor) lets BullMQ retry the whole job, and the segment can be
  * re-run from the UI once 69labs recovers. The chosen provider is returned for
  * cost attribution (always "sixtynine_image").
  */
 export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
-  const c = cfg();
+  cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
   const prompt = withStylePrompt(basePrompt);
-  // Hold a global image slot for the whole submit→poll→download so total
-  // in-flight 69labs image work stays under the provider's concurrent cap.
-  await acquireImageSlot(getEnv().SIXTYNINE_IMAGE_CONCURRENCY);
-  try {
+  const limit = getEnv().SIXTYNINE_IMAGE_CONCURRENCY;
+
+  // Try each key in round-robin order. The FIRST key is the load-balanced choice
+  // for this generation; the rest are failover targets used only when a key dies
+  // with a permanent auth 403. Each key's slot is held only for ITS attempt, so a
+  // busy key on one account never blocks a free slot on the other.
+  const order = nextKeyOrder(keyPool());
+  let lastErr: unknown;
+  for (let i = 0; i < order.length; i++) {
+    const key = order[i];
+    // Hold a PER-KEY image slot for the whole submit→poll→download so each
+    // account's in-flight image work stays under its own concurrent cap.
+    await imageSemaphoreFor(key).acquire(limit);
     try {
-      const { image, contentType } = await generateNanoBananaImage(prompt, c.key as string);
+      const { image, contentType } = await generateNanoBananaImage(prompt, key);
       return { image, contentType, provider: "sixtynine_image" };
     } catch (err) {
-      // Primary key hit a permanent auth 403 and a backup is configured: fail
-      // over to it once. Any other error (transient, poll timeout, censored,
-      // etc.) propagates unchanged — only a dead PRIMARY KEY warrants the backup.
-      if (c.backupKey && isAuthForbidden(err)) {
+      lastErr = err;
+      // Only a PERMANENT auth 403 (revoked/blocked/expired key) is worth failing
+      // over to the next key. Any other error (transient 403 "concurrent limit",
+      // poll timeout, censored, etc.) propagates unchanged — those are ridden out
+      // on the same key by withHttpRetry, or are genuine content errors.
+      const hasNext = i < order.length - 1;
+      if (hasNext && isAuthForbidden(err)) {
         console.warn(
           JSON.stringify({
             msg: "69labs.image.key_failover",
-            note: "primary image key returned a permanent auth 403; retrying on backup key",
+            note: "image key returned a permanent auth 403; retrying on next key in pool",
             err: (err as Error).message?.slice(0, 200),
           }),
         );
-        const { image, contentType } = await generateNanoBananaImage(prompt, c.backupKey);
-        return { image, contentType, provider: "sixtynine_image" };
+        continue;
       }
       throw err;
+    } finally {
+      imageSemaphoreFor(key).release();
     }
-  } finally {
-    releaseImageSlot();
   }
+  // Unreachable when the pool is non-empty (cfg() guarantees a primary), but
+  // keeps the type checker happy and surfaces the real cause if it ever is.
+  throw lastErr ?? new Error("generateImage: no 69labs key configured");
 }

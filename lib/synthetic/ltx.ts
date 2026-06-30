@@ -31,6 +31,7 @@ function cfg() {
     base: env.LTX_BASE_URL.replace(/\/$/, ""),
     model: env.LTX_MODEL,
     resolution: env.LTX_RESOLUTION,
+    fps: env.LTX_FPS,
     maxDuration: env.LTX_MAX_DURATION,
     pollTimeoutMs: env.LTX_POLL_TIMEOUT_SECONDS * 1000,
   };
@@ -110,6 +111,9 @@ export async function generateLtxVideo(input: GenerateClipInput): Promise<Genera
         model: c.model,
         duration,
         resolution: c.resolution,
+        // ltx-2-fast rejects the API's default fps 24 at 1080p; send an allowed
+        // value (25/50) explicitly. Downstream render re-encodes to 30 anyway.
+        fps: c.fps,
       }),
       timeoutMs: 60_000,
     }),

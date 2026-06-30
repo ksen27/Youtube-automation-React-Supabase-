@@ -655,28 +655,62 @@ const AVATAR_PART_MAX_SECONDS = 60;
 // minimum, so a short block also merges back into a previous block that is
 // ALREADY at/above the minimum (the goal is "no visual under the minimum", not
 // "grow until reached"). Merging stops at a non-mergeable block (avatar /
-// split_2 / type change) or when it would exceed the split threshold (keeps a
-// merged ai_clip inside LTX's animatable range); a short block the cap can't
-// absorb is left as a rare orphan.
+// split_2 / type change) or once the combined span passes the combine ceiling
+// (~2 slots' worth); a short block with no mergeable neighbor falls through to
+// the avatar pass or stays a rare orphan.
 //
-// Per client direction (2026-06): a SHORT sentence merges into the PREVIOUS
-// sentence so the two render as ONE visual instead of two flashes. Because the
-// merged block now covers BOTH sentences' narration, its visual must reflect
-// the COMBINED thought — so we flag every merged block (`needsPromptRegen`) and
-// the planner regenerates one combined imagePrompt for the merged script before
-// persist. (The old hold-extension behaviour lingered the FIRST sentence's
-// image over the second sentence's words, which mismatched the narration.)
+// Per client direction (2026-06): a SHORT sentence merges with its neighbor so
+// the two render as ONE combined visual unit instead of a flash. Because the
+// merged block covers BOTH sentences' narration, its visual must reflect the
+// COMBINED thought — so we flag every merged block (`needsPromptRegen`) and the
+// planner regenerates one combined imagePrompt for the merged script.
 //
-// ONLY 'image' and 'ai_clip' merge, but they merge ACROSS types (client
-// direction 2026-06: a short sentence must never stay a flash, even when its
-// neighbor is the other visual type). When an image and an ai_clip merge, the
-// result is an 'ai_clip' if EITHER side was a clip — preserving motion for the
-// clip-heavy intro — and the planner then regenerates a combined prompt
-// (including an animationPrompt for the now-clip block). 'avatar' and 'split_2'
-// are explicitly NEVER merged: avatar parts are atomic HeyGen renders handled
-// by coalesceAvatarSegments, and split_2 is a presenter-beside-still layout
-// that holds its whole sentence. Both act as run boundaries.
+// The combined window may exceed the 8s cap — when it does, splitMergedVisuals
+// (run after the regen) re-splits it into N EVEN ~min-second slots so it plays
+// as N visuals of ~5s each (slot 1 = combined prompt, slots 2+ = a different
+// angle), NOT one over-long hold. So a 7s + 2.6s pair → two ~4.8s visuals, and a
+// clip+clip = 10s → two 5s clips with motion preserved (each slot < 8s).
+//
+// ONLY 'image' and 'ai_clip' merge, but they merge ACROSS types (a short
+// sentence must never stay a flash, even next to the other visual type). The
+// merged result type comes from resolveMerge: an 'ai_clip' if EITHER side was a
+// clip (preserving motion for the clip-heavy intro), otherwise an 'image'.
+// Merging is tried BACKWARD (into the
+// previous visual), then FORWARD (into the next, for blocks whose previous
+// neighbor is a boundary), then as an AVATAR fallback. 'avatar' and 'split_2'
+// are explicitly NEVER a visual-merge target: avatar parts are atomic HeyGen
+// renders handled by coalesceAvatarSegments (a stranded orphan can still be
+// absorbed into an adjacent avatar's audio window — see mergeOrphansIntoAvatar),
+// and split_2 is a presenter-beside-still layout that holds its whole sentence.
+// Both act as visual-run boundaries.
 const MERGEABLE_VISUAL_TYPES = new Set<SyntheticBlockType>(["image", "ai_clip"]);
+
+// Upper bound on a COMBINED short-sentence window before merging stops absorbing
+// more. A merged block over maxHold is later re-split into even ~min-second
+// slots (splitMergedVisuals), so we don't need the old 8s cap here — but we DO
+// cap the combine at ~2 slots' worth so a long run of shorts doesn't fuse into
+// one block that re-splits into many near-identical visuals. 2*maxHold (16s)
+// re-splits into at most ~3 slots, which is plenty.
+const MERGE_COMBINE_CEILING_FACTOR = 2;
+
+// Decide whether two adjacent visual blocks can merge and, if so, the result
+// type. The result is an ai_clip when EITHER side is a clip (so motion is
+// preserved — each re-split slot is < maxHold, well inside LTX's range), else an
+// image. We allow the combined span to exceed maxHoldSeconds (the merged block
+// is re-split into even ~min-second slots afterward — client direction 2026-06:
+// a 7s + 2.6s pair merges to 9.6s and shows as TWO ~4.8s visuals, not one flash
+// and not a long static hold). We only refuse once the combined span passes the
+// combine ceiling, to avoid fusing a long run of shorts into one block.
+function resolveMerge(
+  a: PlannedSegment,
+  b: PlannedSegment,
+  spanSeconds: number,
+  maxHoldSeconds: number,
+): SyntheticBlockType | null {
+  if (spanSeconds > maxHoldSeconds * MERGE_COMBINE_CEILING_FACTOR) return null;
+  return a.blockType === "ai_clip" || b.blockType === "ai_clip" ? "ai_clip" : "image";
+}
+
 export function mergeShortVisualSegments(
   segs: PlannedSegment[],
   minHoldSeconds: number,
@@ -692,27 +726,27 @@ export function mergeShortVisualSegments(
       MERGEABLE_VISUAL_TYPES.has(seg.blockType);
     // Merge when EITHER block is under the minimum hold — the goal is "no visual
     // under the minimum", not "grow blocks until they reach it". So a SHORT
-    // block (seg) merges back into the previous same-type block even if that
-    // block is already >= the minimum (e.g. a 6s image followed by a 1s "She's
-    // right." flash → one 7s image), and a still-short open block keeps
-    // absorbing following blocks. Both paths are gated by the max-hold cap so a
-    // merged ai_clip stays inside LTX's single-generation range and an image
-    // never becomes an over-long static hold. When the cap blocks the merge the
-    // short block is left as-is (a rare unavoidable orphan).
-    if (
-      mergeable &&
-      (seg.duration < minHoldSeconds || prev!.duration < minHoldSeconds) &&
-      seg.endTime - prev!.startTime <= maxHoldSeconds
-    ) {
+    // block (seg) merges back into the previous block even if that block is
+    // already >= the minimum (e.g. a 6s image followed by a 1s "She's right."
+    // flash → one 7s image), and a still-short open block keeps absorbing
+    // following blocks. resolveMerge decides the result type (clip if either
+    // side is a clip, else image) and returns null when the merged span won't
+    // fit the cap — in which case the merge is skipped, never forced into a
+    // long static hold.
+    const bothShortTrigger =
+      mergeable && (seg.duration < minHoldSeconds || prev!.duration < minHoldSeconds);
+    const resultType = bothShortTrigger
+      ? resolveMerge(prev!, seg, seg.endTime - prev!.startTime, maxHoldSeconds)
+      : null;
+    if (resultType) {
       prev!.script = `${prev!.script} ${seg.script}`.replace(/\s+/g, " ").trim();
       prev!.endTime = seg.endTime;
       prev!.duration = Math.max(0.5, prev!.endTime - prev!.startTime);
-      // Cross-type merge: if EITHER side was an ai_clip the merged block is an
-      // ai_clip (preserve motion); only two stills stay an image. The combined
-      // prompt regen below (re)derives the animationPrompt for a clip result.
-      if (prev!.blockType === "ai_clip" || seg.blockType === "ai_clip") {
-        prev!.blockType = "ai_clip";
-      }
+      // Result type from resolveMerge: ai_clip (motion kept) when either side is
+      // a clip, else image. The combined-prompt regen below (re)derives the
+      // animationPrompt only for a clip result.
+      prev!.blockType = resultType;
+      if (resultType === "image") prev!.animationPrompt = null;
       // The merged block now covers two sentences — its stored prompt is the
       // FIRST sentence's only, so mark it for a combined-prompt regen.
       prev!.needsPromptRegen = true;
@@ -722,8 +756,20 @@ export function mergeShortVisualSegments(
     out.push({ ...seg });
   }
 
+  // Forward visual-merge pass. The backward pass above only folds a short block
+  // into the PREVIOUS visual, so a short block whose previous neighbor is a
+  // boundary (split_2 / avatar) — but whose NEXT neighbor is a mergeable
+  // image/ai_clip — never got a chance to merge (e.g. split_2, then a 3s image,
+  // then an ai_clip: the 3s image couldn't go back into the split_2 and the
+  // backward pass never looks forward). This pass absorbs such a short block
+  // into the FOLLOWING visual instead, keeping the visual-merge-first priority
+  // before the avatar fallback. Same cross-type rule (result is ai_clip if
+  // either side was a clip) and max-hold cap.
+  const fwdMerged = mergeShortVisualsForward(out, minHoldSeconds, maxHoldSeconds);
+  merged += fwdMerged;
+
   // Avatar-fallback pass (client direction 2026-06). A SHORT image/ai_clip that
-  // still has NO mergeable visual neighbor after the pass above (e.g. one
+  // still has NO mergeable visual neighbor after the passes above (e.g. one
   // stranded between a split_2 and an avatar) is absorbed into an ADJACENT
   // AVATAR block instead of staying a ~1-2s flash. We prefer a visual merge
   // first (handled above); only true orphans reach here.
@@ -740,6 +786,47 @@ export function mergeShortVisualSegments(
   const avMerged = mergeOrphansIntoAvatar(out, minHoldSeconds);
   merged += avMerged;
   return { segments: out, merged };
+}
+
+// Absorb a SHORT image/ai_clip into the FOLLOWING image/ai_clip when it could
+// not merge backward (its previous neighbor was a split_2/avatar boundary).
+// Mutates `segs` in place by removing absorbed orphans and extending the next
+// block's window/script back over them; returns how many were absorbed. Same
+// cross-type rule as the backward pass (the merged block is an ai_clip if either
+// side was a clip) and the same max-hold cap. The next block's prompt is the
+// SECOND sentence's, so the merged block is flagged for a combined-prompt regen.
+function mergeShortVisualsForward(
+  segs: PlannedSegment[],
+  minHoldSeconds: number,
+  maxHoldSeconds: number,
+): number {
+  let absorbed = 0;
+  let i = 0;
+  while (i < segs.length) {
+    const seg = segs[i];
+    const next = segs[i + 1];
+    const isShortVisual =
+      MERGEABLE_VISUAL_TYPES.has(seg.blockType) && seg.duration < minHoldSeconds;
+    const nextMergeable =
+      next != null && MERGEABLE_VISUAL_TYPES.has(next.blockType);
+    const resultType =
+      isShortVisual && nextMergeable
+        ? resolveMerge(seg, next, next.endTime - seg.startTime, maxHoldSeconds)
+        : null;
+    if (resultType) {
+      next.script = `${seg.script} ${next.script}`.replace(/\s+/g, " ").trim();
+      next.startTime = seg.startTime;
+      next.duration = Math.max(0.5, next.endTime - next.startTime);
+      next.blockType = resultType;
+      if (resultType === "image") next.animationPrompt = null;
+      next.needsPromptRegen = true;
+      segs.splice(i, 1); // remove the orphan; the next block shifts to index i
+      absorbed++;
+      continue; // re-check index i (the merged block may now absorb more)
+    }
+    i++;
+  }
+  return absorbed;
 }
 
 // Absorb SHORT visual orphans (image/ai_clip under the min hold with no
@@ -789,6 +876,53 @@ function mergeOrphansIntoAvatar(segs: PlannedSegment[], minHoldSeconds: number):
     i++;
   }
   return absorbed;
+}
+
+// Re-split a MERGED visual block whose combined window is longer than maxHold
+// into N even slots so it shows as N visuals of ~minHold each, instead of one
+// over-long hold (client direction 2026-06: a 7s + 2.6s pair merges to 9.6s and
+// plays as TWO ~4.8s images, "half the time each"). Mirrors splitByDuration but
+// produces N EVEN slots (N = round(dur / minHold), at least 2) rather than two
+// halves, and operates on the post-merge block.
+//
+// Only blocks flagged needsPromptRegen (i.e. blocks this pass's merge actually
+// combined) are re-split here; a naturally-long Gemini block was already carved
+// by the earlier duration-split pass. Slot 1 keeps the merged block's
+// (regenerated, combined) prompt; slots 2+ are flagged secondVisual so persist
+// appends the "different angle" variation — distinct compositions of the same
+// combined thought. Each slot inherits the merged blockType (an ai_clip stays an
+// ai_clip; each slot < maxHold so it's inside LTX's range, motion preserved).
+// Returns a new array; positions are renumbered by the caller.
+export function splitMergedVisuals(
+  segs: PlannedSegment[],
+  minHoldSeconds: number,
+  maxHoldSeconds: number,
+): { segments: PlannedSegment[]; split: number } {
+  const out: PlannedSegment[] = [];
+  let split = 0;
+  for (const seg of segs) {
+    const dur = seg.endTime - seg.startTime;
+    if (!seg.needsPromptRegen || !MERGEABLE_VISUAL_TYPES.has(seg.blockType) || dur <= maxHoldSeconds) {
+      out.push(seg);
+      continue;
+    }
+    const slots = Math.max(2, Math.round(dur / minHoldSeconds));
+    for (let k = 0; k < slots; k++) {
+      const startTime = seg.startTime + (k * dur) / slots;
+      const endTime = seg.startTime + ((k + 1) * dur) / slots;
+      out.push({
+        ...seg,
+        startTime,
+        endTime,
+        duration: Math.max(0.5, endTime - startTime),
+        // Slot 1 carries the combined prompt as-is; later slots show a different
+        // angle/composition of the same combined thought.
+        secondVisual: k > 0,
+      });
+    }
+    split++;
+  }
+  return { segments: out, split };
 }
 
 // Coalesce CONTIGUOUS avatar segments into one atomic avatar "part".
@@ -959,6 +1093,134 @@ function applyMark(seg: PlannedSegment, marked: boolean, basePrompt: string): Pl
   return seg;
 }
 
+type RawSegment = z.infer<typeof GeminiSegmentSchema>;
+
+// Salvage a segments array from a response that JSON.parse rejected because it
+// was cut off mid-stream (Gemini hit its output-token cap and never closed the
+// JSON). The shape is { basePrompt, segments: [ { ...flat fields... } ] }, so a
+// segment object closes when we drop from brace-depth 2 -> 1 while inside the
+// segments bracket (bracket-depth 1). We truncate to the last fully-closed
+// segment and re-close the array + object, recovering every complete segment
+// instead of losing the whole chunk. Returns null when nothing is salvageable.
+function salvageTruncatedTimeline(raw: string): unknown | null {
+  let depthBrace = 0;
+  let depthBracket = 0;
+  let lastSafeEnd = -1;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\" && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{") depthBrace++;
+    else if (c === "}") {
+      const before = depthBrace;
+      depthBrace--;
+      // Just closed a segment object: was at depth 2, now 1, inside segments[].
+      if (before === 2 && depthBracket === 1) lastSafeEnd = i;
+    } else if (c === "[") depthBracket++;
+    else if (c === "]") depthBracket--;
+  }
+  if (lastSafeEnd < 0) return null;
+  const trimmed = raw.slice(0, lastSafeEnd + 1) + "]}";
+  try { return JSON.parse(trimmed); } catch { return null; }
+}
+
+// Split a transcript into chunks of at most maxChars, breaking only at sentence
+// boundaries (. ? ! followed by whitespace) so a chunk never ends mid-sentence
+// — the planner's "one sentence = one block" rule depends on whole sentences,
+// and a clean boundary keeps each chunk's segments aligned to real text. A
+// single sentence longer than maxChars is emitted as its own (oversized) chunk
+// rather than being cut, since cutting it would violate the rule anyway.
+function chunkTranscriptBySentence(transcript: string, maxChars: number): string[] {
+  const text = transcript.trim();
+  if (text.length <= maxChars) return [text];
+  // Sentence terminators with trailing space; keep the terminator with its
+  // sentence. The lookbehind-free split keeps delimiters via a capturing regex.
+  const parts = text.split(/(?<=[.?!])\s+/);
+  const chunks: string[] = [];
+  let cur = "";
+  for (const sentence of parts) {
+    if (!cur) {
+      cur = sentence;
+    } else if (cur.length + 1 + sentence.length <= maxChars) {
+      cur += " " + sentence;
+    } else {
+      chunks.push(cur);
+      cur = sentence;
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
+// Run the Gemini planner for ONE transcript chunk and return its parsed
+// basePrompt + raw segments. Sets thinkingBudget:0 and a generous output cap
+// (the same fix proven in scoreClipsForSections): gemini-2.5-flash otherwise
+// spends its whole output budget on hidden reasoning tokens and truncates the
+// visible JSON. On a truncation we salvage whatever complete segments we got,
+// and surface MAX_TOKENS in the error instead of the misleading "non-JSON".
+async function planTranscriptChunk(
+  ctx: { projectId: string; jobId?: string },
+  transcript: string,
+  chunkLabel: string,
+): Promise<{ basePrompt: string; segments: RawSegment[] }> {
+  const { result: res, model: usedModel } = await withGeminiModelFallback(
+    "buildSyntheticTimeline",
+    (model) =>
+      model.generateContent({
+        contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.3,
+          // Generous ceiling so we don't truncate from our side; finishReason
+          // tells us if the model still overran.
+          maxOutputTokens: 16384,
+          // gemini-2.5-flash burns its entire output budget on internal
+          // reasoning before emitting any JSON, truncating the response at a
+          // few hundred bytes regardless of the cap (see scoreClipsForSections).
+          // We don't need chain-of-thought to segment a transcript.
+          thinkingConfig: { thinkingBudget: 0 },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      }),
+    { attempts: 6, baseMs: 2000 },
+  );
+  if (usedModel !== getEnv().GEMINI_MODEL) {
+    await logJob(ctx, "synthetic.plan.model_fallback", { model: usedModel, chunk: chunkLabel });
+  }
+  const txt = res.response.text();
+  const finishReason = res.response.candidates?.[0]?.finishReason;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(txt);
+  } catch {
+    const salvaged = salvageTruncatedTimeline(txt);
+    if (salvaged) {
+      await logJob(ctx, "synthetic.plan.salvaged_truncated", {
+        chunk: chunkLabel,
+        finishReason,
+        responseChars: txt.length,
+      });
+      parsed = salvaged;
+    } else {
+      throw new Error(
+        `buildSyntheticTimeline: Gemini response unparseable (finishReason=${finishReason}, chars=${txt.length}, chunk=${chunkLabel}): ${txt.slice(0, 200)}`,
+      );
+    }
+  }
+  const safe = GeminiResponseSchema.safeParse(parsed);
+  if (!safe.success || safe.data.segments.length === 0) {
+    throw new Error(
+      `buildSyntheticTimeline: schema/empty (finishReason=${finishReason}, chunk=${chunkLabel}): ${JSON.stringify(safe.success ? "empty" : safe.error.flatten()).slice(0, 300)}`,
+    );
+  }
+  return { basePrompt: safe.data.basePrompt.trim(), segments: safe.data.segments };
+}
+
 /**
  * Run the Gemini planner and persist the result as synthetic_segments rows.
  * Returns the planned segments. Idempotent on retry: existing segments for the
@@ -979,47 +1241,44 @@ export async function buildSyntheticTimeline(input: {
   const avatarRanges = input.avatarRanges ?? [];
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
 
-  // Gemini 2.5-flash hits intermittent 503 "high demand" spikes. The planner is
-  // a single one-shot call per project (not high-volume), so we can afford to
-  // wait it out: 6 attempts with a longer base backoff rather than the default
-  // 3. A demand spike is per-model, so if the primary model still fails after
-  // all 6 retries we fall back to GEMINI_FALLBACK_MODEL and retry there — turning
-  // a transient Google outage on one model into a slightly slower success on
-  // another, instead of a hard job failure.
-  const { result: res, model: usedModel } = await withGeminiModelFallback(
-    "buildSyntheticTimeline",
-    (model) =>
-      model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
-      }),
-    { attempts: 6, baseMs: 2000 },
-  );
-  if (usedModel !== getEnv().GEMINI_MODEL) {
-    await logJob({ projectId, jobId }, "synthetic.plan.model_fallback", { model: usedModel });
+  // A long transcript makes Gemini emit a segments array that overflows its
+  // output-token budget and truncates the JSON mid-stream — surfacing as the
+  // misleading "Gemini returned non-JSON". So we split the transcript at
+  // sentence boundaries into chunks small enough that each response fits, plan
+  // each chunk in its own call, then concatenate the segments in order. A short
+  // transcript yields a single chunk (one call), so this is a no-op for the
+  // common case. Gemini 2.5-flash also hits intermittent 503 "high demand"
+  // spikes; planTranscriptChunk waits those out (6 attempts) and falls back to
+  // GEMINI_FALLBACK_MODEL before giving up, per chunk.
+  const maxChars = getEnv().SYNTHETIC_PLANNER_MAX_CHARS_PER_CALL;
+  const chunks = chunkTranscriptBySentence(transcript, maxChars);
+  if (chunks.length > 1) {
+    await logJob({ projectId, jobId }, "synthetic.plan.chunked", {
+      chunks: chunks.length,
+      transcriptChars: transcript.trim().length,
+      maxCharsPerCall: maxChars,
+    });
   }
-  const txt = res.response.text();
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(txt);
-  } catch {
-    throw new Error(`buildSyntheticTimeline: Gemini returned non-JSON: ${txt.slice(0, 200)}`);
-  }
-  const safe = GeminiResponseSchema.safeParse(parsed);
-  if (!safe.success || safe.data.segments.length === 0) {
-    throw new Error(
-      `buildSyntheticTimeline: schema/empty: ${JSON.stringify(safe.success ? "empty" : safe.error.flatten()).slice(0, 300)}`,
+  // basePrompt is a whole-video style bible; the first chunk reads enough of the
+  // script to set it for everyone, so we adopt the first chunk's and ignore the
+  // rest (they'd only describe their own slice).
+  let basePrompt = "";
+  const rawSegments: RawSegment[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const { basePrompt: bp, segments } = await planTranscriptChunk(
+      { projectId, jobId },
+      chunks[i],
+      `${i + 1}/${chunks.length}`,
     );
+    if (i === 0) basePrompt = bp;
+    rawSegments.push(...segments);
+  }
+  if (rawSegments.length === 0) {
+    throw new Error("buildSyntheticTimeline: planner produced no segments");
   }
 
-  // Shared style bible for the whole video. Prepended to each block's
-  // scene-specific prompt at persist time (composePrompt) so adjacent blocks of
-  // the same scene generate as one continuous world, and used as the visual
-  // fallback for demoted avatar blocks instead of raw narration text.
-  const basePrompt = safe.data.basePrompt.trim();
-
-  let planned = alignSegments(safe.data.segments, words, voiceoverDuration);
+  let planned = alignSegments(rawSegments, words, voiceoverDuration);
 
   // Force avatar on segments that overlap a red/orange doc mark.
   //
@@ -1241,14 +1500,22 @@ export async function buildSyntheticTimeline(input: {
             regenFailed++;
           }
         }
-        segments.forEach((p, i) => { p.position = i; });
-        planned = segments;
+        // Re-split any merged block whose combined window exceeds the cap into
+        // even ~minHold slots, so a 7s + 2.6s pair plays as TWO ~4.8s visuals
+        // (slot 1 = combined prompt, slots 2+ = a different angle) instead of
+        // one over-long hold. Runs AFTER the regen loop so slot 1 carries the
+        // combined prompt; each slot ends up < maxHold (clips stay animatable).
+        const { segments: resplit, split: blocksResplit } =
+          splitMergedVisuals(segments, minHold, maxHold);
+        resplit.forEach((p, i) => { p.position = i; });
+        planned = resplit;
         await logJob({ projectId, jobId }, "synthetic.plan.merge_short_visuals", {
           minHoldSeconds: minHold,
           maxHoldSeconds: maxHold,
           blocksMerged: merged,
           promptsRegenerated: regenerated,
           promptRegenFailed: regenFailed,
+          blocksResplit,
           segmentsBefore: before,
           segmentsAfter: planned.length,
         });

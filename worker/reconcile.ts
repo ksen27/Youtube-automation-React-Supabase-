@@ -94,9 +94,20 @@ export async function markJobFailedIfExhausted(
   }
 }
 
-// Periodic safety net. Finds media_jobs rows stuck "running" (or "queued")
-// whose updated_at predates the stall cutoff and marks them failed. This is
-// the layer that catches hard kills where on("failed") never fired.
+// Periodic safety net. Finds media_jobs rows stuck "running" whose updated_at
+// predates the stall cutoff and marks them failed. This is the layer that
+// catches hard kills where on("failed") never fired.
+//
+// We sweep ONLY "running" — NOT "queued". A queued media_job is one the worker
+// has not started yet; with a SERIAL queue (AVATAR_CONCURRENCY=1, ~2 min/render)
+// the avatar queue can be far deeper than staleMs, so a job at the back waits >45
+// min before its turn — through no fault of its own. The old query swept "queued"
+// too, which false-failed those still-waiting avatar jobs in a burst
+// (reconcile.marked_failed source:stall_sweep type:avatar ×N) even while
+// generation was working. A truly orphaned enqueue (worker died before picking it
+// up) is BullMQ's responsibility — its stalled-job check re-delivers it — not this
+// DB sweep's. So queued jobs are left alone; this mirrors sweepStalledSegments,
+// which already skips queued segments for the same reason.
 //
 // staleMs MUST exceed the worker's lockDuration (currently 15 min) plus a
 // margin, or we'd kill jobs that are legitimately mid-await on a long ffmpeg /
@@ -113,7 +124,7 @@ export async function sweepStalledJobs(staleMs: number, onlyTypes?: string[]): P
   let query = sb
     .from("media_jobs")
     .select("id, project_id, type")
-    .in("status", ["running", "queued"])
+    .eq("status", "running")
     .lt("updated_at", cutoff);
   if (onlyTypes && onlyTypes.length > 0) {
     query = query.in("type", onlyTypes);

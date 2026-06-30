@@ -370,14 +370,15 @@ const ServerEnvSchema = z.object({
   // poll GET /api/v1/tts/status/:jobId -> GET /api/v1/tts/download/:jobId.
   // Base URL has NO version suffix here; route paths include /api/v1/...
   SIXTYNINE_LABS_API_KEY: z.string().optional(),
-  // Optional BACKUP image key. Used ONLY for image generation, and ONLY as a
-  // failover: when the primary key returns a permanent auth 403 ("Access denied"
-  // / FORBIDDEN — a revoked/blocked/expired key, NOT the transient "concurrent
-  // limit reached" 403 which is retried on the same key), the image submit
-  // retries once on this key instead of failing the segment. The two keys are
-  // never used concurrently, so the existing per-process concurrency cap
-  // (SIXTYNINE_IMAGE_CONCURRENCY) still protects each key's tier limit unchanged.
-  // Leave empty to keep single-key behavior.
+  // Optional SECOND 69labs key (a SEPARATE account). When set, it joins the
+  // primary in a KEY POOL: image and TTS generations are load-balanced
+  // round-robin across both keys, and each key gets its OWN concurrency slot
+  // pool (SIXTYNINE_IMAGE_CONCURRENCY per key), so two separate-account keys run
+  // their tier limits IN PARALLEL — roughly doubling throughput. It also still
+  // acts as a failover: if one key hits a permanent auth 403, the generation is
+  // retried on the other. Leave empty for single-key behavior (identical to
+  // before). NOTE: only worth setting if this is a DIFFERENT account — two keys
+  // on the same account share one tier limit and gain no parallelism.
   SIXTYNINE_LABS_API_KEY_BACKUP: z.string().optional(),
   SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://69labs.vip"),
   // TTS voiceProvider: elevenlabs | edgetts | minimax (wire-level value).
@@ -425,6 +426,11 @@ const ServerEnvSchema = z.object({
   LTX_BASE_URL: z.string().url().default("https://api.ltx.video"),
   LTX_MODEL: z.string().default("ltx-2-3-pro"),
   LTX_RESOLUTION: z.string().default("1920x1080"),
+  // LTX-2 source frame rate. Allowed values are 25 or 50 (NOT 24 — the API
+  // rejects fps 24 for ltx-2-fast at 1080p). The render pipeline re-encodes
+  // every clip to SYNTHETIC_FPS (30) downstream, so this only has to be a value
+  // LTX accepts; 25 is the documented default for the 1080p duration tiers.
+  LTX_FPS: z.coerce.number().int().positive().default(25),
   LTX_MAX_DURATION: z.coerce.number().int().positive().default(20),
   // Hard timeout (seconds) for a single LTX image-to-video job (poll loop).
   LTX_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
@@ -577,27 +583,54 @@ const ServerEnvSchema = z.object({
   // serial by design.
   TTS_CONCURRENCY: z.coerce.number().int().positive().default(2),
   SYNTHETIC_PLANNER_CONCURRENCY: z.coerce.number().int().positive().default(2),
-  // image=4 to match the confirmed 69labs tier ceiling (4 concurrent). The
-  // SIXTYNINE_IMAGE_CONCURRENCY semaphore below is the real safety cap; this just
-  // lets the image_gen worker feed up to 4 jobs into it.
+  // Max transcript chars sent to the planner's Gemini call in ONE request. A
+  // long script (e.g. a 30-min, ~27k-char voiceover) makes Gemini emit a
+  // segments array that overflows its output-token budget and truncates the
+  // JSON mid-stream — which JSON.parse then reports as the misleading
+  // "Gemini returned non-JSON". Above this size buildSyntheticTimeline splits
+  // the transcript at sentence boundaries into chunks of <= this many chars,
+  // plans each chunk in its own call, and concatenates the segments — so no
+  // single response is large enough to truncate. Tuned below the size that
+  // truncates gemini-2.5-flash with thinkingBudget:0 + 8k output tokens; the
+  // working 11k-char project planned fine in one call, the 27k-char one didn't.
+  SYNTHETIC_PLANNER_MAX_CHARS_PER_CALL: z.coerce.number().int().positive().default(14000),
+  // image=4 to match one 69labs account's tier ceiling (4 concurrent). The
+  // PER-KEY SIXTYNINE_IMAGE_CONCURRENCY semaphore below is the real safety cap;
+  // this just lets the image_gen worker feed up to 4 jobs into it. With a second
+  // key (a separate account) the pool admits 8 in flight (4 per key); the feed
+  // lanes combined (image_gen 4 + image_to_video 3 + avatar 1 = 8) can fill that.
+  // Raise this toward 8 if you want an image-only batch (no clips/avatars) to use
+  // both accounts on its own — the per-key semaphore still prevents any single
+  // account from exceeding its tier.
   IMAGE_GEN_CONCURRENCY: z.coerce.number().int().positive().default(4),
-  IMAGE_TO_VIDEO_CONCURRENCY: z.coerce.number().int().positive().default(2),
+  // ai_clip lane: each job generates a 69labs still then animates it via LTX-2.
+  // Raised 2 -> 3 to overlap one more clip. The LTX-2 video calls have no tier
+  // cap of their own, and the still-generation step is still bounded by the
+  // SIXTYNINE_IMAGE_CONCURRENCY=4 semaphore below regardless of this number — so
+  // 3 ai_clips' stills coexist safely under the 4-concurrent 69labs ceiling. Do
+  // NOT raise so high that this lane alone could push concurrent 69labs image
+  // calls past 4 (it shares that cap with image_gen and avatar/split_2 stills).
+  IMAGE_TO_VIDEO_CONCURRENCY: z.coerce.number().int().positive().default(3),
   AVATAR_CONCURRENCY: z.coerce.number().int().positive().default(1),
-  // Hard cap on CONCURRENT 69labs image generations across ALL queues. The
-  // image_gen, image_to_video (generates a still first), and avatar/split_2
-  // (right-half still) lanes all call generateImage independently, so their
-  // combined in-flight count can exceed 69labs' real per-account limit, which
-  // returns a 403 "Concurrent image generation limit reached" / a 503 cooldown
-  // that fails the segment. This semaphore bounds the total below that limit
-  // regardless of how the per-queue concurrencies add up.
+  // Hard cap on CONCURRENT 69labs image generations PER KEY. The image_gen,
+  // image_to_video (generates a still first), and avatar/split_2 (right-half
+  // still) lanes all call generateImage independently, so their combined
+  // in-flight count can exceed 69labs' real per-account limit, which returns a
+  // 403 "Concurrent image generation limit reached" / a 503 cooldown that fails
+  // the segment. A per-key semaphore bounds each account's in-flight total below
+  // its tier limit, regardless of how the per-queue concurrencies add up.
   //
   // 69labs allows only 1–4 concurrent generations DEPENDING ON SUBSCRIPTION TIER
   // (per 69labs guidance), and pushing past the tier ceiling triggers cooldowns
   // — NOT the "7" an earlier comment assumed. Default 4 = the confirmed tier
-  // ceiling (the client's account permits 4 concurrent), the fastest setting
-  // that stays inside the band. Lower to 1–2 if you ever hit 503 "service
-  // unavailable" / cooldowns (a lower tier / shared account); do NOT raise above
-  // 4 without confirming a higher tier, or the cooldowns return.
+  // ceiling (each account permits 4 concurrent), the fastest setting that stays
+  // inside the band. Lower to 1–2 if you ever hit 503 "service unavailable" /
+  // cooldowns (a lower tier / shared account); do NOT raise above 4 without
+  // confirming a higher tier, or the cooldowns return.
+  //
+  // This is PER KEY: with a second key (SIXTYNINE_LABS_API_KEY_BACKUP) on a
+  // separate account, the cluster runs up to (this × number of keys) concurrent
+  // generations — e.g. 4 × 2 = 8 — because each key has its own slot pool.
   SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
 
   // Synthetic visual-block pacing. The client's reference video paces every

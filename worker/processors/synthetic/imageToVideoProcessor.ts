@@ -8,7 +8,7 @@ import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
-import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
+import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
 
 // 'ai_clip' generation: nano-banana still -> LTX-2 (fal.ai Veo 3 Fast, then
@@ -96,7 +96,11 @@ export async function processImageToVideoJob(
     const primaryProvider = isLtxConfigured() ? "ltx2" : "fal_veo3_fast";
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: primaryProvider, phase: "request",
       extra: { durationSeconds: duration } });
-    const clip = await generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration });
+    // Heartbeat the segment's updated_at across the ~60-95s LTX-2 render so the
+    // stall sweeper can't false-fail a segment that is alive and rendering.
+    const clip = await withSegmentHeartbeat(segmentId, () =>
+      generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration }),
+    );
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId, provider: clip.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: clip.provider, seconds: clip.seconds },

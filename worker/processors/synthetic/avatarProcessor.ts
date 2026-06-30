@@ -12,7 +12,7 @@ import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
-import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
+import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import { classOf, userFacingMessage } from "@/lib/synthetic/heygen-errors";
 import type { JobAttemptInfo } from "@/worker/index";
 
@@ -139,12 +139,32 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   const [{ data: seg, error: segErr }, { data: project, error: projErr }] = await Promise.all([
     sb
       .from("synthetic_segments")
-      .select("id, block_type, script, image_prompt, right_image_url, start_time, end_time, metadata")
+      .select("id, block_type, status, script, image_prompt, right_image_url, start_time, end_time, metadata")
       .eq("id", segmentId)
       .single(),
     sb.from("projects").select("avatar_image_url, voiceover_url").eq("id", projectId).single(),
   ]);
   if (segErr || !seg) throw new Error(`avatar: segment ${segmentId} not found`);
+
+  // STALE-JOB GUARD. The queue accumulates duplicate avatar jobs from earlier
+  // stall-sweep churn / regenerates: a segment is re-dispatched (new mediaJobId),
+  // succeeds via that NEW job, flips to 'ready' — but the OLD job is still sitting
+  // in BullMQ and gets drained later, re-rendering an already-finished segment
+  // (wasted HeyGen time + cost, and the worker looks "stuck generating" long after
+  // the project is done). The segment row's metadata.mediaJobId points at its
+  // CURRENT job; if this job isn't that one AND the segment is already ready, this
+  // is a stale duplicate — no-op it. (imageOnly regen always has work to do, so it
+  // is exempt; a genuine regenerate resets the segment off 'ready' before
+  // re-dispatch, so this never skips real work.)
+  const currentJobId = ((seg.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined;
+  if (!imageOnly && seg.status === "ready" && currentJobId && currentJobId !== mediaJobId) {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.stale_job_skipped", {
+      segmentStatus: seg.status,
+      currentJobId,
+    });
+    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { skipped: "stale_duplicate" } });
+    return;
+  }
 
   // IMAGE-ONLY regenerate (split_2): re-create ONLY the right-half still and KEEP
   // the existing avatar video — no HeyGen re-render. Used by "Regenerate image"
@@ -240,20 +260,25 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
     beginRender();
     let result;
     try {
-      result = await generateAvatar(
-        {
-          projectId,
-          segmentId,
-          jobId: mediaJobId,
-          avatarImageUrl: project.avatar_image_url as string,
-          script: seg.script ?? "",
-          audioFilePath: audio?.path,
-          audioDurationSeconds: audio?.durationSeconds,
-          // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
-          // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
-          aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
-        },
-        imageBytes,
+      // Heartbeat the segment's updated_at across the multi-minute HeyGen render
+      // so the stall sweeper can't false-fail an avatar that is alive and
+      // rendering (the race the finishSegment error-clear below only papered over).
+      result = await withSegmentHeartbeat(segmentId, () =>
+        generateAvatar(
+          {
+            projectId,
+            segmentId,
+            jobId: mediaJobId,
+            avatarImageUrl: project.avatar_image_url as string,
+            script: seg.script ?? "",
+            audioFilePath: audio?.path,
+            audioDurationSeconds: audio?.durationSeconds,
+            // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
+            // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
+            aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
+          },
+          imageBytes,
+        ),
       );
     } finally {
       endRender();
