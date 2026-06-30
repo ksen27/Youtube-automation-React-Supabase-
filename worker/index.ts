@@ -32,6 +32,13 @@ const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
 const downloadConcurrency = env.DOWNLOAD_CONCURRENCY;
 
+// BullMQ job lock / stalled window. Must exceed the longest a single job can run
+// without the lock being renewed. The avatar worst case (a wrong-orientation
+// render polled to budget, then a rotated re-render) stacks two ~11-min HeyGen
+// renders on ONE job — past the old 15-min ceiling, which tripped a stalled
+// re-delivery. 25 min covers it; see the per-worker comment below for detail.
+const LOCK_DURATION_MS = 25 * 60_000; // 25 min
+
 console.log(JSON.stringify({
   ts: new Date().toISOString(),
   msg: "worker.starting",
@@ -58,12 +65,34 @@ function startWorker<T>(
       attemptsAllowed: job.opts?.attempts ?? 1,
     };
     console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.start", attempt, data: job.data }));
+    // LOCK RENEWAL (defence-in-depth). BullMQ auto-renews a job's lock at
+    // lockDuration/2 from inside the worker, but that single renewal command can
+    // be DROPPED when the Fly Redis proxy recycles the connection mid-flight
+    // (the ~10-20 min ECONNRESET cycle this file's connection options fight). If
+    // a renewal is lost and the next auto-renew is a full lockDuration/2 away,
+    // the lock can lapse on a long (multi-render, ~30 min) avatar job — and the
+    // stalled-job check then RE-DELIVERS the same job id, which re-renders an
+    // already-finished avatar (the never-clearing-spinner bug). So we add our own
+    // independent extendLock heartbeat on a TIGHTER interval: a single dropped
+    // tick is recovered by the next one well before the lock expires.
+    const renewMs = Math.floor(LOCK_DURATION_MS / 4);
+    const renew = setInterval(() => {
+      // job.extendLock(token, duration). The processing token the worker assigned
+      // to this run lives on job.token; without it extendLock can't authenticate.
+      const token = (job as { token?: string }).token;
+      if (!token) return;
+      // A failed tick is harmless — the next one (renewMs later) renews well
+      // before the lock's full LOCK_DURATION_MS expiry.
+      void job.extendLock(token, LOCK_DURATION_MS).catch(() => {});
+    }, renewMs);
     try {
       await handler(job.data, attempt);
       console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.done", ms: Date.now() - t0 }));
     } catch (e) {
       console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.failed", attempt, err: (e as Error).message, ms: Date.now() - t0 }));
       throw e;
+    } finally {
+      clearInterval(renew);
     }
   }, {
     connection: getRedisConnection(),
@@ -77,15 +106,18 @@ function startWorker<T>(
     // yt-dlp call that runs longer than lockDuration trips "stalled more
     // than allowable limit" and BullMQ re-queues the job.
     //
-    // 15 minutes covers the render queue's worst case: the final concat
-    // re-encodes a 100+ item timeline plus voiceover + bg music in a
-    // single ffmpeg call, which on shared-CPU Fly machines can take 8–12
-    // minutes during which nothing else awaits. With ffmpeg's hard
-    // timeout at 240s and yt-dlp at 300s, the smaller queues
-    // (clip/download/match/search) never approach this lock window;
-    // they just inherit the safer ceiling.
-    stalledInterval: 900_000,
-    lockDuration: 900_000,
+    // 25 minutes covers two stacked worst cases:
+    //   - the render queue's final concat (100+ item timeline + voiceover + bg
+    //     music in one ffmpeg pass), 8–12 min on shared-CPU Fly machines; and
+    //   - an avatar job whose FIRST HeyGen render came back wrong-orientation
+    //     (~11 min polled to the render budget) then rotated and rendered AGAIN
+    //     (~11 min) — ~22 min on one job, which the old 15 min ceiling tripped
+    //     into a stalled RE-DELIVERY that re-rendered an already-ready avatar.
+    // The explicit extendLock heartbeat above is the primary guard; this ceiling
+    // is the backstop. With ffmpeg's hard timeout at 240s and yt-dlp at 300s, the
+    // smaller queues (clip/download/match/search) never approach this window.
+    stalledInterval: LOCK_DURATION_MS,
+    lockDuration: LOCK_DURATION_MS,
   });
 
   // Transient Redis disconnects (ECONNRESET, ETIMEDOUT) get auto-recovered

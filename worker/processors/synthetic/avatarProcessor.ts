@@ -139,30 +139,41 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   const [{ data: seg, error: segErr }, { data: project, error: projErr }] = await Promise.all([
     sb
       .from("synthetic_segments")
-      .select("id, block_type, status, script, image_prompt, right_image_url, start_time, end_time, metadata")
+      .select("id, block_type, status, script, image_prompt, right_image_url, video_url, start_time, end_time, metadata")
       .eq("id", segmentId)
       .single(),
     sb.from("projects").select("avatar_image_url, voiceover_url").eq("id", projectId).single(),
   ]);
   if (segErr || !seg) throw new Error(`avatar: segment ${segmentId} not found`);
 
-  // STALE-JOB GUARD. The queue accumulates duplicate avatar jobs from earlier
-  // stall-sweep churn / regenerates: a segment is re-dispatched (new mediaJobId),
-  // succeeds via that NEW job, flips to 'ready' — but the OLD job is still sitting
-  // in BullMQ and gets drained later, re-rendering an already-finished segment
-  // (wasted HeyGen time + cost, and the worker looks "stuck generating" long after
-  // the project is done). The segment row's metadata.mediaJobId points at its
-  // CURRENT job; if this job isn't that one AND the segment is already ready, this
-  // is a stale duplicate — no-op it. (imageOnly regen always has work to do, so it
-  // is exempt; a genuine regenerate resets the segment off 'ready' before
-  // re-dispatch, so this never skips real work.)
+  // STALE-JOB GUARD. Duplicate avatar jobs reach this processor two ways, and
+  // BOTH redundantly re-render a segment that already succeeded (wasted HeyGen
+  // time + cost, and the worker looks "stuck generating" long after the project
+  // is done):
+  //   (a) DIFFERENT job id — a stall-sweep/regenerate re-dispatched the segment
+  //       under a NEW mediaJobId; the OLD job is still sitting in BullMQ and gets
+  //       drained later. metadata.mediaJobId points at the CURRENT job, so this
+  //       job's id differs from it.
+  //   (b) SAME job id — a single long render (e.g. a wrong-orientation retry that
+  //       stacked two ~11-min HeyGen renders) outran the BullMQ lockDuration, so
+  //       BullMQ judged the job "stalled" and RE-DELIVERED the very same job id.
+  //       Here metadata.mediaJobId === mediaJobId, so the (a) check alone misses
+  //       it and we re-rendered an already-ready avatar — the observed
+  //       never-clearing spinner.
+  // So the real signal is simpler than id comparison: if the segment is already
+  // 'ready' WITH a rendered video_url and this isn't an image-only regen, the
+  // work is done — no-op regardless of which id re-delivered us. (imageOnly regen
+  // always has work to do, so it's exempt; a genuine full regenerate resets the
+  // segment OFF 'ready' before re-dispatch, so this never skips real work.)
   const currentJobId = ((seg.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined;
-  if (!imageOnly && seg.status === "ready" && currentJobId && currentJobId !== mediaJobId) {
+  const alreadyRendered = seg.status === "ready" && !!seg.video_url;
+  if (!imageOnly && alreadyRendered) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.stale_job_skipped", {
       segmentStatus: seg.status,
       currentJobId,
+      redelivery: currentJobId === mediaJobId, // (b): same-id stalled re-delivery
     });
-    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { skipped: "stale_duplicate" } });
+    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { skipped: "already_rendered" } });
     return;
   }
 

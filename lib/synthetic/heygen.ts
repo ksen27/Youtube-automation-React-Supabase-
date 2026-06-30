@@ -395,6 +395,16 @@ interface HeygenProjectItem {
   error_message?: string;
 }
 
+// HeyGen's created_ts is Unix SECONDS, but be defensive: normalize a value that
+// looks like milliseconds (13+ digits) down to seconds so the freshness guard
+// can't silently mis-compare units. Returns null when absent/non-numeric so the
+// caller falls back to the baseline-only test rather than over-rejecting.
+function createdSeconds(it: HeygenProjectItem): number | null {
+  const v = it.created_ts;
+  if (typeof v !== "number" || !isFinite(v) || v <= 0) return null;
+  return v > 1e12 ? Math.floor(v / 1000) : v;
+}
+
 // Fetch the avatar-video list via the authed browser context (cookies apply).
 async function fetchProjectItems(context: BrowserContext): Promise<HeygenProjectItem[]> {
   const resp = await context.request.get(HEYGEN_ITEMS_API, { timeout: env().HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
@@ -422,13 +432,28 @@ async function awaitNewItemId(
   appearMs: number,
   waitMs: number,
   sleep: (ms: number) => Promise<void>,
+  // Unix SECONDS just before our Generate click. A candidate must be both
+  // not-in-baseline AND created at/after this time to be OURS — created_ts is the
+  // authoritative guard against pinning a sibling project's render from the shared
+  // account list. 0 disables the time guard (legacy behavior).
+  minCreatedTs = 0,
 ): Promise<string> {
   const deadline = Date.now() + appearMs;
   while (Date.now() < deadline) {
     const items = await fetchProjectItems(context);
-    // Newest-first list: the first id not in the baseline is the freshest new
-    // render. (A single avatar Generate creates exactly one new item.)
-    const fresh = items.find((it) => it.video_id && !baseline.has(it.video_id));
+    // Newest-first list: the first id that is NOT in the baseline AND was created
+    // at/after our Generate click is the freshest new render that is genuinely
+    // ours. (A single avatar Generate creates exactly one new item.) The
+    // created_ts gate rejects a neighbor project's render that is also
+    // non-baseline but was created before we clicked.
+    const fresh = items.find((it) => {
+      if (!it.video_id || baseline.has(it.video_id)) return false;
+      if (minCreatedTs <= 0) return true;
+      const ts = createdSeconds(it);
+      // If HeyGen omits created_ts, fall back to the baseline-only test rather
+      // than rejecting a valid render.
+      return ts === null || ts >= minCreatedTs;
+    });
     if (fresh) return fresh.video_id;
     await sleep(waitMs);
   }
@@ -486,6 +511,10 @@ async function retrieveRenderedVideo(
   expectedSeconds = 0,
   expectedAspect: "landscape" | "portrait" | null = null,
   pinnedVideoId = "",
+  // Unix SECONDS just before our Generate click. On the no-pin fallback (newest-
+  // non-baseline scan) this rejects any candidate created BEFORE we clicked —
+  // i.e. a sibling project's render in the shared list. 0 disables the guard.
+  minCreatedTs = 0,
 ): Promise<Buffer> {
   const e = env();
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
@@ -546,9 +575,19 @@ async function retrieveRenderedVideo(
     // for ours. Otherwise fall back to "every item that isn't the pre-generate
     // baseline" (a regenerate leaves several of our own prior renders in the
     // list), disambiguated downstream by the duration/aspect gates.
+    const createdOk = (it: HeygenProjectItem): boolean => {
+      // Only enforce when we have a click time AND HeyGen reported created_ts;
+      // otherwise defer to the baseline/duration gates rather than over-reject.
+      if (minCreatedTs <= 0) return true;
+      const ts = createdSeconds(it);
+      return ts === null || ts >= minCreatedTs;
+    };
     const candidates = pinnedVideoId
       ? items.filter((it) => it.video_id === pinnedVideoId)
-      : items.filter((it) => it.video_id && it.video_id !== baselineId);
+      : // No pin: newest non-baseline render that was ALSO created at/after our
+        // Generate click — the created_ts guard stops the shared-account list
+        // from handing us a previous project's render on the fallback path.
+        items.filter((it) => it.video_id && it.video_id !== baselineId && createdOk(it));
     const completed = candidates.filter((it) => {
       const s = (it.status ?? "").toLowerCase();
       return s === "completed" || s === "success" || s === "done";
@@ -952,6 +991,16 @@ async function attemptOnAccount(
       .getByRole("button", { name: /generate/i })
       .locator("visible=true")
       .first();
+    // Wall-clock just BEFORE we click Generate. The project list is SHARED across
+    // every project on this HeyGen account, so "an id not in the pre-generate
+    // baseline" is not enough to identify OUR render: a sibling project's render
+    // created around now would also be non-baseline, and on the empty-pin fallback
+    // we'd grab it (the "wrong avatar from a previous project" bug). created_ts on
+    // each item is the authoritative freshness signal — we only pin/accept an item
+    // created AT OR AFTER this moment, so a neighbor's earlier render can never be
+    // mistaken for ours. Minus a small skew so a clock difference / a click that
+    // fired a beat early can't exclude our own render.
+    const genClickTs = Math.floor(Date.now() / 1000) - 10; // seconds (HeyGen created_ts unit)
     let started = false;
     let everClicked = false;
     for (let attempt = 0; attempt < 4 && !started; attempt++) {
@@ -1049,6 +1098,7 @@ async function attemptOnAccount(
       30_000,
       3000,
       (ms) => p.waitForTimeout(ms),
+      genClickTs,
     ).catch(() => "");
     console.log(
       JSON.stringify({
@@ -1083,6 +1133,7 @@ async function attemptOnAccount(
       usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
       expectedAspect,
       pinnedVideoId,
+      genClickTs,
     );
     await shot(p, input.projectId, input.segmentId, "done");
 

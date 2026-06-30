@@ -674,6 +674,20 @@ const ServerEnvSchema = z.object({
   // Set to 0 to demote EVERY split_2 to image (no presenter-beside-image layout);
   // set to 1 to disable the cap (back to Gemini's unrestricted choice).
   SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.12),
+  // Minimum split_2 blocks to KEEP when Gemini chose at least one (client:
+  // "why is split_2 not appeared?"). The cap above trims excess split_2; this
+  // floor guarantees a few survive the later passes so the layout still shows
+  // up. 0 = no floor (a video can have zero split_2 if Gemini chose none).
+  SYNTHETIC_SPLIT2_MIN_KEEP: z.coerce.number().int().nonnegative().default(2),
+  // Target fraction of POST-clip-heavy-cutoff visual blocks that stay ai_clip,
+  // the rest demoted to image (client: "after 3 mins, image and ai_clip should
+  // appear naturally" — NOT all-clip). The short-visual merge biases every
+  // merge to ai_clip, which snowballed one plan to 100 clips / 15 images; this
+  // final pass re-balances the post-cutoff stretch to a natural mix by spacing
+  // clips evenly. 0.25 ≈ ~1 in 4 stays a clip after the intro, the rest stills
+  // (client 2026-06-30: "after 3 mins, reduce the ai_clip count"). 1 = keep all
+  // clips (disable), 0 = all stills after the cutoff, 0.5 = even split.
+  SYNTHETIC_POST_INTRO_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.25),
   // Low-fi "vlogging" degrade (client requirement 2026-06). The reference channel
   // looks REAL precisely because its footage is slightly LOW QUALITY — grainy,
   // soft, compressed, like a real phone vlog. Our generations come out too clean

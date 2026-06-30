@@ -27,17 +27,31 @@ import { type AvatarMarkRange } from "@/lib/synthetic/doc-marks";
 
 const PLANNER_BLOCK_TYPES: SyntheticBlockType[] = ["avatar", "image", "ai_clip", "split_2"];
 
+// Optional STRING field that tolerates an explicit JSON `null`. Gemini emits
+// `"imagePrompt": null` (etc.) for blocks that legitimately have no value (an
+// avatar block has no image prompt) and the salvage path for a MAX_TOKENS-
+// truncated response also yields nulls. z.string().optional().default("") does
+// NOT coerce an explicit null — it only fills a MISSING key — so a single null
+// threw "Expected string, received null" and failed the ENTIRE plan (observed
+// on a re-plan: 100+ salvaged segments rejected wholesale). nullish + a
+// null->"" transform makes these fields accept null and normalize it to "".
+const optString = () =>
+  z
+    .string()
+    .nullish()
+    .transform((v) => v ?? "");
+
 const GeminiSegmentSchema = z.object({
   blockType: z.enum(["avatar", "image", "ai_clip", "split_2"]),
   // The contiguous slice of transcript this block covers. Used to find the
   // block's spoken window in the word timings.
   script: z.string().min(1),
-  imagePrompt: z.string().optional().default(""),
+  imagePrompt: optString(),
   // The shot type / framing for this block's still, rotated across the video so
   // consecutive images don't all read as the same "hands-in-the-dirt close-up".
   // Drives real visual VARIETY (scale + angle) on top of the subject change. See
   // SHOT_TYPES / the shot-variety rule. Empty -> generation adds no shot hint.
-  shotType: z.string().optional().default(""),
+  shotType: optString(),
   // A SECOND, genuinely DIFFERENT scene for the same sentence. A long sentence
   // (> SYNTHETIC_BLOCK_SPLIT_THRESHOLD) is covered by TWO visuals; without a
   // distinct prompt the second one reused imagePrompt + a weak "different angle"
@@ -45,18 +59,18 @@ const GeminiSegmentSchema = z.object({
   // a different subject / moment / detail OF THE SAME sentence so the two
   // visuals don't look like duplicates. Only used when the block actually splits
   // (short blocks ignore it); empty for avatar blocks.
-  imagePrompt2: z.string().optional().default(""),
+  imagePrompt2: optString(),
   // Shot type for the SECOND visual — different from shotType so the two frames
   // of a split sentence differ in framing as well as subject.
-  shotType2: z.string().optional().default(""),
-  animationPrompt: z.string().optional().default(""),
+  shotType2: optString(),
+  animationPrompt: optString(),
 });
 const GeminiResponseSchema = z.object({
   // A global "style bible" for the whole video: the recurring subjects, setting,
   // era, and mood that every block shares. Composed in FRONT of each block's
   // scene-specific imagePrompt at persist time so adjacent blocks describing the
   // same scene generate as one continuous world instead of drifting apart.
-  basePrompt: z.string().optional().default(""),
+  basePrompt: optString(),
   segments: z.array(GeminiSegmentSchema),
 });
 
@@ -200,12 +214,16 @@ function buildPrompt(transcript: string): string {
     "             talking to camera).",
     "  - image  : explanations / factual exposition best shown with a still.",
     "  - ai_clip: action or dynamic scenes that benefit from motion.",
-    "  - split_2: mixed explanation where a talking presenter AND an",
-    "             illustrative image should appear together. Use this SPARINGLY",
-    "             (client requirement) — only a small handful of blocks in the",
-    "             whole video, reserved for the few moments a presenter genuinely",
-    "             needs to appear beside an illustration. Do NOT default to it;",
-    "             prefer plain image / ai_clip for ordinary explanatory lines.",
+    "  - split_2: a talking presenter beside an illustrative image, shown",
+    "             together. CHOOSE THIS BASED ON THE CONTENT: use it whenever the",
+    "             narrator is personally explaining, walking through, or",
+    "             commenting on something the viewer should ALSO see beside them",
+    "             (e.g. 'here's what I mean…', 'look at this…', a tip the presenter",
+    "             demonstrates). It is a normal, useful layout — pick it naturally",
+    "             wherever it fits the script, the same way you pick image or",
+    "             ai_clip. The only limit: it should not DOMINATE the video (don't",
+    "             make it the majority of blocks); a varied mix of all four types",
+    "             is the goal.",
     "",
     "Block sizing — ONE SENTENCE = ONE BLOCK. Each block's `script` MUST be a",
     "WHOLE sentence (or a few short, tightly-related sentences). NEVER break a",
@@ -294,8 +312,19 @@ function buildPrompt(transcript: string): string {
 // the single-subject / no-text rule) but for ONE block: given this block's
 // spoken `script` and the video's shared `basePrompt`, return only a fresh
 // scene-specific imagePrompt. No segmentation, no JSON array.
-function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType: SyntheticBlockType): string {
+function buildSingleSegmentPrompt(
+  script: string,
+  basePrompt: string,
+  blockType: SyntheticBlockType,
+  // Scenes the OTHER visuals of this SAME sentence already show. When this block
+  // is one of several visuals covering one long sentence, we pass the prior
+  // slots' prompts here so Gemini writes a GENUINELY DIFFERENT scene (different
+  // subject / moment / detail) instead of a near-clone — the whole point of
+  // having multiple visuals on a sentence is variety, not the same frame N times.
+  avoidScenes: string[] = [],
+): string {
   const wantsAnimation = blockType === "ai_clip";
+  const hasAvoid = avoidScenes.filter((s) => s.trim()).length > 0;
   return [
     "You are a video director writing the visual for ONE block of an",
     "AI-generated narrated video. Below is the block's spoken narration",
@@ -311,6 +340,19 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
     "is what is SPOKEN; the imagePrompt is what is SHOWN. When the line is",
     "conversational, abstract, or filler, INVENT an on-topic visual that fits the",
     "video's world — do NOT fall back to the spoken words.",
+    ...(hasAvoid
+      ? [
+          "",
+          "DIFFERENT SCENE (critical): this sentence is shown with MULTIPLE visuals.",
+          "The OTHER visuals of this same sentence ALREADY show the scene(s) listed",
+          "below. Your imagePrompt MUST be a GENUINELY DIFFERENT picture of the same",
+          "thought — a different subject, a different moment, or a different detail —",
+          "NOT the same scene with a reworded angle. Do NOT reuse the subject or",
+          "composition of any already-shown scene; the viewer must see something NEW.",
+          "ALREADY-SHOWN scene(s) to avoid repeating:",
+          ...avoidScenes.filter((s) => s.trim()).map((s, i) => `  ${i + 1}. ${s.trim()}`),
+        ]
+      : []),
     "",
     SINGLE_SUBJECT_RULE,
     "",
@@ -337,8 +379,8 @@ function buildSingleSegmentPrompt(script: string, basePrompt: string, blockType:
 
 const SingleSegmentSchema = z.object({
   imagePrompt: z.string().min(1),
-  shotType: z.string().optional().default(""),
-  animationPrompt: z.string().optional().default(""),
+  shotType: optString(),
+  animationPrompt: optString(),
 });
 
 export interface RegeneratedPrompt {
@@ -360,8 +402,11 @@ export async function regenerateSegmentPrompt(input: {
   script: string;
   basePrompt: string;
   blockType: SyntheticBlockType;
+  // Optional scenes that OTHER visuals of this same sentence already show, so the
+  // regenerated prompt is a genuinely different picture (see buildSingleSegmentPrompt).
+  avoidScenes?: string[];
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -371,7 +416,7 @@ export async function regenerateSegmentPrompt(input: {
     "regenerateSegmentPrompt",
     (model) =>
       model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? []) }] }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
       }),
     { attempts: 4, baseMs: 1500 },
@@ -574,6 +619,97 @@ export function intersectRuns(
     }
   }
   return runs;
+}
+
+// Snap avatar mark ranges OUT to whole-sentence boundaries.
+//
+// The Google-Doc highlight is hand-drawn, so a red span routinely starts or ends
+// MID-SENTENCE (observed: a mark covering "...we had two kids, a boy and" but
+// stopping just before "a girl." in the same sentence). splitByMarks honors the
+// exact char boundary, so it would carve that sentence into an avatar half ("a
+// boy and") and a stranded visual fragment ("a girl.") — breaking the
+// ONE-SENTENCE = ONE-BLOCK rule and leaking a fragment onto the next visual
+// block. The avatar marking only ever needs SENTENCE granularity (a sentence is
+// either spoken by the talking head or shown as B-roll, never half-and-half), so
+// before any carving we EXPAND each range to the sentences it touches: a range
+// that starts inside a sentence snaps back to that sentence's start, and one that
+// ends inside a sentence snaps forward to that sentence's end. Adjacent/
+// overlapping ranges are then re-merged. This is what kept marks sentence-aligned
+// before; carving at the raw doc offset is what regressed.
+export function snapRangesToSentences(
+  transcript: string,
+  ranges: AvatarMarkRange[],
+): AvatarMarkRange[] {
+  if (ranges.length === 0) return ranges;
+  // Sentence boundaries: the offset just AFTER each terminal . ! ? (plus any
+  // trailing quote/bracket), i.e. where the next sentence begins. 0 and the end
+  // are implicit boundaries. We snap a range start back to the boundary at or
+  // before it, and a range end forward to the boundary at or after it.
+  const boundaries: number[] = [0];
+  const re = /[.!?]+["')\]]*\s*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(transcript)) !== null) {
+    const b = m.index + m[0].length;
+    if (b > 0 && b < transcript.length) boundaries.push(b);
+  }
+  boundaries.push(transcript.length);
+  // boundaries is sorted & unique by construction (regex advances monotonically).
+  const sentenceStartAtOrBefore = (pos: number): number => {
+    let lo = 0, hi = boundaries.length - 1, ans = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (boundaries[mid] <= pos) { ans = boundaries[mid]; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return ans;
+  };
+  const sentenceEndAtOrAfter = (pos: number): number => {
+    let lo = 0, hi = boundaries.length - 1, ans = transcript.length;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (boundaries[mid] >= pos) { ans = boundaries[mid]; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return ans;
+  };
+
+  // A hand-drawn highlight often includes the LEADING space before a sentence
+  // (range starts on " Let me..." not "Let me..."), which sits one char before
+  // the real sentence-start boundary and would snap the start back a whole extra
+  // sentence. Anchor the snap on the first/last NON-whitespace char of the range
+  // instead, so leading/trailing spaces in the highlight don't over-expand it.
+  const firstNonWs = (from: number, to: number): number => {
+    let i = from;
+    while (i < to && /\s/.test(transcript[i])) i++;
+    return Math.min(i, to);
+  };
+  const lastNonWs = (from: number, to: number): number => {
+    let i = to - 1;
+    while (i > from && /\s/.test(transcript[i])) i--;
+    return Math.max(i, from);
+  };
+  const snapped = ranges
+    .map((r) => {
+      const a = firstNonWs(r.start, r.end);
+      const b = lastNonWs(r.start, r.end);
+      return {
+        start: sentenceStartAtOrBefore(a),
+        // Snap the end forward from the last non-ws char (end is exclusive) to
+        // that sentence's end. A range ending on a boundary stays put.
+        end: sentenceEndAtOrAfter(b + 1),
+      };
+    })
+    .filter((r) => r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+
+  // Re-merge adjacent/overlapping ranges produced by the expansion.
+  const merged: AvatarMarkRange[] = [];
+  for (const r of snapped) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else merged.push({ ...r });
+  }
+  return merged;
 }
 
 // Split `seg` (whose transcript char window is [origStart, origEnd)) into one
@@ -929,6 +1065,111 @@ export function splitMergedVisuals(
   return { segments: out, split };
 }
 
+// FINAL position-based image/ai_clip balance (client 2026-06-30: "first 3 min
+// should be many ai_clip, after that image and ai_clip should appear NATURALLY"
+// — not all-clip). Must run LAST, after all merge/split churn, because the
+// short-visual merge biases every merge to ai_clip (resolveMerge returns ai_clip
+// when EITHER side is a clip), which snowballed one plan to 100 clips / 15
+// images. This pass is the final word on visual type:
+//   * a visual block (image/ai_clip) STARTING before `clipHeavyCutoff` -> ai_clip
+//     (the clip-heavy intro look).
+//   * after the cutoff -> keep only a `postClipFraction` share as ai_clip,
+//     spaced EVENLY across the post-cutoff visuals (every Nth), the rest demoted
+//     to image. Even spacing avoids a clump of clips then a clump of stills.
+// avatar / split_2 are NEVER touched (different render paths). A block flipped
+// to image loses its animationPrompt (a still has no motion); a block flipped to
+// ai_clip gets a null animationPrompt and the worker's default gentle push-in.
+export function balanceVisualTypesByPosition(
+  segs: PlannedSegment[],
+  clipHeavyCutoffSeconds: number,
+  postClipFraction: number,
+): { segments: PlannedSegment[]; toClip: number; toImage: number } {
+  let toClip = 0;
+  let toImage = 0;
+  // Index among POST-cutoff visual blocks, used to space clips evenly. We keep a
+  // clip when floor(i * frac) increments — a classic even-distribution stride.
+  let postIdx = 0;
+  const out = segs.map((seg) => {
+    if (seg.blockType !== "image" && seg.blockType !== "ai_clip") return seg;
+    const beforeCutoff = clipHeavyCutoffSeconds > 0 && seg.startTime < clipHeavyCutoffSeconds;
+    let want: SyntheticBlockType;
+    if (beforeCutoff) {
+      want = "ai_clip";
+    } else {
+      // Even-spacing decision: keep a clip when the running quota ticks up.
+      const i = postIdx++;
+      const shouldBeClip =
+        postClipFraction >= 1
+          ? true
+          : postClipFraction <= 0
+            ? false
+            : Math.floor((i + 1) * postClipFraction) > Math.floor(i * postClipFraction);
+      want = shouldBeClip ? "ai_clip" : "image";
+    }
+    if (want === seg.blockType) return seg;
+    if (want === "ai_clip") { toClip++; return { ...seg, blockType: "ai_clip" as SyntheticBlockType }; }
+    toImage++;
+    return { ...seg, blockType: "image" as SyntheticBlockType, animationPrompt: null };
+  });
+  return { segments: out, toClip, toImage };
+}
+
+// Guarantee a MINIMUM number of split_2 blocks (client 2026-06-30: "why is
+// split_2 not appeared?"). Gemini sometimes returns ZERO split_2, and nothing
+// upstream can keep what was never produced — so when the final plan has fewer
+// than `minKeep`, we PROMOTE evenly-spaced eligible 'image' blocks to split_2.
+//
+// A promoted split_2 is fully renderable: the avatar processor generates the
+// talking-head LEFT half (from the project avatar image) and the still RIGHT
+// half (from the block's existing image_prompt), so an 'image' with a usable
+// prompt is a safe source. We promote only AFTER the clip-heavy intro cutoff
+// (split_2 is a presenter-beside-still explanatory layout, not an opening-action
+// shot) and space the promotions evenly across eligible blocks so they don't
+// clump. avatar / ai_clip / existing split_2 are never touched. Runs LAST (after
+// the visual-balance pass) so balance can't flip a promotion back to image.
+export function ensureMinSplit2(
+  segs: PlannedSegment[],
+  minKeep: number,
+  clipHeavyCutoffSeconds: number,
+): { segments: PlannedSegment[]; promoted: number } {
+  if (minKeep <= 0) return { segments: segs, promoted: 0 };
+  const have = segs.filter((s) => s.blockType === "split_2").length;
+  const need = minKeep - have;
+  if (need <= 0) return { segments: segs, promoted: 0 };
+
+  // Eligible: a plain 'image' AFTER the intro cutoff with a non-empty prompt.
+  const eligibleIdx: number[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (
+      s.blockType === "image" &&
+      s.startTime >= clipHeavyCutoffSeconds &&
+      (s.imagePrompt ?? "").trim().length > 0
+    ) {
+      eligibleIdx.push(i);
+    }
+  }
+  if (eligibleIdx.length === 0) return { segments: segs, promoted: 0 };
+
+  // Pick `need` (capped by availability) evenly spaced across the eligible list.
+  const take = Math.min(need, eligibleIdx.length);
+  const chosen = new Set<number>();
+  for (let k = 0; k < take; k++) {
+    // Even stride through eligibleIdx: positions 0.5/take, 1.5/take, ...
+    const pick = Math.floor(((k + 0.5) / take) * eligibleIdx.length);
+    chosen.add(eligibleIdx[Math.min(pick, eligibleIdx.length - 1)]);
+  }
+  let promoted = 0;
+  const out = segs.map((s, i) => {
+    if (!chosen.has(i)) return s;
+    promoted++;
+    // image -> split_2: keep script + image_prompt (becomes the right-half
+    // still); a split_2 has no motion, so drop any animationPrompt.
+    return { ...s, blockType: "split_2" as SyntheticBlockType, animationPrompt: null };
+  });
+  return { segments: out, promoted };
+}
+
 // Coalesce CONTIGUOUS avatar segments into one atomic avatar "part".
 //
 // The audio-driven HeyGen flow treats one Google-Doc avatar passage as a SINGLE
@@ -1113,13 +1354,17 @@ function applyMark(seg: PlannedSegment, marked: boolean, basePrompt: string): Pl
 export function capSplit2Blocks(
   segs: PlannedSegment[],
   maxFraction: number,
+  minKeep: number = 0,
 ): { segments: PlannedSegment[]; demoted: number } {
   if (maxFraction >= 1) return { segments: segs, demoted: 0 };
   const split2Count = segs.filter((s) => s.blockType === "split_2").length;
   if (split2Count === 0) return { segments: segs, demoted: 0 };
-  // Allowed count: floor(total * fraction), but keep at least 1 split_2 when the
-  // fraction is non-zero and Gemini wanted any (so a small video still gets one).
-  const allowed = maxFraction <= 0 ? 0 : Math.max(1, Math.floor(segs.length * maxFraction));
+  // Allowed count: floor(total * fraction), floored at minKeep (client: ensure a
+  // few split_2 survive so the layout still appears) but never above what Gemini
+  // actually produced, and at least 1 when the fraction is non-zero. When the
+  // fraction is 0 we still honor minKeep so an explicit floor wins over the cap.
+  const fracAllowed = maxFraction <= 0 ? 0 : Math.max(1, Math.floor(segs.length * maxFraction));
+  const allowed = Math.min(split2Count, Math.max(fracAllowed, minKeep));
   if (split2Count <= allowed) return { segments: segs, demoted: 0 };
 
   let kept = 0;
@@ -1221,8 +1466,15 @@ async function planTranscriptChunk(
           responseMimeType: "application/json",
           temperature: 0.3,
           // Generous ceiling so we don't truncate from our side; finishReason
-          // tells us if the model still overran.
-          maxOutputTokens: 16384,
+          // tells us if the model still overran. Raised from 16384 -> 32768:
+          // a 14k-char chunk that segments into ~115 verbose blocks (each with
+          // imagePrompt + imagePrompt2 + shotType + shotType2 + animationPrompt)
+          // emitted ~62k chars of JSON and hit MAX_TOKENS at 16384, truncating
+          // mid-stream (salvage recovered most, but it shouldn't truncate at
+          // all). 32k tokens comfortably fits one chunk's output; gemini-2.5-
+          // flash allows up to 65k. The chunker still caps INPUT size so this is
+          // headroom, not a license to send the whole transcript in one call.
+          maxOutputTokens: 32768,
           // gemini-2.5-flash burns its entire output budget on internal
           // reasoning before emitting any JSON, truncating the response at a
           // few hundred bytes regardless of the cap (see scoreClipsForSections).
@@ -1283,7 +1535,7 @@ export async function buildSyntheticTimeline(input: {
   avatarRanges?: AvatarMarkRange[];
 }): Promise<PlannedSegment[]> {
   const { projectId, jobId, transcript, words, voiceoverDuration } = input;
-  const avatarRanges = input.avatarRanges ?? [];
+  let avatarRanges = input.avatarRanges ?? [];
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
 
   // A long transcript makes Gemini emit a segments array that overflows its
@@ -1325,6 +1577,19 @@ export async function buildSyntheticTimeline(input: {
 
   let planned = alignSegments(rawSegments, words, voiceoverDuration);
 
+  // Diagnostic: Gemini's RAW block-type choice, BEFORE any avatar-marking,
+  // capping, promotion, or merging. This is the ground truth for "did Gemini
+  // pick any split_2 at all?" — if rawSplit2 is 0, the downstream split_2 floor
+  // (promotion) is what makes the layout appear; if it's non-zero but the final
+  // plan has none, a later pass is consuming them.
+  await logJob({ projectId, jobId }, "synthetic.plan.raw_types", {
+    total: planned.length,
+    byType: PLANNER_BLOCK_TYPES.reduce<Record<string, number>>((acc, t) => {
+      acc[t] = planned.filter((p) => p.blockType === t).length;
+      return acc;
+    }, {}),
+  });
+
   // Force avatar on segments that overlap a red/orange doc mark.
   //
   // We locate each segment's char window in the transcript so we can test it
@@ -1336,6 +1601,19 @@ export async function buildSyntheticTimeline(input: {
   // index back to the original offsets, then find each segment's normalized
   // script within it. This tolerates Gemini's rewording and never drifts.
   if (avatarRanges.length > 0) {
+    // Snap each hand-drawn doc range out to whole-sentence boundaries FIRST, so a
+    // highlight that stops mid-sentence (e.g. "...a boy and" with "a girl." left
+    // unmarked in the same sentence) covers the WHOLE sentence and splitByMarks
+    // never strands a fragment onto the next visual block. Marking is
+    // sentence-granular by design.
+    const snappedRanges = snapRangesToSentences(transcript, avatarRanges);
+    await logJob({ projectId, jobId }, "synthetic.plan.avatar_ranges_snapped", {
+      before: avatarRanges.length,
+      after: snappedRanges.length,
+      markedCharsBefore: avatarRanges.reduce((a, r) => a + (r.end - r.start), 0),
+      markedCharsAfter: snappedRanges.reduce((a, r) => a + (r.end - r.start), 0),
+    });
+    avatarRanges = snappedRanges;
     // normChars[i] = original transcript offset of the i-th normalized char.
     let normStr = "";
     const normToOrig: number[] = [];
@@ -1442,8 +1720,9 @@ export async function buildSyntheticTimeline(input: {
   // carved by duration-split like any other image).
   {
     const maxFraction = getEnv().SYNTHETIC_SPLIT2_MAX_FRACTION;
+    const minKeep = getEnv().SYNTHETIC_SPLIT2_MIN_KEEP;
     const before = planned.filter((p) => p.blockType === "split_2").length;
-    const { segments, demoted } = capSplit2Blocks(planned, maxFraction);
+    const { segments, demoted } = capSplit2Blocks(planned, maxFraction, minKeep);
     if (demoted > 0) {
       segments.forEach((p, i) => { p.position = i; });
       planned = segments;
@@ -1588,6 +1867,121 @@ export async function buildSyntheticTimeline(input: {
           segmentsAfter: planned.length,
         });
       }
+    }
+  }
+
+  // FINAL image/ai_clip balance by position. Runs LAST so the short-visual
+  // merge's clip-bias can't undo it: before the clip-heavy cutoff every visual
+  // is a clip; after it, only a fraction stay clips (evenly spaced) and the rest
+  // become stills — a natural mix instead of the all-clip snowball. split_2 and
+  // avatar are untouched.
+  {
+    const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
+    const postFraction = getEnv().SYNTHETIC_POST_INTRO_CLIP_FRACTION;
+    const { segments, toClip, toImage } = balanceVisualTypesByPosition(planned, cutoff, postFraction);
+    if (toClip > 0 || toImage > 0) {
+      planned = segments;
+      await logJob({ projectId, jobId }, "synthetic.plan.visual_balance", {
+        clipHeavyCutoffSeconds: cutoff,
+        postIntroClipFraction: postFraction,
+        flippedToClip: toClip,
+        flippedToImage: toImage,
+        byTypeAfter: PLANNER_BLOCK_TYPES.reduce<Record<string, number>>((acc, t) => {
+          acc[t] = planned.filter((p) => p.blockType === t).length;
+          return acc;
+        }, {}),
+      });
+    }
+  }
+
+  // split_2 FLOOR. Gemini sometimes returns zero split_2; promote a few
+  // evenly-spaced post-intro 'image' blocks to split_2 so the layout still
+  // appears (client: "why is split_2 not appeared?"). Runs AFTER the visual
+  // balance so the balance pass can't flip a promotion back to image.
+  {
+    const minKeep = getEnv().SYNTHETIC_SPLIT2_MIN_KEEP;
+    const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
+    const haveBefore = planned.filter((p) => p.blockType === "split_2").length;
+    const { segments, promoted } = ensureMinSplit2(planned, minKeep, cutoff);
+    if (promoted > 0) {
+      planned = segments;
+      await logJob({ projectId, jobId }, "synthetic.plan.split2_floor", {
+        minKeep,
+        split2Before: haveBefore,
+        promotedFromImage: promoted,
+        split2After: haveBefore + promoted,
+      });
+    }
+  }
+
+  // DISTINCT-SCENE pass for the EXTRA visuals of one sentence (client 2026-06-30:
+  // "if several images are generated in the same sentence, the image is the same
+  // now"). When a sentence is shown with MULTIPLE visuals, every slot after the
+  // first is flagged `secondVisual` and, until now, reused slot 1's imagePrompt
+  // with only a weak "different angle" text nudge — which nano-banana renders as a
+  // near-clone (the exact failure the imagePrompt2 system documents). That nudge
+  // also never covered the 3rd+ slot from splitMergedVisuals at all.
+  //
+  // So here, for EACH secondVisual slot, regenerate a GENUINELY DIFFERENT scene of
+  // the same sentence, telling Gemini which scenes the earlier slots already show
+  // (avoidScenes) so it picks a new subject/moment/detail. Slots are grouped into
+  // "same sentence" runs by their identical script: a non-secondVisual anchor
+  // followed by its secondVisual slots. A regen failure is non-fatal — that one
+  // slot keeps the old angle-nudge prompt (set below via secondVisualPrompt at
+  // persist) rather than failing the whole plan.
+  {
+    let distinctRegenerated = 0;
+    let distinctRegenFailed = 0;
+    let i = 0;
+    while (i < planned.length) {
+      const anchor = planned[i];
+      if (anchor.blockType === "avatar" || anchor.secondVisual) { i++; continue; }
+      // Collect the run of following slots that belong to the SAME sentence: same
+      // script, a visual block, and flagged secondVisual.
+      const avoid: string[] = [];
+      const anchorScene = anchor.imagePrompt?.trim();
+      if (anchorScene) avoid.push(anchorScene);
+      let j = i + 1;
+      while (
+        j < planned.length &&
+        planned[j].secondVisual &&
+        planned[j].blockType !== "avatar" &&
+        planned[j].script === anchor.script
+      ) {
+        const slot = planned[j];
+        try {
+          const r = await regenerateSegmentPrompt({
+            projectId,
+            jobId,
+            script: slot.script,
+            basePrompt,
+            blockType: slot.blockType,
+            avoidScenes: avoid,
+          });
+          // regenerateSegmentPrompt returns a prompt already composed WITH the
+          // base in front and the shot folded in, so clear shotType and the
+          // second-visual nudge — persist's composePrompt passes it through.
+          slot.imagePrompt = r.imagePrompt;
+          slot.shotType = null;
+          slot.secondVisual = false;
+          if (slot.blockType === "ai_clip") slot.animationPrompt = r.animationPrompt;
+          // The next slot of this sentence must also avoid THIS new scene.
+          avoid.push(r.imagePrompt);
+          distinctRegenerated++;
+        } catch {
+          distinctRegenFailed++;
+          // Keep the existing scene in avoid so a later slot still differs from it.
+          if (slot.imagePrompt?.trim()) avoid.push(slot.imagePrompt.trim());
+        }
+        j++;
+      }
+      i = j > i + 1 ? j : i + 1;
+    }
+    if (distinctRegenerated > 0 || distinctRegenFailed > 0) {
+      await logJob({ projectId, jobId }, "synthetic.plan.distinct_second_visuals", {
+        regenerated: distinctRegenerated,
+        regenFailed: distinctRegenFailed,
+      });
     }
   }
 
