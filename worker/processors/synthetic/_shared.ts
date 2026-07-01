@@ -213,15 +213,22 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     metadata: { synthetic_segment_id: s.id },
   }));
   if (rows.length > 0) {
-    // Upsert (not insert) so a concurrent finalize that already inserted this
-    // segment makes our row a no-op via the unique index instead of a dup.
-    const { error } = await sb
-      .from("timeline_items")
-      .upsert(rows, {
-        onConflict: "project_id,synthetic_segment_id",
-        ignoreDuplicates: true,
-      });
-    if (error) throw new Error(`maybeFinalizeSynthetic materialize: ${error.message}`);
+    // Insert the missing rows. We CANNOT use PostgREST's upsert onConflict here:
+    // the backing unique index timeline_items_project_segment_uq (migration 0024)
+    // is PARTIAL (WHERE synthetic_segment_id IS NOT NULL), and PostgREST refuses a
+    // partial unique index for ON CONFLICT resolution — it throws "no unique or
+    // exclusion constraint matching the ON CONFLICT specification" on every
+    // row-bearing finalize. That froze projects whose FIRST row-bearing finalize
+    // hit this path (no prior finalize had populated the rows, so the in-memory
+    // alreadyMaterialized fast-path couldn't skip the insert). See the unstick of
+    // c91311bb. The partial index still does its job at the DB level: a racing
+    // concurrent finalize that inserts the same segment now fails with a unique
+    // violation (23505), which we swallow as the intended no-op. Non-duplicate
+    // errors still throw.
+    const { error } = await sb.from("timeline_items").insert(rows);
+    if (error && error.code !== "23505") {
+      throw new Error(`maybeFinalizeSynthetic materialize: ${error.message}`);
+    }
     // Renumber every synthetic row by its segment's planned position so the
     // timeline is contiguous and in order, even after a reconcile inserted late
     // blocks out of sequence. Segments carry the authoritative order via

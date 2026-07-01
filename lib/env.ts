@@ -485,6 +485,17 @@ const ServerEnvSchema = z.object({
   HEYGEN_AUTH_MARKER_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   // How long an avatar render may take inside HeyGen before we give up (ms).
   HEYGEN_RENDER_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
+  // How long (seconds) an account is LEASED to one avatar job for parallel
+  // generation (migration 0026). While leased, no other concurrent job can claim
+  // it (public.claim_heygen_account, FOR UPDATE SKIP LOCKED), and the keep-alive
+  // sweep skips it. Must comfortably EXCEED one attempt's worst case
+  // (HEYGEN_RENDER_TIMEOUT_MS = 600s plus composer setup/upload/retrieval), so a
+  // normal render never outlives its lease; generateAvatar also renews the lease
+  // before each attempt. If a worker crashes the lease auto-expires after this
+  // window and the account becomes claimable again — so keep it long enough to
+  // avoid a live render's account being stolen, but not so long that a crash
+  // strands the account for ages. Default 900s (15 min).
+  HEYGEN_ACCOUNT_LEASE_SECONDS: z.coerce.number().int().positive().default(900),
   // fail_count threshold past which an account is auto-disabled (taken out of
   // rotation) rather than merely cooled down.
   HEYGEN_MAX_FAIL_COUNT: z.coerce.number().int().positive().default(3),

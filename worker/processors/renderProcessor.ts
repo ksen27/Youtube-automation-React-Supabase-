@@ -2668,10 +2668,25 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           if (voProbe.durationSeconds > 0) voiceoverDurationSeconds = voProbe.durationSeconds;
         } catch { /* voProbe failure → log as null */ }
       }
-      // Expected final length = voiceover + intro − intro acrossfade overlap.
-      // The intro is a prefix, not under voiceover, so it ADDS to the total.
+      // Pitch video (migration 0025) is a non-voiceover block: the narration
+      // pauses over it and it keeps its own audio, so it ADDS its full slot
+      // length to the final file without adding anything to the voiceover.
+      // Without this term the validator reads the pitch duration as drift and
+      // fails a render that is actually perfectly in sync (e.g. 2026-06-30:
+      // driftMs 27408 == the 27.8s pitch block). Sum the rendered slot length
+      // of every pitch block — they never merge into a neighbor, so the slot
+      // duration equals their contribution to the timeline.
+      let pitchVideoSeconds = 0;
+      for (let i = 0; i < renderable.length; i++) {
+        if (renderable[i]?.type === "pitch_video" && slotDurations[i] > 0) {
+          pitchVideoSeconds += slotDurations[i];
+        }
+      }
+      // Expected final length = voiceover + intro − intro acrossfade overlap
+      // + pitch video. The intro is a prefix and the pitch is a mid-timeline
+      // insert; neither sits under the voiceover, so both ADD to the total.
       const expectedFinalSeconds = voiceoverDurationSeconds != null
-        ? voiceoverDurationSeconds + introDurationActual - introAudioOverlap
+        ? voiceoverDurationSeconds + introDurationActual - introAudioOverlap + pitchVideoSeconds
         : null;
       const driftMs = finalDurationSeconds != null && expectedFinalSeconds != null
         ? Math.round((finalDurationSeconds - expectedFinalSeconds) * 1000)
@@ -2681,6 +2696,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         voiceoverDurationSeconds: voiceoverDurationSeconds != null ? Math.round(voiceoverDurationSeconds * 1000) / 1000 : null,
         introDurationActual: Math.round(introDurationActual * 1000) / 1000,
         introAudioOverlap,
+        pitchVideoSeconds: Math.round(pitchVideoSeconds * 1000) / 1000,
         expectedFinalSeconds: expectedFinalSeconds != null ? Math.round(expectedFinalSeconds * 1000) / 1000 : null,
         driftMs,
         toleranceMs: POST_RENDER_TOLERANCE_MS,

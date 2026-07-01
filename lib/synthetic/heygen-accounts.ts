@@ -29,9 +29,14 @@ export interface DecryptedAccount {
   cookies: unknown | null;     // decrypted Playwright storage state
   proxy: string | null;        // per-account override or null (global pool)
   fail_count: number;
+  // The lease token this account was claimed under (parallel avatar generation).
+  // Set by claimAccount(); passed back to renewLease()/releaseAccount() so a
+  // worker only ever renews or releases a lease it actually holds. null when the
+  // account was fetched without a claim (keep-alive sweep, admin lookups).
+  leaseToken: string | null;
 }
 
-function decrypt(row: HeygenAccount): DecryptedAccount {
+function decrypt(row: HeygenAccount, leaseToken: string | null = null): DecryptedAccount {
   return {
     id: row.id,
     email: row.email,
@@ -39,6 +44,7 @@ function decrypt(row: HeygenAccount): DecryptedAccount {
     cookies: decryptJson(row.cookies_json),
     proxy: row.proxy,
     fail_count: row.fail_count,
+    leaseToken,
   };
 }
 
@@ -73,6 +79,110 @@ export async function getAvailableAccount(): Promise<DecryptedAccount | null> {
   // (should not happen at avatar concurrency=1, but defensive) moves on.
   await sb.from("heygen_accounts").update({ last_used_at: nowIso }).eq("id", row.id);
   return decrypt(row);
+}
+
+// A short random token identifying one worker's hold on an account. Not the job
+// id — a single job may rotate through several accounts, and each hold gets its
+// own token so release/renew is scoped to the exact lease. Prefixed with the pid
+// for greppability in logs.
+function newLeaseToken(): string {
+  return `w${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * ATOMICALLY claim the least-recently-used eligible account and LEASE it for
+ * `leaseSeconds`. This is the parallel-safe replacement for getAvailableAccount:
+ * it runs the whole "reactivate rested cooldowns -> pick LRU active+unleased ->
+ * stamp the lease" sequence inside one `FOR UPDATE SKIP LOCKED` transaction
+ * (public.claim_heygen_account), so N concurrent avatar jobs each get a DISTINCT
+ * account and never drive the same warm browser at once.
+ *
+ * The lease AUTO-EXPIRES: a crashed worker's account becomes claimable again
+ * after `leaseSeconds` without any manual cleanup. Pick a lease comfortably
+ * above one avatar render's worst case; renewLease() extends the lease via
+ * heartbeat for a genuinely long render.
+ *
+ * Returns the claimed (decrypted) account carrying its leaseToken, or null when
+ * the pool is exhausted / every account is busy. NEVER logs the decrypted fields.
+ */
+export async function claimAccount(leaseSeconds: number): Promise<DecryptedAccount | null> {
+  const sb = getServerSupabase();
+  const token = newLeaseToken();
+  const { data, error } = await sb.rpc("claim_heygen_account", {
+    p_lease_seconds: Math.max(1, Math.round(leaseSeconds)),
+    p_claimed_by: token,
+  });
+  if (error) throw new Error(`claimAccount: ${error.message}`);
+  const row = ((data as HeygenAccount[] | null) ?? [])[0];
+  if (!row) return null;
+  return decrypt(row, token);
+}
+
+/**
+ * Extend the lease on an account this worker holds (call periodically during a
+ * long render so the lease can't expire mid-job and let a peer claim the same
+ * account). No-op — returns false — if the lease was already reclaimed by
+ * someone else (expired then re-claimed); the caller may then abandon its hold.
+ * Requires account.leaseToken to be set (i.e. it came from claimAccount).
+ */
+export async function renewLease(
+  account: DecryptedAccount,
+  leaseSeconds: number,
+): Promise<boolean> {
+  if (!account.leaseToken) return false;
+  const sb = getServerSupabase();
+  const { data, error } = await sb.rpc("renew_heygen_lease", {
+    p_id: account.id,
+    p_lease_seconds: Math.max(1, Math.round(leaseSeconds)),
+    p_claimed_by: account.leaseToken,
+  });
+  if (error) throw new Error(`renewLease: ${error.message}`);
+  return Number(data ?? 0) > 0;
+}
+
+/**
+ * Release this worker's lease on an account so it is immediately claimable again.
+ * Call in a finally after every avatar job (success OR failure). Scoped to the
+ * lease token so a worker never clears a lease a peer has since taken over. A
+ * no-token account (fetched without a claim) is a no-op. Never throws — a failed
+ * release just means the account waits out its lease TTL, which is safe.
+ */
+export async function releaseAccount(account: DecryptedAccount): Promise<void> {
+  if (!account.leaseToken) return;
+  const sb = getServerSupabase();
+  await sb
+    .rpc("release_heygen_account", { p_id: account.id, p_claimed_by: account.leaseToken })
+    .then(({ error }) => {
+      if (error) {
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            msg: "heygen.releaseAccount.error",
+            accountId: account.id,
+            err: error.message?.slice(0, 200),
+          }),
+        );
+      }
+    });
+}
+
+/**
+ * The set of account ids currently under a live lease (claimed_until in the
+ * future). The keep-alive sweep uses this to skip EVERY busy account — opening a
+ * second concurrent HeyGen browser for an account mid-render is the fingerprint
+ * churn the pool design avoids, and with a multi-account pool the old single
+ * `warmAccountId()` skip was insufficient. Best-effort: on a query error returns
+ * an empty set (the sweep then falls back to its own warm-account skip).
+ */
+export async function claimedAccountIds(): Promise<Set<string>> {
+  const sb = getServerSupabase();
+  const { data, error } = await sb
+    .from("heygen_accounts")
+    .select("id")
+    .not("claimed_until", "is", null)
+    .gt("claimed_until", new Date().toISOString());
+  if (error) return new Set();
+  return new Set((data ?? []).map((r) => (r as { id: string }).id));
 }
 
 /**
@@ -258,6 +368,15 @@ export async function applyDisposition(
   disposition: HeygenDisposition,
   klass: HeygenErrorClass,
   reason: string,
+  // How to obtain the NEXT account to try after applying this disposition:
+  //   - "claim:<seconds>": atomically CLAIM+lease a fresh account (parallel-safe
+  //     path — generateAvatar passes this so rotation never hands two concurrent
+  //     jobs the same account). The failed account's lease MUST be released by
+  //     the caller separately (it still holds it here).
+  //   - "available": legacy un-leased getAvailableAccount (kept for any caller
+  //     that isn't lease-managed).
+  // Default preserves the historical behavior.
+  next: { mode: "available" } | { mode: "claim"; leaseSeconds: number } = { mode: "available" },
 ): Promise<DecryptedAccount | null> {
   console.log(
     JSON.stringify({
@@ -290,7 +409,7 @@ export async function applyDisposition(
       await recordErrorClass(accountId, klass, reason);
       break;
   }
-  return getAvailableAccount();
+  return next.mode === "claim" ? claimAccount(next.leaseSeconds) : getAvailableAccount();
 }
 
 
