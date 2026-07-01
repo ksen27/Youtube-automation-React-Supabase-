@@ -249,8 +249,18 @@ export async function keepAliveSession(
  * worker host). Never throws — keep-alive must not crash the worker loop.
  */
 export async function sweepKeepAlive(
-  opts: { skipAccountId?: string | null } = {},
+  // skipAccountIds: the SET of accounts that must NOT be refreshed right now
+  // because they're in use by a running avatar job (a live DB lease, a live warm
+  // browser, or a render in flight). Opening a second concurrent HeyGen browser
+  // for any of them is the fingerprint churn the pool design avoids. With a
+  // multi-account pool this must be a set — the old single skipAccountId couldn't
+  // cover several concurrent renders. skipAccountId is kept as a back-compat
+  // convenience (folded into the set). Cookies for skipped accounts stay fresh
+  // via the post-render saveCookies anyway.
+  opts: { skipAccountIds?: Iterable<string> | null; skipAccountId?: string | null } = {},
 ): Promise<{ refreshed: number; expired: number; errors: number; skipped: number }> {
+  const skip = new Set<string>(opts.skipAccountIds ?? []);
+  if (opts.skipAccountId) skip.add(opts.skipAccountId);
   let refreshed = 0;
   let expired = 0;
   let errors = 0;
@@ -265,11 +275,11 @@ export async function sweepKeepAlive(
     return { refreshed, expired, errors: 1, skipped };
   }
   for (const acc of accounts) {
-    // Skip the account whose warm browser session is currently in use by the
-    // avatar worker — opening a SECOND concurrent HeyGen browser for it is the
-    // fingerprint churn this whole design avoids; its cookies are kept fresh by
-    // the post-render saveCookies anyway.
-    if (opts.skipAccountId && acc.id === opts.skipAccountId) {
+    // Skip any account currently in use by a running avatar job — opening a
+    // SECOND concurrent HeyGen browser for it is the fingerprint churn this whole
+    // design avoids; its cookies are kept fresh by the post-render saveCookies
+    // anyway.
+    if (skip.has(acc.id)) {
       skipped++;
       continue;
     }

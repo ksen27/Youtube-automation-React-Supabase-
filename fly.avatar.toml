@@ -77,6 +77,38 @@ primary_region = 'lhr'
   # — so the scriptField wait timed out and threw a FALSE blank_composer on a page
   # that was actually rendered. 90s covers the real paint time.
   HEYGEN_SETUP_TIMEOUT_MS = "90000"
+  # PARALLEL AVATAR GENERATION. How many avatar jobs render CONCURRENTLY, each on
+  # a DISTINCT HeyGen account (claimed via an atomic DB lease — migration 0026 —
+  # so two jobs never drive the same account's warm browser). Raising this is the
+  # only lever for BATCH throughput: per-render is floored at HeyGen's ~1min
+  # server render, so N accounts in parallel cut a batch to ~1/N the wall time.
+  #
+  # SAFETY PRECONDITIONS before raising above 1:
+  #   1. HEYGEN_PROXIES must hold >= this many DISTINCT exit IPs — resolveProxy()
+  #      maps each account to its own IP, so concurrent browsers egress from
+  #      different IPs and don't look like one bot hammering Cloudflare. Too few
+  #      IPs = two live accounts share an IP = the blank-composer wall.
+  #   2. >= this many accounts must be 'active' (npm run heygen:status).
+  # ROLLOUT: start at 2 (pilot), confirm on a real batch that logs show
+  # heygen.session.reused, NO blank_composer, and no two jobs on the same
+  # accountId, then raise to 3-4. Overridable by a Fly secret if you'd rather not
+  # redeploy to tune it.
+  #
+  # CURRENT SETUP (2 accounts, 2 machines): this is PER MACHINE. We run 2 machines
+  # (fly scale count 2) for parallel RENDERS, and we have exactly 2 HeyGen
+  # accounts, each pinned to its own dedicated residential IP (the per-account
+  # `proxy` column, not the pool). So "1" here × 2 machines = 2 concurrent avatars
+  # = 2 accounts, one browser per machine per IP — no shared-IP Cloudflare signal
+  # and no wasted slot fighting over a 3rd account that doesn't exist. Do NOT raise
+  # above 1 until there are MORE than 2 accounts (each with its own clean IP): with
+  # 2 accounts, 2 here would let one machine try to claim both and the other starve
+  # on "no available accounts".
+  AVATAR_CONCURRENCY = "1"
+  # Per-job account lease length (seconds). Must exceed one avatar attempt's worst
+  # case (HEYGEN_RENDER_TIMEOUT_MS 600s + setup); generateAvatar renews it before
+  # each attempt. A crashed worker's account auto-frees after this. Default in
+  # lib/env.ts is 900; set here only to override.
+  # HEYGEN_ACCOUNT_LEASE_SECONDS = "900"
   # Local scratch for downloads/screenshots (ephemeral is fine for HeyGen
   # automation artifacts).
   TMP_DIR = "/tmp/work"

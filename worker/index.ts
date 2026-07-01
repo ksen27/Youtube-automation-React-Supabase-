@@ -26,7 +26,8 @@ import { processAvatarJob }           from "./processors/synthetic/avatarProcess
 import { markJobFailedIfExhausted, sweepStalledJobs, sweepStalledSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
-import { closeWarmSession, warmAccountId, isRenderActive } from "@/lib/synthetic/heygen-session";
+import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
+import { claimedAccountIds } from "@/lib/synthetic/heygen-accounts";
 
 const env = getEnv();
 const concurrency = env.WORKER_CONCURRENCY;
@@ -264,20 +265,27 @@ let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 if (runSynthetic) {
   // Kick once shortly after boot (don't wait a full interval), then on the timer.
   const runKeepAlive = () => {
-    // NEVER sweep while an avatar render is in flight. Opening a second
-    // concurrent HeyGen browser during a render — even for a DIFFERENT account,
-    // but especially for the same one on a single-account pool — is the
+    // Refresh only the IDLE accounts. Opening a second concurrent HeyGen browser
+    // for an account that a render is using — from the same exit IP — is the
     // concurrent-session activity that trips Cloudflare into wiping the composer
     // page mid-job (observed: keepalive fired ~1min after boot, on top of a live
-    // render, and the next jobs failed blank_composer). warmAccountId() alone
-    // didn't cover this: it's null in the gap right before a job builds its warm
-    // session, so the sweep still hit the only account. Defer to the next tick.
-    if (isRenderActive()) {
-      return;
-    }
-    // Skip the account whose warm browser is in use — refreshing it would open a
-    // second concurrent HeyGen session for it (the churn we're avoiding).
-    void sweepKeepAlive({ skipAccountId: warmAccountId() })
+    // render, and the next jobs failed blank_composer).
+    //
+    // With a multi-account pool we can no longer just bail when ANY render is in
+    // flight — that would starve the sweep whenever the pool is busy, and other
+    // idle accounts still need their TTL kept warm. Instead we skip the exact SET
+    // of in-use accounts, built from three independent signals so none can slip
+    // through a timing gap:
+    //   - claimedAccountIds(): the DB lease — authoritative "a job holds this
+    //     account right now", set the instant claimAccount() runs (covers the gap
+    //     before the warm browser is even built);
+    //   - warmAccountIds(): accounts with a live warm browser in the pool;
+    //   - activeAccountIds(): accounts with a render in flight this instant.
+    void (async () => {
+      const skip = new Set<string>([...warmAccountIds(), ...activeAccountIds()]);
+      for (const id of await claimedAccountIds().catch(() => new Set<string>())) skip.add(id);
+      return sweepKeepAlive({ skipAccountIds: skip });
+    })()
       .then((r) => {
         if (r.refreshed + r.expired + r.errors > 0) {
           console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "heygen.keepalive.done", ...r }));

@@ -78,6 +78,12 @@ export interface HeygenAccount {
   fail_count: number;
   cooldown_until: string | null;
   last_used_at: string | null;
+  // Per-job LEASE for parallel avatar generation (migration 0026). claimed_until
+  // is the lease expiry (NULL = free / claimable); claimed_by is an opaque
+  // worker token. A lease is a healthy-but-busy marker, distinct from a
+  // cooldown/needs_reauth penalty. See lib/synthetic/heygen-accounts.ts.
+  claimed_until: string | null;
+  claimed_by: string | null;
   proxy: string | null;
   // Last failure classification + reason, surfaced in the settings UI so an
   // operator can tell a stale session apart from a real account problem.

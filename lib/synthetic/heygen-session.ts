@@ -27,29 +27,31 @@ function baseUrl() {
   return getEnv().HEYGEN_BASE_URL;
 }
 
-// Warm HeyGen session singleton.
+// Warm HeyGen session POOL — one warm browser per ACCOUNT.
 //
-// THE BUG THIS FIXES: avatar generation opened a NEW browser + context per job
-// and re-navigated to /home to verify the session every time. Each /home hit is
-// a fresh Cloudflare challenge against a headless fingerprint, so after ~3
-// back-to-back renders HeyGen invalidated the session ("login required") and the
-// account got flagged needs_reauth — even at concurrency=1.
+// HISTORY: this was a single module-global `current` warm-browser SINGLETON,
+// safe only at AVATAR_CONCURRENCY=1. Everything below implicitly acted on that
+// one session.
 //
-// THE FIX (spec point 4): keep ONE browser+context alive for the worker's
-// lifetime and reuse it across all jobs. A job opens a cheap fresh PAGE (no
-// Cloudflare challenge), drives the composer, and closes only that page. The
-// /home verify runs only on first use or after a long idle gap
-// (HEYGEN_REVERIFY_AFTER_MINUTES), not every job — so a burst of renders no
-// longer triggers a challenge per job.
+// PARALLEL AVATARS: to render 3-4 accounts at once (each on its own proxy exit
+// IP so the concurrent headless browsers don't look like one bot IP), the
+// singleton becomes a POOL keyed by accountId. Each concurrent avatar job CLAIMS
+// a distinct account (public.claim_heygen_account, FOR UPDATE SKIP LOCKED — see
+// lib/synthetic/heygen-accounts.ts) and drives ONLY that account's warm browser,
+// so two jobs never touch the same session.
 //
-// Cookies are still re-saved to the DB after each render (heygen.ts) so the
-// encrypted copy stays fresh for cold start and the keep-alive sweep; we just no
-// longer RELOAD storageState per job — the live context already holds the warm
-// session.
+// WHAT THE WARM BROWSER STILL FIXES (unchanged, now per-account): a job opens a
+// cheap fresh PAGE on an already-warm context (no Cloudflare challenge), drives
+// the composer, and closes only that page. The /home verify runs only on first
+// use or after a long idle gap (HEYGEN_REVERIFY_AFTER_MINUTES), not every job —
+// so a burst of renders on one account no longer triggers a challenge per job.
+// Cookies are re-saved to the DB after each render (heygen.ts) for cold start.
 //
-// Safe at concurrency=1: only one job touches the context at a time. We still
-// serialize acquire() with an in-flight promise so a re-entrant call can never
-// launch two browsers. NEVER logs in (login is human-only via the connect CLI).
+// CONCURRENCY: one job touches one account's context at a time (guaranteed by
+// the DB lease — a peer job can't claim the same account). We still serialize
+// acquire() PER ACCOUNT with an in-flight promise so a re-entrant call for the
+// same account can never launch two browsers. NEVER logs in (login is human-only
+// via the connect CLI).
 
 function env() {
   return getEnv();
@@ -76,21 +78,24 @@ interface WarmSession {
   health: BrowserHealth;
 }
 
-let current: WarmSession | null = null;
-// Serializes concurrent acquire() calls so we never launch two browsers for the
-// same generation. (Concurrency is 1 today, but a keep-alive sweep or a future
-// bump must not race the launch.)
-let acquiring: Promise<WarmSession> | null = null;
+// The pool: one warm session per accountId. Replaces the old `current` singleton.
+const sessions = new Map<string, WarmSession>();
+// Serializes concurrent acquire() calls PER ACCOUNT so we never launch two
+// browsers for the same account. (A DB lease already stops two jobs claiming the
+// same account, but a keep-alive sweep or a re-entrant call must not race the
+// launch either.)
+const acquiring = new Map<string, Promise<WarmSession>>();
 
 function reverifyAfterMs(): number {
   return env().HEYGEN_REVERIFY_AFTER_MINUTES * 60_000;
 }
 
-// Tear down the held browser/context (best-effort) and clear the singleton.
-async function disposeCurrent(): Promise<void> {
-  const s = current;
-  current = null;
+// Tear down ONE account's held browser/context (best-effort) and drop it from
+// the pool.
+async function disposeSession(accountId: string): Promise<void> {
+  const s = sessions.get(accountId);
   if (!s) return;
+  sessions.delete(accountId);
   await s.context.close().catch(() => {});
   await s.browser.close().catch(() => {});
 }
@@ -138,26 +143,28 @@ async function launch(account: DecryptedAccount): Promise<WarmSession> {
 
 /**
  * Get a warm, authenticated browser context for `account`, reusing the held one
- * when possible:
- *   - No session held, or held for a DIFFERENT account (rotation) -> launch a
- *     fresh one (closing the old) and verify /home once.
- *   - Held for the SAME account and verified recently (within
- *     HEYGEN_REVERIFY_AFTER_MINUTES) -> return it WITHOUT touching /home (the
- *     hot path: back-to-back jobs skip the Cloudflare challenge entirely).
- *   - Held for the SAME account but stale -> re-verify /home once (a single
- *     challenge), refresh the timestamp, and keep the SAME context warm. If it's
- *     expired, dispose and throw session_expired.
+ * for THAT account when possible:
+ *   - No session held for this account -> launch a fresh one and verify /home once.
+ *   - Held and verified recently (within HEYGEN_REVERIFY_AFTER_MINUTES) -> return
+ *     it WITHOUT touching /home (the hot path: back-to-back jobs on the same
+ *     account skip the Cloudflare challenge entirely).
+ *   - Held but stale -> re-verify /home once (a single challenge), refresh the
+ *     timestamp, keep the SAME context warm. If expired, dispose and throw
+ *     session_expired.
+ *   - Held but UNHEALTHY or over the render cap -> recycle (dispose + relaunch).
+ *
+ * Each account owns its own pool slot; acquiring account B NEVER evicts account
+ * A's warm browser (that eviction was the old singleton's rotation cost).
  *
  * Returns the live context. The caller opens its own page and MUST close that
  * page when done (NOT the context — that stays warm for the next job).
  */
 export async function acquireWarmSession(account: DecryptedAccount): Promise<BrowserContext> {
-  if (acquiring) await acquiring.catch(() => {});
-
-  // Different account than the one we hold => rotation; rebuild.
-  if (current && current.accountId !== account.id) {
-    await disposeCurrent();
-  }
+  const id = account.id;
+  // If a launch for THIS account is already in flight, wait it out first so we
+  // don't double-launch.
+  const pending = acquiring.get(id);
+  if (pending) await pending.catch(() => {});
 
   // Health-OR-cap recycle (Objectives #1, #4). Two complementary triggers:
   //
@@ -169,81 +176,86 @@ export async function acquireWarmSession(account: DecryptedAccount): Promise<Bro
   //   2. RENDER CAP (backstop, preemptive): a healthy headless session still
   //      gets Cloudflare-flagged after a number of renders and then walls every
   //      load. Recycling BEFORE that point keeps the happy path from ever hitting
-  //      the wall. This is why the cap survives the move to health-based
-  //      recycling — health reacts AFTER a wall; the cap avoids reaching it. 0
-  //      disables the cap and relies on health alone.
+  //      the wall. 0 disables the cap and relies on health alone.
   //
-  // Either trigger tears the whole browser down and rebuilds a FRESH one from
-  // stored cookies (fresh fingerprint, resetting the heuristic).
+  // Either trigger tears THIS account's browser down and rebuilds a FRESH one
+  // from stored cookies (fresh fingerprint, resetting the heuristic).
   const maxRenders = env().HEYGEN_MAX_RENDERS_PER_SESSION;
-  if (current && current.accountId === account.id) {
-    const unhealthy = !isHealthy(current.health);
-    const capReached = maxRenders > 0 && current.rendersServed >= maxRenders;
+  const held = sessions.get(id);
+  if (held) {
+    const unhealthy = !isHealthy(held.health);
+    const capReached = maxRenders > 0 && held.rendersServed >= maxRenders;
     if (unhealthy || capReached) {
       logSession("recycled", {
-        accountId: account.id,
+        accountId: id,
         reason: unhealthy ? "unhealthy" : "render_cap",
-        rendersServed: current.rendersServed,
+        rendersServed: held.rendersServed,
         maxRenders,
-        health: current.health,
+        health: held.health,
       });
-      await disposeCurrent();
+      await disposeSession(id);
     }
   }
 
-  // Warm + same account + fresh enough => reuse with no /home hit.
-  if (current && current.accountId === account.id) {
-    const ageMs = Date.now() - current.verifiedAtMs;
+  // Warm + fresh enough => reuse with no /home hit.
+  const warm = sessions.get(id);
+  if (warm) {
+    const ageMs = Date.now() - warm.verifiedAtMs;
     if (ageMs <= reverifyAfterMs()) {
       logSession("reused", {
-        accountId: account.id,
-        rendersServed: current.rendersServed,
-        consecutiveFailures: current.health.consecutiveFailures,
+        accountId: id,
+        rendersServed: warm.rendersServed,
+        consecutiveFailures: warm.health.consecutiveFailures,
       });
-      return current.context;
+      return warm.context;
     }
     // Stale: re-verify once on a throwaway page, refresh the stamp, keep warm.
-    const probe = await current.context.newPage();
+    const probe = await warm.context.newPage();
     try {
       const verdict = await verifyAuthenticated(probe);
       if (verdict === "expired") {
         await probe.close().catch(() => {});
-        await disposeCurrent();
+        await disposeSession(id);
         throw new HeygenError(
           "session_expired",
           `heygen: account ${account.email} session expired — reconnect with \`npm run heygen:connect ${account.email}\``,
         );
       }
-      current.verifiedAtMs = Date.now();
-      return current.context;
+      warm.verifiedAtMs = Date.now();
+      return warm.context;
     } finally {
       await probe.close().catch(() => {});
     }
   }
 
-  // Nothing held => launch (serialized so a re-entrant call can't double-launch).
-  acquiring = launch(account);
+  // Nothing held for this account => launch (serialized PER ACCOUNT so a
+  // re-entrant call can't double-launch this account's browser).
+  const launchPromise = launch(account);
+  acquiring.set(id, launchPromise);
   try {
-    current = await acquiring;
-    return current.context;
+    const session = await launchPromise;
+    sessions.set(id, session);
+    return session.context;
   } finally {
-    acquiring = null;
+    acquiring.delete(id);
   }
 }
 
 /**
- * The session hit a login wall mid-job. Drop the warm singleton so the NEXT
- * acquire rebuilds from the (caller-refreshed) stored cookies instead of reusing
- * a context whose cookies HeyGen just invalidated.
+ * The session for `accountId` hit a login wall mid-job. Drop THAT account's warm
+ * slot so the NEXT acquire rebuilds from the (caller-refreshed) stored cookies
+ * instead of reusing a context whose cookies HeyGen just invalidated. Other
+ * accounts' warm browsers are untouched.
  */
-export async function invalidateWarmSession(): Promise<void> {
-  await disposeCurrent();
+export async function invalidateWarmSession(accountId: string): Promise<void> {
+  await disposeSession(accountId);
 }
 
 /**
- * Get the WARM job page for one avatar job. Unlike a fresh page per job (which
- * reloads /avatar cold and made generation take minutes to start), this REUSES a
- * single page parked on /avatar so the SPA stays hydrated between jobs:
+ * Get the WARM job page for one avatar job on `account`. Unlike a fresh page per
+ * job (which reloads /avatar cold and made generation take minutes to start),
+ * this REUSES a single page parked on /avatar so the SPA stays hydrated between
+ * jobs:
  *   - first call (or after a crash): create the page and navigate to /avatar once;
  *   - subsequent calls: hand back the SAME page, re-navigating to /avatar only if
  *     it drifted off the composer (e.g. landed on /projects after a render).
@@ -255,9 +267,9 @@ export async function acquireJobPage(
   account: DecryptedAccount,
 ): Promise<{ page: Page; context: BrowserContext }> {
   const context = await acquireWarmSession(account);
-  const session = current; // set by acquireWarmSession
+  const session = sessions.get(account.id); // set by acquireWarmSession
   if (!session) {
-    // Shouldn't happen (acquire throws or sets current), but be defensive.
+    // Shouldn't happen (acquire throws or sets the slot), but be defensive.
     const page = await context.newPage();
     return { page, context };
   }
@@ -296,104 +308,112 @@ export async function acquireJobPage(
   return { page: session.jobPage, context };
 }
 
-/** Graceful teardown for worker shutdown. Never throws. */
+/** Graceful teardown for worker shutdown — closes EVERY account's warm browser. */
 export async function closeWarmSession(): Promise<void> {
-  await disposeCurrent();
+  const ids = [...sessions.keys()];
+  await Promise.all(ids.map((id) => disposeSession(id)));
 }
 
-/** Test/diagnostic helper: is a warm session currently held? */
-export function hasWarmSession(): boolean {
-  return current !== null;
+/** Test/diagnostic helper: is a warm session held for this account (or any)? */
+export function hasWarmSession(accountId?: string): boolean {
+  return accountId ? sessions.has(accountId) : sessions.size > 0;
 }
 
 /**
- * Count one completed render against the warm session's render budget AND mark
- * the browser's health as a success (clears the failure streak). The caller
- * invokes this AFTER a successful generation: the count feeds the backstop cap
- * (recycle before the Cloudflare wall) and the health success keeps a
- * still-healthy browser warm for the next job. No-op if no session is held
- * (e.g. it was torn down on failure).
+ * Count one completed render on `accountId` against its warm session's render
+ * budget AND mark the browser's health as a success (clears the failure streak).
+ * The caller invokes this AFTER a successful generation: the count feeds the
+ * backstop cap (recycle before the Cloudflare wall) and the health success keeps
+ * a still-healthy browser warm for the next job. No-op if no session is held for
+ * the account (e.g. it was torn down on failure).
  */
-export function recordRenderServed(): void {
-  if (!current) return;
-  current.rendersServed += 1;
-  markSuccess(current.health);
+export function recordRenderServed(accountId: string): void {
+  const s = sessions.get(accountId);
+  if (!s) return;
+  s.rendersServed += 1;
+  markSuccess(s.health);
   logSession("health_updated", {
-    accountId: current.accountId,
+    accountId,
     outcome: "success",
-    rendersServed: current.rendersServed,
-    health: current.health,
+    rendersServed: s.rendersServed,
+    health: s.health,
   });
 }
 
 /**
- * Record a FAILED render against the warm browser's health (Objective #4/#6).
- * `klass` is the classified failure (heygen-errors) — a blank_composer flips the
- * browser unhealthy at once (the Cloudflare wall is sticky on a flagged
- * session); other classes flip it after a short streak. This is a BROWSER-level
- * signal only; ACCOUNT disposition (cooldown/reauth/rotate) is decided
- * separately in generateAvatar(), keeping the two systems independent. The next
- * acquireWarmSession() recycles the browser if this made it unhealthy. No-op if
- * no session is held.
+ * Record a FAILED render on `accountId` against its warm browser's health
+ * (Objective #4/#6). `klass` is the classified failure (heygen-errors) — a
+ * blank_composer flips the browser unhealthy at once (the Cloudflare wall is
+ * sticky on a flagged session); other classes flip it after a short streak. This
+ * is a BROWSER-level signal only; ACCOUNT disposition (cooldown/reauth/rotate) is
+ * decided separately in generateAvatar(), keeping the two systems independent.
+ * The next acquireWarmSession() recycles the browser if this made it unhealthy.
+ * No-op if no session is held for the account.
  */
-export function recordRenderFailure(klass: string): void {
-  if (!current) return;
-  markFailure(current.health, klass);
+export function recordRenderFailure(accountId: string, klass: string): void {
+  const s = sessions.get(accountId);
+  if (!s) return;
+  markFailure(s.health, klass);
   logSession("health_updated", {
-    accountId: current.accountId,
+    accountId,
     outcome: "failure",
     klass,
-    healthy: isHealthy(current.health),
-    health: current.health,
+    healthy: isHealthy(s.health),
+    health: s.health,
   });
-  if (!isHealthy(current.health)) {
+  if (!isHealthy(s.health)) {
     logSession("unhealthy", {
-      accountId: current.accountId,
+      accountId,
       reason: "render_failure",
       klass,
-      consecutiveFailures: current.health.consecutiveFailures,
+      consecutiveFailures: s.health.consecutiveFailures,
     });
   }
 }
 
-/** The current warm browser's health snapshot, or null if none is held. */
-export function currentHealth(): BrowserHealth | null {
-  return current ? { ...current.health } : null;
+/** A warm browser's health snapshot for `accountId`, or null if none is held. */
+export function currentHealth(accountId: string): BrowserHealth | null {
+  const s = sessions.get(accountId);
+  return s ? { ...s.health } : null;
 }
 
 /**
- * The account id of the currently-held warm session, or null. The keep-alive
- * sweep uses this to SKIP refreshing the warm account: that account already has
- * a live, in-use browser session, and opening a SECOND concurrent browser to
+ * The account ids that currently hold a live warm session. The keep-alive sweep
+ * uses this (together with the DB lease set) to SKIP refreshing an account that
+ * already has a live, in-use browser: opening a SECOND concurrent browser to
  * HeyGen for the same account is exactly the fingerprint churn we're avoiding.
- * Its cookies are re-saved after every render anyway, so the sweep adds nothing.
+ * Cookies are re-saved after every render anyway, so the sweep adds nothing.
  */
-export function warmAccountId(): string | null {
-  return current?.accountId ?? null;
+export function warmAccountIds(): string[] {
+  return [...sessions.keys()];
 }
 
-// Count of avatar renders currently in flight. The keep-alive sweep MUST NOT
-// open a second concurrent HeyGen browser while a render is running: two live
-// sessions for the same account from the same IP is exactly the activity that
-// trips Cloudflare into the blank-composer / page-wipe challenge. The old
-// `skipAccountId: warmAccountId()` guard was insufficient on a single-account
-// pool — between/just-before jobs warmAccountId() is null, so the sweep would
-// refresh the ONLY account right as a render started. This counter is the
-// authoritative "a job is active" signal, independent of whether the warm
-// session object exists yet.
-let activeRenders = 0;
+// Count of avatar renders currently in flight PER ACCOUNT. The keep-alive sweep
+// MUST NOT open a second concurrent HeyGen browser for an account while a render
+// is running on it: two live sessions for the same account from the same IP is
+// exactly the activity that trips Cloudflare into the blank-composer / page-wipe
+// challenge. This map is the authoritative "a job is active on account X" signal,
+// independent of whether that account's warm session object exists yet.
+const activeRenders = new Map<string, number>();
 
-/** Mark an avatar render as started — the keep-alive sweep will skip while >0. */
-export function beginRender(): void {
-  activeRenders += 1;
+/** Mark an avatar render as started on `accountId` — the sweep skips it while >0. */
+export function beginRender(accountId: string): void {
+  activeRenders.set(accountId, (activeRenders.get(accountId) ?? 0) + 1);
 }
 
-/** Mark an avatar render as finished (success OR failure). Never goes negative. */
-export function endRender(): void {
-  activeRenders = Math.max(0, activeRenders - 1);
+/** Mark an avatar render finished on `accountId` (success OR failure). >=0. */
+export function endRender(accountId: string): void {
+  const n = (activeRenders.get(accountId) ?? 0) - 1;
+  if (n <= 0) activeRenders.delete(accountId);
+  else activeRenders.set(accountId, n);
 }
 
-/** True while at least one avatar render is in flight. */
-export function isRenderActive(): boolean {
-  return activeRenders > 0;
+/** True while at least one avatar render is in flight on `accountId`. */
+export function isRenderActive(accountId: string): boolean {
+  return (activeRenders.get(accountId) ?? 0) > 0;
+}
+
+/** All account ids with at least one render in flight (for the sweep skip-set). */
+export function activeAccountIds(): string[] {
+  return [...activeRenders.keys()];
 }

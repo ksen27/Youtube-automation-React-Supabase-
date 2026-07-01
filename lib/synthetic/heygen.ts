@@ -8,7 +8,9 @@ import { uploadBuffer } from "@/lib/storage";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import {
-  getAvailableAccount,
+  claimAccount,
+  renewLease,
+  releaseAccount,
   saveCookies,
   recordSuccess,
   applyDisposition,
@@ -22,6 +24,8 @@ import {
   invalidateWarmSession,
   recordRenderServed,
   recordRenderFailure,
+  beginRender,
+  endRender,
 } from "@/lib/synthetic/heygen-session";
 import { inspectPage } from "@/lib/synthetic/heygen-health";
 import {
@@ -1158,8 +1162,9 @@ async function attemptOnAccount(
     // (keeps a healthy browser warm) and counts it against the backstop render
     // cap. Once the cap is reached — or health degrades earlier — the NEXT
     // acquire recycles the browser to a fresh fingerprint before Cloudflare walls
-    // it into a blank composer.
-    recordRenderServed();
+    // it into a blank composer. Keyed by accountId so it targets THIS account's
+    // warm browser in the pool.
+    recordRenderServed(account.id);
 
     // Output length. For audio-driven renders the render length equals the
     // uploaded audio, so use its known duration; otherwise fall back to the
@@ -1195,8 +1200,8 @@ async function attemptOnAccount(
     // streak. The next acquireWarmSession() recycles the browser if so. This is
     // independent of the ACCOUNT disposition applied in generateAvatar() — a
     // browser problem recycles the browser; an account problem rotates the
-    // account.
-    recordRenderFailure(typed.klass);
+    // account. Keyed by accountId so it hits THIS account's warm browser.
+    recordRenderFailure(account.id, typed.klass);
 
     // Spec E: full diagnostics on every failure (url, title, screenshot, HTML).
     await captureDiagnostics(page, input.jobId, "error");
@@ -1230,7 +1235,7 @@ async function attemptOnAccount(
       typed.klass === "login_required" ||
       typed.klass === "blank_composer"
     ) {
-      await invalidateWarmSession().catch(() => {});
+      await invalidateWarmSession(account.id).catch(() => {});
     }
     throw typed;
   }
@@ -1261,42 +1266,77 @@ export async function generateAvatar(
   const spacingMs = env().HEYGEN_JOB_SPACING_SECONDS * 1000;
   if (spacingMs > 0) await new Promise((r) => setTimeout(r, spacingMs));
 
-  let account = await getAvailableAccount();
+  // PARALLEL-SAFE ACCOUNT CLAIM. With AVATAR_CONCURRENCY > 1 several avatar jobs
+  // run at once; each must drive a DISTINCT account or they'd corrupt each
+  // other's warm browser. claimAccount() leases one account atomically (FOR
+  // UPDATE SKIP LOCKED in the DB), so two concurrent jobs can never get the same
+  // one. The lease AUTO-EXPIRES (a crashed worker frees its account), and we
+  // release it in the finally below. Lease length = the render timeout plus
+  // headroom, so a normal render never outlives its lease; a genuinely long one
+  // is kept alive by renewLease() heartbeats between attempts.
+  const leaseSeconds = env().HEYGEN_ACCOUNT_LEASE_SECONDS;
+  let account = await claimAccount(leaseSeconds);
   if (!account) {
     throw new HeygenError(
       "session_expired",
-      "heygen: no available accounts in pool — connect or re-auth one with `npm run heygen:connect <email>`",
+      "heygen: no available accounts in pool — every account is busy or awaiting re-auth; " +
+        "connect or re-auth one with `npm run heygen:connect <email>`",
     );
   }
 
   let lastErr: unknown;
-  // NEVER degrade an audio-driven job to the script (HeyGen TTS) path. The audio
-  // path attaches the sliced 69labs voiceover so the render carries the CORRECT
-  // audio; the script path speaks HeyGen's own TTS = WRONG audio on the clip,
-  // which is UNUSABLE and still burns a HeyGen credit. The client made clear that
-  // a wrong-audio render is worse than no render (wasted credit, unusable output).
-  //
-  // So an audio-upload failure is treated like any other failure: we ROTATE to a
-  // fresh account and retry the SAME audio path (a fresh session usually uploads
-  // the same audio cleanly). If every account's fresh session still fails the
-  // upload, we throw — the job hard-fails and no credit is spent on a wrong-audio
-  // render. `forceScriptPath` is left false on every attempt for audio-driven
-  // jobs; it stays available only for genuinely script-only inputs (no
-  // audioFilePath), which were never audio-driven to begin with.
-  for (let i = 0; i < maxAccounts; i++) {
-    try {
-      return await attemptOnAccount(account, input, imageBytes, false);
-    } catch (err) {
-      lastErr = err;
-      const next = await applyDisposition(
-        account.id,
-        dispositionOf(err),
-        classOf(err),
-        (err as Error).message ?? "unknown",
-      );
-      if (!next) break; // pool exhausted
-      account = next;
+  try {
+    // NEVER degrade an audio-driven job to the script (HeyGen TTS) path. The audio
+    // path attaches the sliced 69labs voiceover so the render carries the CORRECT
+    // audio; the script path speaks HeyGen's own TTS = WRONG audio on the clip,
+    // which is UNUSABLE and still burns a HeyGen credit. The client made clear that
+    // a wrong-audio render is worse than no render (wasted credit, unusable output).
+    //
+    // So an audio-upload failure is treated like any other failure: we ROTATE to a
+    // fresh account and retry the SAME audio path (a fresh session usually uploads
+    // the same audio cleanly). If every account's fresh session still fails the
+    // upload, we throw — the job hard-fails and no credit is spent on a wrong-audio
+    // render. `forceScriptPath` is left false on every attempt for audio-driven
+    // jobs; it stays available only for genuinely script-only inputs (no
+    // audioFilePath), which were never audio-driven to begin with.
+    for (let i = 0; i < maxAccounts; i++) {
+      // Extend the lease before each attempt so a multi-minute render can't lapse
+      // it and let a peer job claim the same account mid-render.
+      await renewLease(account, leaseSeconds).catch(() => {});
+      const attemptAccount = account;
+      // Mark a render in flight ON THIS ACCOUNT so the keep-alive sweep won't
+      // open a second concurrent HeyGen browser on top of it (the Cloudflare
+      // page-wipe trigger). Per-account now (was a global flag) since several
+      // accounts render at once; cleared on success AND failure.
+      beginRender(attemptAccount.id);
+      try {
+        return await attemptOnAccount(attemptAccount, input, imageBytes, false);
+      } catch (err) {
+        lastErr = err;
+        // Rotate: apply this account's disposition AND atomically claim+lease the
+        // NEXT account in one step (applyDisposition claim mode). Then release the
+        // FAILED account's lease so it's free again once its penalty allows.
+        const next = await applyDisposition(
+          attemptAccount.id,
+          dispositionOf(err),
+          classOf(err),
+          (err as Error).message ?? "unknown",
+          { mode: "claim", leaseSeconds },
+        );
+        await releaseAccount(attemptAccount).catch(() => {});
+        if (!next) break; // pool exhausted
+        account = next;
+      } finally {
+        endRender(attemptAccount.id);
+      }
     }
+  } finally {
+    // Release whatever account we currently hold (the successful one on the happy
+    // path — the return above runs this finally first; the last-tried one on the
+    // exhausted path). Failed accounts mid-loop were already released above, and
+    // releaseAccount is a no-op for one whose lease we no longer own, so this is
+    // safe to call unconditionally.
+    await releaseAccount(account).catch(() => {});
   }
   throw new Error(
     `heygen: avatar generation failed across ${maxAccounts} account(s): ${(lastErr as Error)?.message ?? "unknown"}`,

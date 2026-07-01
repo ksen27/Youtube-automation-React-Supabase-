@@ -6,7 +6,6 @@ import type { AvatarJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
-import { beginRender, endRender } from "@/lib/synthetic/heygen-session";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -174,6 +173,14 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
       redelivery: currentJobId === mediaJobId, // (b): same-id stalled re-delivery
     });
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { skipped: "already_rendered" } });
+    // Still drain the project. If THIS skipped re-delivery is the LAST segment
+    // (its real render finished, but BullMQ re-delivered the job — case b — or a
+    // duplicate job trailed it), the original delivery may have been killed as
+    // "stalled" before reaching the finalize at the end of this function. Without
+    // finalizing here the project would sit in generating_* forever with every
+    // segment ready and no Render button. maybeFinalizeSynthetic is idempotent and
+    // no-ops if another finalize already advanced the project past review.
+    await maybeFinalizeSynthetic(projectId);
     return;
   }
 
@@ -265,35 +272,30 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   }
 
   try {
-    // Mark a render in flight so the keep-alive sweep won't open a second
-    // concurrent HeyGen browser on top of it (the Cloudflare page-wipe trigger).
-    // Wrapped in try/finally so the flag clears on success AND failure.
-    beginRender();
-    let result;
-    try {
-      // Heartbeat the segment's updated_at across the multi-minute HeyGen render
-      // so the stall sweeper can't false-fail an avatar that is alive and
-      // rendering (the race the finishSegment error-clear below only papered over).
-      result = await withSegmentHeartbeat(segmentId, () =>
-        generateAvatar(
-          {
-            projectId,
-            segmentId,
-            jobId: mediaJobId,
-            avatarImageUrl: project.avatar_image_url as string,
-            script: seg.script ?? "",
-            audioFilePath: audio?.path,
-            audioDurationSeconds: audio?.durationSeconds,
-            // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
-            // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
-            aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
-          },
-          imageBytes,
-        ),
-      );
-    } finally {
-      endRender();
-    }
+    // Heartbeat the segment's updated_at across the multi-minute HeyGen render
+    // so the stall sweeper can't false-fail an avatar that is alive and
+    // rendering (the race the finishSegment error-clear below only papered over).
+    // NOTE: the "render in flight" marker that keeps the keep-alive sweep off a
+    // busy account now lives INSIDE generateAvatar (beginRender/endRender), keyed
+    // by the account it actually claims — the processor can't know that account
+    // id ahead of the claim.
+    const result = await withSegmentHeartbeat(segmentId, () =>
+      generateAvatar(
+        {
+          projectId,
+          segmentId,
+          jobId: mediaJobId,
+          avatarImageUrl: project.avatar_image_url as string,
+          script: seg.script ?? "",
+          audioFilePath: audio?.path,
+          audioDurationSeconds: audio?.durationSeconds,
+          // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
+          // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
+          aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
+        },
+        imageBytes,
+      ),
+    );
     // For split_2 the avatar is the LEFT video; the right still is set by the
     // image-gen processor. video_url holds the avatar mp4 either way.
     // Clear any error left by a prior attempt or a premature stall-sweep — a
