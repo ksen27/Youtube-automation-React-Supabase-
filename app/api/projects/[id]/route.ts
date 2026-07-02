@@ -70,6 +70,10 @@ const PatchSchema = z.object({
   intro_source_youtube_url: z.string().trim().max(500).nullable().optional(),
   intro_source_start_seconds: z.number().min(0).max(36_000).nullable().optional(),
   intro_duration_seconds: z.number().min(1).max(15).nullable().optional(),
+  // AI-Avatar (synthetic) only: the NAME of the HeyGen saved avatar to drive the
+  // Avatar III (orange-mark) flow. The user creates that avatar in HeyGen and
+  // enters its exact name here. Empty string clears it.
+  heygen_avatar_name: z.string().trim().max(200).nullable().optional(),
 }).strict();
 
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -110,6 +114,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
     intro_source_youtube_url?: string | null;
     intro_source_start_seconds?: number | null;
     intro_duration_seconds?: number | null;
+    heygen_avatar_name?: string | null;
   } = {
     ...parsed.data,
   };

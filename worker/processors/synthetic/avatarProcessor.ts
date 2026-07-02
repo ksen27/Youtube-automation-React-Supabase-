@@ -138,10 +138,10 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   const [{ data: seg, error: segErr }, { data: project, error: projErr }] = await Promise.all([
     sb
       .from("synthetic_segments")
-      .select("id, block_type, status, script, image_prompt, right_image_url, video_url, start_time, end_time, metadata")
+      .select("id, block_type, avatar_model, status, script, image_prompt, right_image_url, video_url, start_time, end_time, metadata")
       .eq("id", segmentId)
       .single(),
-    sb.from("projects").select("avatar_image_url, voiceover_url").eq("id", projectId).single(),
+    sb.from("projects").select("avatar_image_url, voiceover_url, heygen_avatar_name").eq("id", projectId).single(),
   ]);
   if (segErr || !seg) throw new Error(`avatar: segment ${segmentId} not found`);
 
@@ -292,6 +292,18 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
           // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
           // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
           aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
+          // Doc-highlight color picked the HeyGen model (red -> Avatar IV,
+          // orange -> Avatar III). Null (legacy rows) defaults to Avatar IV.
+          // split_2 is a GEMINI layout choice, never a colored mark, so it always
+          // stays on Avatar IV (the working split-screen path) — never Avatar III.
+          avatarModel:
+            seg.block_type !== "split_2" &&
+            (seg as { avatar_model?: string | null }).avatar_model === "avatar_iii"
+              ? "avatar_iii"
+              : "avatar_iv",
+          // Avatar III finds its saved avatar on HeyGen by this user-entered name.
+          heygenAvatarName:
+            (project as { heygen_avatar_name?: string | null }).heygen_avatar_name ?? null,
         },
         imageBytes,
       ),

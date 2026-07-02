@@ -7,7 +7,7 @@ import type { WordTiming } from "@/lib/ai/deepgram";
 import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
 import type { Sentence } from "@/lib/ai/sentences";
 import type { SyntheticBlockType } from "@/lib/types";
-import { type AvatarMarkRange } from "@/lib/synthetic/doc-marks";
+import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
 
 // Synthetic timeline planner. Gemini reads the transcript and segments it into
 // ordered visual blocks, choosing a block_type per the spec rules:
@@ -94,6 +94,11 @@ export interface PlannedSegment {
   // Shot type for the SECOND visual (paired with imagePrompt2).
   shotType2?: string | null;
   animationPrompt: string | null;
+  // Which HeyGen model an avatar-bearing block renders with. Set by avatar
+  // marking from the doc-highlight color (red -> avatar_iv, orange ->
+  // avatar_iii). Null on every non-avatar block; null on an avatar block means
+  // the worker default (Avatar IV). See applyMark / coalesceAvatarSegments.
+  avatarModel?: AvatarModel | null;
   // True for the SECOND visual attached to a long sentence (see
   // splitByDuration). The second visual prefers imagePrompt2; if that's absent
   // this flag tells the persist step to nudge imagePrompt to a different
@@ -591,6 +596,7 @@ interface MarkRun {
   start: number; // char offset into transcript, inclusive
   end: number; // exclusive
   marked: boolean;
+  model: AvatarModel | null; // the model of the range covering this run (marked runs only)
 }
 export function intersectRuns(
   segStart: number,
@@ -610,12 +616,14 @@ export function intersectRuns(
     const b = sorted[i + 1];
     if (b <= a) continue;
     const mid = (a + b) / 2;
-    const marked = ranges.some((r) => r.start <= mid && mid < r.end);
+    const covering = ranges.find((r) => r.start <= mid && mid < r.end);
+    const marked = !!covering;
+    const model = covering?.model ?? null;
     const last = runs[runs.length - 1];
-    if (last && last.marked === marked) {
-      last.end = b; // coalesce same-type adjacent runs
+    if (last && last.marked === marked && last.model === model) {
+      last.end = b; // coalesce same-type + same-model adjacent runs
     } else {
-      runs.push({ start: a, end: b, marked });
+      runs.push({ start: a, end: b, marked, model });
     }
   }
   return runs;
@@ -697,16 +705,19 @@ export function snapRangesToSentences(
         // Snap the end forward from the last non-ws char (end is exclusive) to
         // that sentence's end. A range ending on a boundary stays put.
         end: sentenceEndAtOrAfter(b + 1),
+        model: r.model,
       };
     })
     .filter((r) => r.end > r.start)
     .sort((a, b) => a.start - b.start);
 
-  // Re-merge adjacent/overlapping ranges produced by the expansion.
+  // Re-merge adjacent/overlapping ranges produced by the expansion — but only
+  // ranges of the SAME model, so a red (Avatar IV) sentence abutting an orange
+  // (Avatar III) one stays two ranges driving two different models.
   const merged: AvatarMarkRange[] = [];
   for (const r of snapped) {
     const last = merged[merged.length - 1];
-    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    if (last && r.model === last.model && r.start <= last.end) last.end = Math.max(last.end, r.end);
     else merged.push({ ...r });
   }
   return merged;
@@ -726,7 +737,8 @@ export function splitByMarks(
   // Whole-block (single run) — no carving needed; just label it.
   if (runs.length <= 1) {
     const marked = runs.length === 1 ? runs[0].marked : false;
-    return [applyMark(seg, marked, basePrompt)];
+    const model = runs.length === 1 ? runs[0].model : null;
+    return [applyMark(seg, marked, basePrompt, model)];
   }
 
   const scriptLen = seg.script.length;
@@ -752,9 +764,11 @@ export function splitByMarks(
       duration: Math.max(0.5, endTime - startTime),
       script: piece,
     };
-    out.push(applyMark(sub, run.marked, basePrompt));
+    out.push(applyMark(sub, run.marked, basePrompt, run.model));
   }
-  return out.length > 0 ? out : [applyMark(seg, runs.some((r) => r.marked), basePrompt)];
+  return out.length > 0
+    ? out
+    : [applyMark(seg, runs.some((r) => r.marked), basePrompt, runs.find((r) => r.marked)?.model ?? null)];
 }
 
 // Round a char index to the nearest whitespace boundary in `text` so a script
@@ -1200,7 +1214,15 @@ export function coalesceAvatarSegments(segs: PlannedSegment[]): {
   let overLengthParts = 0;
   for (const seg of segs) {
     const prev = out[out.length - 1];
-    if (prev && prev.blockType === "avatar" && seg.blockType === "avatar") {
+    if (
+      prev &&
+      prev.blockType === "avatar" &&
+      seg.blockType === "avatar" &&
+      // Only coalesce parts of the SAME model — an Avatar IV (red) part and an
+      // Avatar III (orange) part must each render on their own model, so they
+      // stay separate HeyGen renders even when contiguous.
+      (prev.avatarModel ?? "avatar_iv") === (seg.avatarModel ?? "avatar_iv")
+    ) {
       // Extend the open avatar part to include this segment.
       prev.script = `${prev.script} ${seg.script}`.replace(/\s+/g, " ").trim();
       prev.endTime = seg.endTime;
@@ -1324,15 +1346,30 @@ export function splitByDuration(
 // prompt would be empty. We fall back to the basePrompt — a real, on-style
 // visual of the video's recurring world — instead of the raw narration sentence,
 // which makes a poor, over-literal generation prompt.
-function applyMark(seg: PlannedSegment, marked: boolean, basePrompt: string): PlannedSegment {
+function applyMark(
+  seg: PlannedSegment,
+  marked: boolean,
+  basePrompt: string,
+  model: AvatarModel | null = null,
+): PlannedSegment {
   if (marked) {
-    return { ...seg, blockType: "avatar", imagePrompt: null, animationPrompt: null };
+    // Doc marks are authoritative, so the model comes from the highlight color.
+    // Fall back to Avatar IV if a mark somehow arrived without a model (it
+    // shouldn't — every range carries one).
+    return {
+      ...seg,
+      blockType: "avatar",
+      imagePrompt: null,
+      animationPrompt: null,
+      avatarModel: model ?? "avatar_iv",
+    };
   }
   if (seg.blockType === "avatar") {
     return {
       ...seg,
       blockType: "image",
       imagePrompt: seg.imagePrompt || basePrompt.trim() || seg.script.slice(0, 200),
+      avatarModel: null,
     };
   }
   return seg;
@@ -2007,6 +2044,9 @@ export async function buildSyntheticTimeline(input: {
         ? null
         : composePrompt(basePrompt, secondVisualPrompt(p.imagePrompt, p.secondVisual), p.shotType),
     animation_prompt: p.animationPrompt,
+    // Which HeyGen model an avatar block renders with (red highlight ->
+    // avatar_iv, orange -> avatar_iii). Null for every non-avatar block.
+    avatar_model: p.blockType === "avatar" ? (p.avatarModel ?? "avatar_iv") : null,
     // Stash the video's recurring world on every row so the image processors
     // have a LAST-RESORT visual prompt that is on-topic — never the spoken
     // narration. A visual block should always carry a composed image_prompt

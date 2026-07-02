@@ -13,15 +13,23 @@ import {
 // should become AVATAR (talking-head) segments. Everything else flows into the
 // plain transcript and the planner/Gemini decides its block type.
 //
+// The highlight COLOR additionally picks the HeyGen model:
+//   red    -> Avatar IV  ("avatar_iv") — the photo-to-video composer
+//   orange -> Avatar III ("avatar_iii") — the cheaper Avatar-Shots flow
+//
 // Output:
 //   transcript   — the doc's plain text (what the rest of the pipeline aligns)
 //   avatarRanges — [start, end) character offsets INTO `transcript` that were
-//                  red/orange. The planner forces any segment overlapping one
-//                  of these ranges to block_type = 'avatar'.
+//                  red/orange, each tagged with its model. The planner forces
+//                  any segment overlapping one of these ranges to
+//                  block_type = 'avatar' and copies the model onto it.
+
+export type AvatarModel = "avatar_iv" | "avatar_iii";
 
 export interface AvatarMarkRange {
   start: number; // inclusive char offset into transcript
   end: number;   // exclusive
+  model: AvatarModel; // red -> avatar_iv, orange -> avatar_iii
 }
 
 export interface ExtractedDoc {
@@ -46,11 +54,18 @@ function isOrange(c: { red?: number; green?: number; blue?: number }): boolean {
   return r > 0.6 && g >= 0.25 && g <= 0.75 && r > g + 0.15 && g > b + 0.15;
 }
 
-// A run is an avatar mark if its foreground color is red OR orange.
-function isAvatarMarked(run: GoogleDocsTextRun): boolean {
+// Classify a run's foreground color into an avatar model, or null if it is not
+// an avatar highlight. Red -> Avatar IV, orange -> Avatar III. We test orange
+// FIRST because the orange band (high red) partially overlaps the red test's
+// "red dominates" — but isRed() additionally requires green to be LOW
+// (r > g + 0.3), so a true orange (mid green) never satisfies isRed anyway; the
+// explicit order just makes the intent unambiguous.
+function avatarModelForRun(run: GoogleDocsTextRun): AvatarModel | null {
   const c = run.textStyle?.foregroundColor?.color?.rgbColor;
-  if (!c) return false;
-  return isRed(c) || isOrange(c);
+  if (!c) return null;
+  if (isOrange(c)) return "avatar_iii";
+  if (isRed(c)) return "avatar_iv";
+  return null;
 }
 
 /** Walk a fetched doc into transcript + avatar char-ranges. Pure (testable). */
@@ -68,19 +83,22 @@ export function extractAvatarDoc(doc: GoogleDocsDocument): ExtractedDoc {
       const start = transcript.length;
       transcript += content;
       const end = transcript.length;
-      if (run && isAvatarMarked(run)) {
-        ranges.push({ start, end });
+      const model = run ? avatarModelForRun(run) : null;
+      if (model) {
+        ranges.push({ start, end, model });
       }
     }
   }
 
   // Merge adjacent/overlapping ranges so a multi-run highlighted sentence
-  // becomes one span (Docs splits a styled sentence into several runs).
+  // becomes one span (Docs splits a styled sentence into several runs). Only
+  // merge runs of the SAME model — a red span abutting an orange span must stay
+  // two separate ranges so each drives its own HeyGen model.
   ranges.sort((a, b) => a.start - b.start);
   const merged: AvatarMarkRange[] = [];
   for (const r of ranges) {
     const last = merged[merged.length - 1];
-    if (last && r.start <= last.end) {
+    if (last && r.model === last.model && r.start <= last.end) {
       last.end = Math.max(last.end, r.end);
     } else {
       merged.push({ ...r });
@@ -96,8 +114,8 @@ export function extractAvatarDoc(doc: GoogleDocsDocument): ExtractedDoc {
   const leadingWs = transcript.length - transcript.replace(/^\s+/, "").length;
   const trimmedStart = transcript.replace(/^\s+/, "").replace(/\s+$/, "");
   const adjusted = merged
-    .map((r) => ({ start: r.start - leadingWs, end: r.end - leadingWs }))
-    .map((r) => ({ start: Math.max(0, r.start), end: Math.min(trimmedStart.length, r.end) }))
+    .map((r) => ({ start: r.start - leadingWs, end: r.end - leadingWs, model: r.model }))
+    .map((r) => ({ start: Math.max(0, r.start), end: Math.min(trimmedStart.length, r.end), model: r.model }))
     .filter((r) => r.end > r.start);
 
   return {

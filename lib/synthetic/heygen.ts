@@ -60,6 +60,34 @@ import {
   clickFirstVisible,
   waitFirstVisible,
   isVisible,
+  // Avatar III ("Create new shots") flow + Avatar IV avatar-naming.
+  avatarsNavEntry,
+  avatarsSearchBox,
+  avatarsLoadError,
+  firstAvatarTile,
+  createVideoWithAvatarButton,
+  createNewShotsMenuItem,
+  avatarMoreMenuOpen,
+  avatarModelDropdownTrigger,
+  avatarIIIOption,
+  avatarModelIsIII,
+  avatarShotsLookPreview,
+  avatarShotsSwitchLookButton,
+  avatarShotsLookModal,
+  avatarShotsLookUploadButton,
+  avatarShotsLookValidating,
+  avatarShotsPhotoAvatarTiles,
+  avatarShotsLookTileImages,
+  avatarShotsPhotoAvatarTileImage,
+  avatarShotsTileClickTarget,
+  avatarShotsChooseLookButton,
+  avatarShotsOrientationTrigger,
+  avatarShotsOrientationOption,
+  avatarShotsOrientationConfirmed,
+  avatarShotsUploadAudioLink,
+  avatarShotsAudioInput,
+  avatarShotsAudioAttached,
+  avatarShotsGenerateButton,
 } from "@/lib/synthetic/heygen-selectors";
 
 // HeyGen avatar generation via Playwright browser automation (NOT the HeyGen
@@ -108,6 +136,19 @@ export interface GenerateAvatarInput {
   // portrait source fits naturally while a landscape one would be heavily
   // side-cropped. Defaults to "landscape" when unset.
   aspectRatio?: "landscape" | "portrait";
+  // Which HeyGen model to render with, picked from the doc-highlight color:
+  //   "avatar_iv"  (red)    — the Photo-to-video composer that uploads the photo
+  //                           directly (the historical default).
+  //   "avatar_iii" (orange) — the cheaper "Create new shots" / Avatar-Shots flow
+  //                           that reuses a SAVED avatar and applies lip-sync to
+  //                           the uploaded audio.
+  // Defaults to "avatar_iv" when unset (legacy segments).
+  avatarModel?: "avatar_iv" | "avatar_iii";
+  // The NAME of the HeyGen saved avatar to use for the Avatar III flow. Set by
+  // the user at intake (they create the avatar in HeyGen with this exact name).
+  // Avatar III searches the Avatars page for it. Required when avatarModel is
+  // "avatar_iii"; ignored by the Avatar IV path (which uploads the photo).
+  heygenAvatarName?: string | null;
 }
 
 export interface GenerateAvatarResult {
@@ -397,6 +438,13 @@ interface HeygenProjectItem {
   video_url?: string;
   video_download_url?: string;
   error_message?: string;
+  // HeyGen reports the render's shape directly on the item (verified 2026-07):
+  //   aspect_ratio: "16:9" | "9:16" | ...   orientation: "landscape" | "portrait"
+  // Both Avatar IV and Avatar III (Avatar-Shots) renders appear in the SAME
+  // avatar_video list, so orientation is the cleanest signal to skip a wrong-
+  // aspect render BEFORE downloading it (the file probe remains the final gate).
+  aspect_ratio?: string;
+  orientation?: string;
 }
 
 // HeyGen's created_ts is Unix SECONDS, but be defensive: normalize a value that
@@ -606,6 +654,25 @@ async function retrieveRenderedVideo(
         lastShortSeconds = cand.duration ?? lastShortSeconds;
         continue;
       }
+      // EARLY orientation gate using the item's OWN aspect_ratio/orientation (no
+      // download needed). Both Avatar IV and Avatar III renders share the list, so
+      // a wrong-orientation render (e.g. a 9:16 render when we asked for 16:9) is
+      // skipped here BEFORE spending a download — the file probe below is still the
+      // final authority when the item doesn't report a shape.
+      if (expectedAspect) {
+        const itemAspect =
+          cand.orientation === "landscape" || cand.orientation === "portrait"
+            ? (cand.orientation as "landscape" | "portrait")
+            : cand.aspect_ratio === "16:9"
+            ? "landscape"
+            : cand.aspect_ratio === "9:16"
+            ? "portrait"
+            : null;
+        if (itemAspect && itemAspect !== expectedAspect) {
+          sawWrongAspect = true;
+          continue;
+        }
+      }
       const url = cand.video_url || cand.video_download_url;
       if (!url || !/^https?:/.test(url)) continue;
       const got = await downloadAndProbe(url);
@@ -674,10 +741,739 @@ async function retrieveRenderedVideo(
   );
 }
 
+// Upload the sliced 69labs audio on the Avatar-Shots (Avatar III) page. Unlike
+// the /avatar Photo-to-video composer (a two-step Upload-Audio/Confirm-Audio
+// modal handled by uploadAudioTrack), the Avatar-Shots page attaches audio via a
+// "upload/record" link that opens the native file chooser directly; the track
+// then appears INLINE (name + play control + a "Voice Mirroring" checkbox) with
+// no confirm modal. Throws a classified HeygenError if the audio never attaches.
+async function uploadAvatarShotsAudio(
+  page: Page,
+  audioPath: string,
+  timeoutMs: number,
+): Promise<void> {
+  // 1) Click the "upload/record" affordance to open the audio modal. This is the
+  // SAME "Record Audio / Upload Audio" modal as the /avatar composer — it opens
+  // DEFAULTED TO THE "Record Audio" TAB, which prompts for the microphone and
+  // strands the run (observed 2026-07). So opening the modal is only step one; we
+  // MUST switch to the Upload Audio tab next.
+  const heading = audioModalHeading(page).locator("visible=true").first();
+  let modalOpen = false;
+  for (let attempt = 0; attempt < 4 && !modalOpen; attempt++) {
+    await clickFirstVisible(avatarShotsUploadAudioLink(page), timeoutMs, "Avatar Shots upload/record link").catch(() => {});
+    modalOpen = await heading
+      .waitFor({ state: "visible", timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!modalOpen) await page.waitForTimeout(2_000);
+  }
+  if (!modalOpen) {
+    throw new HeygenError("ui_changed", "heygen: Avatar Shots audio modal did not open");
+  }
+
+  // 2) Switch to the "Upload Audio" tab (away from the default "Record Audio",
+  // which is what triggered the mic-permission prompt). Retry a couple of times —
+  // the tab must be active before the dropzone/file input exists.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (await isVisible(uploadAudioTab(page), 3000)) {
+      await clickFirstVisible(uploadAudioTab(page), timeoutMs, "Upload Audio tab").catch(() => {});
+    }
+    // The dropzone / file input only mounts on the Upload tab; use it as the
+    // "tab is active" signal.
+    if (await isVisible(audioDropzone(page), 2500)) break;
+    await page.waitForTimeout(800);
+  }
+
+  // 3) Upload the file via the native chooser the dropzone opens; fall back to a
+  // hidden <input type=file>.
+  try {
+    const [chooser] = await Promise.all([
+      page.waitForEvent("filechooser", { timeout: timeoutMs }),
+      clickFirstVisible(audioDropzone(page), timeoutMs, "audio dropzone"),
+    ]);
+    await chooser.setFiles(audioPath);
+  } catch (err) {
+    if ((await audioFileInput(page).count()) > 0) {
+      await audioFileInput(page).first().setInputFiles(audioPath);
+    } else if ((await avatarShotsAudioInput(page).count()) > 0) {
+      await avatarShotsAudioInput(page).first().setInputFiles(audioPath);
+    } else {
+      throw new HeygenError("ui_changed", "heygen: could not open Avatar Shots audio file chooser", err);
+    }
+  }
+
+  // 4) Commit: picking a file advances to a "Confirm Audio" step; click its
+  // commit button once enabled, then confirm the modal closed. Mirrors the
+  // /avatar Upload-Audio flow. Tolerates a build that attaches directly (no
+  // confirm modal) by treating the modal closing as success.
+  await Promise.race([
+    audioConfirmHeading(page).locator("visible=true").first().waitFor({ state: "visible", timeout: timeoutMs }).catch(() => {}),
+    audioModalHeading(page).first().waitFor({ state: "hidden", timeout: timeoutMs }).catch(() => {}),
+  ]);
+  const confirmBtn = audioConfirmButton(page).locator("visible=true").first();
+  const modalsGone = async () =>
+    !(await isVisible(audioModalHeading(page), 500)) && !(await isVisible(audioConfirmHeading(page), 500));
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (await modalsGone()) break;
+    if (await confirmBtn.isEnabled().catch(() => false)) {
+      await confirmBtn.click({ timeout: 5000 }).catch(() => {});
+    }
+    await page.waitForTimeout(3000);
+  }
+
+  // 5) Confirm the track attached — an <audio> element / the file name / a "Voice
+  // Mirroring" affordance appears once HeyGen decoded it.
+  await avatarShotsAudioAttached(page)
+    .locator("visible=true")
+    .first()
+    .waitFor({ state: "visible", timeout: timeoutMs })
+    .catch(() => {
+      throw new HeygenError("ui_changed", "heygen: Avatar Shots audio did not attach after upload");
+    });
+}
+
+// Drive the Avatar III render through the "Create new shots" / Avatar-Shots flow
+// and CLICK Generate. Returns once the render is kicked off; the SHARED
+// retrieval in attemptOnAccount (Projects poll + download) then collects the
+// output exactly as for Avatar IV. Steps (verified against the live UI 2026-07):
+//   1) Avatars page -> search the project's saved-avatar name -> open its tile's
+//      "Create video with this avatar" (▷) -> "Create new shots".
+//   2) On Avatar Shots: pick model "Avatar III", set orientation, upload audio.
+//   3) Click "Generate for 1 credit".
+// Throws a classified HeygenError on any missing control.
+async function driveAvatarIIIComposer(
+  page: Page,
+  input: GenerateAvatarInput,
+  audioPath: string,
+  imageBytes: Buffer,
+): Promise<void> {
+  const e = env();
+  const p = page;
+  const wantPortrait = input.aspectRatio === "portrait";
+  // NAME-INDEPENDENT entry. Avatar III used to require a user-supplied HeyGen
+  // avatar name (searched on the Avatars page) — but users don't know HeyGen's
+  // internal avatar names, so they entered it wrong and every Avatar III segment
+  // failed. We no longer need a name: we enter the composer from the FIRST avatar
+  // that exists in this account, then OVERRIDE its look with the project's own
+  // photo via Switch-look (step 5.5 below, now unconditional). The starting
+  // avatar's identity is irrelevant — only the uploaded look renders. Every
+  // account is kept seeded with at least one avatar for exactly this entry step.
+  // (input.heygenAvatarName is now ignored; the intake field is left in place.)
+
+  // 1+2) Open the Avatars grid and pick the FIRST tile (any one) to enter the
+  // composer from — no name search, since the look is replaced with the project
+  // photo below. HeyGen's Avatars grid sometimes fails to load with a transient
+  // "Couldn't load your avatars. Please refresh and try again." (observed 2026-07)
+  // — the account HAS avatars, the API just hiccuped, so NO tile renders. We MUST
+  // distinguish that from a genuinely empty account: on the load-error banner (or
+  // a no-tile timeout) we RELOAD the page and retry a few times before giving up.
+  const tile = firstAvatarTile(p).first();
+  let tileReady = false;
+  for (let attempt = 0; attempt < 4 && !tileReady; attempt++) {
+    // (Re)navigate to the Avatars grid. First attempt is the warm in-SPA nav; a
+    // retry after a load error does a genuine reload to re-fetch the grid.
+    if (attempt === 0) {
+      await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatars`, { waitUntil: "commit" }).catch(() => {});
+      if (!(await isVisible(avatarsSearchBox(p), 8000))) {
+        await clickFirstVisible(avatarsNavEntry(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars nav").catch(() => {});
+      }
+    } else {
+      await p.reload({ waitUntil: "commit" }).catch(() => {});
+    }
+    await waitFirstVisible(avatarsSearchBox(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars search box").catch(() => {});
+
+    // If HeyGen shows the transient load-error banner, this attempt has no tiles —
+    // reload and retry rather than concluding the account is empty.
+    if (await isVisible(avatarsLoadError(p), 2500)) {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.avatar3_avatars_load_error",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          attempt,
+          note: "'Couldn't load your avatars' — reloading and retrying",
+        }),
+      );
+      await p.waitForTimeout(2500);
+      continue;
+    }
+
+    tileReady = await tile
+      .waitFor({ state: "visible", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
+      .then(() => true)
+      .catch(() => false);
+    // A no-tile timeout might still be a slow/failed grid load — one more reload.
+    if (!tileReady) {
+      await p.waitForTimeout(2000);
+    }
+  }
+  if (!tileReady) {
+    // Persisted past retries: either the grid keeps failing to load, or this
+    // account genuinely has no seed avatar. Surface both possibilities; the caller
+    // rotates to another account (which should hold its own seed avatar).
+    await captureDiagnostics(p, input.jobId, "avatar_iii_no_avatar_tile");
+    throw new HeygenError(
+      "ui_changed",
+      "heygen: no avatar tile available on the Avatars page for Avatar III after retries — " +
+        "either HeyGen's avatar grid failed to load ('Couldn't load your avatars') or this " +
+        "account is missing its seed avatar",
+    );
+  }
+  await shot(p, input.projectId, input.segmentId, "avatar3_tile");
+
+  // 3) Hover the tile to reveal its actions, click the ▷ "Create video with this
+  // avatar" icon, then "Create new shots" in the menu it opens.
+  //
+  // The tile also has a "..." more-menu (Edit/Share/Delete/Copy Identity) and a
+  // ♡ favorite icon right next to the ▷. A mis-click on "..." opens the WRONG
+  // menu (no "Create new shots"), so we VERIFY the right menu appeared and retry
+  // the ▷ if the "..." menu opened instead — closing it first with Escape.
+  let menuOpen = false;
+  for (let attempt = 0; attempt < 3 && !menuOpen; attempt++) {
+    await tile.hover().catch(() => {});
+    await clickFirstVisible(
+      createVideoWithAvatarButton(tile),
+      e.HEYGEN_SETUP_TIMEOUT_MS,
+      "Create video with this avatar",
+    ).catch(() => {});
+    // Wait for EITHER the right item or the wrong "..." menu to resolve.
+    menuOpen = await createNewShotsMenuItem(p)
+      .locator("visible=true")
+      .first()
+      .waitFor({ state: "visible", timeout: 6000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!menuOpen && (await isVisible(avatarMoreMenuOpen(p), 1500))) {
+      // We opened the "..." menu by mistake — dismiss it and retry the ▷.
+      await p.keyboard.press("Escape").catch(() => {});
+      await p.waitForTimeout(400);
+    }
+  }
+  if (!menuOpen) {
+    await captureDiagnostics(p, input.jobId, "avatar_iii_create_menu_not_open");
+    throw new HeygenError(
+      "ui_changed",
+      "heygen: the avatar tile's 'Create video' menu (with 'Create new shots') never opened",
+    );
+  }
+  await clickFirstVisible(createNewShotsMenuItem(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Create new shots");
+
+  // 4) Wait for the Avatar-Shots composer (the model pill is the readiness tell).
+  await waitFirstVisible(avatarModelDropdownTrigger(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatar Shots model pill");
+  await shot(p, input.projectId, input.segmentId, "avatar3_composer");
+
+  // 5) MODEL + LOOK are COUPLED on this HeyGen build — setting one RESETS the
+  // other (observed 2026-07): selecting the model reverts the look to the model's
+  // default avatar, and uploading a look reverts the model to Avatar IV. So a
+  // single pass in either order leaves one wrong at Generate. We therefore define
+  // both as idempotent helpers, run model-then-look once, then a FINAL GUARD loop
+  // that re-checks BOTH and re-applies whichever got clobbered — model first, look
+  // last (look is what renders, so it must be the last write to survive).
+
+  // Stage the project photo once (reused if the look must be re-applied).
+  const lookDir = path.join(e.TMP_DIR, "heygen-uploads");
+  await fs.mkdir(lookDir, { recursive: true });
+  const lookPath = path.join(lookDir, `${input.segmentId}_look.jpg`);
+  await fs.writeFile(lookPath, imageBytes);
+
+  // Set to the uploaded look's img src once applyLook identifies it — so we can
+  // DELETE exactly that look after the render (keeps the seed avatar's grid small,
+  // which is what makes tile selection reliable). "" = nothing to delete.
+  let uploadedLookSrc = "";
+
+  // The composer preview <img> src identifies WHICH face is currently selected.
+  // After a successful look upload it points at our uploaded photo; if the model
+  // switch reverts the look, this src changes back to the seed avatar's. We
+  // capture it post-upload and re-verify it before Generate.
+  const lookPreviewSrc = async (): Promise<string> =>
+    avatarShotsLookPreview(p)
+      .first()
+      .getAttribute("src")
+      .then((s) => s ?? "")
+      .catch(() => "");
+
+  // Select the Avatar III model, verifying the pill reads "Avatar III". Idempotent
+  // — returns immediately if already set.
+  const selectModelIII = async (): Promise<boolean> => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await isVisible(avatarModelIsIII(p), 2000)) return true;
+      await clickFirstVisible(avatarModelDropdownTrigger(p), e.HEYGEN_SETUP_TIMEOUT_MS, "model dropdown").catch(() => {});
+      await clickFirstVisible(avatarIIIOption(p), 10_000, "Avatar III option").catch(() => {});
+      if (
+        await avatarModelIsIII(p)
+          .locator("visible=true")
+          .first()
+          .waitFor({ state: "visible", timeout: 6000 })
+          .then(() => true)
+          .catch(() => false)
+      )
+        return true;
+    }
+    return false;
+  };
+
+  // Upload the project photo as the look and select it. Returns the committed
+  // preview src on success (so the caller can pin/verify it), or throws.
+  const applyLook = async (): Promise<string> => {
+    await avatarShotsLookPreview(p).first().hover().catch(() => {});
+    await clickFirstVisible(avatarShotsSwitchLookButton(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch look").catch(() => {});
+    await waitFirstVisible(avatarShotsLookModal(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch-look modal");
+
+    // SNAPSHOT existing look-tile srcs BEFORE upload. The seed avatar has many
+    // identically-captioned "Photo Avatar" looks and the fresh upload does NOT land
+    // at a predictable position (positional selection picked a PREVIOUS look — the
+    // bug). The ONE img src that appears AFTER the upload that wasn't here before is
+    // unambiguously OURS — used both to SELECT the right tile and (later) to delete
+    // exactly that look. Read currentSrc||src to be robust to lazy/srcset loading.
+    const readTileSrcs = async (): Promise<string[]> =>
+      (await avatarShotsLookTileImages(p)
+        .evaluateAll((imgs) =>
+          imgs.map((im) => (im as HTMLImageElement).currentSrc || (im as HTMLImageElement).src || "")
+        )
+        .catch(() => [] as string[])).filter(Boolean);
+    const srcsBefore = new Set(await readTileSrcs());
+
+    // Click Upload inside the modal, catching the native chooser.
+    try {
+      const [chooser] = await Promise.all([
+        p.waitForEvent("filechooser", { timeout: e.HEYGEN_SETUP_TIMEOUT_MS }),
+        clickFirstVisible(avatarShotsLookUploadButton(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch-look Upload"),
+      ]);
+      await chooser.setFiles(lookPath);
+    } catch (err) {
+      const input2 = p.locator('input[type="file"]');
+      if ((await input2.count()) > 0) await input2.first().setInputFiles(lookPath);
+      else throw new HeygenError("ui_changed", "heygen: Switch-look Upload chooser did not open", err);
+    }
+    await shot(p, input.projectId, input.segmentId, "avatar3_look_uploading");
+
+    // ENFORCE THE REAL UPLOAD SEQUENCE (verified from the live UI 2026-07):
+    //   1) green toast "Image uploaded successfully"  (upload received), THEN
+    //   2) the NEW tile shows in-tile "Validating photo / This will take a few
+    //      seconds." over a blurred preview — the tile is NOT selectable yet, THEN
+    //   3) that text clears and the tile becomes the real selectable look.
+    // We must NOT touch any tile until step 3. So: wait for the success toast
+    // (best-effort), then wait for "Validating photo" to APPEAR and then DISAPPEAR.
+    // WAIT FOR VALIDATION — but do NOT burn fixed timeouts on toast/validating-text
+    // selectors that may not match this build (that made the step take ~50s of dead
+    // waiting). The AUTHORITATIVE, self-timing signal is the STABLE NEW SRC: the
+    // uploaded tile's final thumbnail src appears and holds only once validation
+    // completes. So we poll for it directly on a SHORT (1s) interval and stop the
+    // instant it's ready — fast when validation is fast, still correct when slow.
+    // A best-effort peek at the validating text is logged for diagnostics only; it
+    // never gates timing.
+    // HARD GATE ON VALIDATION — the ROOT of "selects a previous image before
+    // validating": the srcsBefore baseline only captured the ~9 VIRTUALIZED tiles
+    // rendered at snapshot time, so a pre-existing tile scrolled/rendered later
+    // looked "new" and got clicked mid-validation. The reliable, unambiguous signal
+    // is the in-tile "Validating photo" text — it appears ONLY on OUR uploaded tile.
+    // So: (1) wait for it to APPEAR (our upload is validating), capturing the CARD
+    // it lives in as OUR tile; (2) wait for it to DISAPPEAR (validation done). We do
+    // NOT touch any tile until it's gone.
+    //
+    // OUR tile = the PrivatePhotoAvatarCard that contains the "Validating photo"
+    // text. We pin it while the text is showing, then reuse that exact card after
+    // validation clears (its position is stable — it stays where it validated).
+    const validatingText = avatarShotsLookValidating(p).first();
+    const appeared = await validatingText
+      .waitFor({ state: "visible", timeout: 30_000 })
+      .then(() => true)
+      .catch(() => false);
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: appeared
+          ? "synthetic.heygen.avatar3_validating_seen"
+          : "synthetic.heygen.avatar3_validating_missing",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+      }),
+    );
+
+    // Identify OUR tile. While the "Validating photo" text is showing it uniquely
+    // marks our tile — but the tile's img during validation is a BLURRED PLACEHOLDER
+    // whose src differs from the final thumbnail. So we do NOT pin the src now;
+    // instead we snapshot the FULL set of tile srcs at validation START, WAIT for
+    // validation to finish, then the new fully-loaded src that appears is our final
+    // thumbnail. Combined with the hard validation gate, this can't fire early.
+    let ourImgSrc = "";
+    if (appeared) {
+      // Baseline srcs the moment validation is confirmed in-flight (grid is settled
+      // to its current virtualized set; our tile currently shows the placeholder).
+      const srcsAtValidateStart = await avatarShotsLookTileImages(p)
+        .evaluateAll((imgs) =>
+          imgs.map((im) => (im as HTMLImageElement).currentSrc || (im as HTMLImageElement).src || "")
+        )
+        .catch(() => [] as string[]);
+      // HARD GATE: wait for the validating text to fully disappear.
+      await validatingText
+        .waitFor({ state: "hidden", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
+        .catch(() => {});
+      if (await isVisible(avatarShotsLookValidating(p), 1000)) {
+        await avatarShotsLookValidating(p)
+          .first()
+          .waitFor({ state: "hidden", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
+          .catch(() => {});
+      }
+      await p.waitForTimeout(500);
+      // After validation, the final thumbnail replaces the placeholder → its src is
+      // the one NOT present during validation. Poll briefly for that fully-loaded
+      // new src.
+      const deadline = Date.now() + 30_000;
+      while (!ourImgSrc && Date.now() < deadline) {
+        ourImgSrc = await avatarShotsLookTileImages(p)
+          .evaluateAll(
+            (imgs, before) => {
+              for (const el of imgs) {
+                const im = el as HTMLImageElement;
+                const s = im.currentSrc || im.src || "";
+                if (s && !before.includes(s) && im.complete && im.naturalWidth > 0) return s;
+              }
+              return "";
+            },
+            srcsAtValidateStart,
+          )
+          .catch(() => "");
+        if (!ourImgSrc) await p.waitForTimeout(400);
+      }
+    } else {
+      // Validating text never seen (very fast, or text differs on this build). Fall
+      // back to the new-src diff, but ONLY accept a fully-loaded src that stays
+      // stable across two 700ms reads — reduces the chance of grabbing a scrolled-in
+      // pre-existing tile.
+      let candidate = "";
+      const deadline = Date.now() + 30_000;
+      while (!ourImgSrc && Date.now() < deadline) {
+        const fresh = await avatarShotsLookTileImages(p)
+          .evaluateAll(
+            (imgs, before) => {
+              for (const el of imgs) {
+                const im = el as HTMLImageElement;
+                const s = im.currentSrc || im.src || "";
+                if (s && !before.includes(s) && im.complete && im.naturalWidth > 0) return s;
+              }
+              return "";
+            },
+            [...srcsBefore],
+          )
+          .catch(() => "");
+        if (fresh && fresh === candidate) ourImgSrc = fresh;
+        else {
+          candidate = fresh;
+          await p.waitForTimeout(700);
+        }
+      }
+    }
+
+    if (!ourImgSrc) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_look_newsrc_missing");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: could not identify the uploaded look tile after validation — " +
+          "would risk selecting the wrong face",
+      );
+    }
+    // Settle so the post-validation grid is stable, then resolve OUR tile by the
+    // pinned src (the tile that was validating now carries this final thumbnail).
+    await p.waitForTimeout(500);
+    const newSrc = ourImgSrc;
+    const uploadedImg = p.locator(`img[src="${newSrc.replace(/"/g, '\\"')}"]`).first();
+    const topTile = p
+      .locator('[data-pacific-component="PrivatePhotoAvatarCard"]')
+      .filter({ has: p.locator(`img[src="${newSrc.replace(/"/g, '\\"')}"]`) })
+      .first();
+    // Remember our src so the caller can delete exactly this look after the render.
+    uploadedLookSrc = newSrc;
+
+    const clickLook = async (): Promise<void> => {
+      // The commit action is the tile's own "Choose look" BUTTON (verified from the
+      // live DOM: every card has one). Clicking the tile card just highlights it and
+      // does NOT close the modal — which is why the old card-click loop retried
+      // forever ("modal never closed"). The button lives in a group-hover overlay,
+      // so we HOVER our tile to reveal it, then FORCE-click it (the overlay is
+      // pointer-events-none until hover; force bypasses the actionability check).
+      await uploadedImg.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+      await topTile.hover().catch(() => {});
+      await p.waitForTimeout(150);
+      // Primary: this tile's "Choose look" button.
+      await avatarShotsChooseLookButton(topTile)
+        .first()
+        .click({ timeout: 4000, force: true })
+        .catch(() => {});
+      // Fallbacks if the modal is still open: the card, then the image.
+      if (await isVisible(avatarShotsLookModal(p), 500)) {
+        await avatarShotsTileClickTarget(topTile).first().click({ timeout: 3000, force: true }).catch(() => {});
+      }
+      if (await isVisible(avatarShotsLookModal(p), 500)) {
+        await uploadedImg.click({ timeout: 3000, force: true }).catch(() => {});
+      }
+    };
+
+    // Click the tile, then confirm success by the MODAL CLOSING. HeyGen closes the
+    // "My Avatars" Switch-look modal ONLY when a look is applied, so a closed modal
+    // IS the commit signal. We deliberately do NOT compare the composer preview src
+    // here: that check was giving FALSE NEGATIVES (the look WAS applied, but the
+    // broad preview selector read a stale/unchanged src), which made the loop think
+    // it failed and RE-CLICK / re-open the modal endlessly until it threw — the
+    // "selects again many times then stalls" bug. Modal-closed is the reliable,
+    // low-false-negative signal.
+    let lookApplied = false;
+    for (let attempt = 0; attempt < 3 && !lookApplied; attempt++) {
+      await clickLook();
+      lookApplied = await avatarShotsLookModal(p)
+        .first()
+        .waitFor({ state: "hidden", timeout: 8000 })
+        .then(() => true)
+        .catch(() => false);
+      if (lookApplied) break;
+      // Modal still open — the click didn't commit. Only in this case do we retry
+      // (the modal is already open, so no need to re-open it).
+      await p.waitForTimeout(600);
+    }
+    if (!lookApplied) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_look_not_applied");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: uploaded project photo did not commit as the selected look " +
+          "(Switch-look modal never closed after selecting) — would render the wrong face",
+      );
+    }
+    await p.waitForTimeout(600); // settle so the composer preview repaints
+    return lookPreviewSrc();
+  };
+
+  // ORDER: LOOK FIRST, MODEL LAST. Verified on the current build (2026-07):
+  // selecting the uploaded LOOK resets the model back to the default (Avatar IV),
+  // but selecting the MODEL does NOT change the look. So the convergent order is to
+  // apply the look FIRST, then select Avatar III LAST — the model is the final
+  // write and nothing after it disturbs it, and the look survives because
+  // model-select doesn't touch it. (The old model-first order left the pill on
+  // Avatar IV because applyLook reset it; a guard that alternated could never win
+  // since look-select always re-reset the model.)
+  await applyLook();
+  await shot(p, input.projectId, input.segmentId, "avatar3_look_selected");
+
+  if (!(await selectModelIII())) {
+    await captureDiagnostics(p, input.jobId, "avatar_iii_model_not_selected");
+    throw new HeygenError("ui_changed", "heygen: could not select the Avatar III model");
+  }
+
+  // Final assertion — never Generate on the wrong model. Model was the LAST write
+  // and look-select is what resets the model (not vice-versa), so both should hold.
+  if (!(await isVisible(avatarModelIsIII(p), 3000))) {
+    await captureDiagnostics(p, input.jobId, "avatar_iii_model_look_unstable");
+    throw new HeygenError(
+      "ui_changed",
+      "heygen: Avatar III model not selected after applying the look",
+    );
+  }
+  await shot(p, input.projectId, input.segmentId, "avatar3_model_look_stable");
+  // Best-effort cleanup of the staged look file.
+  await fs.unlink(lookPath).catch(() => {});
+
+  // 6) Set orientation. split_2 avatars -> Portrait (9:16); full-frame -> Landscape
+  // (16:9). HeyGen DEFAULTS to Portrait, so for a full-frame avatar this MUST flip
+  // to Landscape — a silently-missed toggle renders 9:16 (observed 2026-07). So we
+  // open the menu, click the wanted option, and VERIFY it's marked selected;
+  // retry a few times. For the wanted==default case (portrait) the verify still
+  // confirms rather than assuming.
+  const wantOrientation: "landscape" | "portrait" = wantPortrait ? "portrait" : "landscape";
+  let orientationSet = false;
+  for (let attempt = 0; attempt < 3 && !orientationSet; attempt++) {
+    // Already in the wanted orientation? (Portrait is the default — this skips a
+    // needless toggle.) The trigger's own sprite is the source of truth.
+    if (await isVisible(avatarShotsOrientationConfirmed(p, wantOrientation), 1500)) {
+      orientationSet = true;
+      break;
+    }
+    // Open the orientation menu (the 📱 phone-sprite trigger — NOT the model pill)
+    // and click the wanted option.
+    await clickFirstVisible(avatarShotsOrientationTrigger(p), 8000, "orientation pill").catch(() => {});
+    await p.waitForTimeout(400); // let the menu open
+    await clickFirstVisible(
+      avatarShotsOrientationOption(p, wantOrientation),
+      8000,
+      `${wantOrientation} orientation`,
+    ).catch(() => {});
+    await p.waitForTimeout(700); // let the toolbar sprite + layout re-render
+    // Verify by the TRIGGER SPRITE flipping to the wanted orientation.
+    orientationSet = await isVisible(avatarShotsOrientationConfirmed(p, wantOrientation), 3000);
+    if (!orientationSet) {
+      await p.keyboard.press("Escape").catch(() => {}); // close a stray-open menu, retry
+      await p.waitForTimeout(300);
+    }
+  }
+  if (!orientationSet) {
+    // Don't hard-fail: the retrieval's aspect probe still guards the final output
+    // (it rejects a wrong-orientation render and keeps polling / the job fails
+    // cleanly). But log loudly so we can pin the selector if this recurs.
+    await captureDiagnostics(p, input.jobId, "avatar_iii_orientation_unconfirmed");
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.avatar3_orientation_unconfirmed",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        wanted: wantOrientation,
+        note: "orientation toggle could not be confirmed; aspect probe still guards output",
+      }),
+    );
+  }
+  await shot(p, input.projectId, input.segmentId, wantPortrait ? "avatar3_portrait" : "avatar3_landscape");
+
+  // 7) Upload the sliced 69labs audio (lip-sync source; render length == audio).
+  await uploadAvatarShotsAudio(p, audioPath, e.HEYGEN_SETUP_TIMEOUT_MS);
+  await shot(p, input.projectId, input.segmentId, "avatar3_audio_uploaded");
+  await p.waitForTimeout(1200); // settle before submit
+
+  // 8) Generate. Click + confirm it took (button leaves enabled state / route
+  // changes), escalating through normal -> force -> DOM click like the IV path.
+  const gen = avatarShotsGenerateButton(p).locator("visible=true").first();
+  try {
+    await gen.waitFor({ state: "visible", timeout: 30_000 });
+  } catch {
+    await captureDiagnostics(p, input.jobId, "avatar_iii_generate_missing");
+    throw new HeygenError("ui_changed", "heygen: Avatar III Generate button never appeared");
+  }
+  let started = false;
+  for (let attempt = 0; attempt < 4 && !started; attempt++) {
+    await gen.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    try {
+      await gen.click({ timeout: 15_000 });
+    } catch {
+      try {
+        await gen.click({ timeout: 5000, force: true });
+      } catch {
+        await gen.evaluate((el) => (el as HTMLElement).click()).catch(() => {});
+      }
+    }
+    if (attempt === 0) await shot(p, input.projectId, input.segmentId, "generating");
+    started = await Promise.race([
+      gen
+        .waitFor({ state: "hidden", timeout: 12_000 })
+        .then(() => true)
+        .catch(() => false),
+      p
+        .waitForURL((u) => /\/(projects|video)\b/i.test(u.toString()), { timeout: 12_000 })
+        .then(() => true)
+        .catch(() => false),
+    ]);
+  }
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: "synthetic.heygen.avatar3_generate_click",
+      projectId: input.projectId,
+      segmentId: input.segmentId,
+      started,
+    }),
+  );
+  if (!started) {
+    // Same SAFEGUARD as the IV path: HeyGen often DID start even when the signal
+    // is uncertain, so proceed to the shared Projects retrieval (bounded) rather
+    // than orphaning a paid render.
+    await captureDiagnostics(p, input.jobId, "avatar_iii_generate_no_start");
+  }
+}
+
+// SHARED post-Generate retrieval (steps 8–9), used by BOTH the Avatar IV and
+// Avatar III composers. After Generate is clicked, the finished mp4 lives only
+// on the Projects page — this pins OUR render, polls until it finalizes,
+// downloads it, uploads to R2, records success, and returns the result.
+//
+// `genClickTs` (unix seconds, minus a small skew) is the wall-clock just before
+// Generate; retrieval only accepts an item created at/after it, so a neighbor
+// project's earlier render on the shared account can't be mistaken for ours.
+// `usedAudioPath` gates the duration probe: true when the render length equals
+// the uploaded audio slice (both new composers are audio-driven), false on the
+// IV script fallback (HeyGen TTS sets the length, so the probe is disabled).
+async function finishRenderRetrieval(
+  p: Page,
+  context: BrowserContext,
+  account: DecryptedAccount,
+  input: GenerateAvatarInput,
+  baselineId: string,
+  baselineIds: Set<string>,
+  genClickTs: number,
+  usedAudioPath: boolean,
+  t0: number,
+): Promise<GenerateAvatarResult> {
+  // Give HeyGen a moment to REGISTER the new project before we poll /projects.
+  await p.waitForTimeout(4000);
+
+  // PIN our exact render: the ONE video_id that appeared since the pre-generate
+  // snapshot. "" degrades to the gated newest-non-baseline scan.
+  const pinnedVideoId = await awaitNewItemId(
+    context,
+    baselineIds,
+    30_000,
+    3000,
+    (ms) => p.waitForTimeout(ms),
+    genClickTs,
+  ).catch(() => "");
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: "synthetic.heygen.render_pinned",
+      projectId: input.projectId,
+      segmentId: input.segmentId,
+      pinnedVideoId: pinnedVideoId || null,
+      pinned: !!pinnedVideoId,
+    }),
+  );
+
+  // Expected orientation matches what we asked HeyGen to compose: full-frame
+  // avatar = landscape, split_2 avatar-half = portrait.
+  const expectedAspect: "landscape" | "portrait" =
+    input.aspectRatio === "portrait" ? "portrait" : "landscape";
+  const videoBytes = await retrieveRenderedVideo(
+    p,
+    context,
+    baselineId,
+    usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
+    expectedAspect,
+    pinnedVideoId,
+    genClickTs,
+  );
+  await shot(p, input.projectId, input.segmentId, "done");
+
+  // Upload to R2 under a VERSIONED (timestamped) key so a regenerate gets a fresh
+  // URL with nothing stale cached.
+  const up = await uploadBuffer(
+    videoBytes,
+    r2Keys.avatarVideo(input.projectId, input.segmentId, Date.now()),
+    "video/mp4",
+  );
+
+  await saveCookies(account.id, await context.storageState()).catch(() => {});
+  await recordSuccess(account.id);
+  recordRenderServed(account.id);
+
+  const seconds =
+    input.audioDurationSeconds && input.audioDurationSeconds > 0
+      ? Math.max(2, Math.round(input.audioDurationSeconds))
+      : Math.max(2, Math.round(input.script.split(/\s+/).filter(Boolean).length / 2.5));
+  await logProviderCall({
+    projectId: input.projectId,
+    jobId: input.jobId,
+    segmentId: input.segmentId,
+    provider: "heygen_avatar",
+    phase: "response",
+    durationMs: Date.now() - t0,
+    cost: { provider: "heygen_avatar", seconds },
+    extra: { accountId: account.id },
+  });
+
+  return { videoUrl: up.publicUrl, accountId: account.id, seconds };
+}
+
 // One full avatar generation attempt on a single account. Throws a classified
 // HeygenError on failure; generateAvatar() wraps this with disposition-aware
-// account rotation.
-async function attemptOnAccount(
+// account rotation. Exported for the headed debug script, which pins a SPECIFIC
+// account (bypassing the pool claim) so it can drive the account that actually
+// holds a given saved avatar — never used by the production worker path.
+export async function attemptOnAccount(
   account: DecryptedAccount,
   input: GenerateAvatarInput,
   imageBytes: Buffer,
@@ -718,6 +1514,39 @@ async function attemptOnAccount(
     // baseline retrieval; it never hard-fails.
     const baselineIds = await baselineItemIds(context).catch(() => new Set<string>());
     const baselineId = [...baselineIds][0] ?? "";
+
+    // AVATAR III (orange marks): drive the "Create new shots" / Avatar-Shots
+    // composer instead of the /avatar Photo-to-video one, then fall through to the
+    // SHARED retrieval below. This path REQUIRES the sliced audio (the whole point
+    // is lip-sync to the 69labs voiceover). It NO LONGER needs a user-supplied
+    // avatar name: it enters the composer from any seed avatar and overrides the
+    // look with the project photo (see driveAvatarIIIComposer). forceScriptPath
+    // never applies here.
+    if (input.avatarModel === "avatar_iii") {
+      if (!input.audioFilePath || forceScriptPath) {
+        throw new HeygenError(
+          "ui_changed",
+          "heygen: Avatar III requires an uploaded audio slice (no script fallback)",
+        );
+      }
+      // Wall-clock just before Generate fires inside the composer, minus skew —
+      // the freshness floor for pinning OUR render in the shared Projects list.
+      const genClickTs = Math.floor(Date.now() / 1000) - 10;
+      await driveAvatarIIIComposer(p, input, input.audioFilePath, imageBytes);
+      // Steps 8–9 (Projects poll + download) are shared; jump straight to them.
+      // Always audio-driven on this path (audioFilePath asserted above).
+      return await finishRenderRetrieval(
+        p,
+        context,
+        account,
+        input,
+        baselineId,
+        baselineIds,
+        genClickTs,
+        true,
+        t0,
+      );
+    }
 
     // 2) Re-navigate to the avatar "Quick create" workspace for a CLEAN composer
     // each job. The page is warm (reused across jobs), so this is a fast in-SPA
@@ -1085,106 +1914,22 @@ async function attemptOnAccount(
       );
     }
 
-    // Give HeyGen a moment to REGISTER the new project before we poll /projects.
-    // Navigating instantly after the click can beat the backend creating the
-    // project row, so the grid shows only prior cards. A short settle lets our
-    // render appear (the poll loop below still tolerates it being mid-render).
-    await p.waitForTimeout(4000);
-
-    // PIN our exact render: find the ONE video_id that appeared since the pre-
-    // generate snapshot. That id IS our render — retrieval then polls only it and
-    // can never pick a same-length render of another segment from the shared
-    // account list. Best-effort within ~30s; "" degrades to the gated newest-non-
-    // baseline scan (still protected by the duration/aspect probe gates).
-    const pinnedVideoId = await awaitNewItemId(
-      context,
-      baselineIds,
-      30_000,
-      3000,
-      (ms) => p.waitForTimeout(ms),
-      genClickTs,
-    ).catch(() => "");
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        msg: "synthetic.heygen.render_pinned",
-        projectId: input.projectId,
-        segmentId: input.segmentId,
-        pinnedVideoId: pinnedVideoId || null,
-        pinned: !!pinnedVideoId,
-      }),
-    );
-
-    // 8–9) Retrieve the finished video from the Projects page (the only place
-    // the rendered mp4 exists). Returns the downloaded bytes.
-    //
-    // expectedSeconds gates the duration validation. ONLY pass it on the
-    // audio-driven path: there the render length == the uploaded audio, so the
-    // probe gate is correct. On the forced-script fallback HeyGen's own TTS sets
-    // the length (not our audio), so passing audioDurationSeconds would let the
-    // probe wrongly reject a valid render — pass 0 to keep the legacy behavior.
+    // 8–9) SHARED retrieval: pin our render, poll Projects until it finalizes,
+    // download, upload to R2, record success, and return. usedAudioPath is true
+    // only when the render length == the uploaded audio (the probe gate is valid);
+    // on the forced-script fallback HeyGen's own TTS sets the length, so disable it.
     const usedAudioPath = !!input.audioFilePath && !forceScriptPath;
-    // Expected orientation always matches what we asked HeyGen to compose:
-    // full-frame avatar = landscape, split_2 avatar-half = portrait. Defaults to
-    // landscape when unset (the full-frame default). This guards against picking
-    // a stale render of the OTHER aspect ratio for the same segment.
-    const expectedAspect: "landscape" | "portrait" =
-      input.aspectRatio === "portrait" ? "portrait" : "landscape";
-    const videoBytes = await retrieveRenderedVideo(
+    return await finishRenderRetrieval(
       p,
       context,
+      account,
+      input,
       baselineId,
-      usedAudioPath ? (input.audioDurationSeconds ?? 0) : 0,
-      expectedAspect,
-      pinnedVideoId,
+      baselineIds,
       genClickTs,
+      usedAudioPath,
+      t0,
     );
-    await shot(p, input.projectId, input.segmentId, "done");
-
-    // 8) Upload to R2 under a VERSIONED key (timestamp) so a regenerate writes a
-    // NEW URL. Overwriting the same key left the CDN/browser serving the stale
-    // cached video (old aspect ratio/duration) after a regenerate; a fresh URL
-    // has nothing cached. The new URL is persisted to the segment row by the
-    // caller, so the app always points at this file.
-    const up = await uploadBuffer(
-      videoBytes,
-      r2Keys.avatarVideo(input.projectId, input.segmentId, Date.now()),
-      "video/mp4",
-    );
-
-    // Persist the now-fresh cookies to the DB (status untouched) so a cold start
-    // or the keep-alive sweep has the latest session. The LIVE context already
-    // holds these cookies and stays warm for the next job — we save, we do not
-    // reload.
-    await saveCookies(account.id, await context.storageState()).catch(() => {});
-    await recordSuccess(account.id);
-    // Mark this render a success: clears the warm browser's failure streak
-    // (keeps a healthy browser warm) and counts it against the backstop render
-    // cap. Once the cap is reached — or health degrades earlier — the NEXT
-    // acquire recycles the browser to a fresh fingerprint before Cloudflare walls
-    // it into a blank composer. Keyed by accountId so it targets THIS account's
-    // warm browser in the pool.
-    recordRenderServed(account.id);
-
-    // Output length. For audio-driven renders the render length equals the
-    // uploaded audio, so use its known duration; otherwise fall back to the
-    // rough word-count estimate (HeyGen ~ real-time speech).
-    const seconds =
-      input.audioDurationSeconds && input.audioDurationSeconds > 0
-        ? Math.max(2, Math.round(input.audioDurationSeconds))
-        : Math.max(2, Math.round(input.script.split(/\s+/).filter(Boolean).length / 2.5));
-    await logProviderCall({
-      projectId: input.projectId,
-      jobId: input.jobId,
-      segmentId: input.segmentId,
-      provider: "heygen_avatar",
-      phase: "response",
-      durationMs: Date.now() - t0,
-      cost: { provider: "heygen_avatar", seconds },
-      extra: { accountId: account.id },
-    });
-
-    return { videoUrl: up.publicUrl, accountId: account.id, seconds };
   } catch (err) {
     // Classify against the live page, then re-throw a typed HeygenError so the
     // rotation layer can apply the right (often no-penalty) disposition.

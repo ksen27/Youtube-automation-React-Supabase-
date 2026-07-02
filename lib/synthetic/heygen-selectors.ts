@@ -580,6 +580,390 @@ export function moreActionsButton(page: Page): Locator {
 }
 
 // ---------------------------------------------------------------------------
+// Avatar III (orange marks) — "Create new shots" / Avatar-Shots flow
+//
+// Red doc-highlights render with Avatar IV via the /avatar Photo-to-video
+// composer above. Orange highlights render with the cheaper Avatar III model,
+// which HeyGen only exposes through a DIFFERENT flow (verified against the live
+// UI 2026-07 via the user's captured screenshots):
+//
+//   1) Open the Avatars page (left-nav "Avatars", /avatar/avatars). It lists the
+//      account's SAVED avatars as named tiles (e.g. "Japan", "Earl"). The user
+//      creates this avatar MANUALLY in HeyGen at project setup and enters its
+//      exact name in the app (projects.heygen_avatar_name); we search for it.
+//   2) Search the grid by that name, hover the tile, click its "Create video with
+//      this avatar" (▷) icon, then "Create new shots" in the dropdown.
+//   3) That lands on the Avatar-Shots "Presenter" page (/avatar/avatar-shots).
+//      There a model pill (defaulting to "Avatar IV") opens a dropdown with
+//      Avatar V / IV / III — pick "Avatar III". An orientation pill toggles
+//      Portrait/Landscape. The "upload/record" link attaches the audio, and
+//      "Generate for 1 credit" kicks off the render.
+//
+// Retrieval (Projects list poll + download) is SHARED with the Avatar IV path;
+// only the composer differs.
+// ---------------------------------------------------------------------------
+
+// Left-nav "Avatars" entry (MANAGE section). Distinct from the top-level
+// "Avatar" nav (which opens Quick create). We match the exact "Avatars" label
+// and the stable my-avatars href.
+export function avatarsNavEntry(page: Page): Locator {
+  return page
+    .getByRole("link", { name: /^avatars$/i })
+    .or(page.locator('a[href*="/avatar/avatars"], a[href*="/my-avatars"]'));
+}
+
+// The search box on the Avatars page ("Search"). Used to filter the grid to the
+// project's saved avatar by name.
+export function avatarsSearchBox(page: Page): Locator {
+  return page
+    .getByRole("searchbox")
+    .or(page.getByPlaceholder(/search/i))
+    .or(page.getByRole("textbox", { name: /search/i }));
+}
+
+// A saved-avatar tile on the Avatars page, located by its visible NAME. HeyGen
+// renders each tile as a card whose label is the avatar name; we match the card
+// container that holds that text. Exact (case-insensitive) match on the name so
+// "Japan" doesn't also match "Japan 2".
+export function avatarTileByName(page: Page, name: string): Locator {
+  const exact = new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+  return page
+    .getByRole("link", { name: exact })
+    .or(page.getByRole("button", { name: exact }))
+    // Fallback: a card element that CONTAINS the exact name text node.
+    .or(
+      page
+        .locator('[class*="card" i], [data-testid*="avatar" i], a, [role="button"]')
+        .filter({ has: page.getByText(exact) }),
+    );
+}
+
+// HeyGen's transient "Couldn't load your avatars. Please refresh and try again."
+// error state on the Avatars page (observed 2026-07): the grid API failed, so NO
+// tiles render even though the account HAS avatars. Detecting this lets us reload
+// + retry instead of falsely concluding "no seed avatar".
+export function avatarsLoadError(page: Page): Locator {
+  return page.getByText(/couldn't load your avatars|couldn.t load your avatars|failed to load|please refresh and try again/i);
+}
+
+// The FIRST avatar tile on the Avatars grid, used name-INDEPENDENTLY: Avatar III
+// no longer needs a user-supplied avatar name because it enters the composer from
+// whatever avatar exists, then OVERRIDES the look with the project's own photo via
+// Switch-look. So the starting tile's identity is irrelevant — we just need any
+// tile to open the "Create new shots" composer. Matches the same card shapes as
+// avatarTileByName but with no name filter. Requires the account to hold at least
+// one saved avatar (a seed avatar is kept in every account for exactly this).
+export function firstAvatarTile(page: Page): Locator {
+  return page
+    .locator('[class*="card" i], [data-testid*="avatar" i], [role="button"]')
+    .filter({ has: page.locator('img, video') })
+    .first();
+}
+
+// The "Create video with this avatar" (▷ play) icon revealed on tile hover.
+// Scoped to a given tile locator.
+//
+// CRITICAL (2026-07): the tile has THREE hover icons in DOM order — "..." (more:
+// Edit/Share/Delete/Copy Identity), then ▷ (create video), then ♡ (favorite).
+// The old blind `:has(svg)` fallback matched the FIRST icon button, i.e. the
+// "..." menu — which opens Edit/Share/Delete and has NO "Create new shots",
+// stranding the flow. So we target the ▷ PRECISELY and never fall back to a bare
+// icon button. Order of preference:
+//   1) tooltip / accessible name "Create video with this avatar" (most stable);
+//   2) a play/arrow sprite id;
+//   3) any icon button EXCLUDING the "..." (more/options) and ♡ (favorite/like)
+//      ones — identified by their own names/sprites — so a nameless ▷ still wins
+//      without ever re-matching the "..." menu.
+export function createVideoWithAvatarButton(tile: Locator): Locator {
+  return tile
+    .getByRole("button", { name: /create video with this avatar/i })
+    .or(tile.getByRole("button", { name: /create video|make video/i }))
+    .or(tile.locator('button[aria-label*="create video" i], [role="button"][aria-label*="create video" i]'))
+    .or(tile.locator(':is(button,[role="button"]):has(svg use[href*="play" i], svg use[href*="triangle" i])'))
+    // Nameless-icon fallback: any icon button that is NOT the "..." more-menu and
+    // NOT the heart/favorite. The CSS :not(:has(...)) is evaluated PER candidate
+    // (relative to each button), so it excludes those two siblings by their sprite
+    // ids and leaves only the ▷ — never re-selecting the "..." menu.
+    .or(
+      tile.locator(
+        ':is(button,[role="button"]):has(svg)' +
+          ':not(:has(svg use[href*="more" i]))' +
+          ':not(:has(svg use[href*="ellipsis" i]))' +
+          ':not(:has(svg use[href*="dots" i]))' +
+          ':not(:has(svg use[href*="heart" i]))' +
+          ':not(:has(svg use[href*="like" i]))' +
+          ':not(:has(svg use[href*="favorite" i]))' +
+          ':not([aria-label*="more" i]):not([aria-label*="option" i]):not([aria-label*="favorite" i]):not([aria-label*="like" i])',
+      ),
+    );
+}
+
+// The "Create new shots" item in the dropdown opened by the ▷ icon. Sits next to
+// "Build scene-by-scene" / "Add a script" / "Use with prompt".
+export function createNewShotsMenuItem(page: Page): Locator {
+  return page
+    .getByRole("menuitem", { name: /create new shots/i })
+    .or(page.getByRole("button", { name: /create new shots/i }))
+    .or(page.getByText(/^create new shots$/i));
+}
+
+// The WRONG "..." (more-options) menu, detected by its distinctive items
+// (Edit / Delete / Copy Avatar Identity ID). If this is open, we clicked the
+// three-dots button instead of the ▷ — close it and retry the ▷. "Copy Avatar
+// Identity ID" is unique to this menu, so it's the cleanest tell.
+export function avatarMoreMenuOpen(page: Page): Locator {
+  return page
+    .getByRole("menuitem", { name: /copy avatar identity id|^delete$/i })
+    .or(page.getByText(/copy avatar identity id/i));
+}
+
+// The model-selector pill on the Avatar-Shots (and Quick-create) toolbar. Its
+// visible label is the CURRENT model — "Avatar IV" by default, "Avatar III" once
+// selected, etc. Clicking it opens the model dropdown. We match a button whose
+// text is an "Avatar <roman>" label.
+export function avatarModelDropdownTrigger(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /avatar\s+(v|iv|iii|ii|i)\b/i })
+    .or(page.locator(':is(button,[role="button"])', { hasText: /avatar\s+(v|iv|iii|ii|i)\b/i }));
+}
+
+// The "Avatar III" option inside the model dropdown ("Avatar III — Applies lip
+// sync."). Anchor on the exact "Avatar III" label so it never matches "Avatar
+// IV". A menuitem/option first, then any clickable row containing the text.
+export function avatarIIIOption(page: Page): Locator {
+  const name = /avatar\s+iii\b/i;
+  return page
+    .getByRole("menuitem", { name })
+    .or(page.getByRole("option", { name }))
+    .or(page.getByRole("button", { name }))
+    .or(page.getByText(/^avatar\s+iii\b/i));
+}
+
+// Confirmation that the model pill now reads "Avatar III" (i.e. the selection
+// took). Used to verify the dropdown click landed before generating.
+export function avatarModelIsIII(page: Page): Locator {
+  return page.locator(':is(button,[role="button"])', { hasText: /avatar\s+iii\b/i });
+}
+
+// --- Avatar-Shots "look" selection ---------------------------------------
+//
+// The avatar preview shows the currently-selected LOOK. HeyGen defaults it to a
+// prior look which may be PORTRAIT (9:16) — rendering that into a 16:9 frame
+// center-crops the face (observed 2026-07). So for a full-frame (landscape)
+// avatar we ensure the selected look is 16:9: if it isn't, we UPLOAD the project
+// photo (which lands as a landscape "Photo Avatar" look) and select it.
+
+// The avatar preview thumbnail on the Avatar-Shots composer (left of the script
+// box). We read its box size to tell portrait vs landscape, and hover it to
+// reveal the "Switch look" button.
+export function avatarShotsLookPreview(page: Page): Locator {
+  return page
+    .locator('img[alt*="avatar" i], img[class*="avatar" i], [class*="preview" i] img')
+    .or(page.locator("video"))
+    .first();
+}
+
+// The "Switch look" button revealed on hovering the avatar preview.
+export function avatarShotsSwitchLookButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /switch look|change look|choose look/i })
+    .or(page.getByText(/^switch look$/i));
+}
+
+// The open "Switch look" modal (header "My Avatars > <name>"). Presence == open.
+export function avatarShotsLookModal(page: Page): Locator {
+  return page
+    .getByText(/my avatars/i)
+    .or(page.getByRole("dialog").filter({ has: page.getByText(/my avatars/i) }));
+}
+
+// The "Upload" control INSIDE the Switch-look modal (uploads a new look image).
+// Distinct from "Design with AI". Opens the native file chooser.
+export function avatarShotsLookUploadButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^upload$/i })
+    .or(page.locator(':is(button,[role="button"])', { hasText: /^upload$/i }))
+    .or(page.getByText(/^upload$/i));
+}
+
+// The IN-TILE "Validating photo" state. Verified from the live UI (2026-07): after
+// the green "Image uploaded successfully" toast, the NEW look tile itself shows
+// "Validating photo / This will take a few seconds." over a blurred preview. The
+// tile is NOT selectable until this clears. This in-tile text (appearing then
+// disappearing) is the authoritative "validation finished" signal — it is NOT a
+// toast and NOT the same as the success toast. Match its exact wording.
+export function avatarShotsLookValidating(page: Page): Locator {
+  return page.getByText(/validating photo|this will take a few seconds|validating/i);
+}
+
+// The green success TOAST shown right after the upload is accepted ("Image uploaded
+// successfully"). This fires BEFORE validation — it means "upload received", not
+// "ready to select". Verified 2026-07.
+export function avatarShotsLookUploadSuccess(page: Page): Locator {
+  return page.getByText(/image uploaded successfully|uploaded successfully|upload complete/i);
+}
+
+// The look tiles in the "Switch look" modal. Verified against the LIVE DOM
+// (2026-07): each tile is `<div data-pacific-component="PrivatePhotoAvatarCard">`
+// wrapping a `tw-cursor-pointer tw-group` card with the look <img> and a caption.
+// The stable `data-pacific-component` anchor is FAR more reliable than the old
+// text/class heuristics (which matched giant wrapper DIVs and picked dead space).
+// The "Design with AI"/"Upload" action cell is NOT a PrivatePhotoAvatarCard, so it
+// is naturally excluded. Tiles are in DOM = visual order; the just-uploaded photo
+// is the first PrivatePhotoAvatarCard (HeyGen prepends the fresh upload and even
+// auto-selects it — the selected tile carries a brand-colored border).
+export function avatarShotsPhotoAvatarTiles(page: Page): Locator {
+  return page
+    .locator('[data-pacific-component="PrivatePhotoAvatarCard"]')
+    // Fallback for a build without the data attr: a captioned image card.
+    .or(
+      page
+        .locator('[class*="card" i]')
+        .filter({ has: page.locator('img[alt*="photo avatar" i]') }),
+    );
+}
+
+// All look-tile thumbnail <img>s in the Switch-look grid, in DOM order. Used to
+// identify OUR just-uploaded look by NEW src (snapshot before upload → the one src
+// that appears after is ours) — the only reliable identity when the seed avatar
+// has many identically-captioned looks and the upload's grid position varies.
+export function avatarShotsLookTileImages(page: Page): Locator {
+  return page.locator(
+    '[data-pacific-component="PrivatePhotoAvatarCard"] img[alt*="photo avatar" i], ' +
+      '[data-pacific-component="PrivatePhotoAvatarCard"] img',
+  );
+}
+
+// The look tile HeyGen has AUTO-SELECTED (verified 2026-07: after upload, the
+// fresh photo tile gets a brand-colored border — `tw-border-brand` — while the
+// rest stay `tw-border-transparent`). Since HeyGen auto-selects the just-uploaded
+// look, targeting the brand-bordered tile is the most reliable way to act on OUR
+// upload regardless of its grid position.
+export function avatarShotsSelectedLookTile(page: Page): Locator {
+  return page.locator(
+    '[data-pacific-component="PrivatePhotoAvatarCard"]:has(.tw-border-brand), ' +
+      '[data-pacific-component="PrivatePhotoAvatarCard"].tw-border-brand, ' +
+      '[data-pacific-component="PrivatePhotoAvatarCard"] .tw-border-brand',
+  );
+}
+
+// The clickable INNER card of a tile. From the live DOM the `tw-cursor-pointer`
+// group div IS the click target (the whole card selects the look); the hover
+// "Choose look" button sits in a `pointer-events-none` overlay and can't be
+// clicked directly, and there's a transparent `z-[8]` hit-layer over the image.
+// We target the cursor-pointer group, falling back to the tile itself.
+export function avatarShotsTileClickTarget(tile: Locator): Locator {
+  return tile.locator('.tw-cursor-pointer').first().or(tile);
+}
+
+// The clickable IMAGE inside a look tile — a secondary click target.
+export function avatarShotsPhotoAvatarTileImage(tile: Locator): Locator {
+  return tile.locator("img").first();
+}
+
+// The "Choose look" button revealed on HOVER over a look tile. NOTE (live DOM
+// 2026-07): its container is `tw-pointer-events-none tw-opacity-0` until
+// group-hover, so a direct click is unreliable — prefer clicking the tile card
+// (avatarShotsTileClickTarget). Kept as a last-resort target.
+export function avatarShotsChooseLookButton(scope: Page | Locator): Locator {
+  return scope
+    .locator('button:has-text("Choose look")')
+    .or(scope.getByText(/^choose look$/i));
+}
+
+// The orientation pill on the Avatar-Shots toolbar. Verified against the LIVE
+// HTML 2026-07: it's a div with aria-haspopup="menu" containing an svg sprite —
+// `#portrait-phone` when portrait, `#landscape-phone` when landscape — plus a
+// `#down` caret. Clicking it opens a Portrait / Landscape menu. HeyGen DEFAULTS
+// to Portrait (9:16), so a full-frame avatar MUST flip to Landscape.
+//
+// CRITICAL: the OLD selector matched the MODEL pill instead (it also has
+// aria-haspopup + an icon), which is why "Landscape" was never in the opened
+// menu and the render stayed 9:16. We now anchor STRICTLY on the phone sprites,
+// which the model pill (an <img> avatar, no phone sprite) never has.
+export function avatarShotsOrientationTrigger(page: Page): Locator {
+  return page.locator(
+    ':is(button,[role="button"],[aria-haspopup="menu"]):has(svg use[href="#portrait-phone"]), ' +
+      ':is(button,[role="button"],[aria-haspopup="menu"]):has(svg use[href="#landscape-phone"]), ' +
+      // Forward-compat: any element with the popup role carrying a phone-ish sprite.
+      '[aria-haspopup="menu"]:has(svg use[href*="phone" i])',
+  );
+}
+
+// The "Landscape" / "Portrait" item inside the orientation menu. Radix menuitems
+// (role="menuitem") whose visible label is the orientation name.
+export function avatarShotsOrientationOption(page: Page, which: "landscape" | "portrait"): Locator {
+  const name = which === "landscape" ? /^landscape$/i : /^portrait$/i;
+  return page
+    .getByRole("menuitem", { name })
+    .or(page.getByRole("menuitemradio", { name }))
+    .or(page.locator('[role="menuitem"]', { hasText: name }))
+    .or(page.getByText(name));
+}
+
+// Read-back verification: after selecting an orientation, the TRIGGER's own sprite
+// flips to match — `#landscape-phone` once Landscape is active, `#portrait-phone`
+// for Portrait. Reading the trigger sprite is far more reliable than hunting a
+// checkmark inside the (now-closed) menu. Returns a locator that exists only when
+// the trigger shows the wanted orientation.
+export function avatarShotsOrientationConfirmed(page: Page, which: "landscape" | "portrait"): Locator {
+  const sprite = which === "landscape" ? "#landscape-phone" : "#portrait-phone";
+  return page.locator(`[aria-haspopup="menu"]:has(svg use[href="${sprite}"])`);
+}
+
+// The "upload/record" audio affordance on the Avatar-Shots page. In the VIDEO
+// SCRIPT box the placeholder reads "Type your script, or upload/record" where
+// "upload/record" is a link. Clicking it opens a "Record Audio / Upload Audio"
+// modal (the SAME modal as the /avatar composer), DEFAULTED to the Record tab —
+// so the caller must switch to the Upload Audio tab (uploadAudioTab) before
+// uploading, else HeyGen prompts for the microphone and the run stalls.
+//
+// We prefer an "upload"-worded target so we're more likely to land on the upload
+// path directly, but the combined "upload/record" link is a single element so the
+// tab switch is still the reliable step.
+export function avatarShotsUploadAudioLink(page: Page): Locator {
+  return page
+    .getByText(/upload\/record/i)
+    .or(page.getByRole("link", { name: /upload/i }))
+    .or(page.getByRole("button", { name: /upload\/record|upload/i }))
+    .or(page.getByRole("link", { name: /record/i }))
+    .or(page.getByRole("button", { name: /record/i }));
+}
+
+// A hidden audio <input type=file> on the Avatar-Shots page (setInputFiles
+// fallback when the filechooser event doesn't fire).
+export function avatarShotsAudioInput(page: Page): Locator {
+  return page.locator(
+    'input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], ' +
+      'input[type="file"][accept*="wav"], input[type="file"]',
+  );
+}
+
+// After the audio attaches, the script box shows the uploaded track name + a
+// play control and a "Voice Mirroring" checkbox. Presence of this text confirms
+// the audio committed (the readiness signal before Generate on this flow).
+export function avatarShotsAudioAttached(page: Page): Locator {
+  return page
+    .getByText(/voice mirroring/i)
+    .or(page.locator("audio[src]"))
+    .or(page.getByText(/\.mp3\b|\.wav\b/i));
+}
+
+// The Avatar-Shots Generate button ("Generate for 1 credit"). Enabled once a
+// model, orientation and audio/script are set.
+export function avatarShotsGenerateButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^generate\b/i })
+    .or(page.getByRole("button", { name: /generate/i }));
+}
+
+// NOTE: the saved avatar used by Avatar III is created MANUALLY by the user in
+// HeyGen at project setup, under a name they enter into the app at intake
+// (projects.heygen_avatar_name). The app never creates/names avatars itself — it
+// only SEARCHES for that name (avatarTileByName above) — so no New-Avatar / name
+// modal selectors are needed here.
+
+// ---------------------------------------------------------------------------
 // LOGIN selectors — connect script ONLY (headed, human-driven)
 // ---------------------------------------------------------------------------
 

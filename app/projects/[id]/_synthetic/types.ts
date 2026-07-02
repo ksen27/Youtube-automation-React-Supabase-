@@ -9,11 +9,14 @@ export interface SyntheticProject {
   voiceover_url: string | null;
   voiceover_duration_seconds: number | null;
   avatar_image_url: string | null;
+  // Name of the HeyGen saved avatar used to drive the Avatar III (orange-mark)
+  // flow. Set by the user at intake; null when no Avatar III parts are used.
+  heygen_avatar_name: string | null;
   voiceover_source: "tts" | "uploaded" | null;
   tts_voice_id: string | null;
   transcript: string | null;
   script_doc_url: string | null;
-  avatar_mark_ranges: Array<{ start: number; end: number }> | null;
+  avatar_mark_ranges: Array<{ start: number; end: number; model?: "avatar_iv" | "avatar_iii" }> | null;
   // Sales-pitch video inserted near the 3:00 mark (migration 0025).
   pitch_video_url: string | null;
   pitch_video_duration_seconds: number | null;
@@ -36,6 +39,9 @@ export interface SyntheticSegmentRow {
   id: string;
   position: number;
   block_type: "avatar" | "image" | "ai_clip" | "split_2";
+  // Which HeyGen model an avatar block renders with (red highlight -> Avatar IV,
+  // orange -> Avatar III). Null for non-avatar blocks and legacy rows.
+  avatar_model: "avatar_iv" | "avatar_iii" | null;
   start_time: number;
   end_time: number;
   duration: number;

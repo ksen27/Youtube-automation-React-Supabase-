@@ -13,6 +13,9 @@
 # testing
 /coverage
 
+# local heygen debug test audio (staged file for scripts/heygen-debug-gen.ts)
+/slice.mp3
+
 # next.js
 /.next/
 /out/

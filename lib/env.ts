@@ -380,6 +380,15 @@ const ServerEnvSchema = z.object({
   // before). NOTE: only worth setting if this is a DIFFERENT account — two keys
   // on the same account share one tier limit and gain no parallelism.
   SIXTYNINE_LABS_API_KEY_BACKUP: z.string().optional(),
+  // Optional THIRD 69labs key (a SEPARATE account). Joins the pool exactly like
+  // the backup: another own concurrency slot pool + failover target. With three
+  // separate-account keys the cluster runs up to SIXTYNINE_IMAGE_CONCURRENCY × 3
+  // concurrent generations. Empty = ignored.
+  SIXTYNINE_LABS_API_KEY_3: z.string().optional(),
+  // Future-proof: any number of EXTRA keys as one comma/newline-separated list,
+  // so a 4th/5th account needs NO code change — just append here. These are
+  // appended to the pool after the three named keys above (duplicates dropped).
+  SIXTYNINE_LABS_API_KEYS: z.string().optional(),
   SIXTYNINE_LABS_BASE_URL: z.string().url().default("https://69labs.vip"),
   // TTS voiceProvider: elevenlabs | edgetts | minimax (wire-level value).
   SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),

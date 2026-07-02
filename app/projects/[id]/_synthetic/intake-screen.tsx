@@ -81,6 +81,7 @@ export function SyntheticIntakeScreen({
     onError: (e) => setError((e as Error).message),
   });
 
+
   // Sales-pitch video: uploaded direct to R2, inserted near the 3:00 mark of
   // the final render (snapped to the nearest segment boundary). Plays its own
   // audio while the narration pauses, then narration resumes.

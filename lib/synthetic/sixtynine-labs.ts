@@ -76,14 +76,32 @@ function ttsSemaphoreFor(key: string): KeySemaphore {
   return sem;
 }
 
-// The ordered key pool: primary first, then the optional second key. Empty
-// values are filtered out, so a single configured key yields a 1-element pool
-// (identical behavior to before — no parallelism, no failover target).
+// The ordered key pool: primary first, then the optional 2nd and 3rd named
+// keys, then any extra keys from the SIXTYNINE_LABS_API_KEYS list. Empty values
+// are filtered out and duplicates dropped, so a single configured key yields a
+// 1-element pool (identical behavior to before — no parallelism, no failover).
+// Each DISTINCT key gets its own SIXTYNINE_IMAGE_CONCURRENCY slot pool, so N
+// separate-account keys run their tier limits in parallel (≈ N× throughput).
 function keyPool(): string[] {
   const env = getEnv();
-  return [env.SIXTYNINE_LABS_API_KEY, env.SIXTYNINE_LABS_API_KEY_BACKUP]
-    .map((k) => (k || "").trim())
-    .filter((k): k is string => k.length > 0);
+  const extra = (env.SIXTYNINE_LABS_API_KEYS || "")
+    .split(/[\n,]/)
+    .map((k) => k.trim());
+  const seen = new Set<string>();
+  const pool: string[] = [];
+  for (const k of [
+    env.SIXTYNINE_LABS_API_KEY,
+    env.SIXTYNINE_LABS_API_KEY_BACKUP,
+    env.SIXTYNINE_LABS_API_KEY_3,
+    ...extra,
+  ]) {
+    const key = (k || "").trim();
+    if (key.length > 0 && !seen.has(key)) {
+      seen.add(key);
+      pool.push(key);
+    }
+  }
+  return pool;
 }
 
 // Round-robin cursor for balancing new generations across the key pool. A plain
