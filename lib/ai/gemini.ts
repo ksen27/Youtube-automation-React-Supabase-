@@ -106,10 +106,17 @@ export async function withGeminiRetry<T>(
 // reused for whichever model it's handed. Returns the result and which model
 // produced it. No fallback model configured (env empty) -> behaves exactly like
 // withGeminiRetry on the primary.
+// `opts` tunes the PRIMARY ladder. `fallbackOpts` (default: opts) tunes the
+// fallback ladder. During a BROAD primary outage (the whole model is 503ing,
+// as in the 2026-07 planner slowdown) a long primary ladder wastes ~20s per
+// call exhausting a dead model before ever reaching the healthy fallback — so
+// callers on a hot loop should pass a SHORT primary ladder (e.g. attempts: 2)
+// and a fuller fallback ladder to reach gemini-2.0-flash fast.
 export async function withGeminiModelFallback<T>(
   label: string,
   run: (model: ReturnType<typeof getGeminiModel>) => Promise<T>,
   opts: { attempts?: number; baseMs?: number } = {},
+  fallbackOpts?: { attempts?: number; baseMs?: number },
 ): Promise<{ result: T; model: string }> {
   const env = getEnv();
   const primary = env.GEMINI_MODEL;
@@ -130,7 +137,7 @@ export async function withGeminiModelFallback<T>(
     const result = await withGeminiRetry(
       `${label}:fallback`,
       () => run(getGeminiModel(fallback)),
-      opts,
+      fallbackOpts ?? opts,
     );
     return { result, model: fallback };
   }
@@ -141,7 +148,7 @@ export async function withGeminiModelFallback<T>(
 // we don't fan out 10+ batches against a model that's already throwing 503s.
 // ---------------------------------------------------------------------------
 
-function makeLimit(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
+export function makeLimit(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
   let active = 0;
   const waiters: Array<() => void> = [];
   const next = () => {

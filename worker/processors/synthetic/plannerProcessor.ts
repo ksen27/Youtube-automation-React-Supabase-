@@ -26,7 +26,7 @@ export async function processSyntheticPlannerJob(
 
   const { data: project, error } = await sb
     .from("projects")
-    .select("transcript, transcript_words, voiceover_duration_seconds, avatar_mark_ranges")
+    .select("title, transcript, transcript_words, voiceover_duration_seconds, avatar_mark_ranges")
     .eq("id", projectId)
     .single();
   if (error || !project) throw new Error(`planner: project ${projectId} not found`);
@@ -41,6 +41,7 @@ export async function processSyntheticPlannerJob(
   const planned = await buildSyntheticTimeline({
     projectId,
     jobId: mediaJobId,
+    projectTitle: (project.title as string | null) ?? "",
     transcript,
     words,
     voiceoverDuration,

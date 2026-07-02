@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { getEnv } from "@/lib/env";
-import { withGeminiModelFallback } from "@/lib/ai/gemini";
+import { withGeminiModelFallback, makeLimit } from "@/lib/ai/gemini";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import type { WordTiming } from "@/lib/ai/deepgram";
@@ -129,28 +129,61 @@ const SINGLE_SUBJECT_RULE =
   "whenever the narration calls for it; its imagePrompt still follows this rule " +
   "(one clean single-subject still for the illustrative half).";
 
+// The video's derived niche/world. Filled by deriveVideoTopic() from the
+// project title + a transcript sample so the planner prompt anchors visuals to
+// the ACTUAL subject of the video (car maintenance, cooking, finance, gardening,
+// …) instead of the previously-hardcoded gardening/lawn-care niche. Every field
+// may be empty — when the whole topic is empty the rule builders below fall back
+// to niche-neutral phrasing so nothing regresses to a fixed domain.
+export interface VideoTopic {
+  // Short human niche label, e.g. "automotive / DIY car maintenance".
+  niche: string;
+  // Recurring physical setting, e.g. "home garage / driveway, under the hood".
+  setting: string;
+  // A few example on-topic subjects, e.g. "spark plugs, engine bays, hand tools".
+  subjectExamples: string;
+}
+
+const EMPTY_TOPIC: VideoTopic = { niche: "", setting: "", subjectExamples: "" };
+
+function hasTopic(t: VideoTopic): boolean {
+  return Boolean(t.niche.trim() || t.setting.trim() || t.subjectExamples.trim());
+}
+
 // Object-first B-roll rule (client requirement 2026-06). The reference channel
-// reads as the creator filming his OWN garden, not a stock library: when the
+// reads as the creator filming his OWN scene, not a stock library: when the
 // narration names a THING, the screen shows THAT thing (script says "water" ->
-// show water; "clogged gutter" -> show the gutter; "potted geranium" -> show the
-// flower; "female mosquito" -> show the mosquito), NOT a person. Our earlier
-// output leaned on people (an old lady / an old man / the presenter) for lines
-// that were really about objects, which read as generic stock footage. So the
-// DEFAULT subject is the concrete object, plant, tool, pest, or patch of garden
-// the line is about — shoot it close, hands-and-soil B-roll, owner's-own-garden
-// feel. Only put a PERSON in frame when the narration is genuinely about a
-// person or a first-person action; never as filler for an object-focused line.
-const BROLL_OBJECT_RULE =
-  "B-ROLL, OBJECTS NOT PEOPLE (critical, client requirement): this is an " +
-  "owner filming his OWN garden, NOT a stock-photo library. When the narration " +
-  "names a concrete thing — a plant, flower, tool, pest, water, soil, a patch " +
-  "of lawn, a gutter, etc. — the imagePrompt MUST show THAT thing as the single " +
-  "subject (close, candid, hands-in-the-dirt B-roll of the real object in a " +
-  "real garden), NOT a person. Do NOT default to people (no 'an elderly woman', " +
-  "'a man', 'a gardener' standing there) for lines that are about objects — that " +
-  "reads as generic stock footage, which the client does NOT want. Put a PERSON " +
-  "in frame ONLY when the line is genuinely about a person or a first-person " +
-  "action; otherwise show the object / plant / place itself.";
+// show water; "clogged gutter" -> show the gutter; "spark plug" -> show the
+// plug; "engine" -> show the engine bay), NOT a person. Our earlier output
+// leaned on people (an old lady / an old man / the presenter) for lines that
+// were really about objects, which read as generic stock footage. So the
+// DEFAULT subject is the concrete object, tool, or place the line is about —
+// shoot it close, hands-on B-roll, owner's-own-project feel. Only put a PERSON
+// in frame when the narration is genuinely about a person or a first-person
+// action; never as filler for an object-focused line. The subject/setting
+// examples are derived from the video's actual topic (VideoTopic) so this rule
+// stays on-niche for ANY channel instead of the old hardcoded garden wording.
+function brollObjectRule(topic: VideoTopic): string {
+  const settingPhrase = topic.setting.trim()
+    ? `their own ${topic.setting.trim()}`
+    : "their own real setting for this video";
+  const examplePhrase = topic.subjectExamples.trim()
+    ? `— e.g. ${topic.subjectExamples.trim()}, a tool, water, a part, a surface, etc. —`
+    : "— a tool, a part, an object, a place, etc. —";
+  const brollPhrase = topic.setting.trim()
+    ? `close, candid, hands-on B-roll of the real object in ${topic.setting.trim()}`
+    : "close, candid, hands-on B-roll of the real object in the video's own setting";
+  return (
+    "B-ROLL, OBJECTS NOT PEOPLE (critical, client requirement): this is an " +
+    `owner filming ${settingPhrase}, NOT a stock-photo library. When the narration ` +
+    `names a concrete thing ${examplePhrase} the imagePrompt MUST show THAT thing ` +
+    `as the single subject (${brollPhrase}), NOT a person. Do NOT default to ` +
+    "people (no 'an elderly woman', 'a man' standing there) for lines that are " +
+    "about objects — that reads as generic stock footage, which the client does " +
+    "NOT want. Put a PERSON in frame ONLY when the line is genuinely about a " +
+    "person or a first-person action; otherwise show the object / part / place itself."
+  );
+}
 
 // Amateur-real look rule (client requirement 2026-06). Even though the phone-shot
 // STYLE_PROMPT is appended at generation time, Gemini tends to slip cinematic
@@ -158,18 +191,24 @@ const BROLL_OBJECT_RULE =
 // hour", "professional photo", "dramatic lighting"), which fight the amateur look
 // and bring back the gorgeous-but-fake stock/CGI vibe the client rejected. Forbid
 // those here so the scene prompt describes WHAT is shown, never a produced style.
-const AMATEUR_LOOK_RULE =
-  "AMATEUR REAL LOOK (client requirement): describe the scene as if shot by an " +
-  "ordinary person on a phone in their own garden. Do NOT add any cinematic, " +
-  "professional, or stock-photo styling words — NO 'cinematic', NO 'shallow depth " +
-  "of field' / 'bokeh' / 'blurred background', NO 'golden hour' / 'dramatic " +
-  "lighting' / 'lens flare', NO 'professional photo' / 'award-winning' / '8k'. " +
-  "Just describe the real subject and setting plainly; the camera look is added " +
-  "separately.";
+function amateurLookRule(topic: VideoTopic): string {
+  const wherePhrase = topic.setting.trim()
+    ? `in their own ${topic.setting.trim()}`
+    : "in their own real setting";
+  return (
+    "AMATEUR REAL LOOK (client requirement): describe the scene as if shot by an " +
+    `ordinary person on a phone ${wherePhrase}. Do NOT add any cinematic, ` +
+    "professional, or stock-photo styling words — NO 'cinematic', NO 'shallow depth " +
+    "of field' / 'bokeh' / 'blurred background', NO 'golden hour' / 'dramatic " +
+    "lighting' / 'lens flare', NO 'professional photo' / 'award-winning' / '8k'. " +
+    "Just describe the real subject and setting plainly; the camera look is added " +
+    "separately."
+  );
+}
 
 // Shot-variety rule (client variety fix 2026-06). The footage all looked the
-// same — every still was a close-up of hands in soil — because the prompts
-// changed the SUBJECT but never the FRAMING. Each block now picks a `shotType`
+// same — every still was the same tight close-up — because the prompts changed
+// the SUBJECT but never the FRAMING. Each block now picks a `shotType`
 // (scale + angle) and consecutive blocks MUST differ, so the video reads as a
 // varied edit instead of one repeated shot. shotType describes only camera
 // distance/angle, NOT subject and NOT camera-look styling.
@@ -183,30 +222,60 @@ const SHOT_VARIETY_RULE =
   "pick a `shotType` from: " + SHOT_TYPES + ". Do NOT use the same shotType on " +
   "two consecutive blocks, and across any run of 4-5 blocks use several DIFFERENT " +
   "shot types — mix scales (some macro, some wide, some overhead) and angles. " +
-  "Specifically STOP defaulting every block to a close-up of hands in soil: only " +
-  "a minority of blocks should be hands-in-the-dirt. When a long sentence splits " +
+  "Specifically do NOT default every block to the same tight close-up: only a " +
+  "minority of blocks should be extreme close-ups. When a long sentence splits " +
   "into two visuals, give `shotType2` a DIFFERENT framing from `shotType` so the " +
   "two frames don't match. shotType is camera distance/angle ONLY — never put " +
   "subject or film-look words in it.";
 
 // Product / brand exception (client requirement 2026-06, signed off to relax the
 // blanket no-text / no-logo ban for product lines ONLY). When the narration is
-// genuinely about a specific PRODUCT or BRAND — a bag of rice bran (nuka), a
-// fertilizer product, a named amendment — the client WANTS that product shown:
-// its packaging, label, or a brand/company logo may appear. This overrides the
-// otherwise-blanket "NO text / NO logo / NO label" rule for that one block only;
-// every NON-product block still follows the no-text rule strictly.
-const PRODUCT_BRAND_RULE =
-  "PRODUCT / BRAND LINES (client requirement): when the narration is genuinely " +
-  "about a specific product or brand (e.g. a bag of rice bran / nuka, a bottle or " +
-  "bag of fertilizer, a named soil amendment), SHOW THAT PRODUCT as the single " +
-  "subject — its packaging or label, or a fertilizer brand/company logo, IS " +
-  "allowed and wanted here (prefer a 'product shot' shotType). This is the ONLY " +
-  "case where text/labels/logos are permitted. For every other (non-product) " +
-  "line keep the strict no-text, no-label, no-logo rule.";
+// genuinely about a specific PRODUCT or BRAND — a named part, a bottle of oil, a
+// branded tool — the client WANTS that product shown: its packaging, label, or a
+// brand/company logo may appear. This overrides the otherwise-blanket "NO text /
+// NO logo / NO label" rule for that one block only; every NON-product block still
+// follows the no-text rule strictly.
+function productBrandRule(topic: VideoTopic): string {
+  const examplePhrase = topic.subjectExamples.trim()
+    ? `(e.g. ${topic.subjectExamples.trim()}, a bottle or bag of a named product, a branded tool)`
+    : "(e.g. a named part, a bottle or bag of a named product, a branded tool)";
+  return (
+    "PRODUCT / BRAND LINES (client requirement): when the narration is genuinely " +
+    `about a specific product or brand ${examplePhrase}, SHOW THAT PRODUCT as the ` +
+    "single subject — its packaging or label, or the product's brand/company logo, " +
+    "IS allowed and wanted here (prefer a 'product shot' shotType). This is the ONLY " +
+    "case where text/labels/logos are permitted. For every other (non-product) " +
+    "line keep the strict no-text, no-label, no-logo rule."
+  );
+}
 
-function buildPrompt(transcript: string): string {
+function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): string {
+  // Niche anchor. When we could derive the video's topic from the title +
+  // transcript, we tell Gemini the world up front so EVERY scene stays on-theme
+  // — the fix for off-topic visuals (a car video that rendered houses & lawns
+  // because the planner never knew the niche). When empty, we emit a neutral
+  // instruction so nothing regresses to a hardcoded domain.
+  const topicBlock = hasTopic(topic)
+    ? [
+        `VIDEO SUBJECT / NICHE: ${topic.niche.trim() || topic.setting.trim()}.`,
+        topic.setting.trim() ? `Recurring setting: ${topic.setting.trim()}.` : "",
+        topic.subjectExamples.trim() ? `On-topic subjects include: ${topic.subjectExamples.trim()}.` : "",
+        "The basePrompt and EVERY imagePrompt MUST stay inside this world. Never",
+        "introduce houses, lawns, offices, or any setting unrelated to the video's",
+        "subject. When a line is abstract or has no literal scene, invent a visual",
+        "from THIS niche (an on-topic object, tool, part, or place), never a",
+        "generic unrelated one.",
+        "",
+      ].filter(Boolean)
+    : [
+        "Read the whole transcript and infer the video's SUBJECT / niche, then keep",
+        "the basePrompt and EVERY imagePrompt inside that world. When a line is",
+        "abstract or has no literal scene, invent a visual from the video's own",
+        "subject, never a generic unrelated setting.",
+        "",
+      ];
   return [
+    ...topicBlock,
     "You are a video director planning the visual track for an AI-generated",
     "narrated video. Segment the transcript below into an ordered list of",
     "visual blocks that play in sync with the narration. Cover the ENTIRE",
@@ -244,7 +313,7 @@ function buildPrompt(transcript: string): string {
     "the overall mood ONLY. This is a shared style bible that every block builds",
     "on, added as trailing context to each block. Keep it SHORT (one sentence).",
     "Do NOT bake in a fixed framing or composition (do NOT say 'close-up' or",
-    "'hands-in-the-dirt shots' here) and do NOT name one specific subject — the",
+    "one repeated shot here) and do NOT name one specific subject — the",
     "framing comes from each block's shotType and the subject from each block's",
     "imagePrompt, both of which MUST vary block to block. Do NOT include camera or",
     "film-grain styling — that is appended separately.",
@@ -271,8 +340,8 @@ function buildPrompt(transcript: string): string {
     "A long sentence is shown with TWO visuals, so imagePrompt2 is a SECOND,",
     "genuinely DIFFERENT picture of the SAME sentence — a different subject, a",
     "different moment, or a different detail of this same thought (e.g. if",
-    "imagePrompt shows a close-up of cracked soil, imagePrompt2 might show a dead",
-    "earthworm in that soil, or a wide shot of the bare patch). It MUST NOT be the",
+    "imagePrompt is a close-up of the main object, imagePrompt2 might show a",
+    "related detail beside it, or a wide shot of the whole scene). It MUST NOT be the",
     "same scene as imagePrompt with only a reworded angle — make it a DISTINCT",
     "shot so the two visuals never look like duplicates. It follows ALL the same",
     "rules as imagePrompt (picture-not-narration, single-subject, B-roll objects,",
@@ -282,13 +351,13 @@ function buildPrompt(transcript: string): string {
     "",
     SINGLE_SUBJECT_RULE,
     "",
-    BROLL_OBJECT_RULE,
+    brollObjectRule(topic),
     "",
     SHOT_VARIETY_RULE,
     "",
-    PRODUCT_BRAND_RULE,
+    productBrandRule(topic),
     "",
-    AMATEUR_LOOK_RULE,
+    amateurLookRule(topic),
     "",
     "CONTINUITY (critical): when consecutive blocks describe one continuous",
     "scene, they MUST keep the SAME setting, lighting, subjects, and framing so",
@@ -361,15 +430,18 @@ function buildSingleSegmentPrompt(
     "",
     SINGLE_SUBJECT_RULE,
     "",
-    BROLL_OBJECT_RULE,
+    // Regeneration anchors the niche via the stored basePrompt (printed below),
+    // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
+    // re-derive the topic for a single-block regen.
+    brollObjectRule(EMPTY_TOPIC),
     "",
     "Also pick a `shotType` (camera framing) from: " + SHOT_TYPES + ". Choose one",
     "that fits this line's subject; it is camera distance/angle ONLY, no subject or",
     "film-look words.",
     "",
-    PRODUCT_BRAND_RULE,
+    productBrandRule(EMPTY_TOPIC),
     "",
-    AMATEUR_LOOK_RULE,
+    amateurLookRule(EMPTY_TOPIC),
     "",
     wantsAnimation
       ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = BARELY PERCEPTIBLE motion: an extremely slow, very slight push-in over a completely still, frozen scene. NO panning, NO sudden motion, NO camera shake, NO motion blur, NO eventful action.).'
@@ -424,6 +496,11 @@ export async function regenerateSegmentPrompt(input: {
         contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? []) }] }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
       }),
+    // SHORT primary ladder: during a broad gemini-2.5-flash 503 spike (the cause
+    // of the 2026-07 planner slowdown) we don't want each of the ~74 regen calls
+    // to burn ~20s exhausting the dead primary. 2 quick attempts, then fail over
+    // to the healthy fallback which gets the fuller budget.
+    { attempts: 2, baseMs: 800 },
     { attempts: 4, baseMs: 1500 },
   );
   if (usedModel !== getEnv().GEMINI_MODEL) {
@@ -1483,6 +1560,84 @@ function chunkTranscriptBySentence(transcript: string, maxChars: number): string
   return chunks;
 }
 
+const VideoTopicSchema = z.object({
+  niche: optString(),
+  setting: optString(),
+  subjectExamples: optString(),
+});
+
+// Derive the video's niche/world from the project title + a leading transcript
+// sample, ONCE per plan. This is the fix for off-topic visuals: the planner was
+// hardcoded to a gardening/lawn-care niche, so a car-maintenance script rendered
+// houses and lawns. We now infer the actual subject and thread it into every
+// image prompt so the visuals stay on-theme for ANY channel. A cheap Gemini call
+// (thinkingBudget:0, tiny output) — on any failure we return EMPTY_TOPIC and the
+// prompt falls back to niche-neutral phrasing (no regression).
+async function deriveVideoTopic(input: {
+  projectId: string;
+  jobId?: string;
+  title: string;
+  transcript: string;
+}): Promise<VideoTopic> {
+  const { projectId, jobId, title, transcript } = input;
+  const sample = transcript.trim().slice(0, 1500);
+  if (!title.trim() && !sample) return EMPTY_TOPIC;
+  const prompt = [
+    "You are setting up the visual world for a short narrated video. From the",
+    "TITLE and the transcript SAMPLE below, infer the video's subject/niche so a",
+    "downstream image generator keeps every shot on-theme.",
+    "",
+    "Return STRICT JSON ONLY:",
+    '{"niche": "...", "setting": "...", "subjectExamples": "..."}',
+    "- niche: short label of the topic, e.g. \"automotive / DIY car maintenance\",",
+    '  "home cooking", "personal finance", "lawn & garden care".',
+    "- setting: the recurring physical place the creator would film in, e.g.",
+    '  "home garage / driveway, under the hood", "a home kitchen", "a backyard garden".',
+    "- subjectExamples: a few concrete on-topic objects/subjects, comma-separated,",
+    '  e.g. "spark plugs, engine bays, hand tools, oil, dashboards".',
+    "Keep each field short (a phrase, not a sentence). No commentary.",
+    "",
+    `TITLE: ${title.trim() || "(none)"}`,
+    "",
+    "TRANSCRIPT SAMPLE:",
+    sample || "(none)",
+  ].join("\n");
+  try {
+    const { result: res } = await withGeminiModelFallback(
+      "deriveVideoTopic",
+      (model) =>
+        model.generateContent({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.2,
+            maxOutputTokens: 512,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            thinkingConfig: { thinkingBudget: 0 },
+          } as any,
+        }),
+      { attempts: 3, baseMs: 1000 },
+    );
+    const parsed = VideoTopicSchema.safeParse(JSON.parse(res.response.text()));
+    if (!parsed.success) return EMPTY_TOPIC;
+    const topic: VideoTopic = {
+      niche: parsed.data.niche.trim(),
+      setting: parsed.data.setting.trim(),
+      subjectExamples: parsed.data.subjectExamples.trim(),
+    };
+    await logJob({ projectId, jobId }, "synthetic.plan.topic_derived", {
+      niche: topic.niche,
+      setting: topic.setting,
+    });
+    return topic;
+  } catch (e) {
+    await logJob({ projectId, jobId }, "synthetic.plan.topic_failed", {
+      err: (e as Error).message?.slice(0, 200),
+    });
+    return EMPTY_TOPIC;
+  }
+}
+
 // Run the Gemini planner for ONE transcript chunk and return its parsed
 // basePrompt + raw segments. Sets thinkingBudget:0 and a generous output cap
 // (the same fix proven in scoreClipsForSections): gemini-2.5-flash otherwise
@@ -1493,12 +1648,13 @@ async function planTranscriptChunk(
   ctx: { projectId: string; jobId?: string },
   transcript: string,
   chunkLabel: string,
+  topic: VideoTopic = EMPTY_TOPIC,
 ): Promise<{ basePrompt: string; segments: RawSegment[] }> {
   const { result: res, model: usedModel } = await withGeminiModelFallback(
     "buildSyntheticTimeline",
     (model) =>
       model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildPrompt(transcript) }] }],
+        contents: [{ role: "user", parts: [{ text: buildPrompt(transcript, topic) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.3,
@@ -1563,6 +1719,10 @@ async function planTranscriptChunk(
 export async function buildSyntheticTimeline(input: {
   projectId: string;
   jobId?: string;
+  // Project title — used (with a transcript sample) to derive the video's niche
+  // so every image prompt stays on-theme. Optional/empty is fine: the planner
+  // then falls back to niche-neutral phrasing.
+  projectTitle?: string;
   transcript: string;
   words: WordTiming[] | null;
   voiceoverDuration: number;
@@ -1571,9 +1731,18 @@ export async function buildSyntheticTimeline(input: {
   // 'avatar', overriding Gemini's choice. Empty when no doc marks (pasted text).
   avatarRanges?: AvatarMarkRange[];
 }): Promise<PlannedSegment[]> {
-  const { projectId, jobId, transcript, words, voiceoverDuration } = input;
+  const { projectId, jobId, projectTitle, transcript, words, voiceoverDuration } = input;
   let avatarRanges = input.avatarRanges ?? [];
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
+
+  // Derive the video's niche ONCE so every chunk's basePrompt + imagePrompts
+  // stay on-theme (the off-topic-visuals fix). Cheap, fault-tolerant call.
+  const topic = await deriveVideoTopic({
+    projectId,
+    jobId,
+    title: projectTitle ?? "",
+    transcript,
+  });
 
   // A long transcript makes Gemini emit a segments array that overflows its
   // output-token budget and truncates the JSON mid-stream — surfacing as the
@@ -1604,6 +1773,7 @@ export async function buildSyntheticTimeline(input: {
       { projectId, jobId },
       chunks[i],
       `${i + 1}/${chunks.length}`,
+      topic,
     );
     if (i === 0) basePrompt = bp;
     rawSegments.push(...segments);
@@ -1861,29 +2031,41 @@ export async function buildSyntheticTimeline(input: {
         // lands, only that one block's prompt is sub-optimal.
         let regenerated = 0;
         let regenFailed = 0;
-        for (const p of segments) {
-          if (!p.needsPromptRegen || p.blockType === "avatar") continue;
-          try {
-            const r = await regenerateSegmentPrompt({
-              projectId,
-              jobId,
-              script: p.script,
-              basePrompt,
-              blockType: p.blockType,
-            });
-            // regenerateSegmentPrompt returns a prompt already composed WITH the
-            // base in front and the shot folded in, so clear shotType and the
-            // second-visual nudge — persist's composePrompt sees the base
-            // already present and passes it through unchanged.
-            p.imagePrompt = r.imagePrompt;
-            p.shotType = null;
-            p.secondVisual = false;
-            if (p.blockType === "ai_clip") p.animationPrompt = r.animationPrompt;
-            regenerated++;
-          } catch {
-            regenFailed++;
-          }
-        }
+        // Regenerate in PARALLEL with a concurrency cap. These blocks have no
+        // cross-item dependency (each mutates only its own fields), so running
+        // them one-at-a-time serialized ~74 Gemini calls behind each other —
+        // the dominant cost of the 2026-07 planner slowdown when 2.5-flash was
+        // broadly 503ing. The limiter keeps ~5 in flight so a spike doesn't fan
+        // out into its own throttle, while collapsing the wall-time ~5x.
+        const mergeLimit = makeLimit(5);
+        await Promise.all(
+          segments
+            .filter((p) => p.needsPromptRegen && p.blockType !== "avatar")
+            .map((p) =>
+              mergeLimit(async () => {
+                try {
+                  const r = await regenerateSegmentPrompt({
+                    projectId,
+                    jobId,
+                    script: p.script,
+                    basePrompt,
+                    blockType: p.blockType,
+                  });
+                  // regenerateSegmentPrompt returns a prompt already composed WITH
+                  // the base in front and the shot folded in, so clear shotType and
+                  // the second-visual nudge — persist's composePrompt sees the base
+                  // already present and passes it through unchanged.
+                  p.imagePrompt = r.imagePrompt;
+                  p.shotType = null;
+                  p.secondVisual = false;
+                  if (p.blockType === "ai_clip") p.animationPrompt = r.animationPrompt;
+                  regenerated++;
+                } catch {
+                  regenFailed++;
+                }
+              }),
+            ),
+        );
         // Re-split any merged block whose combined window exceeds the cap into
         // even ~minHold slots, so a 7s + 2.6s pair plays as TWO ~4.8s visuals
         // (slot 1 = combined prompt, slots 2+ = a different angle) instead of
@@ -1969,15 +2151,19 @@ export async function buildSyntheticTimeline(input: {
   {
     let distinctRegenerated = 0;
     let distinctRegenFailed = 0;
+    // First collect each sentence's run of secondVisual slots (an anchor +
+    // its following same-script slots). The `avoid` chaining is sequential
+    // WITHIN a run (each slot avoids the earlier slots' scenes), so slots in
+    // one run can't be parallelized against each other — but DIFFERENT runs
+    // are independent. So we process runs in parallel with a concurrency cap
+    // and keep each run's slots sequential, cutting wall-time without breaking
+    // the avoid-chaining that makes the extra visuals distinct.
+    const runs: { anchor: PlannedSegment; slots: PlannedSegment[] }[] = [];
     let i = 0;
     while (i < planned.length) {
       const anchor = planned[i];
       if (anchor.blockType === "avatar" || anchor.secondVisual) { i++; continue; }
-      // Collect the run of following slots that belong to the SAME sentence: same
-      // script, a visual block, and flagged secondVisual.
-      const avoid: string[] = [];
-      const anchorScene = anchor.imagePrompt?.trim();
-      if (anchorScene) avoid.push(anchorScene);
+      const slots: PlannedSegment[] = [];
       let j = i + 1;
       while (
         j < planned.length &&
@@ -1985,35 +2171,49 @@ export async function buildSyntheticTimeline(input: {
         planned[j].blockType !== "avatar" &&
         planned[j].script === anchor.script
       ) {
-        const slot = planned[j];
-        try {
-          const r = await regenerateSegmentPrompt({
-            projectId,
-            jobId,
-            script: slot.script,
-            basePrompt,
-            blockType: slot.blockType,
-            avoidScenes: avoid,
-          });
-          // regenerateSegmentPrompt returns a prompt already composed WITH the
-          // base in front and the shot folded in, so clear shotType and the
-          // second-visual nudge — persist's composePrompt passes it through.
-          slot.imagePrompt = r.imagePrompt;
-          slot.shotType = null;
-          slot.secondVisual = false;
-          if (slot.blockType === "ai_clip") slot.animationPrompt = r.animationPrompt;
-          // The next slot of this sentence must also avoid THIS new scene.
-          avoid.push(r.imagePrompt);
-          distinctRegenerated++;
-        } catch {
-          distinctRegenFailed++;
-          // Keep the existing scene in avoid so a later slot still differs from it.
-          if (slot.imagePrompt?.trim()) avoid.push(slot.imagePrompt.trim());
-        }
+        slots.push(planned[j]);
         j++;
       }
+      if (slots.length > 0) runs.push({ anchor, slots });
       i = j > i + 1 ? j : i + 1;
     }
+
+    const distinctLimit = makeLimit(5);
+    await Promise.all(
+      runs.map(({ anchor, slots }) =>
+        distinctLimit(async () => {
+          const avoid: string[] = [];
+          const anchorScene = anchor.imagePrompt?.trim();
+          if (anchorScene) avoid.push(anchorScene);
+          for (const slot of slots) {
+            try {
+              const r = await regenerateSegmentPrompt({
+                projectId,
+                jobId,
+                script: slot.script,
+                basePrompt,
+                blockType: slot.blockType,
+                avoidScenes: avoid,
+              });
+              // regenerateSegmentPrompt returns a prompt already composed WITH the
+              // base in front and the shot folded in, so clear shotType and the
+              // second-visual nudge — persist's composePrompt passes it through.
+              slot.imagePrompt = r.imagePrompt;
+              slot.shotType = null;
+              slot.secondVisual = false;
+              if (slot.blockType === "ai_clip") slot.animationPrompt = r.animationPrompt;
+              // The next slot of this sentence must also avoid THIS new scene.
+              avoid.push(r.imagePrompt);
+              distinctRegenerated++;
+            } catch {
+              distinctRegenFailed++;
+              // Keep the existing scene in avoid so a later slot still differs from it.
+              if (slot.imagePrompt?.trim()) avoid.push(slot.imagePrompt.trim());
+            }
+          }
+        }),
+      ),
+    );
     if (distinctRegenerated > 0 || distinctRegenFailed > 0) {
       await logJob({ projectId, jobId }, "synthetic.plan.distinct_second_visuals", {
         regenerated: distinctRegenerated,
