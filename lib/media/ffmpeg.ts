@@ -1143,6 +1143,120 @@ export async function buildSilentAudio(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// Result of a voiceover loudness-dropout scan (see detectLoudnessDropout).
+export interface LoudnessDropout {
+  // A sustained low-volume span was found (a likely-corrupted TTS stretch).
+  dropout: boolean;
+  // The track's normal loudness (median of voiced samples), in LUFS.
+  medianLufs: number;
+  // The worst offending span, when dropout is true.
+  worstSpan: { startSeconds: number; endSeconds: number; minLufs: number } | null;
+  // How many momentary-loudness samples ebur128 emitted (0 = analysis produced
+  // no usable data, e.g. a silent/failed file — caller treats this as "unknown",
+  // NOT as a clean pass).
+  samples: number;
+}
+
+// Scan an audio file for a SUSTAINED low-volume stretch — the signature of a
+// corrupted 69labs TTS render where a middle chunk comes back at the wrong
+// voice / a dropped level (client-reported: ~5 min much quieter from 9:12 on a
+// 31-min voiceover). ffmpeg's ebur128 filter prints momentary loudness (`M:`)
+// roughly every 100ms with a timestamp (`t:`); we treat the MEDIAN of the
+// voiced samples as the track's normal level and flag any contiguous run of
+// samples that sits `dropDb` LU or more below it for at least `minSpanSeconds`.
+//
+// Using a span floor (not a single quiet sample) is what keeps ordinary
+// sentence gaps and breaths from false-flagging — those are far shorter than a
+// real corrupted stretch. Best-effort: on any analysis failure it returns
+// dropout:false with samples:0 so the caller can distinguish "clean" (samples>0,
+// dropout:false) from "couldn't tell" (samples:0) and not regenerate blindly.
+export async function detectLoudnessDropout(opts: {
+  inputPath: string;
+  dropDb: number;
+  minSpanSeconds: number;
+  signal?: AbortSignal;
+}): Promise<LoudnessDropout> {
+  const env = getEnv();
+  const empty: LoudnessDropout = { dropout: false, medianLufs: -Infinity, worstSpan: null, samples: 0 };
+  let stderr: string;
+  try {
+    // ebur128 with metadata=1 prints per-frame `t:` (seconds) and `M:` (momentary
+    // LUFS) lines to stderr. -f null discards the (unused) audio output; the scan
+    // just reads the log. Timeout is generous — a 30-min track scans in real-ish
+    // time but far under this ceiling.
+    stderr = await runFFmpegCaptureStderr(
+      env.FFMPEG_PATH,
+      ["-nostats", "-i", opts.inputPath, "-af", "ebur128=metadata=1", "-f", "null", "-"],
+      opts.signal,
+      600,
+    );
+  } catch {
+    return empty;
+  }
+
+  // Parse `t: <sec>` and `M: <lufs>` pairs. They appear on consecutive lines per
+  // frame; pair each M with the most recent t. ebur128 emits M:-120.7 for true
+  // silence — those samples are dropped from the median (they're gaps, not the
+  // voice level) but still count against a span only via the below-median test.
+  const samples: Array<{ t: number; m: number }> = [];
+  let lastT = 0;
+  const lineRe = /t:\s*([\d.]+)|M:\s*(-?[\d.]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = lineRe.exec(stderr)) !== null) {
+    if (match[1] !== undefined) {
+      lastT = Number(match[1]);
+    } else if (match[2] !== undefined) {
+      const m = Number(match[2]);
+      if (Number.isFinite(m)) samples.push({ t: lastT, m });
+    }
+  }
+  if (samples.length === 0) return empty;
+
+  // Median of the VOICED samples (drop near-silence so pauses don't drag the
+  // baseline down and mask a real dropout). -70 LUFS is comfortably below any
+  // spoken level and above ebur128's -120 silence floor.
+  const voiced = samples.map((s) => s.m).filter((m) => m > -70).sort((a, b) => a - b);
+  if (voiced.length === 0) return { ...empty, samples: samples.length };
+  const median = voiced[Math.floor(voiced.length / 2)];
+  const floor = median - opts.dropDb;
+
+  // Walk the timeline; accumulate the longest contiguous span whose samples are
+  // ALL below `floor`. Track its extent and minimum level for logging.
+  let worst: LoudnessDropout["worstSpan"] = null;
+  let runStart: number | null = null;
+  let runMin = Infinity;
+  let runEndT = 0;
+  const closeRun = (endT: number) => {
+    if (runStart === null) return;
+    const span = endT - runStart;
+    if (span >= opts.minSpanSeconds && (!worst || span > worst.endSeconds - worst.startSeconds)) {
+      worst = { startSeconds: runStart, endSeconds: endT, minLufs: runMin };
+    }
+    runStart = null;
+    runMin = Infinity;
+  };
+  for (const s of samples) {
+    // Ignore true-silence samples: a corrupted stretch is QUIET-BUT-PRESENT, not
+    // dead air, and long legit pauses shouldn't seed a false span.
+    if (s.m <= -70) { closeRun(runEndT); runEndT = s.t; continue; }
+    if (s.m < floor) {
+      if (runStart === null) runStart = s.t;
+      runMin = Math.min(runMin, s.m);
+    } else {
+      closeRun(s.t);
+    }
+    runEndT = s.t;
+  }
+  closeRun(runEndT);
+
+  return {
+    dropout: worst !== null,
+    medianLufs: median,
+    worstSpan: worst,
+    samples: samples.length,
+  };
+}
+
 export async function cutAudio(opts: {
   inputPath: string;
   outputPath: string;

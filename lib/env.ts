@@ -685,6 +685,13 @@ const ServerEnvSchema = z.object({
   // this cutoff blocks keep whatever type Gemini chose (stills dominate, cheaper).
   // 0 disables the promotion entirely.
   SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(180),
+  // Intro clip/image run pattern (client 2026-07-03: the all-clip intro was too
+  // expensive — "ai clip - ai clip - image - image" for the first 3 min, after
+  // that leave as is). Within the clip-heavy window above, visual blocks follow
+  // a repeating pattern of CLIP_RUN ai_clips then IMAGE_RUN images. IMAGE_RUN 0
+  // restores the old all-clip intro.
+  SYNTHETIC_INTRO_CLIP_RUN: z.coerce.number().int().positive().default(2),
+  SYNTHETIC_INTRO_IMAGE_RUN: z.coerce.number().int().nonnegative().default(2),
   // split_2 cap (client feedback 2026-06: "too many split_2 parts, I don't want
   // many split_2 part video"). split_2 (a talking presenter beside an
   // illustrative still) is chosen freely by Gemini and routinely overruns — one
@@ -699,6 +706,13 @@ const ServerEnvSchema = z.object({
   // floor guarantees a few survive the later passes so the layout still shows
   // up. 0 = no floor (a video can have zero split_2 if Gemini chose none).
   SYNTHETIC_SPLIT2_MIN_KEEP: z.coerce.number().int().nonnegative().default(2),
+  // Minimum number of blocks between two kept split_2 (client 2026-07: a
+  // step-by-step walkthrough section came back as 15+ consecutive split_2 —
+  // the count cap above has no spacing rule, so an in-budget clump survived).
+  // A split_2 is kept only when at least this many non-split_2 blocks sit
+  // between it and the previously kept one; the ones in between are demoted to
+  // plain 'image'. 0 disables spacing (count cap only); 1 = never back-to-back.
+  SYNTHETIC_SPLIT2_MIN_GAP: z.coerce.number().int().nonnegative().default(3),
   // Target fraction of POST-clip-heavy-cutoff visual blocks that stay ai_clip,
   // the rest demoted to image (client: "after 3 mins, image and ai_clip should
   // appear naturally" — NOT all-clip). The short-visual merge biases every
@@ -735,6 +749,53 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_DEGRADE_IMAGE_JPEG_QUALITY: z.coerce.number().int().min(1).max(100).default(60),
   SYNTHETIC_DEGRADE_VIDEO_NOISE: z.coerce.number().nonnegative().default(18),
   SYNTHETIC_DEGRADE_VIDEO_CRF_DELTA: z.coerce.number().int().nonnegative().default(6),
+
+  // Voiceover QC (client 2026-07: "sometimes the audio file is corrupted —
+  // check if the audio has any low volume and if so, regenerate"). 69labs
+  // occasionally renders a MIDDLE stretch of a long TTS job with the wrong
+  // voice / a dropped level (observed: ~5 min at a lower volume from 9:12 on a
+  // 31-min voiceover). Our pipeline plays back whatever 69labs produced, so we
+  // detect the defect right after generation and re-run the TTS.
+  //
+  // Detection (see detectLoudnessDropout): ffmpeg ebur128 emits momentary
+  // loudness every ~100ms; we take the median of the VOICED samples as the
+  // track's normal level, then flag a CONTIGUOUS span that sits far below it.
+  //   _DROP_DB    — how far below the median counts as a dropout (LU). A real
+  //                 wrong-voice/level section runs many LU quieter; natural
+  //                 sentence gaps are excluded by the span floor below.
+  //   _MIN_SPAN_S — minimum length of the low span to flag (seconds). Long
+  //                 enough that ordinary pauses/breaths never trip it, short
+  //                 enough to catch a multi-second corrupted stretch.
+  //   _MAX_REGEN  — how many times to re-generate before giving up and shipping
+  //                 the least-bad take (0 disables the whole QC pass).
+  SYNTHETIC_VOICEOVER_QC_DROP_DB: z.coerce.number().positive().default(9),
+  SYNTHETIC_VOICEOVER_QC_MIN_SPAN_S: z.coerce.number().positive().default(4),
+  SYNTHETIC_VOICEOVER_QC_MAX_REGEN: z.coerce.number().int().nonnegative().default(2),
+
+  // =======================================================================
+  // THUMBNAILS ENGINE (migration 0027). A third top-level product, separate
+  // from the sourced/synthetic VIDEO engines. Generates YouTube thumbnails
+  // from 1–5 reference thumbnails + a title/prompt via the Pikzels API
+  // (https://docs.pikzels.com). All optional — when PIKZELS_API_KEY is unset,
+  // the /api/thumbnails/generate route 503s and the video engines are
+  // unaffected.
+  //
+  // Auth is the `X-Api-Key` header (keys look like `pkz_...`). The reference
+  // endpoint (POST {base}/v2/thumbnail/image) returns { output, request_id }
+  // where `output` is a CDN URL that EXPIRES in ~24h — so the route downloads
+  // it and re-hosts to R2 for a permanent link.
+  PIKZELS_API_KEY: z.string().optional(),
+  PIKZELS_BASE_URL: z.string().url().default("https://api.pikzels.com"),
+  // Generation model. Enum per Pikzels docs: pkz_2 | pkz_3 | pkz_4 | pkz_4_5.
+  // The optional style reference (support_image_url) is honored ONLY by pkz_4
+  // and pkz_4_5, so we default to pkz_4_5 to keep the two-reference flow usable.
+  PIKZELS_MODEL: z.enum(["pkz_2", "pkz_3", "pkz_4", "pkz_4_5"]).default("pkz_4_5"),
+  // Aspect ratio. Enum per docs: 16:9 (YouTube) | 9:16 | 1:1.
+  PIKZELS_FORMAT: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+  // Hard timeout (seconds) for one Pikzels generation request. The image
+  // endpoint responds synchronously (~<30s per Pikzels), so this is a
+  // fetch-abort backstop, not a poll loop.
+  PIKZELS_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

@@ -142,12 +142,18 @@ export interface VideoTopic {
   setting: string;
   // A few example on-topic subjects, e.g. "spark plugs, engine bays, hand tools".
   subjectExamples: string;
+  // Wider real-world context/action scenes of the niche — the subject in use or
+  // in motion in its environment, e.g. "utes driving on highways, vehicles on
+  // outback roads" for an engine video. Feeds the context-variety rule so the
+  // visuals aren't ONLY literal close-ups of the narrated object (client
+  // feedback 2026-07: an engine video should also show cars driving as B-roll).
+  environmentExamples: string;
 }
 
-const EMPTY_TOPIC: VideoTopic = { niche: "", setting: "", subjectExamples: "" };
+const EMPTY_TOPIC: VideoTopic = { niche: "", setting: "", subjectExamples: "", environmentExamples: "" };
 
 function hasTopic(t: VideoTopic): boolean {
-  return Boolean(t.niche.trim() || t.setting.trim() || t.subjectExamples.trim());
+  return Boolean(t.niche.trim() || t.setting.trim() || t.subjectExamples.trim() || t.environmentExamples.trim());
 }
 
 // Object-first B-roll rule (client requirement 2026-06). The reference channel
@@ -182,6 +188,34 @@ function brollObjectRule(topic: VideoTopic): string {
     "about objects — that reads as generic stock footage, which the client does " +
     "NOT want. Put a PERSON in frame ONLY when the line is genuinely about a " +
     "person or a first-person action; otherwise show the object / part / place itself."
+  );
+}
+
+// Context-variety rule (client feedback 2026-07). The object-first rule above
+// made every visual a literal close-up of the narrated thing — an engine video
+// became wall-to-wall engine bays. The client wants the niche's WIDER world on
+// screen too: the subject in use / in motion in its real environment (for an
+// engine video, the vehicles those engines live in driving on real roads). The
+// environment examples come from deriveVideoTopic() so this stays generic for
+// any niche; when the topic is empty the phrasing stays niche-neutral.
+function contextVarietyRule(topic: VideoTopic): string {
+  const envPhrase = topic.environmentExamples.trim()
+    ? `(e.g. ${topic.environmentExamples.trim()})`
+    : "(the thing being used, driven, cooked, grown, worn… out in its real environment)";
+  return (
+    "CONTEXT VARIETY (critical, client requirement): do NOT make every visual a " +
+    "literal close-up of the exact object the narration names — that reads as the " +
+    "same shot over and over. A meaningful share of blocks (roughly one in three) " +
+    "MUST instead show the niche's WIDER real-world context: the subject in use or " +
+    `in motion in its environment ${envPhrase}. These context shots are on-topic ` +
+    "and in-world — prefer them for imagePrompt2 second visuals, for " +
+    "wide/establishing shotTypes, and for abstract or filler lines (describe the " +
+    "scene as a captured moment; the camera-motion rules elsewhere still apply). " +
+    "When the narration keeps returning to the same " +
+    "object for several blocks in a row, break the run with a context shot rather " +
+    "than another close-up of that same object. The object-first rule above still " +
+    "decides the DEFAULT subject when a line names a concrete thing; this rule " +
+    "supplies the variety around it."
   );
 }
 
@@ -260,6 +294,9 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
         `VIDEO SUBJECT / NICHE: ${topic.niche.trim() || topic.setting.trim()}.`,
         topic.setting.trim() ? `Recurring setting: ${topic.setting.trim()}.` : "",
         topic.subjectExamples.trim() ? `On-topic subjects include: ${topic.subjectExamples.trim()}.` : "",
+        topic.environmentExamples.trim()
+          ? `The niche's wider real-world context is ALSO in-world and on-topic: ${topic.environmentExamples.trim()}.`
+          : "",
         "The basePrompt and EVERY imagePrompt MUST stay inside this world. Never",
         "introduce houses, lawns, offices, or any setting unrelated to the video's",
         "subject. When a line is abstract or has no literal scene, invent a visual",
@@ -353,6 +390,8 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
     "",
     brollObjectRule(topic),
     "",
+    contextVarietyRule(topic),
+    "",
     SHOT_VARIETY_RULE,
     "",
     productBrandRule(topic),
@@ -434,6 +473,8 @@ function buildSingleSegmentPrompt(
     // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
     // re-derive the topic for a single-block regen.
     brollObjectRule(EMPTY_TOPIC),
+    "",
+    contextVarietyRule(EMPTY_TOPIC),
     "",
     "Also pick a `shotType` (camera framing) from: " + SHOT_TYPES + ". Choose one",
     "that fits this line's subject; it is camera distance/angle ONLY, no subject or",
@@ -1162,8 +1203,11 @@ export function splitMergedVisuals(
 // short-visual merge biases every merge to ai_clip (resolveMerge returns ai_clip
 // when EITHER side is a clip), which snowballed one plan to 100 clips / 15
 // images. This pass is the final word on visual type:
-//   * a visual block (image/ai_clip) STARTING before `clipHeavyCutoff` -> ai_clip
-//     (the clip-heavy intro look).
+//   * a visual block (image/ai_clip) STARTING before `clipHeavyCutoff` follows a
+//     repeating run pattern of `introClipRun` clips then `introImageRun` images
+//     (client 2026-07-03: all-clip intro was too expensive — wants
+//     "ai clip - ai clip - image - image" for the first 3 min). introImageRun 0
+//     restores the old all-clip intro.
 //   * after the cutoff -> keep only a `postClipFraction` share as ai_clip,
 //     spaced EVENLY across the post-cutoff visuals (every Nth), the rest demoted
 //     to image. Even spacing avoids a clump of clips then a clump of stills.
@@ -1174,18 +1218,26 @@ export function balanceVisualTypesByPosition(
   segs: PlannedSegment[],
   clipHeavyCutoffSeconds: number,
   postClipFraction: number,
+  introClipRun: number = 2,
+  introImageRun: number = 2,
 ): { segments: PlannedSegment[]; toClip: number; toImage: number } {
   let toClip = 0;
   let toImage = 0;
+  // Index among PRE-cutoff visual blocks, used to walk the clip/image run
+  // pattern (e.g. 2/2 -> clip clip image image clip clip …).
+  let preIdx = 0;
   // Index among POST-cutoff visual blocks, used to space clips evenly. We keep a
   // clip when floor(i * frac) increments — a classic even-distribution stride.
   let postIdx = 0;
+  const clipRun = Math.max(1, Math.floor(introClipRun));
+  const imageRun = Math.max(0, Math.floor(introImageRun));
   const out = segs.map((seg) => {
     if (seg.blockType !== "image" && seg.blockType !== "ai_clip") return seg;
     const beforeCutoff = clipHeavyCutoffSeconds > 0 && seg.startTime < clipHeavyCutoffSeconds;
     let want: SyntheticBlockType;
     if (beforeCutoff) {
-      want = "ai_clip";
+      want = imageRun <= 0 || preIdx % (clipRun + imageRun) < clipRun ? "ai_clip" : "image";
+      preIdx++;
     } else {
       // Even-spacing decision: keep a clip when the running quota ticks up.
       const i = postIdx++;
@@ -1462,15 +1514,20 @@ function applyMark(
 // Policy: keep at most `maxFraction` of total blocks as split_2 (at least 1 when
 // any exist and the fraction is > 0), KEEPING the earliest in timeline order and
 // demoting the rest. Earliest-kept gives an even early sprinkle rather than a
-// late clump. A demoted block keeps its script + imagePrompt and just changes
-// type (animationPrompt stays null — image has no motion). Mutates nothing;
-// returns a new array. position is reassigned by the caller if needed.
+// late clump. `minGap` additionally requires at least that many blocks between
+// two kept split_2 (client 2026-07: a step-by-step walkthrough section survived
+// the count cap as 15+ CONSECUTIVE split_2 — an in-budget clump; the spacing
+// rule breaks it up by demoting the in-between ones). A demoted block keeps its
+// script + imagePrompt and just changes type (animationPrompt stays null —
+// image has no motion). Mutates nothing; returns a new array. position is
+// reassigned by the caller if needed.
 export function capSplit2Blocks(
   segs: PlannedSegment[],
   maxFraction: number,
   minKeep: number = 0,
+  minGap: number = 0,
 ): { segments: PlannedSegment[]; demoted: number } {
-  if (maxFraction >= 1) return { segments: segs, demoted: 0 };
+  if (maxFraction >= 1 && minGap <= 0) return { segments: segs, demoted: 0 };
   const split2Count = segs.filter((s) => s.blockType === "split_2").length;
   if (split2Count === 0) return { segments: segs, demoted: 0 };
   // Allowed count: floor(total * fraction), floored at minKeep (client: ensure a
@@ -1478,15 +1535,19 @@ export function capSplit2Blocks(
   // actually produced, and at least 1 when the fraction is non-zero. When the
   // fraction is 0 we still honor minKeep so an explicit floor wins over the cap.
   const fracAllowed = maxFraction <= 0 ? 0 : Math.max(1, Math.floor(segs.length * maxFraction));
-  const allowed = Math.min(split2Count, Math.max(fracAllowed, minKeep));
-  if (split2Count <= allowed) return { segments: segs, demoted: 0 };
+  const allowed = maxFraction >= 1 ? split2Count : Math.min(split2Count, Math.max(fracAllowed, minKeep));
+  if (split2Count <= allowed && minGap <= 0) return { segments: segs, demoted: 0 };
 
   let kept = 0;
   let demoted = 0;
-  const out = segs.map((s) => {
+  // Index of the last KEPT split_2 — spacing is measured in block positions, so
+  // "minGap 3" means at least 3 other blocks (of any type) between two split_2.
+  let lastKeptIdx = -Infinity;
+  const out = segs.map((s, i) => {
     if (s.blockType !== "split_2") return s;
-    if (kept < allowed) {
+    if (kept < allowed && i - lastKeptIdx > minGap) {
       kept++;
+      lastKeptIdx = i;
       return s;
     }
     demoted++;
@@ -1564,6 +1625,7 @@ const VideoTopicSchema = z.object({
   niche: optString(),
   setting: optString(),
   subjectExamples: optString(),
+  environmentExamples: optString(),
 });
 
 // Derive the video's niche/world from the project title + a leading transcript
@@ -1588,13 +1650,18 @@ async function deriveVideoTopic(input: {
     "downstream image generator keeps every shot on-theme.",
     "",
     "Return STRICT JSON ONLY:",
-    '{"niche": "...", "setting": "...", "subjectExamples": "..."}',
+    '{"niche": "...", "setting": "...", "subjectExamples": "...", "environmentExamples": "..."}',
     "- niche: short label of the topic, e.g. \"automotive / DIY car maintenance\",",
     '  "home cooking", "personal finance", "lawn & garden care".',
     "- setting: the recurring physical place the creator would film in, e.g.",
     '  "home garage / driveway, under the hood", "a home kitchen", "a backyard garden".',
     "- subjectExamples: a few concrete on-topic objects/subjects, comma-separated,",
     '  e.g. "spark plugs, engine bays, hand tools, oil, dashboards".',
+    "- environmentExamples: a few WIDER real-world context scenes of this niche —",
+    "  the subject in use or in motion out in its environment, NOT close-ups of",
+    '  the objects, comma-separated. e.g. for an engine video: "utes driving on',
+    '  highways, vehicles on outback roads, a pickup pulling into a driveway";',
+    '  for a cooking video: "a family dinner table, dishes being served".',
     "Keep each field short (a phrase, not a sentence). No commentary.",
     "",
     `TITLE: ${title.trim() || "(none)"}`,
@@ -1624,10 +1691,12 @@ async function deriveVideoTopic(input: {
       niche: parsed.data.niche.trim(),
       setting: parsed.data.setting.trim(),
       subjectExamples: parsed.data.subjectExamples.trim(),
+      environmentExamples: parsed.data.environmentExamples.trim(),
     };
     await logJob({ projectId, jobId }, "synthetic.plan.topic_derived", {
       niche: topic.niche,
       setting: topic.setting,
+      environmentExamples: topic.environmentExamples,
     });
     return topic;
   } catch (e) {
@@ -1928,13 +1997,15 @@ export async function buildSyntheticTimeline(input: {
   {
     const maxFraction = getEnv().SYNTHETIC_SPLIT2_MAX_FRACTION;
     const minKeep = getEnv().SYNTHETIC_SPLIT2_MIN_KEEP;
+    const minGap = getEnv().SYNTHETIC_SPLIT2_MIN_GAP;
     const before = planned.filter((p) => p.blockType === "split_2").length;
-    const { segments, demoted } = capSplit2Blocks(planned, maxFraction, minKeep);
+    const { segments, demoted } = capSplit2Blocks(planned, maxFraction, minKeep, minGap);
     if (demoted > 0) {
       segments.forEach((p, i) => { p.position = i; });
       planned = segments;
       await logJob({ projectId, jobId }, "synthetic.plan.split2_cap", {
         maxFraction,
+        minGap,
         split2Before: before,
         split2After: before - demoted,
         demotedToImage: demoted,
@@ -2090,19 +2161,26 @@ export async function buildSyntheticTimeline(input: {
   }
 
   // FINAL image/ai_clip balance by position. Runs LAST so the short-visual
-  // merge's clip-bias can't undo it: before the clip-heavy cutoff every visual
-  // is a clip; after it, only a fraction stay clips (evenly spaced) and the rest
-  // become stills — a natural mix instead of the all-clip snowball. split_2 and
-  // avatar are untouched.
+  // merge's clip-bias can't undo it: before the clip-heavy cutoff visuals follow
+  // the intro run pattern (default 2 clips / 2 images — client cost fix
+  // 2026-07-03); after it, only a fraction stay clips (evenly spaced) and the
+  // rest become stills — a natural mix instead of the all-clip snowball. split_2
+  // and avatar are untouched.
   {
     const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
     const postFraction = getEnv().SYNTHETIC_POST_INTRO_CLIP_FRACTION;
-    const { segments, toClip, toImage } = balanceVisualTypesByPosition(planned, cutoff, postFraction);
+    const introClipRun = getEnv().SYNTHETIC_INTRO_CLIP_RUN;
+    const introImageRun = getEnv().SYNTHETIC_INTRO_IMAGE_RUN;
+    const { segments, toClip, toImage } = balanceVisualTypesByPosition(
+      planned, cutoff, postFraction, introClipRun, introImageRun,
+    );
     if (toClip > 0 || toImage > 0) {
       planned = segments;
       await logJob({ projectId, jobId }, "synthetic.plan.visual_balance", {
         clipHeavyCutoffSeconds: cutoff,
         postIntroClipFraction: postFraction,
+        introClipRun,
+        introImageRun,
         flippedToClip: toClip,
         flippedToImage: toImage,
         byTypeAfter: PLANNER_BLOCK_TYPES.reduce<Record<string, number>>((acc, t) => {
