@@ -194,20 +194,38 @@ async function main() {
       ...over,
     });
 
-    test("a long ai_clip splits into exactly 2 pieces (clip + fill image)", () => {
-      // A long sentence is ONE thought: cover it with a clip then a fill image,
-      // each holding half the window (21 / 2 = 10.5s), never fragmented further.
+    test("a long ai_clip splits into ~target-second even slots", () => {
+      // 21s at target 6 -> round(21/6) = 4 slots of 5.25s. A midpoint-only
+      // split used to leave two 10.5s halves, still over the 8s threshold.
       const out = splitByDuration(mk(), 6, 8);
-      assert.strictEqual(out.length, 2);
-      for (const p of out) assert.ok(Math.abs(p.duration - 10.5) < 1e-9);
+      assert.strictEqual(out.length, 4);
+      for (const p of out) assert.ok(Math.abs(p.duration - 5.25) < 1e-9);
     });
-    test("piece 1 is the ai_clip, piece 2 is the fill image", () => {
+    test("a very long sentence never leaves a slot over the threshold", () => {
+      // The screenshot bug: a 26s sentence became two 13s blocks.
+      const out = splitByDuration(mk({ endTime: 26, duration: 26 }), 6, 8);
+      assert.strictEqual(out.length, 4);
+      for (const p of out) assert.ok(p.duration <= 8, `slot ${p.duration}s over threshold`);
+    });
+    test("slot 1 is the ai_clip, later slots are fill images", () => {
       const out = splitByDuration(mk(), 6, 8);
       assert.strictEqual(out[0].blockType, "ai_clip");
-      assert.strictEqual(out[1].blockType, "image");
-      // The fill image drops the animation prompt and is flagged as second visual.
-      assert.strictEqual(out[1].animationPrompt, null);
-      assert.strictEqual(out[1].secondVisual, true);
+      for (const p of out.slice(1)) {
+        // Fill images drop the animation prompt and are flagged as second
+        // visuals (slot 2 would carry imagePrompt2 instead, when present).
+        assert.strictEqual(p.blockType, "image");
+        assert.strictEqual(p.animationPrompt, null);
+        assert.strictEqual(p.secondVisual, true);
+      }
+    });
+    test("slot 2 uses imagePrompt2 when present; slots 3+ stay secondVisual", () => {
+      const out = splitByDuration(mk({ imagePrompt2: "a quiet harbor at dawn" }), 6, 8);
+      assert.strictEqual(out[1].imagePrompt, "a quiet harbor at dawn");
+      assert.strictEqual(out[1].secondVisual, false);
+      for (const p of out.slice(2)) {
+        assert.strictEqual(p.imagePrompt, "a busy market street");
+        assert.strictEqual(p.secondVisual, true);
+      }
     });
     test("sub-blocks tile the parent window with no gap/overlap", () => {
       const out = splitByDuration(mk(), 6, 8);
