@@ -291,7 +291,10 @@ const PITCH_TIMELINE_FLAG = "pitch_video";
 /**
  * Insert (or re-position) the sales-pitch video as a single timeline_item near
  * the project's pitch_video_insert_seconds mark, SNAPPED to the nearest segment
- * boundary so it never cuts an avatar part mid-sentence.
+ * boundary so it never cuts an avatar part mid-sentence — and, when that
+ * boundary falls between the two visual pieces of one time-split sentence,
+ * pushed forward past the sentence so the pitch always starts after a full
+ * sentence (client 2026-07-03).
  *
  * Idempotent: keyed on metadata.kind === 'pitch_video', so repeated finalize
  * calls update the one row rather than inserting duplicates. After placing the
@@ -325,7 +328,7 @@ export async function ensurePitchTimelineItem(projectId: string): Promise<void> 
   // column, because the renderer's effective cut is duration-driven.
   const { data: rowsRaw } = await sb
     .from("timeline_items")
-    .select("id, position, duration, synthetic_segment_id, metadata")
+    .select("id, position, duration, synthetic_segment_id, metadata, script_text")
     .eq("project_id", projectId)
     .order("position", { ascending: true });
   const rows = rowsRaw ?? [];
@@ -358,6 +361,22 @@ export async function ensurePitchTimelineItem(projectId: string): Promise<void> 
   if (Math.abs(cum - insertSeconds) < bestDelta) {
     boundaryIndex = segmentRows.length;
   }
+
+  // SENTENCE GUARD (client 2026-07-03): a long sentence is time-split by the
+  // planner into TWO timeline rows (two visuals, one continuous narration), and
+  // both pieces keep the parent's full script. A boundary BETWEEN those pieces
+  // is therefore mid-sentence — the narration pauses for the pitch and the
+  // sentence resumes after it, which sounds broken. Detect it by adjacent rows
+  // carrying identical non-empty script_text, and push the pitch FORWARD to the
+  // first boundary after the sentence completes.
+  const isMidSentence = (i: number): boolean => {
+    if (i <= 0 || i >= segmentRows.length) return false;
+    const prev = ((segmentRows[i - 1].script_text as string | null) ?? "").trim();
+    const next = ((segmentRows[i].script_text as string | null) ?? "").trim();
+    return prev.length > 0 && prev === next;
+  };
+  const rawBoundaryIndex = boundaryIndex;
+  while (isMidSentence(boundaryIndex)) boundaryIndex++;
 
   // Upsert the pitch row.
   const pitchPayload = {
@@ -403,6 +422,9 @@ export async function ensurePitchTimelineItem(projectId: string): Promise<void> 
   await logJob({ projectId }, "synthetic.pitch_video.placed", {
     insertSeconds,
     snappedBoundaryIndex: boundaryIndex,
+    // Non-zero shift = the nearest boundary was inside a time-split sentence
+    // and the pitch was pushed forward past it (sentence guard).
+    sentenceGuardShift: boundaryIndex - rawBoundaryIndex,
     snapDeltaSeconds: Math.round(bestDelta * 100) / 100,
     pitchDurationSeconds: pitchDuration,
     totalRows: orderedIds.length,
