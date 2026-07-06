@@ -9,6 +9,7 @@ import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import {
   claimAccount,
+  countUsableAccounts,
   renewLease,
   releaseAccount,
   saveCookies,
@@ -28,6 +29,7 @@ import {
   endRender,
 } from "@/lib/synthetic/heygen-session";
 import { inspectPage } from "@/lib/synthetic/heygen-health";
+import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
 import {
   HeygenError,
   classifyHeygenFailure,
@@ -62,6 +64,7 @@ import {
   isVisible,
   // Avatar III ("Create new shots") flow + Avatar IV avatar-naming.
   avatarsNavEntry,
+  avatarShotsNavEntry,
   avatarsSearchBox,
   avatarsLoadError,
   firstAvatarTile,
@@ -126,6 +129,12 @@ export interface GenerateAvatarInput {
   // voiceover duration mismatch). When absent, we fall back to the legacy
   // script-text path. `script` is still passed through for diagnostics/billing.
   audioFilePath?: string;
+  // Public URL of the SAME audio slice (it's cached to R2 when staged). Used ONLY
+  // by the API fallback (generateAvatarViaApi), which can pass audio_url directly
+  // instead of re-uploading the bytes as an asset — one fewer API call / failure
+  // point. The browser path ignores this (it uploads the local file). Optional:
+  // when absent the API path falls back to uploading audioFilePath as an asset.
+  audioUrl?: string;
   // Duration (seconds) of the uploaded audio slice, when known. Used for the
   // cost/billing estimate (the render length == this) instead of guessing from
   // the script word count. Ignored on the legacy script path.
@@ -860,107 +869,171 @@ async function driveAvatarIIIComposer(
   // account is kept seeded with at least one avatar for exactly this entry step.
   // (input.heygenAvatarName is now ignored; the intake field is left in place.)
 
-  // 1+2) Open the Avatars grid and pick the FIRST tile (any one) to enter the
-  // composer from — no name search, since the look is replaced with the project
-  // photo below. HeyGen's Avatars grid sometimes fails to load with a transient
-  // "Couldn't load your avatars. Please refresh and try again." (observed 2026-07)
-  // — the account HAS avatars, the API just hiccuped, so NO tile renders. We MUST
-  // distinguish that from a genuinely empty account: on the load-error banner (or
-  // a no-tile timeout) we RELOAD the page and retry a few times before giving up.
-  const tile = firstAvatarTile(p).first();
-  let tileReady = false;
-  for (let attempt = 0; attempt < 4 && !tileReady; attempt++) {
-    // (Re)navigate to the Avatars grid. First attempt is the warm in-SPA nav; a
-    // retry after a load error does a genuine reload to re-fetch the grid.
-    if (attempt === 0) {
-      await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatars`, { waitUntil: "commit" }).catch(() => {});
-      if (!(await isVisible(avatarsSearchBox(p), 8000))) {
-        await clickFirstVisible(avatarsNavEntry(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars nav").catch(() => {});
-      }
-    } else {
-      await p.reload({ waitUntil: "commit" }).catch(() => {});
-    }
-    await waitFirstVisible(avatarsSearchBox(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars search box").catch(() => {});
-
-    // If HeyGen shows the transient load-error banner, this attempt has no tiles —
-    // reload and retry rather than concluding the account is empty.
-    if (await isVisible(avatarsLoadError(p), 2500)) {
-      console.log(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          msg: "synthetic.heygen.avatar3_avatars_load_error",
-          projectId: input.projectId,
-          segmentId: input.segmentId,
-          attempt,
-          note: "'Couldn't load your avatars' — reloading and retrying",
-        }),
-      );
-      await p.waitForTimeout(2500);
-      continue;
-    }
-
-    tileReady = await tile
+  // 1) ENTER THE AVATAR-SHOTS COMPOSER. Two entry paths, tried in order — the
+  // readiness tell for BOTH is the composer's model pill:
+  //
+  //   (A) NEW UI (July-2026 accounts): a dedicated "Avatar Shots" link in the left
+  //       sidebar opens the composer DIRECTLY. On these accounts clicking a tile
+  //       opens the avatar's looks-detail page instead of a ▷ "Create video" menu,
+  //       so the old (B) path can't reach the composer at all.
+  //   (B) OLD UI (pre-July accounts): the composer is reached only via the Avatars
+  //       grid -> hover a tile -> ▷ "Create video with this avatar" -> "Create new
+  //       shots". The sidebar has no "Avatar Shots" link.
+  //
+  // HeyGen rolls its redesign out account-by-account, so both UIs coexist across
+  // our pool. We try the direct sidebar link first (it's the simpler, more stable
+  // path and covers the accounts that were FAILING), and fall back to the tile
+  // dance only if the sidebar link isn't present / doesn't open the composer.
+  const composerReady = (): Promise<boolean> =>
+    avatarModelDropdownTrigger(p)
+      .locator("visible=true")
+      .first()
       .waitFor({ state: "visible", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
       .then(() => true)
       .catch(() => false);
-    // A no-tile timeout might still be a slow/failed grid load — one more reload.
+
+  let inComposer = false;
+
+  // (A) DIRECT SIDEBAR ENTRY. Navigate to the Avatar-Shots page (sidebar link, else
+  // a direct URL) and see if the composer's model pill appears. If it does we're in
+  // — skip the whole tile dance.
+  await clickFirstVisible(avatarShotsNavEntry(p), 8000, "Avatar Shots nav").catch(async () => {
+    // No sidebar link matched — try the stable URL directly (old-UI accounts just
+    // won't render the composer here and we fall through to (B)).
+    await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatar-shots`, { waitUntil: "commit" }).catch(() => {});
+  });
+  inComposer = await composerReady();
+  if (inComposer) {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.avatar3_entry",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        path: "sidebar_avatar_shots",
+      }),
+    );
+  }
+
+  // (B) TILE FALLBACK (old-UI accounts). Only runs if the direct entry didn't land
+  // in the composer. Open the Avatars grid and pick the FIRST tile (any one) to
+  // enter from — no name search, since the look is replaced with the project photo
+  // below. HeyGen's grid sometimes fails to load with a transient "Couldn't load
+  // your avatars. Please refresh and try again." (the account HAS avatars, the API
+  // just hiccuped), so on that banner (or a no-tile timeout) we RELOAD and retry a
+  // few times before giving up.
+  if (!inComposer) {
+    const tile = firstAvatarTile(p).first();
+    let tileReady = false;
+    for (let attempt = 0; attempt < 4 && !tileReady; attempt++) {
+      // (Re)navigate to the Avatars grid. First attempt is the warm in-SPA nav; a
+      // retry after a load error does a genuine reload to re-fetch the grid.
+      if (attempt === 0) {
+        await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatars`, { waitUntil: "commit" }).catch(() => {});
+        if (!(await isVisible(avatarsSearchBox(p), 8000))) {
+          await clickFirstVisible(avatarsNavEntry(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars nav").catch(() => {});
+        }
+      } else {
+        await p.reload({ waitUntil: "commit" }).catch(() => {});
+      }
+      await waitFirstVisible(avatarsSearchBox(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatars search box").catch(() => {});
+
+      // If HeyGen shows the transient load-error banner, this attempt has no tiles —
+      // reload and retry rather than concluding the account is empty.
+      if (await isVisible(avatarsLoadError(p), 2500)) {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            msg: "synthetic.heygen.avatar3_avatars_load_error",
+            projectId: input.projectId,
+            segmentId: input.segmentId,
+            attempt,
+            note: "'Couldn't load your avatars' — reloading and retrying",
+          }),
+        );
+        await p.waitForTimeout(2500);
+        continue;
+      }
+
+      tileReady = await tile
+        .waitFor({ state: "visible", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
+        .then(() => true)
+        .catch(() => false);
+      // A no-tile timeout might still be a slow/failed grid load — one more reload.
+      if (!tileReady) {
+        await p.waitForTimeout(2000);
+      }
+    }
     if (!tileReady) {
-      await p.waitForTimeout(2000);
+      // Persisted past retries: neither the direct sidebar entry NOR a tile is
+      // available — the grid keeps failing to load, or this account genuinely has
+      // no seed avatar. Surface both possibilities; the caller rotates.
+      await captureDiagnostics(p, input.jobId, "avatar_iii_no_avatar_tile");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: could not enter the Avatar-Shots composer for Avatar III — the direct " +
+          "'Avatar Shots' entry did not open the composer AND no avatar tile is available " +
+          "on the Avatars page (grid failed to load, or the account is missing its seed avatar)",
+      );
     }
-  }
-  if (!tileReady) {
-    // Persisted past retries: either the grid keeps failing to load, or this
-    // account genuinely has no seed avatar. Surface both possibilities; the caller
-    // rotates to another account (which should hold its own seed avatar).
-    await captureDiagnostics(p, input.jobId, "avatar_iii_no_avatar_tile");
-    throw new HeygenError(
-      "ui_changed",
-      "heygen: no avatar tile available on the Avatars page for Avatar III after retries — " +
-        "either HeyGen's avatar grid failed to load ('Couldn't load your avatars') or this " +
-        "account is missing its seed avatar",
+    await shot(p, input.projectId, input.segmentId, "avatar3_tile");
+
+    // Hover the tile to reveal its actions, click the ▷ "Create video with this
+    // avatar" icon, then "Create new shots" in the menu it opens.
+    //
+    // The tile also has a "..." more-menu (Edit/Share/Delete/Copy Identity) and a
+    // ♡ favorite icon right next to the ▷. A mis-click on "..." opens the WRONG
+    // menu (no "Create new shots"), so we VERIFY the right menu appeared and retry
+    // the ▷ if the "..." menu opened instead — closing it first with Escape.
+    let menuOpen = false;
+    for (let attempt = 0; attempt < 3 && !menuOpen; attempt++) {
+      await tile.hover().catch(() => {});
+      await clickFirstVisible(
+        createVideoWithAvatarButton(tile),
+        e.HEYGEN_SETUP_TIMEOUT_MS,
+        "Create video with this avatar",
+      ).catch(() => {});
+      // Wait for EITHER the right item or the wrong "..." menu to resolve.
+      menuOpen = await createNewShotsMenuItem(p)
+        .locator("visible=true")
+        .first()
+        .waitFor({ state: "visible", timeout: 6000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!menuOpen && (await isVisible(avatarMoreMenuOpen(p), 1500))) {
+        // We opened the "..." menu by mistake — dismiss it and retry the ▷.
+        await p.keyboard.press("Escape").catch(() => {});
+        await p.waitForTimeout(400);
+      }
+    }
+    if (!menuOpen) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_create_menu_not_open");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: the avatar tile's 'Create video' menu (with 'Create new shots') never opened",
+      );
+    }
+    await clickFirstVisible(createNewShotsMenuItem(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Create new shots");
+
+    // Wait for the Avatar-Shots composer (the model pill is the readiness tell).
+    inComposer = await composerReady();
+    if (!inComposer) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_composer_not_ready");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: Avatar Shots model pill never appeared",
+      );
+    }
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.avatar3_entry",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        path: "tile_create_new_shots",
+      }),
     );
   }
-  await shot(p, input.projectId, input.segmentId, "avatar3_tile");
-
-  // 3) Hover the tile to reveal its actions, click the ▷ "Create video with this
-  // avatar" icon, then "Create new shots" in the menu it opens.
-  //
-  // The tile also has a "..." more-menu (Edit/Share/Delete/Copy Identity) and a
-  // ♡ favorite icon right next to the ▷. A mis-click on "..." opens the WRONG
-  // menu (no "Create new shots"), so we VERIFY the right menu appeared and retry
-  // the ▷ if the "..." menu opened instead — closing it first with Escape.
-  let menuOpen = false;
-  for (let attempt = 0; attempt < 3 && !menuOpen; attempt++) {
-    await tile.hover().catch(() => {});
-    await clickFirstVisible(
-      createVideoWithAvatarButton(tile),
-      e.HEYGEN_SETUP_TIMEOUT_MS,
-      "Create video with this avatar",
-    ).catch(() => {});
-    // Wait for EITHER the right item or the wrong "..." menu to resolve.
-    menuOpen = await createNewShotsMenuItem(p)
-      .locator("visible=true")
-      .first()
-      .waitFor({ state: "visible", timeout: 6000 })
-      .then(() => true)
-      .catch(() => false);
-    if (!menuOpen && (await isVisible(avatarMoreMenuOpen(p), 1500))) {
-      // We opened the "..." menu by mistake — dismiss it and retry the ▷.
-      await p.keyboard.press("Escape").catch(() => {});
-      await p.waitForTimeout(400);
-    }
-  }
-  if (!menuOpen) {
-    await captureDiagnostics(p, input.jobId, "avatar_iii_create_menu_not_open");
-    throw new HeygenError(
-      "ui_changed",
-      "heygen: the avatar tile's 'Create video' menu (with 'Create new shots') never opened",
-    );
-  }
-  await clickFirstVisible(createNewShotsMenuItem(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Create new shots");
-
-  // 4) Wait for the Avatar-Shots composer (the model pill is the readiness tell).
-  await waitFirstVisible(avatarModelDropdownTrigger(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Avatar Shots model pill");
   await shot(p, input.projectId, input.segmentId, "avatar3_composer");
 
   // 5) MODEL + LOOK are COUPLED on this HeyGen build — setting one RESETS the
@@ -1990,6 +2063,54 @@ export async function attemptOnAccount(
   // (closeWarmSession) or when a session_expired invalidation rebuilds it.
 }
 
+// Attempt the OFFICIAL HeyGen API path for this clip. Shared by the two triggers
+// that route here: the EARLY speed switch (mid-rotation, once the 2-tries or
+// 30-min threshold fires) and the original pool-exhausted last resort. Returns
+// the result on success, or null when the API path is not applicable (flag/key
+// off, avatar_iii, or no sliced audio) OR the API render itself failed — the
+// caller then continues the browser rotation / throws the original error. Never
+// throws: an API failure must not mask the underlying browser error.
+async function tryApiFallback(
+  input: GenerateAvatarInput,
+  imageBytes: Buffer,
+  reason: string,
+): Promise<GenerateAvatarResult | null> {
+  // Scope guard: talking-photo (Avatar IV) driven by the sliced audio only —
+  // NOT Avatar III (different API surface) and NOT script/TTS. On any of those,
+  // or if the flag/key is unset, the API path is unavailable → return null.
+  if (
+    !heygenApiFallbackEnabled() ||
+    input.avatarModel === "avatar_iii" ||
+    (!input.audioUrl && !input.audioFilePath)
+  ) {
+    return null;
+  }
+  try {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "heygen.api_fallback.attempt",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        reason,
+      }),
+    );
+    return await generateAvatarViaApi(input, imageBytes);
+  } catch (apiErr) {
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "heygen.api_fallback.failed",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        reason,
+        err: (apiErr as Error)?.message?.slice(0, 200),
+      }),
+    );
+    return null;
+  }
+}
+
 /**
  * Generate an avatar video, rotating through the account pool on failure. Each
  * account gets one attempt; the FAILURE CLASS decides what happens to it:
@@ -1997,15 +2118,23 @@ export async function attemptOnAccount(
  *   - rate_limit/credit -> cooldown
  *   - ui_changed/selector/network -> rotate with NO penalty (not the account's
  *     fault — surfaced via last_error_class + diagnostics instead)
- * then the next available account is tried, up to `maxAccounts`. Throws when
- * the pool is exhausted or none succeed — the avatar processor decides how to
+ * then the next available account is tried, up to `maxAccounts`. When
+ * `maxAccounts` is omitted it defaults to the WHOLE usable pool
+ * (countUsableAccounts) so rotation tries EVERY account before failing — adding a
+ * 4th/5th account is picked up automatically, no code change. Throws when the
+ * pool is exhausted or none succeed — the avatar processor decides how to
  * degrade.
  */
 export async function generateAvatar(
   input: GenerateAvatarInput,
   imageBytes: Buffer,
-  maxAccounts = 3,
+  maxAccounts?: number,
 ): Promise<GenerateAvatarResult> {
+  // Default the rotation cap to the full usable pool so we never stop short of an
+  // account that WOULD succeed (the "only 3 of 4 tried" gap). An explicit
+  // maxAccounts (e.g. the debug script's 1) still wins.
+  const rotationCap = maxAccounts ?? (await countUsableAccounts());
+
   // Anti-bot pacing: space serial avatar jobs apart so a back-to-back burst
   // doesn't trip HeyGen's Cloudflare protection (which kills the session).
   const spacingMs = env().HEYGEN_JOB_SPACING_SECONDS * 1000;
@@ -2029,6 +2158,18 @@ export async function generateAvatar(
     );
   }
 
+  // SPEED SWITCH thresholds (client 2026-07-06): route to the API EARLY — before
+  // the whole pool exhausts — once either fires. A failed account count of 0 or a
+  // minutes of 0 disables that trigger. Both are inert unless the API fallback is
+  // enabled + configured (heygenApiFallbackEnabled), so production is unchanged
+  // until the key + flag are set.
+  const switchAfterAccounts = env().HEYGEN_API_SWITCH_AFTER_ACCOUNTS;
+  const switchAfterMs = env().HEYGEN_API_SWITCH_AFTER_MINUTES * 60_000;
+  const clipStartMs = Date.now();
+  // Reason recorded when an early switch fires, so the loop can attempt the API
+  // after releasing the account (mirrors the pool-exhausted path's ordering).
+  let earlySwitchReason: string | null = null;
+
   let lastErr: unknown;
   try {
     // NEVER degrade an audio-driven job to the script (HeyGen TTS) path. The audio
@@ -2044,7 +2185,7 @@ export async function generateAvatar(
     // render. `forceScriptPath` is left false on every attempt for audio-driven
     // jobs; it stays available only for genuinely script-only inputs (no
     // audioFilePath), which were never audio-driven to begin with.
-    for (let i = 0; i < maxAccounts; i++) {
+    for (let i = 0; i < rotationCap; i++) {
       // Extend the lease before each attempt so a multi-minute render can't lapse
       // it and let a peer job claim the same account mid-render.
       await renewLease(account, leaseSeconds).catch(() => {});
@@ -2071,6 +2212,25 @@ export async function generateAvatar(
         await releaseAccount(attemptAccount).catch(() => {});
         if (!next) break; // pool exhausted
         account = next;
+
+        // EARLY SPEED SWITCH. Only when the API path is actually usable — no point
+        // aborting the browser rotation for an API that would no-op. `i` is
+        // 0-indexed, so after the (i+1)-th failure `i + 1` browser accounts have
+        // failed. When the client's "after N tries" or "after M minutes" threshold
+        // is crossed, stop rotating and hand this clip to the API instead of
+        // grinding through the remaining accounts (and the outer BullMQ retries).
+        if (heygenApiFallbackEnabled()) {
+          const accountsFailed = i + 1;
+          const elapsedMs = Date.now() - clipStartMs;
+          const countHit = switchAfterAccounts > 0 && accountsFailed >= switchAfterAccounts;
+          const timeHit = switchAfterMs > 0 && elapsedMs >= switchAfterMs;
+          if (countHit || timeHit) {
+            earlySwitchReason = countHit
+              ? `speed switch: ${accountsFailed} browser account(s) failed (>= ${switchAfterAccounts})`
+              : `speed switch: ${Math.round(elapsedMs / 60_000)} min elapsed (>= ${env().HEYGEN_API_SWITCH_AFTER_MINUTES})`;
+            break;
+          }
+        }
       } finally {
         endRender(attemptAccount.id);
       }
@@ -2083,8 +2243,26 @@ export async function generateAvatar(
     // safe to call unconditionally.
     await releaseAccount(account).catch(() => {});
   }
+
+  // API FALLBACK (now reachable two ways, both released the account in the finally
+  // above so the API never runs on top of a held browser lease):
+  //   * EARLY SPEED SWITCH — a trigger fired mid-rotation (client's "after 2 tries
+  //     / after 30 min" rule); switch instead of exhausting the pool + BullMQ
+  //     retries. This is the fast-recovery path for the "temporarily unavailable"
+  //     account failures that fail in seconds.
+  //   * LAST RESORT — the browser pool exhausted with no early trigger; produce a
+  //     clip that would otherwise HARD-FAIL.
+  // Both bill API credits (pricier than the browser renders), so tryApiFallback is
+  // a no-op unless enabled + configured, avatar_iv, and audio-driven. On an API
+  // failure it returns null and we fall through to the original error below.
+  const apiReason =
+    earlySwitchReason ??
+    `pool exhausted: ${(lastErr as Error)?.message?.slice(0, 200) ?? "unknown"}`;
+  const apiResult = await tryApiFallback(input, imageBytes, apiReason);
+  if (apiResult) return apiResult;
+
   throw new Error(
-    `heygen: avatar generation failed across ${maxAccounts} account(s): ${(lastErr as Error)?.message ?? "unknown"}`,
+    `heygen: avatar generation failed across ${rotationCap} account(s): ${(lastErr as Error)?.message ?? "unknown"}`,
   );
 }
 

@@ -21,6 +21,7 @@ export type HeygenErrorClass =
   | "rate_limit"         // throttled — back off and rotate
   | "credit_exhausted"   // quota/credit wall — this account can't produce more right now
   | "network"            // proxy/network/navigation error
+  | "proxy_dead"         // the account's proxy refused/failed to connect at browser launch
   | "unknown";
 
 // What to do with the CURRENT account when a failure of this class occurs.
@@ -47,6 +48,15 @@ export const DISPOSITION_BY_CLASS: Record<HeygenErrorClass, HeygenDisposition> =
   rate_limit: "cooldown",
   credit_exhausted: "cooldown",
   network: "rotate",
+  // A DEAD PROXY is account-scoped and PERSISTENT (unlike a one-off navigation
+  // blip): the browser can't even connect through this account's fixed exit IP,
+  // and every retry on it burns a full launch timeout. Left as "rotate" the
+  // account keeps coming back (LRU) and re-failing, chewing through the rotation
+  // budget until real blocks hard-fail. Cool it down so it drops out of rotation
+  // fast and the pool converges on accounts whose proxies actually work; it
+  // auto-reactivates after the cooldown window (in case the proxy recovers), and
+  // the last_error_class=proxy_dead column flags it for a proxy swap.
+  proxy_dead: "cooldown",
   // An UNKNOWN failure is, by definition, not confirmed to be the account's
   // fault — cooling the account down on it strands small pools (one mystery
   // failure => "no available accounts"). Rotate with no penalty instead; the
@@ -99,6 +109,10 @@ export function userFacingMessage(e: unknown): string {
       return "Avatar generation is temporarily at capacity. Please try again later.";
     case "rate_limit":
       return "Too many avatar requests right now. Please wait a moment and try again.";
+    case "proxy_dead":
+      // Infrastructure-side; the admin sees proxy_dead in last_error_class and
+      // swaps the proxy. Nothing the end user can do beyond retry.
+      return "Avatar generation is temporarily unavailable. The administrator has been notified — please try again shortly.";
     case "ui_changed":
     case "blank_composer":
     case "selector_failure":
@@ -164,6 +178,18 @@ export async function classifyHeygenFailure(
   if (RATE_TEXT.test(errMsg)) return "rate_limit";
   if (/timeout|waiting for selector|no on-screen|not found|not visible|locator/i.test(errMsg)) {
     return "selector_failure";
+  }
+  // A DEAD PROXY (as opposed to a transient navigation blip) surfaces at browser
+  // launch as a proxy-tunnel/connection failure. These specific signatures mean
+  // the account's fixed exit IP is unreachable — it will fail EVERY attempt, so
+  // it must cool the account down (proxy_dead), not merely rotate. Checked before
+  // the broad `network` catch, which stays "rotate" for genuine one-off blips.
+  if (
+    /ERR_PROXY_CONNECTION_FAILED|ERR_TUNNEL_CONNECTION_FAILED|NS_ERROR_PROXY_CONNECTION_REFUSED|ERR_PROXY_AUTH|ERR_NO_SUPPORTED_PROXIES|ERR_SOCKS_CONNECTION_FAILED|proxy connection|tunnel connection failed/i.test(
+      errMsg,
+    )
+  ) {
+    return "proxy_dead";
   }
   if (/net::|proxy|ERR_|navigat|ECONN|ETIMEDOUT|socket/i.test(errMsg)) {
     return "network";

@@ -45,7 +45,12 @@ export interface ScriptClipJobData { projectId: string; mediaJobId: string; mark
 // --- synthetic engine job payloads ---
 // Each stays small: the processor re-reads the project / segment row by id, so
 // retries never depend on stale data pickled into the queue payload.
-export interface TtsJobData              { projectId: string; mediaJobId: string; }
+// voiceoverOnly: regenerate JUST the master voiceover + realignment and STOP —
+// do NOT enqueue the planner (which would wipe + rebuild synthetic_segments).
+// Used by the "Regenerate voiceover" action on a project whose assets are
+// already generated (e.g. to replace a corrupted 69labs voiceover) so the 200+
+// existing images/clips/avatars are preserved.
+export interface TtsJobData              { projectId: string; mediaJobId: string; voiceoverOnly?: boolean; }
 export interface SyntheticPlannerJobData { projectId: string; mediaJobId: string; }
 // One job per synthetic_segments row. segmentId is the unit of work; the
 // processor reads its block_type, prompts and timings from the row.

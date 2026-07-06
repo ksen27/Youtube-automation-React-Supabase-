@@ -95,7 +95,7 @@ async function generateVoiceQC(
 // enqueued. Idempotent on retry: TTS regenerates from the transcript and
 // alignment is recomputed.
 export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo): Promise<void> {
-  const { projectId, mediaJobId } = data;
+  const { projectId, mediaJobId, voiceoverOnly } = data;
   const sb = getServerSupabase();
 
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
@@ -152,6 +152,20 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
     source: project.voiceover_source,
   });
   await setMediaJob(mediaJobId, { status: "completed", progress: 100 });
+
+  // Voiceover-only regenerate (e.g. replacing a corrupted 69labs voiceover on an
+  // already-generated project): STOP here. Re-running the planner would delete +
+  // rebuild synthetic_segments and throw away every existing image/clip/avatar.
+  // The new voiceover + realignment are persisted above; the user re-renders to
+  // pick them up. NOTE: existing segment TIMINGS were planned against the OLD
+  // voiceover, so if 69labs paces the new take differently the timeline may drift
+  // slightly — a full re-plan (not this path) is the fix for that, at the cost of
+  // regenerating all assets.
+  if (voiceoverOnly) {
+    await logJob({ projectId, jobId: mediaJobId }, "synthetic.tts.voiceover_only_done", {});
+    await setProjectStatus(projectId, "completed");
+    return;
+  }
 
   // --- enqueue the planner (STEP 4) ---
   const plannerJobId = await createMediaJob({ projectId, type: "plan_synthetic" });

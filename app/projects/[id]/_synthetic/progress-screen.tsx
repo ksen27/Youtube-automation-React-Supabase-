@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { StepCard, type StepState } from "@/components/ui/step-card";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -102,11 +102,15 @@ export function SyntheticProgressScreen({
         </Button>
       </div>
 
-      {/* Generated voiceover — listen to verify it before assets generate. */}
+      {/* Generated voiceover — listen to verify it before assets generate, and
+          regenerate it (keeping existing assets) if 69labs produced a corrupted
+          / low-volume take. */}
       {resp.project.voiceover_url && (
         <VoiceoverPlayer
+          projectId={projectId}
           url={resp.project.voiceover_url}
           durationSeconds={resp.project.voiceover_duration_seconds}
+          onChange={onChange}
         />
       )}
 
@@ -150,8 +154,46 @@ export function SyntheticProgressScreen({
 }
 
 // Inline player for the generated master voiceover, so the user can listen and
-// verify it before assets are generated (or download it).
-function VoiceoverPlayer({ url, durationSeconds }: { url: string; durationSeconds: number | null }) {
+// verify it before assets are generated (or download it). Also exposes a
+// "Regenerate voiceover" action: 69labs occasionally renders a stretch of a long
+// voiceover at the wrong voice / a dropped volume (a provider defect baked into
+// the audio). This re-runs ONLY the TTS + alignment — the existing images/clips/
+// avatars are kept — so a corrupted voiceover can be replaced without redoing the
+// whole (expensive) asset generation. The user re-renders afterward to pick it up.
+function VoiceoverPlayer({
+  projectId, url, durationSeconds, onChange,
+}: {
+  projectId: string;
+  url: string;
+  durationSeconds: number | null;
+  onChange: () => void;
+}) {
+  const [regenerating, setRegenerating] = useState(false);
+
+  async function regenerate() {
+    if (regenerating) return;
+    if (!window.confirm(
+      "Regenerate the voiceover? This re-runs the 69labs TTS (keeping your existing images/clips/avatars). "
+      + "Use this if the voiceover has a corrupted or low-volume section. You'll need to re-render afterward."
+    )) return;
+    setRegenerating(true);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/synthetic/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ step: "voiceover_only" }),
+      });
+      if (!res.ok) {
+        const msg = await res.json().catch(() => ({}));
+        window.alert(`Could not start regeneration: ${msg?.error ?? res.statusText}`);
+        return;
+      }
+      onChange();
+    } finally {
+      setRegenerating(false);
+    }
+  }
+
   return (
     <Card>
       <CardContent className="p-3 space-y-2">
@@ -163,9 +205,21 @@ function VoiceoverPlayer({ url, durationSeconds }: { url: string; durationSecond
               {Math.floor(durationSeconds / 60)}:{String(durationSeconds % 60).padStart(2, "0")}
             </span>
           )}
-          <a href={url} download className="ml-auto text-[11px] text-brand-300 hover:underline inline-flex items-center gap-1">
-            <Download className="h-3.5 w-3.5" /> Download
-          </a>
+          <div className="ml-auto flex items-center gap-3">
+            <button
+              type="button"
+              onClick={regenerate}
+              disabled={regenerating}
+              className="text-[11px] text-brand-300 hover:underline inline-flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Re-run 69labs TTS, keeping existing assets — for a corrupted/low-volume voiceover"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${regenerating ? "animate-spin" : ""}`} />
+              {regenerating ? "Regenerating…" : "Regenerate voiceover"}
+            </button>
+            <a href={url} download className="text-[11px] text-brand-300 hover:underline inline-flex items-center gap-1">
+              <Download className="h-3.5 w-3.5" /> Download
+            </a>
+          </div>
         </div>
         <audio src={url} controls preload="metadata" className="w-full h-9" />
       </CardContent>

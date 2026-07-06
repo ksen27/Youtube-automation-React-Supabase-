@@ -3,15 +3,17 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
-import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot } from "lucide-react";
+import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// Two top-level products live in this one app:
+// Three top-level products live in this one app:
 //   Celebrity Videos — the sourced engine (edit real YouTube footage) at /dashboard
 //   AI Avatar        — the synthetic engine (AI-generated avatar videos) at /avatar
+//   Thumbnails       — YouTube thumbnail generation (Pikzels) at /thumbnails
 const NAV = [
   { href: "/dashboard", label: "Celebrity Videos", icon: FolderClosed },
   { href: "/avatar", label: "AI Avatar", icon: Bot },
+  { href: "/thumbnails", label: "Thumbnails", icon: ImageIcon },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

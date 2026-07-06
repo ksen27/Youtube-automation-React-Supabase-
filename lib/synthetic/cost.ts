@@ -15,7 +15,8 @@ export type SyntheticProvider =
   | "ltx2"
   | "fal_veo3_fast"
   | "fal_kling"
-  | "heygen_avatar";
+  | "heygen_avatar"
+  | "heygen_api";
 
 // Rough per-unit USD price list. Tunable here as provider pricing changes;
 // kept in code (not env) so a missing override can't silently zero out costs.
@@ -31,6 +32,11 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   fal_veo3_fast:   { unit: "per_second",   usd: 0.10 },
   fal_kling:       { unit: "per_second",   usd: 0.06 },
   heygen_avatar:   { unit: "per_second",   usd: 0.02 },
+  // The official HeyGen API (last-resort fallback when browser automation fails).
+  // Bills API credits, which are MORE expensive than the interactive-plan renders
+  // the browser automation drives — hence "last resort". Rate is an estimate;
+  // tune when the client's API plan pricing is known.
+  heygen_api:      { unit: "per_second",   usd: 0.10 },
 };
 
 export interface CostInput {

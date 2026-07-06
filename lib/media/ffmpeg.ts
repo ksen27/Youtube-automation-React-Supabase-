@@ -1178,38 +1178,47 @@ export async function detectLoudnessDropout(opts: {
 }): Promise<LoudnessDropout> {
   const env = getEnv();
   const empty: LoudnessDropout = { dropout: false, medianLufs: -Infinity, worstSpan: null, samples: 0 };
-  let stderr: string;
+
+  // ebur128 prints a per-frame CONTINUOUS readout to stderr — one line every
+  // ~100ms carrying `t:` (seconds) and `M:` (momentary LUFS). We must NOT pass
+  // -nostats (it suppresses exactly these lines, leaving only the end Summary →
+  // zero samples). A 22-min track emits ~13k lines (~1.2MB) — far past
+  // runFFmpegCaptureStderr's 32KB tail window, which would keep only the last
+  // ~30s. So we stream stderr ourselves and parse each line as it arrives,
+  // keeping only the parsed {t, m} floats (13k numbers ≈ negligible memory).
+  //
+  // Parse `t: <sec>` and `M: <lufs>` per line. ffmpeg prints both spaced
+  // (`M: -15.9`) and unspaced (`M:-120.7`, true silence). Silence samples are
+  // dropped from the median (they're gaps, not voice) but still break a span.
+  const samples: Array<{ t: number; m: number }> = [];
   try {
-    // ebur128 with metadata=1 prints per-frame `t:` (seconds) and `M:` (momentary
-    // LUFS) lines to stderr. -f null discards the (unused) audio output; the scan
-    // just reads the log. Timeout is generous — a 30-min track scans in real-ish
-    // time but far under this ceiling.
-    stderr = await runFFmpegCaptureStderr(
-      env.FFMPEG_PATH,
-      ["-nostats", "-i", opts.inputPath, "-af", "ebur128=metadata=1", "-f", "null", "-"],
-      opts.signal,
-      600,
-    );
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(env.FFMPEG_PATH, ["-i", opts.inputPath, "-af", "ebur128", "-f", "null", "-"], { stdio: ["ignore", "ignore", "pipe"] });
+      let buf = "";
+      const timer = setTimeout(() => child.kill("SIGKILL"), 600_000);
+      const lineRe = /t:\s*([\d.]+).*?M:\s*(-?[\d.]+)/;
+      child.stderr.on("data", (c: Buffer) => {
+        buf += c.toString();
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          const mm = lineRe.exec(line);
+          if (mm) {
+            const t = Number(mm[1]);
+            const m = Number(mm[2]);
+            if (Number.isFinite(t) && Number.isFinite(m)) samples.push({ t, m });
+          }
+        }
+      });
+      child.on("error", (err) => { clearTimeout(timer); reject(err); });
+      child.on("close", () => { clearTimeout(timer); resolve(); });
+      opts.signal?.addEventListener("abort", () => { clearTimeout(timer); child.kill("SIGKILL"); });
+    });
   } catch {
     return empty;
   }
 
-  // Parse `t: <sec>` and `M: <lufs>` pairs. They appear on consecutive lines per
-  // frame; pair each M with the most recent t. ebur128 emits M:-120.7 for true
-  // silence — those samples are dropped from the median (they're gaps, not the
-  // voice level) but still count against a span only via the below-median test.
-  const samples: Array<{ t: number; m: number }> = [];
-  let lastT = 0;
-  const lineRe = /t:\s*([\d.]+)|M:\s*(-?[\d.]+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = lineRe.exec(stderr)) !== null) {
-    if (match[1] !== undefined) {
-      lastT = Number(match[1]);
-    } else if (match[2] !== undefined) {
-      const m = Number(match[2]);
-      if (Number.isFinite(m)) samples.push({ t: lastT, m });
-    }
-  }
   if (samples.length === 0) return empty;
 
   // Median of the VOICED samples (drop near-silence so pauses don't drag the

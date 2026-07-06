@@ -612,6 +612,21 @@ export function avatarsNavEntry(page: Page): Locator {
     .or(page.locator('a[href*="/avatar/avatars"], a[href*="/my-avatars"]'));
 }
 
+// Left-nav "Avatar Shots" entry (under "Avatar videos"). NEW-UI accounts (HeyGen
+// rolls its redesign out account-by-account; our July-2026 signups got it, the
+// June ones did not) expose the Avatar-Shots composer DIRECTLY from this sidebar
+// link — the old "hover a tile -> ▷ Create video -> Create new shots" path no
+// longer reaches it on those accounts (clicking a tile opens the avatar's
+// looks-detail page instead). So we prefer this direct link and fall back to the
+// tile path for old-UI accounts. Match the exact "Avatar Shots" label and the
+// stable /avatar/avatar-shots href.
+export function avatarShotsNavEntry(page: Page): Locator {
+  return page
+    .getByRole("link", { name: /^avatar shots$/i })
+    .or(page.getByRole("button", { name: /^avatar shots$/i }))
+    .or(page.locator('a[href*="/avatar/avatar-shots"], a[href*="/avatar-shots"]'));
+}
+
 // The search box on the Avatars page ("Search"). Used to filter the grid to the
 // project's saved avatar by name.
 export function avatarsSearchBox(page: Page): Locator {

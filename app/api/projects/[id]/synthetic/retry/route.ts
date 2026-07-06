@@ -16,7 +16,13 @@ export const dynamic = "force-dynamic";
 //   voiceover -> re-enqueue the TTS job (regenerates audio + alignment, then
 //                the planner runs and stops at the review gate)
 //   planner   -> re-enqueue just the planner (voiceover already succeeded)
-const Body = z.object({ step: z.enum(["voiceover", "planner"]) });
+// step:
+//   voiceover      -> re-run TTS + alignment, THEN re-plan (rebuilds segments).
+//                     For a FAILED early pipeline (assets not yet generated).
+//   voiceover_only -> re-run ONLY TTS + alignment; keep existing segments/assets
+//                     (replace a corrupted voiceover on a finished project).
+//   planner        -> re-enqueue just the planner (voiceover already succeeded).
+const Body = z.object({ step: z.enum(["voiceover", "voiceover_only", "planner"]) });
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -40,7 +46,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // Mark any in-flight TTS/planner job for THIS step as failed first, so a
   // stuck/orphaned job (e.g. left queued from earlier debugging) can't block a
   // legitimate retry with a 409. This makes Re-plan/Retry always actionable.
-  const jobType = body.data.step === "voiceover" ? "tts" : "plan_synthetic";
+  const jobType = body.data.step === "planner" ? "plan_synthetic" : "tts";
   await sb
     .from("media_jobs")
     .update({ status: "failed", error: "superseded by retry" })
@@ -48,17 +54,21 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     .eq("type", jobType)
     .in("status", ["queued", "running"]);
 
-  if (body.data.step === "voiceover") {
+  if (body.data.step === "voiceover" || body.data.step === "voiceover_only") {
+    const voiceoverOnly = body.data.step === "voiceover_only";
     // Re-read the resolved voiceover source so the retried job behaves the same.
     const { data: project } = await sb
       .from("projects").select("voiceover_source").eq("id", id).single();
     const mediaJobId = await createMediaJob({
       projectId: id, type: "tts",
-      metadata: { voiceoverSource: project?.voiceover_source ?? null, retry: true },
+      metadata: { voiceoverSource: project?.voiceover_source ?? null, retry: true, voiceoverOnly },
     });
-    await enqueueTts({ projectId: id, mediaJobId });
+    // voiceoverOnly skips the planner re-run in the TTS processor, so existing
+    // segments/assets are preserved — nothing here touches synthetic_segments or
+    // timeline_items (unlike the planner branch below).
+    await enqueueTts({ projectId: id, mediaJobId, voiceoverOnly });
     await setProjectStatus(id, "voiceover");
-    return NextResponse.json({ ok: true, media_job_id: mediaJobId, step: "voiceover" }, { status: 202 });
+    return NextResponse.json({ ok: true, media_job_id: mediaJobId, step: body.data.step }, { status: 202 });
   }
 
   // planner retry / re-plan. Also clear any in-flight ASSET jobs + their

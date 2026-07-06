@@ -13,6 +13,7 @@
     "heygen:keepalive": "tsx scripts/heygen-keepalive.ts",
     "heygen:reactivate": "tsx scripts/heygen-reactivate.ts",
     "heygen:status": "tsx scripts/heygen-status.ts",
+    "heygen:api-test": "tsx scripts/heygen-api-test.ts",
     "heygen:stop": "tsx scripts/heygen-stop.ts",
     "heygen:debug-gen": "tsx scripts/heygen-debug-gen.ts",
     "heygen:debug-audio": "tsx scripts/heygen-debug-audio.ts",

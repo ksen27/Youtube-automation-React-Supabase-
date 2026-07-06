@@ -186,6 +186,25 @@ export async function claimedAccountIds(): Promise<Set<string>> {
 }
 
 /**
+ * How many accounts are POTENTIALLY usable for a render right now — 'active' or
+ * 'cooldown' (a cooled-down account can reactivate the moment its window elapses,
+ * which claimAccount does opportunistically). needs_reauth / disabled accounts
+ * can't render, so they're excluded. generateAvatar() uses this as its default
+ * rotation cap so it tries EVERY usable account (not a hardcoded 3) before giving
+ * up — add a 4th/5th account and rotation covers it automatically. Falls back to
+ * 1 on a query error (never 0: the caller still gets one claim attempt).
+ */
+export async function countUsableAccounts(): Promise<number> {
+  const sb = getServerSupabase();
+  const { count, error } = await sb
+    .from("heygen_accounts")
+    .select("id", { count: "exact", head: true })
+    .in("status", ["active", "cooldown"]);
+  if (error || count == null) return 1;
+  return Math.max(1, count);
+}
+
+/**
  * All accounts that currently hold a live session worth keeping warm — 'active'
  * or 'cooldown' (a cooled-down account is still authenticated, just resting).
  * needs_reauth / disabled accounts have nothing to refresh, so they're excluded.

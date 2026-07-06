@@ -265,6 +265,73 @@ async function main() {
     });
   }
 
+  console.log("split_2 duration cap");
+  {
+    const { capSplit2Duration, firstSentenceEnd } = await import("@/lib/synthetic/planner");
+    const script =
+      "Here is what the executives demanded. The engine must produce more power. " +
+      "It must tow more weight. It must fit a smaller bay. And it must be cheaper.";
+    const mk = (over: Partial<Record<string, unknown>> = {}) => ({
+      position: 0,
+      blockType: "split_2" as const,
+      startTime: 10,
+      endTime: 48,
+      duration: 38,
+      script,
+      imagePrompt: "a modern ute towing a large caravan",
+      animationPrompt: null,
+      ...over,
+    });
+
+    test("firstSentenceEnd finds the first internal boundary", () => {
+      assert.strictEqual(firstSentenceEnd("Hello there. And more."), "Hello there.".length);
+      // A single sentence (terminator only at the very end) has no INTERNAL boundary.
+      assert.strictEqual(firstSentenceEnd("Just one sentence."), -1);
+      assert.strictEqual(firstSentenceEnd("no terminator at all"), -1);
+    });
+    test("an over-long split_2 carves into first-sentence split_2 + image remainder", () => {
+      // The screenshot bug: a 38s five-sentence split_2 held one still for 38s.
+      const { segments, carved, demoted, regen } = capSplit2Duration([mk()], 12);
+      assert.strictEqual(carved, 1);
+      assert.strictEqual(demoted, 0);
+      assert.strictEqual(segments.length, 2);
+      assert.strictEqual(segments[0].blockType, "split_2");
+      assert.strictEqual(segments[0].script, "Here is what the executives demanded.");
+      assert.ok(segments[0].duration <= 12, `head still ${segments[0].duration}s over cap`);
+      assert.strictEqual(segments[1].blockType, "image");
+      assert.ok(segments[1].script.startsWith("The engine must"));
+      // Both pieces need a prompt regen (the inherited prompt described the whole passage).
+      assert.strictEqual(regen.length, 2);
+      // The pieces tile the parent window.
+      assert.ok(Math.abs(segments[0].startTime - 10) < 1e-9);
+      assert.ok(Math.abs(segments[0].endTime - segments[1].startTime) < 1e-9);
+      assert.ok(Math.abs(segments[1].endTime - 48) < 1e-9);
+    });
+    test("a single-sentence over-long split_2 is demoted whole to image", () => {
+      const seg = mk({ script: "One very long sentence with no internal boundary at all." });
+      const { segments, carved, demoted, regen } = capSplit2Duration([seg], 12);
+      assert.strictEqual(carved, 0);
+      assert.strictEqual(demoted, 1);
+      assert.strictEqual(segments.length, 1);
+      assert.strictEqual(segments[0].blockType, "image");
+      assert.strictEqual(regen.length, 0);
+    });
+    test("a split_2 at/under the cap is untouched", () => {
+      const seg = mk({ endTime: 21, duration: 11 });
+      const { segments, carved, demoted } = capSplit2Duration([seg], 12);
+      assert.strictEqual(carved + demoted, 0);
+      assert.strictEqual(segments[0], seg);
+    });
+    test("non-split_2 blocks are never touched; cap 0 disables the pass", () => {
+      const img = mk({ blockType: "image" });
+      const r1 = capSplit2Duration([img], 12);
+      assert.strictEqual(r1.segments[0], img);
+      const r2 = capSplit2Duration([mk()], 0);
+      assert.strictEqual(r2.segments[0].blockType, "split_2");
+      assert.strictEqual(r2.segments.length, 1);
+    });
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }

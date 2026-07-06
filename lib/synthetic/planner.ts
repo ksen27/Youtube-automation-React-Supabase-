@@ -1551,6 +1551,80 @@ export function capSplit2Blocks(
   return { segments: out, demoted };
 }
 
+// Char index just past the FIRST sentence terminator (. ? !, optionally followed
+// by a closing quote/bracket) that sits at a word boundary. -1 when the text has
+// no internal sentence boundary (single sentence, or terminator only at the end).
+export function firstSentenceEnd(text: string): number {
+  const m = /[.?!]["')\]]?(?=\s)/.exec(text.trimEnd());
+  return m ? m.index + m[0].length : -1;
+}
+
+// Cap the DURATION of a single split_2 block (client 2026-07-03: a 38s split_2).
+// Gemini may lump several sentences into one split_2 block ("a few short,
+// tightly-related sentences" is allowed) and split_2 is exempt from EVERY carve
+// pass (the presenter half is an atomic HeyGen render), so nothing stops the
+// same still from holding beside the presenter for 30s+.
+//
+// Policy: a split_2 longer than `maxSeconds` keeps its FIRST sentence as the
+// split_2 (the layout still appears where Gemini chose it) and the remaining
+// sentences become ONE plain 'image' block — which the later duration-split
+// pass carves into normal ~target-second visuals like any other long image.
+// Script is cut on the first sentence boundary; time is sliced proportionally
+// by char count (same technique as splitByMarks). When there is no internal
+// sentence boundary, or the first sentence ALONE exceeds the cap, the whole
+// block is demoted to 'image' instead (nothing to carve on).
+//
+// Both carved pieces keep the parent's imagePrompt (which described the WHOLE
+// passage) — the caller regenerates each piece's prompt for its own script via
+// the returned `regen` list (non-fatal on failure, like the merge pass).
+// Returns a new array; `position` is reassigned by the caller.
+export function capSplit2Duration(
+  segs: PlannedSegment[],
+  maxSeconds: number,
+): { segments: PlannedSegment[]; carved: number; demoted: number; regen: PlannedSegment[] } {
+  const out: PlannedSegment[] = [];
+  const regen: PlannedSegment[] = [];
+  let carved = 0;
+  let demoted = 0;
+  if (maxSeconds <= 0) return { segments: segs, carved, demoted, regen };
+  for (const seg of segs) {
+    const dur = seg.endTime - seg.startTime;
+    if (seg.blockType !== "split_2" || dur <= maxSeconds) {
+      out.push(seg);
+      continue;
+    }
+    const cut = firstSentenceEnd(seg.script);
+    const frac = cut > 0 && cut < seg.script.length ? cut / seg.script.length : 1;
+    const mid = seg.startTime + frac * dur;
+    if (frac >= 1 || mid - seg.startTime > maxSeconds) {
+      // Single sentence, or a first sentence that alone runs over the cap:
+      // demote the whole block to a still. Its imagePrompt already describes
+      // the illustrative half, and the duration-split pass paces it.
+      out.push({ ...seg, blockType: "image" as SyntheticBlockType, animationPrompt: null });
+      demoted++;
+      continue;
+    }
+    const head: PlannedSegment = {
+      ...seg,
+      script: seg.script.slice(0, cut).trim(),
+      endTime: mid,
+      duration: Math.max(0.5, mid - seg.startTime),
+    };
+    const rest: PlannedSegment = {
+      ...seg,
+      blockType: "image" as SyntheticBlockType,
+      animationPrompt: null,
+      script: seg.script.slice(cut).trim(),
+      startTime: mid,
+      duration: Math.max(0.5, seg.endTime - mid),
+    };
+    out.push(head, rest);
+    regen.push(head, rest);
+    carved++;
+  }
+  return { segments: out, carved, demoted, regen };
+}
+
 type RawSegment = z.infer<typeof GeminiSegmentSchema>;
 
 // Salvage a segments array from a response that JSON.parse rejected because it
@@ -2007,6 +2081,67 @@ export async function buildSyntheticTimeline(input: {
     }
   }
 
+  // split_2 DURATION cap (client 2026-07-03: a 38s split_2 held the same still
+  // beside the presenter for 5 sentences). An over-long split_2 keeps its FIRST
+  // sentence as the split_2; the remaining sentences become a plain image block.
+  //
+  // This runs TWICE: once here (after the count cap, before the clip-heavy +
+  // duration passes, so the carved-off remainder is paced like any other long
+  // image block) and once as the FINAL pass before persist. The second run is
+  // required because split_2 is exempt from every carve pass (splitByDuration
+  // skips it) and `ensureMinSplit2` can PROMOTE an image to split_2 AFTER this
+  // early pass — a promotion the early cap never sees, which is how a 22.5s /
+  // 5-sentence split_2 reached the review screen. The tag distinguishes the two
+  // in the job log.
+  const runSplit2DurationCap = async (tag: string) => {
+    const maxSeconds = getEnv().SYNTHETIC_SPLIT2_MAX_SECONDS;
+    if (maxSeconds <= 0) return;
+    const { segments, carved, demoted, regen } = capSplit2Duration(planned, maxSeconds);
+    if (carved === 0 && demoted === 0) return;
+    // Each carved piece now covers only PART of the passage its inherited
+    // imagePrompt described, so regenerate a prompt for each piece's own script.
+    // A regen failure is non-fatal — the piece keeps the parent's prompt
+    // (sub-optimal but renderable), the pacing win still lands.
+    let regenerated = 0;
+    let regenFailed = 0;
+    const capLimit = makeLimit(5);
+    await Promise.all(
+      regen.map((p) =>
+        capLimit(async () => {
+          try {
+            const r = await regenerateSegmentPrompt({
+              projectId,
+              jobId,
+              script: p.script,
+              basePrompt,
+              blockType: p.blockType,
+            });
+            // Composed WITH the base in front (like the merge pass), so clear
+            // shotType — persist's composePrompt sees the base already present
+            // and passes it through unchanged.
+            p.imagePrompt = r.imagePrompt;
+            p.shotType = null;
+            regenerated++;
+          } catch {
+            regenFailed++;
+          }
+        }),
+      ),
+    );
+    segments.forEach((p, i) => { p.position = i; });
+    planned = segments;
+    await logJob({ projectId, jobId }, "synthetic.plan.split2_duration_cap", {
+      pass: tag,
+      maxSeconds,
+      blocksCarved: carved,
+      blocksDemoted: demoted,
+      promptsRegenerated: regenerated,
+      promptRegenFailed: regenFailed,
+      totalBlocks: planned.length,
+    });
+  };
+  await runSplit2DurationCap("early");
+
   // Clip-heavy intro pass (client requirement 2026-06). The reference channel
   // opens with mostly MOVING footage and switches to still images later to save
   // credits. Promote every 'image' block whose spoken window STARTS before
@@ -2292,6 +2427,14 @@ export async function buildSyntheticTimeline(input: {
       });
     }
   }
+
+  // FINAL split_2 DURATION cap. `ensureMinSplit2` above can promote an image to
+  // split_2 AFTER the early cap ran, and split_2 is exempt from splitByDuration,
+  // so a promoted long block would otherwise hold beside the presenter past the
+  // cap. Re-run the cap here — a promoted split_2 that fits stays untouched; one
+  // over the cap is carved (first sentence stays split_2, rest → image). Runs
+  // after the distinct-scene pass so no later pass can re-lengthen a split_2.
+  await runSplit2DurationCap("final");
 
   // Persist. Clear any prior plan first so retries don't accumulate.
   const sb = getServerSupabase();

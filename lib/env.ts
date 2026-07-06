@@ -713,6 +713,15 @@ const ServerEnvSchema = z.object({
   // between it and the previously kept one; the ones in between are demoted to
   // plain 'image'. 0 disables spacing (count cap only); 1 = never back-to-back.
   SYNTHETIC_SPLIT2_MIN_GAP: z.coerce.number().int().nonnegative().default(3),
+  // Maximum DURATION for a single split_2 block (client 2026-07-03: a 38s
+  // split_2 — Gemini lumped 5 sentences into one block and, unlike image /
+  // ai_clip, nothing carves a split_2, so the same still held beside the
+  // presenter for 38s). A split_2 over this cap keeps its FIRST sentence as the
+  // split_2 and the remaining sentences become a plain 'image' block, which the
+  // duration-split pass then paces into normal ~target-second visuals. A
+  // single-sentence split_2 that alone exceeds the cap is demoted entirely to
+  // 'image' (there is no sentence boundary to carve on). 0 disables the cap.
+  SYNTHETIC_SPLIT2_MAX_SECONDS: z.coerce.number().nonnegative().default(12),
   // Target fraction of POST-clip-heavy-cutoff visual blocks that stay ai_clip,
   // the rest demoted to image (client: "after 3 mins, image and ai_clip should
   // appear naturally" — NOT all-clip). The short-visual merge biases every
@@ -792,6 +801,42 @@ const ServerEnvSchema = z.object({
   PIKZELS_MODEL: z.enum(["pkz_2", "pkz_3", "pkz_4", "pkz_4_5"]).default("pkz_4_5"),
   // Aspect ratio. Enum per docs: 16:9 (YouTube) | 9:16 | 1:1.
   PIKZELS_FORMAT: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+
+  // =======================================================================
+  // HEYGEN API FALLBACK. When the headless-browser HeyGen automation exhausts
+  // its whole account pool WITHOUT producing an avatar clip, generateAvatar can
+  // fall back to the OFFICIAL HeyGen API (upload photo + audio assets -> create
+  // a talking-photo video -> poll -> download). It is a LAST RESORT because the
+  // API bills API credits, which cost more than the interactive-plan renders the
+  // browser automation drives (the whole reason this project automates the web
+  // UI). Fully OFF by default: the fallback only runs when HEYGEN_API_FALLBACK is
+  // true AND HEYGEN_API_KEY is set — otherwise the pool-exhausted error throws
+  // exactly as before, so production behavior is unchanged until a key + flag are
+  // provisioned. Auth is the `x-api-key` header; assets + video endpoints are v3.
+  HEYGEN_API_KEY: z.string().optional(),
+  HEYGEN_API_FALLBACK: z.coerce.boolean().default(false),
+  HEYGEN_API_BASE_URL: z.string().url().default("https://api.heygen.com"),
+  // Rendered resolution for the API fallback. 720p matches the synthetic render
+  // canvas (1280×720) and keeps API credit cost down; bump to 1080p if the client
+  // wants it and their plan allows.
+  HEYGEN_API_RESOLUTION: z.enum(["720p", "1080p"]).default("720p"),
+  // Hard ceiling (seconds) on the API render poll loop, so a stuck HeyGen-side
+  // render fails in bounded time instead of hanging the avatar job.
+  HEYGEN_API_RENDER_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(900),
+  // SPEED SWITCH (client 2026-07-06): don't wait for the WHOLE browser pool to
+  // exhaust before trying the API. Switch to the API early when EITHER trigger
+  // fires, so a slow/failing clip recovers fast instead of grinding through every
+  // account + BullMQ retry:
+  //   * after this many failed browser accounts in one generateAvatar run
+  //     (client rule "after 2 tries"), or
+  //   * after this much wall-clock has elapsed on the clip (client rule "after 30
+  //     min"), checked between browser attempts.
+  // Both are gated by HEYGEN_API_FALLBACK — when the flag/key are unset the
+  // browser path still runs to full pool-exhaustion exactly as before. Set the
+  // account threshold to 0 to disable the count trigger (time-only), or the
+  // minutes to 0 to disable the time trigger (count-only).
+  HEYGEN_API_SWITCH_AFTER_ACCOUNTS: z.coerce.number().int().nonnegative().default(2),
+  HEYGEN_API_SWITCH_AFTER_MINUTES: z.coerce.number().nonnegative().default(30),
   // Hard timeout (seconds) for one Pikzels generation request. The image
   // endpoint responds synchronously (~<30s per Pikzels), so this is a
   // fetch-abort backstop, not a poll loop.

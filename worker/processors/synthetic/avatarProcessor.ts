@@ -4,7 +4,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { AvatarJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
-import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink } from "@/lib/storage";
+import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink, publicUrlForKey } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
@@ -33,7 +33,7 @@ async function stageAvatarAudio(
   voiceoverUrl: string | null,
   startTime: number | string | null,
   endTime: number | string | null,
-): Promise<{ path: string; durationSeconds: number } | null> {
+): Promise<{ path: string; durationSeconds: number; url: string | null } | null> {
   if (!voiceoverUrl) return null;
   // Supabase can return `numeric` columns as either JS numbers or strings, so
   // coerce + validate finiteness here rather than relying on typeof.
@@ -60,7 +60,9 @@ async function stageAvatarAudio(
   if (cached && cached.size > 0) {
     try {
       await downloadToFile(cacheKey, slicePath);
-      return { path: slicePath, durationSeconds };
+      // The slice is already in R2 at cacheKey — its public URL lets the API
+      // fallback pass audio_url instead of re-uploading the bytes.
+      return { path: slicePath, durationSeconds, url: publicUrlForKey(cacheKey) };
     } catch {
       // Cache fetch failed for some reason — fall through and rebuild the slice.
     }
@@ -84,9 +86,14 @@ async function stageAvatarAudio(
     await safeUnlink(masterPath);
   }
   // Best-effort cache write — a failure here just means the next regenerate
-  // re-cuts; never fail the avatar job over the cache.
-  await uploadFile(slicePath, cacheKey, "audio/mpeg").catch(() => {});
-  return { path: slicePath, durationSeconds };
+  // re-cuts; never fail the avatar job over the cache. Track success so we only
+  // hand back a public URL when the slice actually landed in R2 (the API fallback
+  // needs HeyGen to be able to fetch it; if the upload failed it uploads the local
+  // bytes instead).
+  const cached2 = await uploadFile(slicePath, cacheKey, "audio/mpeg")
+    .then(() => true)
+    .catch(() => false);
+  return { path: slicePath, durationSeconds, url: cached2 ? publicUrlForKey(cacheKey) : null };
 }
 
 // 'avatar' and 'split_2' avatar-half generation via HeyGen Playwright
@@ -249,7 +256,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
   // Slice this avatar part's audio from the master voiceover so HeyGen lip-syncs
   // to the exact 69labs audio (rendered length == audio length). On any failure
   // we degrade to the legacy script-text path rather than failing the render.
-  let audio: { path: string; durationSeconds: number } | null = null;
+  let audio: { path: string; durationSeconds: number; url: string | null } | null = null;
   try {
     audio = await stageAvatarAudio(
       projectId,
@@ -288,6 +295,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
           avatarImageUrl: project.avatar_image_url as string,
           script: seg.script ?? "",
           audioFilePath: audio?.path,
+          audioUrl: audio?.url ?? undefined,
           audioDurationSeconds: audio?.durationSeconds,
           // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
           // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
