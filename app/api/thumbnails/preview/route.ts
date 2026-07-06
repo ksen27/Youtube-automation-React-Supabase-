@@ -17,6 +17,8 @@ export const dynamic = "force-dynamic";
 const BodySchema = z.object({
   channelId: z.string().uuid(),
   title: z.string().trim().min(1, "title is required").max(300),
+  // Optional free-text changes to apply on top of the channel style + title.
+  customPrompt: z.string().trim().max(1000).optional().default(""),
   // 0–2 subject images (celebrity/person or AI avatar), each a YouTube/image URL.
   subjects: z.array(z.string().trim().min(1)).max(2).default([]),
 });
@@ -32,7 +34,7 @@ export async function POST(req: NextRequest) {
       { status: 400 },
     );
   }
-  const { channelId, title, subjects } = parsed.data;
+  const { channelId, title, customPrompt, subjects } = parsed.data;
 
   const sb = getServerSupabase();
   const { data: channel, error } = await sb
@@ -65,6 +67,7 @@ export async function POST(req: NextRequest) {
   const prompt = await buildThumbnailPrompt({
     stylePrompt: (channel.style_prompt as string) ?? "",
     title,
+    customPrompt,
     subjectCount: subjectUrls.length,
     styleImageSent,
   });

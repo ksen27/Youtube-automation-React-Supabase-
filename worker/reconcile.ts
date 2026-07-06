@@ -33,7 +33,6 @@
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import { maybeEnqueueMatch } from "./processors/_shared";
-import { maybeFinalizeSynthetic } from "./processors/synthetic/_shared";
 
 // Marks a single media_jobs row failed if it is not already in a terminal
 // state. Idempotent — safe to call from the failed-event handler even if a
@@ -106,8 +105,7 @@ export async function markJobFailedIfExhausted(
 // (reconcile.marked_failed source:stall_sweep type:avatar ×N) even while
 // generation was working. A truly orphaned enqueue (worker died before picking it
 // up) is BullMQ's responsibility — its stalled-job check re-delivers it — not this
-// DB sweep's. So queued jobs are left alone; this mirrors sweepStalledSegments,
-// which already skips queued segments for the same reason.
+// DB sweep's. So queued jobs are left alone.
 //
 // staleMs MUST exceed the worker's lockDuration (currently 15 min) plus a
 // margin, or we'd kill jobs that are legitimately mid-await on a long ffmpeg /
@@ -153,87 +151,4 @@ export async function sweepStalledJobs(staleMs: number, onlyTypes?: string[]): P
     }
   }
   return touchedProjects.size;
-}
-
-// Periodic safety net for ORPHANED SEGMENTS. A synthetic_segments row is
-// stamped status="generating" when its job is dispatched; the UI shows a
-// spinner for it. If the worker then dies / the session expires / the job is
-// lost, the segment row is frozen at "generating" forever — a dead spinner the
-// user can't clear (only "Regenerate" re-dispatches, but the row never flips to
-// "failed" on its own). This sweeper flips such stale rows to "failed" so the
-// UI shows a retryable failure instead of an endless spinner.
-//
-// The synthetic_segments_touch trigger keeps updated_at fresh on every write,
-// so a segment a worker is actively updating is never swept. staleMs must
-// exceed the longest legitimate quiet window between segment writes during a
-// real generation (HeyGen renders can take minutes) plus a margin.
-export async function sweepStalledSegments(staleMs: number): Promise<number> {
-  const sb = getServerSupabase();
-  const cutoff = new Date(Date.now() - staleMs).toISOString();
-
-  const { data: stalled, error } = await sb
-    .from("synthetic_segments")
-    .select("id, project_id, metadata")
-    .eq("status", "generating")
-    .lt("updated_at", cutoff);
-  if (error) {
-    await logJob({}, "reconcile.segment_sweep.query_error", { err: error.message });
-    return 0;
-  }
-  if (!stalled || stalled.length === 0) return 0;
-
-  // A segment is stamped 'generating' the moment it is DISPATCHED, but with a
-  // serial queue (AVATAR_CONCURRENCY=1, ~5min/HeyGen render) a segment can sit
-  // QUEUED behind many others for far longer than staleMs before its job even
-  // starts. Its updated_at never moves while queued (nothing writes the row), so
-  // the naive cutoff would false-fail avatars that are simply waiting their turn
-  // — exactly the 2026-06-21 mass-sweep (38 segments killed mid-run).
-  //
-  // So before sweeping, look up each segment's linked media_job: if the job is
-  // still 'queued' (never started), the segment is WAITING, not stalled — skip
-  // it. Only sweep segments whose job is actually 'running' (started but went
-  // quiet past the cutoff = genuinely stuck) or whose job is missing/terminal
-  // (orphaned — the spinner can never clear on its own).
-  const jobIds = stalled
-    .map((s) => ((s.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined)
-    .filter((x): x is string => typeof x === "string" && x.length > 0);
-  const jobStatusById = new Map<string, string>();
-  if (jobIds.length > 0) {
-    const { data: jobRows } = await sb
-      .from("media_jobs")
-      .select("id, status")
-      .in("id", jobIds);
-    for (const j of jobRows ?? []) jobStatusById.set(j.id as string, j.status as string);
-  }
-
-  const projects = new Set<string>();
-  let skippedQueued = 0;
-  for (const seg of stalled) {
-    const jobId = ((seg.metadata ?? {}) as Record<string, unknown>).mediaJobId as string | undefined;
-    const jobStatus = jobId ? jobStatusById.get(jobId) : undefined;
-    // Still waiting in the queue — not stalled. Leave it for its turn.
-    if (jobStatus === "queued") {
-      skippedQueued++;
-      continue;
-    }
-    const { error: upErr } = await sb
-      .from("synthetic_segments")
-      .update({ status: "failed", error: "stalled — generation did not complete" })
-      .eq("id", seg.id)
-      .eq("status", "generating"); // guard against a concurrent finish
-    if (upErr) continue;
-    await logJob({ projectId: seg.project_id, sourceId: seg.id },
-      "reconcile.segment_stall_swept", { segmentId: seg.id, jobStatus: jobStatus ?? "none" });
-    projects.add(seg.project_id);
-  }
-  if (skippedQueued > 0) {
-    await logJob({}, "reconcile.segment_sweep.skipped_queued", { count: skippedQueued });
-  }
-
-  // Let the synthetic pipeline finalize on whatever succeeded (drops failed
-  // segments, materializes the timeline) so a stuck project can still advance.
-  for (const projectId of projects) {
-    await maybeFinalizeSynthetic(projectId).catch(() => {});
-  }
-  return projects.size;
 }

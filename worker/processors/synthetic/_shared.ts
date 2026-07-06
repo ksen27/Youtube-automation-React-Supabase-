@@ -493,23 +493,19 @@ export { setMediaJob };
 
 // Heartbeat a segment's updated_at while a long provider call runs.
 //
-// THE PROBLEM THIS FIXES
-// ----------------------
-// sweepStalledSegments (worker/reconcile.ts) treats a 'generating' segment whose
-// updated_at predates SEGMENT_STALE_MS as dead and marks it
-// "stalled — generation did not complete". But updated_at is only bumped by the
-// synthetic_segments_touch trigger on an actual row UPDATE, and NOTHING writes the
-// segment row during the long render await (LTX-2 clip ~60-95s, HeyGen render
-// minutes). So a segment that is ALIVE and rendering goes quiet on updated_at and,
-// once a deep serial backlog pushes its total in-flight time past the cutoff, the
-// sweeper false-fails it even though generation is working. (See the band-aid in
-// avatarProcessor: "a slow-but-alive HeyGen render can complete AFTER the sweeper
-// wrote a 'stalled' error" — this removes the race instead of papering over it.)
+// updated_at is only bumped by the synthetic_segments_touch trigger on an actual
+// row UPDATE, and NOTHING writes the segment row during the long render await
+// (LTX-2 clip ~60-95s, HeyGen render minutes). withSegmentHeartbeat wraps the
+// render call and, every intervalMs, issues a no-op UPDATE that fires the touch
+// trigger so updated_at stays fresh while the work is genuinely in flight — a
+// live freshness signal any monitoring/tooling can rely on to tell a working
+// render from a truly stuck row.
 //
-// withSegmentHeartbeat wraps the render call and, every intervalMs, issues a
-// no-op UPDATE that fires the touch trigger so updated_at stays fresh while the
-// work is genuinely in flight. A segment that is actually stuck stops
-// heartbeating and is still swept correctly.
+// NOTE: there is deliberately no automatic sweeper that flips a stale
+// 'generating' segment to 'failed'. Such a sweep repeatedly false-failed avatars
+// that were still rendering (a running-but-quiet job is normal during a long
+// HeyGen render), surfacing a "failed" badge on a video that then completed fine.
+// A genuinely orphaned spinner is cleared by the user via Regenerate instead.
 export async function withSegmentHeartbeat<T>(
   segmentId: string,
   work: () => Promise<T>,

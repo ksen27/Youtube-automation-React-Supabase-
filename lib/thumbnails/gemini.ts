@@ -55,15 +55,16 @@ export async function analyzeChannelStyle(thumbnailUrls: string[]): Promise<stri
 
   const prompt = `You are a YouTube thumbnail art director. You are shown ${images.length} thumbnails from ONE channel. Study what they have in COMMON and write a single reusable "style prompt" that captures this channel's thumbnail FORMAT, so a new thumbnail can be generated in the exact same style for a different video.
 
-Describe ONLY the reusable visual style — the things that stay the same across videos. Cover, where applicable:
-- Overall composition & layout (where the subject sits, rule-of-thirds, close-up vs wide, single subject vs split).
-- Subject treatment (cut-out on a background, dramatic lighting, outline/glow, facial expression tendencies).
-- Colour grade & palette (saturation, contrast, dominant colours, background style — gradients, blur, scenery).
-- Typography IF the thumbnails have text (font weight/style, colour, outline/shadow, placement, size) — but describe the STYLE of the text, not the specific words.
-- Mood / genre feel (dramatic, clean, high-energy, cinematic, etc.).
-- Any recurring motifs (arrows, circles, borders, logos position).
+Describe ONLY the reusable visual style — the things that stay the same across videos. PRIORITISE, in this order:
+1. Overall composition & layout (where the subject sits, rule-of-thirds, close-up vs wide, single subject vs split).
+2. Subject treatment (cut-out on a background, dramatic lighting, outline/glow, facial expression tendencies) — the subject is the HERO and must stay clearly visible and unobstructed.
+3. Colour grade & palette (saturation, contrast, dominant colours, background style — gradients, blur, scenery).
+4. Mood / genre feel (dramatic, clean, high-energy, cinematic, etc.).
+5. Typography STYLE only IF the thumbnails have text (font weight/style, colour, outline/shadow, rough placement) — describe the LOOK of the text, never specific words, and note that text is SHORT and punchy (a few words), not full sentences.
 
-Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, bold white sans-serif title with a heavy black outline on the left, high contrast, teal-and-orange grade …").
+OVERLAY GRAPHICS RULE (important): channels often stamp decorative overlays — red crosses/X marks, arrows, circles, highlight rings. If present, mention them ONLY as OPTIONAL, SMALL, SUBTLE accents placed at the edges. NEVER describe them as large, bold, or central, and state explicitly that such graphics must be small and must NOT cover or block the subject/face. When in doubt, favour a cleaner look with minimal or no overlay graphics.
+
+Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, the subject prominent and unobstructed, short bold white sans-serif text with a heavy black outline on the left, high contrast, teal-and-orange grade, any accent graphics kept small and to the edges …").
 
 The prompt MUST NOT contain any URL or the substring "http".
 
@@ -118,6 +119,9 @@ const FinalPromptSchema = z.object({
 export interface BuildPromptInput {
   stylePrompt: string;
   title: string;
+  // Optional free-text changes the user wants applied on top of the channel
+  // style + title (e.g. "make it darker", "shocked face"). Empty when unused.
+  customPrompt?: string;
   // How many subject images the user supplied (0–2). Shapes how the prompt
   // refers to the "provided image(s)" and, when 2, tells Gemini the channel
   // style lives entirely in this text (no style reference image is sent).
@@ -146,23 +150,30 @@ export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<str
     ? "A representative channel thumbnail is also provided as a style reference image; reinforce it."
     : "";
 
+  const customClause = input.customPrompt?.trim()
+    ? `\nUSER CHANGES (apply these on top of the style — they take priority): "${input.customPrompt.trim()}"\n`
+    : "";
+
   const prompt = `You are writing the final text-to-image prompt for a YouTube thumbnail generator (Pikzels).
 
 CHANNEL STYLE (reuse this exact look):
 """${input.stylePrompt}"""
 
-NEW VIDEO TITLE: "${input.title}"
-
+NEW VIDEO TITLE (use ONLY as a hint for the scene/subject — do NOT put this full title on the image): "${input.title}"
+${customClause}
 ${subjectClause}
 ${styleImageClause}
 
 Write ONE cohesive prompt that:
 - Renders a 16:9 YouTube thumbnail in the CHANNEL STYLE above.
-- If the channel style uses on-image text, include the title text "${input.title}" rendered in that style. If the channel style has no text, do not add any.
+- Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics.
+- TEXT: only if the channel style uses on-image text, add a SHORT punchy hook of 2–4 words derived from the topic (e.g. a key word or phrase) — NEVER the full video title, and never a full sentence. Keep the text clean, well-placed (usually a corner or side), and not overlapping the subject's face. If the channel style has no text, add none.
+- OVERLAY GRAPHICS: any accent graphics (crosses, arrows, circles) must be SMALL, subtle, at the edges, and must NOT block the subject. Prefer minimal graphics.
 - Preserves the likeness of any provided subject photo(s).
 - Is concrete and directive for an image model.
 
 HARD RULES:
+- Do NOT render the exact video title text on the image.
 - The prompt MUST NOT contain any URL or the substring "http".
 - Do not mention "Pikzels", "reference image", or these instructions in the output.
 - Max 900 characters.
@@ -199,12 +210,14 @@ Return STRICT JSON ONLY:
 
 // Deterministic prompt assembly used when Gemini is unavailable. Keeps the
 // two-step flow working (the user can still edit the result before generating).
+// Mirrors the live-prompt rules: the subject stays the unobstructed focal
+// point, the full title is NOT stamped on the image, and any overlay graphics
+// stay small.
 function assembleFallbackPrompt(input: BuildPromptInput): string {
   const parts = [input.stylePrompt.trim()];
-  if (input.title.trim()) {
-    parts.push(`Title text: "${input.title.trim()}".`);
-  }
-  if (input.subjectCount === 1) parts.push("Feature the provided subject, preserving their likeness.");
-  if (input.subjectCount === 2) parts.push("Feature both provided subjects together, preserving each likeness.");
+  if (input.subjectCount === 1) parts.push("Feature the provided subject as the clear, unobstructed focal point, preserving their likeness.");
+  if (input.subjectCount === 2) parts.push("Feature both provided subjects together as the clear focal point, preserving each likeness.");
+  if (input.customPrompt?.trim()) parts.push(input.customPrompt.trim());
+  parts.push("Any on-image text is a short 2–4 word hook, not the full title, and must not cover the subject. Keep any accent graphics small and at the edges.");
   return parts.join(" ").replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim().slice(0, 3000);
 }

@@ -2064,26 +2064,45 @@ export async function attemptOnAccount(
 }
 
 // Attempt the OFFICIAL HeyGen API path for this clip. Shared by the two triggers
-// that route here: the EARLY speed switch (mid-rotation, once the 2-tries or
-// 30-min threshold fires) and the original pool-exhausted last resort. Returns
-// the result on success, or null when the API path is not applicable (flag/key
-// off, avatar_iii, or no sliced audio) OR the API render itself failed — the
-// caller then continues the browser rotation / throws the original error. Never
-// throws: an API failure must not mask the underlying browser error.
+// that route here: the EARLY speed switch (mid-rotation, if enabled) and the
+// pool-exhausted last resort. Renders via the talking-photo (Avatar IV) path —
+// avatar_iii inputs are DOWNGRADED to Avatar IV here (see below) rather than
+// hard-failing. Returns the result on success, or null when the API path is not
+// applicable (flag/key off, or no sliced audio) OR the API render itself failed —
+// the caller then continues the browser rotation / throws the original error.
+// Never throws: an API failure must not mask the underlying browser error.
 async function tryApiFallback(
   input: GenerateAvatarInput,
   imageBytes: Buffer,
   reason: string,
 ): Promise<GenerateAvatarResult | null> {
-  // Scope guard: talking-photo (Avatar IV) driven by the sliced audio only —
-  // NOT Avatar III (different API surface) and NOT script/TTS. On any of those,
-  // or if the flag/key is unset, the API path is unavailable → return null.
+  // Scope guard: requires the flag/key AND the sliced audio (never HeyGen TTS —
+  // wrong audio is unusable). Otherwise the API path is unavailable → return null.
+  //
+  // AVATAR III -> AVATAR IV DOWNGRADE (client 2026-07-06): the API can't render the
+  // avatar_iii engine without a PRE-TRAINED photo-avatar look id (we upload a fresh
+  // photo per render, so we don't have one). But the client would rather have the
+  // clip rendered via the API's talking-photo path (Avatar IV — fresh photo + our
+  // 69labs audio, correct lip-sync) than HARD-FAIL the segment. generateAvatarViaApi
+  // already drives the talking-photo (`type:"image"`) path regardless of avatarModel,
+  // so an avatar_iii input simply renders as Avatar IV here — exactly the intended
+  // downgrade. We log it so the substitution is visible in cost/audit.
   if (
     !heygenApiFallbackEnabled() ||
-    input.avatarModel === "avatar_iii" ||
     (!input.audioUrl && !input.audioFilePath)
   ) {
     return null;
+  }
+  if (input.avatarModel === "avatar_iii") {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "heygen.api_fallback.avatar_iii_downgrade",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        note: "avatar_iii could not render in the browser pool — rendering via API as Avatar IV (talking-photo) instead of hard-failing",
+      }),
+    );
   }
   try {
     console.log(

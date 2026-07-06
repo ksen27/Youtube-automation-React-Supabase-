@@ -48,6 +48,7 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
   // Step 2 — generate.
   const [selectedId, setSelectedId] = useState<string | null>(initialChannels[0]?.id ?? null);
   const [title, setTitle] = useState("");
+  const [customPrompt, setCustomPrompt] = useState("");
   const [subjects, setSubjects] = useState<Subject[]>([newSubject()]);
   const [prompt, setPrompt] = useState("");
   const [building, setBuilding] = useState(false);
@@ -137,6 +138,7 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
         body: JSON.stringify({
           channelId: selectedId,
           title: title.trim(),
+          customPrompt: customPrompt.trim(),
           subjects: filledSubjects.map((s) => s.url.trim()),
         }),
       });
@@ -170,6 +172,7 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
       if (!r.ok) throw new Error(json.error ?? `Generate failed (${r.status})`);
       // Reset the generate inputs and refresh the gallery.
       setTitle("");
+      setCustomPrompt("");
       setSubjects([newSubject()]);
       setPrompt("");
       router.refresh();
@@ -269,6 +272,23 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                   onChange={(e) => setTitle(e.target.value)}
                   placeholder="e.g. Rome's Collapse"
                 />
+                <p className="text-xs text-fg-subtle">
+                  Used to guide the scene — the full title is not stamped on the image.
+                </p>
+              </div>
+
+              {/* Optional custom prompt */}
+              <div className="space-y-1.5">
+                <Label htmlFor="custom">Custom changes (optional)</Label>
+                <Input
+                  id="custom"
+                  value={customPrompt}
+                  onChange={(e) => setCustomPrompt(e.target.value)}
+                  placeholder="e.g. make it darker, shocked face, no arrows"
+                />
+                <p className="text-xs text-fg-subtle">
+                  Optional tweaks applied on top of the channel style. Leave empty to just use the channel style.
+                </p>
               </div>
 
               {/* Optional subject images */}
