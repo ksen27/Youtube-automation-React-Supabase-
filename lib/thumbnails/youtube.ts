@@ -5,7 +5,7 @@
 // R2). YouTube exposes each video's thumbnail at a stable path derived from the
 // video id, so we never call the YouTube API — we just build the URL.
 
-import { resolveChannel, searchReferenceChannelViaPlaylist } from "@/lib/youtube/search";
+import { getEnv } from "@/lib/env";
 
 // Prefer maxres; YouTube serves hqdefault for every video but maxresdefault
 // only exists when the uploader supplied a high-res custom thumbnail. Pikzels
@@ -81,34 +81,109 @@ export interface ChannelThumbnails {
   thumbnailUrls: string[];
 }
 
+// The YouTube Data API key the /thumbnails feature uses. Prefers the DEDICATED
+// thumbnail key (YOUTUBE_API_KEY_THUMBNAILS) — put it in a separate Google
+// Cloud project for its own 10,000/day quota so channel analysis never eats the
+// celebrity video engine's YouTube quota — and falls back to the shared
+// YOUTUBE_API_KEY when the dedicated one isn't set.
+function thumbnailYoutubeKey(): string {
+  const env = getEnv();
+  const key = env.YOUTUBE_API_KEY_THUMBNAILS || env.YOUTUBE_API_KEY;
+  if (!key) throw new Error("No YouTube API key configured (YOUTUBE_API_KEY_THUMBNAILS or YOUTUBE_API_KEY)");
+  return key;
+}
+
+// Resolve a pasted YouTube CHANNEL url/@handle to its canonical UC… id + title.
+// Self-contained (uses the thumbnail key, not the video engine) so the /thumbnails
+// feature has its own quota. Order: explicit /channel/UC… id -> @handle
+// (forHandle) -> name search (last resort, 100 units). Returns null if nothing
+// resolves. channels.list / search.list are 1 / 100 units respectively.
+async function resolveChannelForThumbnails(
+  ref: string,
+): Promise<{ channelId: string; channelTitle: string } | null> {
+  const key = thumbnailYoutubeKey();
+  const raw = ref.trim();
+  if (!raw) return null;
+  const CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels";
+  const SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
+
+  // 1) Canonical channel id (UC…, 24 chars) or /channel/UC… URL.
+  const idMatch = raw.match(/(UC[0-9A-Za-z_-]{22})/);
+  if (idMatch) {
+    const p = new URLSearchParams({ part: "snippet", id: idMatch[1], key });
+    const r = await fetch(`${CHANNELS_URL}?${p}`);
+    if (r.ok) {
+      const item = ((await r.json()).items ?? [])[0];
+      if (item) return { channelId: item.id, channelTitle: item.snippet?.title ?? raw };
+    }
+  }
+  // 2) @handle — channels.list supports forHandle directly (1 unit).
+  const handleMatch = raw.match(/@([A-Za-z0-9._-]+)/) ?? (/^[A-Za-z0-9._-]+$/.test(raw) ? [raw, raw] : null);
+  if (handleMatch) {
+    const p = new URLSearchParams({ part: "snippet", forHandle: handleMatch[1], key });
+    const r = await fetch(`${CHANNELS_URL}?${p}`);
+    if (r.ok) {
+      const item = ((await r.json()).items ?? [])[0];
+      if (item) return { channelId: item.id, channelTitle: item.snippet?.title ?? raw };
+    }
+  }
+  // 3) Last resort — name search (100 units). Covers legacy /c/ and /user/ URLs.
+  const q = raw.replace(/https?:\/\/(www\.)?youtube\.com\/(c\/|user\/)?/i, "").replace(/@/, "");
+  const p = new URLSearchParams({ part: "snippet", q, type: "channel", maxResults: "1", key });
+  const r = await fetch(`${SEARCH_URL}?${p}`);
+  if (r.ok) {
+    const item = ((await r.json()).items ?? [])[0];
+    const id = item?.id?.channelId;
+    if (id) return { channelId: id, channelTitle: item.snippet?.title ?? raw };
+  }
+  return null;
+}
+
 // Resolve a pasted YouTube CHANNEL url/@handle to its canonical id, then pull
 // the thumbnail urls of its most recent uploads — the sample Gemini analyzes to
-// learn the channel's thumbnail style. Reuses the video engine's channel
-// resolver + cheap uploads-playlist recall (~1 quota unit), so this costs
-// almost nothing on quota.
+// learn the channel's thumbnail style. Uses the dedicated thumbnail key and the
+// cheap uploads-playlist recall (~1 quota unit for the playlist), so a normal
+// @handle/channel-URL analyze costs only a couple of units.
 //
-// `count` caps how many thumbnails we collect (client wants ~5–10). We fetch
-// via the uploads playlist and derive each thumbnail from its videoId at a
-// stable, always-present resolution (hqdefault) so a missing maxres never
-// leaves a gap. Throws when the channel can't be resolved or has no uploads.
+// `count` caps how many thumbnails we collect (client wants ~5–10). We derive
+// each thumbnail from its videoId at a stable, always-present resolution
+// (hqdefault) so a missing maxres never leaves a gap. Throws when the channel
+// can't be resolved or has no uploads.
 export async function fetchChannelThumbnails(
   channelInput: string,
   count = 10,
 ): Promise<ChannelThumbnails> {
-  const resolved = await resolveChannel(channelInput);
+  const key = thumbnailYoutubeKey();
+  const resolved = await resolveChannelForThumbnails(channelInput);
   if (!resolved) {
     throw new Error(`Could not resolve a YouTube channel from: "${channelInput.slice(0, 80)}"`);
   }
-  const uploads = await searchReferenceChannelViaPlaylist(
-    resolved.channelId,
-    // Empty query -> no client-side term filter; we want the channel's most
-    // recent uploads regardless of topic (the style is topic-independent).
-    "",
-    Math.min(50, Math.max(count, count + 5)),
-  );
-  const urls = uploads
-    .map((v) => youtubeThumbnailUrl(v.videoId))
-    .slice(0, Math.max(1, count));
+  if (!/^UC[0-9A-Za-z_-]{22}$/.test(resolved.channelId)) {
+    throw new Error(`Resolved a non-canonical channel id for "${channelInput.slice(0, 80)}"`);
+  }
+
+  // Every channel's uploads live in a playlist whose id is the channel id with
+  // "UC" → "UU". playlistItems.list is 1 unit for up to 50 items.
+  const uploadsPlaylistId = "UU" + resolved.channelId.slice(2);
+  const PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems";
+  const p = new URLSearchParams({
+    part: "contentDetails",
+    playlistId: uploadsPlaylistId,
+    maxResults: String(Math.min(50, Math.max(count, count + 5))),
+    key,
+  });
+  const r = await fetch(`${PLAYLIST_ITEMS_URL}?${p}`);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`Could not list channel uploads (${r.status}): ${txt.slice(0, 200)}`);
+  }
+  const json = await r.json();
+  const urls: string[] = [];
+  for (const item of json.items ?? []) {
+    const vid = item?.contentDetails?.videoId;
+    if (typeof vid === "string") urls.push(youtubeThumbnailUrl(vid));
+    if (urls.length >= Math.max(1, count)) break;
+  }
   if (urls.length === 0) {
     throw new Error(`Channel "${resolved.channelTitle}" has no usable recent uploads to learn a style from.`);
   }

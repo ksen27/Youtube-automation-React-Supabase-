@@ -62,16 +62,17 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
   const anyUploading = subjects.some((s) => s.uploading);
 
   // ----- Step 1: analyze a channel -----
-  async function onAnalyze(e: React.FormEvent) {
-    e.preventDefault();
-    if (!channelInput.trim() || analyzing) return;
+  // `force` re-learns the style even if the channel is already saved (spends
+  // quota); the default reuses a saved channel for free.
+  async function analyzeChannel(input: string, force: boolean) {
+    if (!input.trim() || analyzing) return;
     setAnalyzing(true);
     setError(null);
     try {
       const r = await fetch("/api/thumbnails/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: channelInput.trim() }),
+        body: JSON.stringify({ channel: input.trim(), force }),
       });
       const json = await r.json();
       if (!r.ok) throw new Error(json.error ?? `Analyze failed (${r.status})`);
@@ -84,6 +85,11 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
     } finally {
       setAnalyzing(false);
     }
+  }
+
+  function onAnalyze(e: React.FormEvent) {
+    e.preventDefault();
+    analyzeChannel(channelInput, false);
   }
 
   // Persist an edited style prompt back to the channel.
@@ -236,7 +242,20 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
             <>
               {/* Style prompt (editable, saved to the channel) + sample thumbnails */}
               <div className="space-y-2">
-                <Label htmlFor="style">Channel style prompt (editable)</Label>
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="style">Channel style prompt (editable)</Label>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={analyzing}
+                    onClick={() => analyzeChannel(selected.channel_input, true)}
+                    title="Re-learn this channel's style from its latest thumbnails (uses quota)"
+                  >
+                    {analyzing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                    Re-analyze
+                  </Button>
+                </div>
                 <Textarea
                   id="style"
                   value={selected.style_prompt}

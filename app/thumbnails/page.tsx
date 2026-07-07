@@ -48,7 +48,10 @@ async function loadChannels(): Promise<ChannelRow[]> {
 export default async function ThumbnailsPage() {
   const [thumbnails, channels] = await Promise.all([loadThumbnails(), loadChannels()]);
   const env = getEnv();
-  const ready = isPikzelsConfigured() && Boolean(env.GEMINI_API_KEY) && Boolean(env.YOUTUBE_API_KEY);
+  const ready =
+    isPikzelsConfigured() &&
+    Boolean(env.GEMINI_API_KEY) &&
+    Boolean(env.YOUTUBE_API_KEY_THUMBNAILS || env.YOUTUBE_API_KEY);
 
   return (
     <div className="px-6 lg:px-8 py-8 max-w-7xl mx-auto space-y-10">
@@ -89,7 +92,7 @@ export default async function ThumbnailsPage() {
           ) : (
             <p className="text-sm text-fg-muted">
               Thumbnail generation is not configured. Set <code>PIKZELS_API_KEY</code>, <code>GEMINI_API_KEY</code>,
-              and <code>YOUTUBE_API_KEY</code> in <code>.env.local</code>. See{" "}
+              and <code>YOUTUBE_API_KEY_THUMBNAILS</code> (or <code>YOUTUBE_API_KEY</code>) in <code>.env.local</code>. See{" "}
               <Link className="underline text-brand-300" href="/settings">settings</Link>.
             </p>
           )}

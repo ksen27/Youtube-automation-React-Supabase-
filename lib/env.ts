@@ -23,6 +23,11 @@ const ServerEnvSchema = z.object({
   R2_BUCKET: z.string().default("video-automation"),
   R2_PUBLIC_BASE_URL: z.string().url().optional(),
   YOUTUBE_API_KEY: z.string().optional(),
+  // Optional DEDICATED YouTube Data API key for the /thumbnails feature only.
+  // Put it in a SEPARATE Google Cloud project to get its own 10,000/day quota,
+  // so channel-style analysis never competes with the celebrity video engine's
+  // YouTube search quota. Falls back to YOUTUBE_API_KEY when unset.
+  YOUTUBE_API_KEY_THUMBNAILS: z.string().optional(),
   GEMINI_API_KEY: z.string().optional(),
   // Brave Image Search API. Primary image source — get a key at
   // https://api-dashboard.search.brave.com/. Free tier: 1 qps, 2000/month.
