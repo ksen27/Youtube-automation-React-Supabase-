@@ -311,6 +311,18 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
         "subject, never a generic unrelated setting.",
         "",
       ];
+  // Home is not a garden. A line about being 'home' / indoors must render the
+  // INDOOR living space (kitchen, living room, bedroom, hallway, porch), never a
+  // backyard, lawn, or vegetable patch — unless the narration is specifically
+  // about gardening or being outdoors. This kept leaking on lifestyle/health
+  // videos where frequent 'home' mentions drifted into garden footage.
+  topicBlock.push(
+    "IMPORTANT: 'home' / indoors means the indoor living space (kitchen, living",
+    "room, bedroom, hallway) or its immediate porch/doorway — NOT a garden,",
+    "backyard, lawn, or vegetable patch. Only use garden or outdoor-plant imagery",
+    "when the line is specifically about gardening or being outdoors.",
+    "",
+  );
   return [
     ...topicBlock,
     "You are a video director planning the visual track for an AI-generated",
@@ -1719,9 +1731,9 @@ async function deriveVideoTopic(input: {
     "Return STRICT JSON ONLY:",
     '{"niche": "...", "setting": "...", "subjectExamples": "...", "environmentExamples": "..."}',
     "- niche: short label of the topic, e.g. \"automotive / DIY car maintenance\",",
-    '  "home cooking", "personal finance", "lawn & garden care".',
+    '  "home cooking", "personal finance".',
     "- setting: the recurring physical place the creator would film in, e.g.",
-    '  "home garage / driveway, under the hood", "a home kitchen", "a backyard garden".',
+    '  "home garage / driveway, under the hood", "a home kitchen".',
     "- subjectExamples: a few concrete on-topic objects/subjects, comma-separated,",
     '  e.g. "spark plugs, engine bays, hand tools, oil, dashboards".',
     "- environmentExamples: a few WIDER real-world context scenes of this niche —",
@@ -1729,6 +1741,18 @@ async function deriveVideoTopic(input: {
     '  the objects, comma-separated. e.g. for an engine video: "utes driving on',
     '  highways, vehicles on outback roads, a pickup pulling into a driveway";',
     '  for a cooking video: "a family dinner table, dishes being served".',
+    "The examples above are ONLY to show the format — they are illustrative and",
+    "MUST NOT influence your answer. Derive every field from THIS video's title",
+    "and transcript. In particular, do NOT default to gardening, lawns, a garden",
+    "setting, or 'home & garden' unless the transcript is literally about",
+    "gardening. 'Home' means the INDOOR living space (kitchen, living room,",
+    "bedroom, hallway) and its immediate porch/doorway — it is NOT a garden,",
+    "backyard, lawn, or vegetable patch. Only use garden/outdoor-plant imagery",
+    "when the narration is specifically about gardening or being outdoors.",
+    "For a lifestyle / health / personal-story video with no single",
+    "physical craft, prefer a niche/setting drawn from what the narration actually",
+    "shows (e.g. a health & wellness routine filmed around a home's kitchen,",
+    "living room, and neighbourhood) rather than forcing a generic backyard.",
     "Keep each field short (a phrase, not a sentence). No commentary.",
     "",
     `TITLE: ${title.trim() || "(none)"}`,
