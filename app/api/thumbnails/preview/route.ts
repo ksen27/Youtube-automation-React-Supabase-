@@ -3,7 +3,7 @@ import { z } from "zod";
 import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
 import { resolveReferenceUrl } from "@/lib/thumbnails/youtube";
 import { buildThumbnailPrompt } from "@/lib/thumbnails/gemini";
-import { buildChannelReferenceUrls } from "@/lib/thumbnails/pikzels";
+import { buildChannelReferenceUrls, pickStyleImage } from "@/lib/thumbnails/pikzels";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -59,9 +59,12 @@ export async function POST(req: NextRequest) {
     subjectUrls.push(url);
   }
 
-  // A representative channel thumbnail is the style image (first sample).
+  // Whether a channel style image will be sent depends only on whether samples
+  // exist + the subject count (which specific sample is chosen — rotated for
+  // pose variety — is decided at generate time). Use pickStyleImage(…, 0) here
+  // purely to detect presence.
   const samples = Array.isArray(channel.sample_urls) ? (channel.sample_urls as string[]) : [];
-  const styleImageUrl = samples[0] ?? null;
+  const styleImageUrl = pickStyleImage(samples, 0);
   const { styleImageSent } = buildChannelReferenceUrls({ subjectUrls, styleImageUrl });
 
   const prompt = await buildThumbnailPrompt({

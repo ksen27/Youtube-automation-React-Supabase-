@@ -32,6 +32,7 @@ import { inspectPage } from "@/lib/synthetic/heygen-health";
 import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
 import {
   HeygenError,
+  PoolBusyError,
   classifyHeygenFailure,
   dispositionOf,
   classOf,
@@ -158,6 +159,14 @@ export interface GenerateAvatarInput {
   // Avatar III searches the Avatars page for it. Required when avatarModel is
   // "avatar_iii"; ignored by the Avatar IV path (which uploads the photo).
   heygenAvatarName?: string | null;
+  // FORCE the API fallback, skipping the browser pool entirely (client 2026-07-07).
+  // Set by the avatar worker AFTER a clip has WAITED for a free account past the
+  // client's threshold (2 wait cycles OR 30 min with no account available). At
+  // that point the clip has been queued long enough that we stop waiting for a
+  // browser account and render it via the HeyGen API directly. Ignored (no-op)
+  // unless the API fallback is enabled + configured + the job is audio-driven, in
+  // which case generateAvatar throws so the clip surfaces the original error.
+  forceApi?: boolean;
 }
 
 export interface GenerateAvatarResult {
@@ -2149,6 +2158,24 @@ export async function generateAvatar(
   imageBytes: Buffer,
   maxAccounts?: number,
 ): Promise<GenerateAvatarResult> {
+  // FORCE-API (client 2026-07-07): the worker has already made this clip WAIT for a
+  // free browser account past the threshold (2 wait cycles / 30 min). Stop waiting
+  // and render via the API directly, skipping the pool entirely — no anti-bot
+  // spacing, no account claim (the API doesn't trip Cloudflare). If the API path
+  // isn't usable (flag off / not audio-driven) tryApiFallback returns null and we
+  // surface PoolBusyError so the clip fails visibly rather than looping forever.
+  if (input.forceApi) {
+    const apiResult = await tryApiFallback(
+      input,
+      imageBytes,
+      "forced to API after waiting for a free browser account past threshold",
+    );
+    if (apiResult) return apiResult;
+    throw new PoolBusyError(
+      "heygen: no free browser account and API fallback unavailable for this clip",
+    );
+  }
+
   // Default the rotation cap to the full usable pool so we never stop short of an
   // account that WOULD succeed (the "only 3 of 4 tried" gap). An explicit
   // maxAccounts (e.g. the debug script's 1) still wins.
@@ -2170,10 +2197,16 @@ export async function generateAvatar(
   const leaseSeconds = env().HEYGEN_ACCOUNT_LEASE_SECONDS;
   let account = await claimAccount(leaseSeconds);
   if (!account) {
-    throw new HeygenError(
-      "session_expired",
-      "heygen: no available accounts in pool — every account is busy or awaiting re-auth; " +
-        "connect or re-auth one with `npm run heygen:connect <email>`",
+    // POOL CONTENTION (client 2026-07-07): "Retry all failed" / a burst enqueues
+    // MORE avatar jobs than there are accounts, so the overflow jobs find every
+    // account busy rendering. This is NOT an account defect and must NOT hard-fail
+    // the clip. Signal PoolBusyError so the avatar worker RE-DELAYS the job and the
+    // clip WAITS in the queue for an account to free (a browser render is ~150s, so
+    // one usually frees within a wait cycle → the clip then renders on the cheap
+    // browser path). The worker switches the clip to the API only after the
+    // client's threshold (2 wait cycles / 30 min). See avatarProcessor.
+    throw new PoolBusyError(
+      "heygen: all accounts are busy rendering — waiting for one to free up",
     );
   }
 

@@ -12,7 +12,7 @@ import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
-import { classOf, userFacingMessage } from "@/lib/synthetic/heygen-errors";
+import { classOf, userFacingMessage, isPoolBusyError } from "@/lib/synthetic/heygen-errors";
 import type { JobAttemptInfo } from "@/worker/index";
 
 // An avatar part is capped at 1 minute by the content rules (well under HeyGen
@@ -312,6 +312,9 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
           // Avatar III finds its saved avatar on HeyGen by this user-entered name.
           heygenAvatarName:
             (project as { heygen_avatar_name?: string | null }).heygen_avatar_name ?? null,
+          // Set by the worker after this clip waited for a free account past the
+          // threshold (pool contention) — render via the API, skipping the pool.
+          forceApi: data.forceApi ?? false,
         },
         imageBytes,
       ),
@@ -329,6 +332,13 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
       metadata: { accountId: result.accountId, seconds: result.seconds },
     });
   } catch (err) {
+    // POOL CONTENTION (client 2026-07-07): every account is busy rendering another
+    // clip — this clip did NOT fail. Re-throw so the worker wrapper (handlePoolBusy)
+    // RE-DELAYS the job to WAIT for a free account (then switches to the API past
+    // the threshold). Must happen BEFORE the failed-segment writes below, or the
+    // clip would be marked failed instead of waiting. The staged audio is still
+    // cleaned up by the finally; the next wait-run re-stages it.
+    if (isPoolBusyError(err)) throw err;
     // Raw error → logs only (the admin diagnoses from here + heygen_accounts).
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.failed", {
       err: (err as Error).message?.slice(0, 200),

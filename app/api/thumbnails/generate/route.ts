@@ -6,6 +6,7 @@ import { resolveReferenceUrl } from "@/lib/thumbnails/youtube";
 import {
   generateThumbnailFromReferences,
   buildChannelReferenceUrls,
+  pickStyleImage,
   isPikzelsConfigured,
   promptContainsUrl,
 } from "@/lib/thumbnails/pikzels";
@@ -84,8 +85,17 @@ export async function POST(req: NextRequest) {
   // Build the Pikzels image slots per the channel rule: subject photo(s) fill
   // the slots first; a representative channel thumbnail fills any remaining slot
   // as a style reference (dropped entirely when two subjects are supplied).
+  //
+  // Rotate WHICH channel thumbnail is used as the style/base image so repeated
+  // generations don't all inherit the same pose. Rotation = how many thumbnails
+  // already exist for this channel, so each generation advances to a different
+  // sample pose (same person, different action).
   const samples = Array.isArray(channel.sample_urls) ? (channel.sample_urls as string[]) : [];
-  const styleImageUrl = samples[0] ?? null;
+  const { count: priorCount } = await sb
+    .from("thumbnails")
+    .select("id", { count: "exact", head: true })
+    .eq("channel_id", channelId);
+  const styleImageUrl = pickStyleImage(samples, priorCount ?? 0);
   const { referenceUrls } = buildChannelReferenceUrls({ subjectUrls, styleImageUrl });
   if (referenceUrls.length === 0) {
     return NextResponse.json(

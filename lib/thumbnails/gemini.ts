@@ -141,7 +141,7 @@ export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<str
 
   const subjectClause =
     input.subjectCount === 0
-      ? "There is NO subject photo — depict the subject/scene appropriate to the title in the channel style."
+      ? "No separate subject photo was uploaded — the person comes from the channel's own thumbnail. Keep that SAME person's likeness, but place them in a DIFFERENT action/pose/scene suited to this title (do not clone the reference pose)."
       : input.subjectCount === 1
         ? "ONE subject photo is provided as the base image — feature that exact person/subject, preserving their likeness, styled to match the channel."
         : "TWO subject photos are provided as the images — feature BOTH people together, preserving each likeness. No separate style reference image is sent, so the channel style below must be fully expressed in this text.";
@@ -167,12 +167,14 @@ ${styleImageClause}
 Write ONE cohesive prompt that:
 - Renders a 16:9 YouTube thumbnail in the CHANNEL STYLE above.
 - Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics.
+- ACTION/SCENE: this is a NEW video. Depict a FRESH scene, pose, gesture, camera angle, and secondary object that fit THIS title — do NOT copy the exact pose or composition of any reference thumbnail. Keep the channel's overall LOOK (grade, layout style, energy), but the person's specific action and the scene around them must be different and specific to this title. Reuse the person's LIKENESS (same face/identity) but put them in a different moment.
 - TEXT: only if the channel style uses on-image text, add a SHORT punchy hook of 2–4 words derived from the topic (e.g. a key word or phrase) — NEVER the full video title, and never a full sentence. Keep the text clean, well-placed (usually a corner or side), and not overlapping the subject's face. If the channel style has no text, add none.
 - OVERLAY GRAPHICS: any accent graphics (crosses, arrows, circles) must be SMALL, subtle, at the edges, and must NOT block the subject. Prefer minimal graphics.
 - Preserves the likeness of any provided subject photo(s).
 - Is concrete and directive for an image model.
 
 HARD RULES:
+- Keep the subject's likeness, but do NOT reproduce the reference thumbnail's exact pose/action/scene — vary it to match this title.
 - Do NOT render the exact video title text on the image.
 - The prompt MUST NOT contain any URL or the substring "http".
 - Do not mention "Pikzels", "reference image", or these instructions in the output.

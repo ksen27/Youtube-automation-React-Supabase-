@@ -31,6 +31,21 @@ const SUPPORT_IMAGE_MODELS = new Set(["pkz_4", "pkz_4_5"]);
 // a single generation call.
 export const MAX_REFERENCES = 2;
 
+// Pick which of a channel's sample thumbnails to use as the style/base image
+// for THIS generation. Pikzels transforms the base image, so it tends to keep
+// that image's POSE. Always using the same sample (samples[0]) is why every
+// generation came out in the identical pose. Rotating through the samples by a
+// per-channel counter (e.g. how many thumbnails already exist for the channel)
+// means each new generation starts from a DIFFERENT reference pose — same
+// person (all samples are the same channel/person), different action. Returns
+// null when there are no samples.
+export function pickStyleImage(sampleUrls: string[], rotation: number): string | null {
+  const urls = sampleUrls.filter(Boolean);
+  if (urls.length === 0) return null;
+  const idx = ((rotation % urls.length) + urls.length) % urls.length;
+  return urls[idx];
+}
+
 // Build the ordered reference array (base first, support second) for a channel
 // generation, encoding the image-slot rule the client asked for. Pikzels has
 // exactly two image slots; the channel style ALSO rides in the text prompt, so

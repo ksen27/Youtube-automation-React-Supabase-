@@ -697,14 +697,26 @@ const ServerEnvSchema = z.object({
   // illustrative still) is chosen freely by Gemini and routinely overruns — one
   // 115-block plan came back with 50 split_2 (~43%). This caps split_2 at this
   // FRACTION of total blocks; the excess (lowest-priority first) is demoted to a
-  // plain 'image'. Default 0.12 keeps a sprinkle (~1 in 8) and kills the flood.
+  // plain 'image'. Client 2026-07-07: split_2 should sit at ~10-15% of the video,
+  // so this CEILING is 0.15 and SYNTHETIC_SPLIT2_MIN_FRACTION below is the 0.10
+  // floor — together they hold split_2 in the 10-15% band.
   // Set to 0 to demote EVERY split_2 to image (no presenter-beside-image layout);
   // set to 1 to disable the cap (back to Gemini's unrestricted choice).
-  SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.12),
+  SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.15),
+  // FLOOR of the 10-15% band (client 2026-07-07). The cap KEEPS this fraction of
+  // total blocks as split_2 rather than demoting below it, so a plan with plenty
+  // of split_2 lands at ~10-15%, not scraped down to a token few. NOTE: the capper
+  // only DEMOTES excess split_2; it never PROMOTES images, so this is a
+  // "don't-demote-below" guarantee — if Gemini chose fewer than 10%, the plan keeps
+  // whatever it chose (we don't force the layout onto unsuitable content). 0
+  // disables the fractional floor (fall back to the fixed MIN_KEEP count).
+  SYNTHETIC_SPLIT2_MIN_FRACTION: z.coerce.number().min(0).max(1).default(0.10),
   // Minimum split_2 blocks to KEEP when Gemini chose at least one (client:
   // "why is split_2 not appeared?"). The cap above trims excess split_2; this
   // floor guarantees a few survive the later passes so the layout still shows
-  // up. 0 = no floor (a video can have zero split_2 if Gemini chose none).
+  // up. Combined with SYNTHETIC_SPLIT2_MIN_FRACTION as max(count, fraction*total)
+  // so a short video still keeps a couple even when 10% rounds below 2.
+  // 0 = no fixed floor (a video can have zero split_2 if Gemini chose none).
   SYNTHETIC_SPLIT2_MIN_KEEP: z.coerce.number().int().nonnegative().default(2),
   // Minimum number of blocks between two kept split_2 (client 2026-07: a
   // step-by-step walkthrough section came back as 15+ consecutive split_2 —
@@ -837,6 +849,17 @@ const ServerEnvSchema = z.object({
   // minutes to 0 to disable the time trigger (count-only).
   HEYGEN_API_SWITCH_AFTER_ACCOUNTS: z.coerce.number().int().nonnegative().default(2),
   HEYGEN_API_SWITCH_AFTER_MINUTES: z.coerce.number().nonnegative().default(30),
+  // POOL-WAIT (client 2026-07-07). When a burst enqueues MORE avatar clips than
+  // there are HeyGen accounts, the overflow clips find every account busy. Instead
+  // of hard-failing, the worker RE-DELAYS the clip so it WAITS for an account to
+  // free (a browser render is ~150s, so one usually frees within a cycle → the
+  // clip then renders on the cheap browser path). It re-checks every
+  // HEYGEN_POOL_WAIT_INTERVAL_SECONDS, up to HEYGEN_POOL_WAIT_MAX_CYCLES times;
+  // once that many cycles pass (client's "after 2 tries") OR
+  // HEYGEN_API_SWITCH_AFTER_MINUTES elapses (client's "after 30 min"), the clip
+  // switches to the API. Set MAX_CYCLES to 0 to wait purely on the 30-min timer.
+  HEYGEN_POOL_WAIT_INTERVAL_SECONDS: z.coerce.number().int().positive().default(90),
+  HEYGEN_POOL_WAIT_MAX_CYCLES: z.coerce.number().int().nonnegative().default(2),
   // Hard timeout (seconds) for one Pikzels generation request. The image
   // endpoint responds synchronously (~<30s per Pikzels), so this is a
   // fetch-abort backstop, not a poll loop.

@@ -83,6 +83,31 @@ export function isHeygenError(e: unknown): e is HeygenError {
   return e instanceof HeygenError;
 }
 
+/**
+ * POOL CONTENTION signal (client 2026-07-07). Distinct from HeygenError: it means
+ * "every account is currently BUSY rendering another clip" — NOT that this clip's
+ * render failed and NOT that an account's session is broken. A burst (e.g. "Retry
+ * all failed") enqueues more avatar jobs than there are accounts, so the overflow
+ * jobs find nothing to claim.
+ *
+ * The avatar worker treats this specially: instead of failing the clip (and
+ * burning a BullMQ attempt), it RE-DELAYS the job so the clip WAITS in the queue
+ * for an account to free up — a browser render is ~150s, so one usually frees
+ * within a wait cycle and the clip then renders on the cheap browser path. Only
+ * after the client's threshold (2 wait cycles OR 30 min with no account) does the
+ * worker switch the clip to the API. See avatarProcessor / worker/index.ts.
+ */
+export class PoolBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolBusyError";
+  }
+}
+
+export function isPoolBusyError(e: unknown): e is PoolBusyError {
+  return e instanceof PoolBusyError;
+}
+
 export function classOf(e: unknown): HeygenErrorClass {
   return isHeygenError(e) ? e.klass : "unknown";
 }

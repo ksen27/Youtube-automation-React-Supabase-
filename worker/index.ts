@@ -7,9 +7,10 @@ import { config as loadDotenv } from "dotenv";
 loadDotenv({ path: ".env.local" });
 loadDotenv();
 
-import { Worker } from "bullmq";
+import { Worker, DelayedError, type Job } from "bullmq";
 import { QUEUE_NAMES, getRedisConnection, closeAllQueues } from "@/lib/jobs/queue";
 import { getEnv } from "@/lib/env";
+import { isPoolBusyError } from "@/lib/synthetic/heygen-errors";
 
 import { processSearchJob }     from "./processors/searchProcessor";
 import { processDownloadJob }   from "./processors/downloadProcessor";
@@ -54,12 +55,83 @@ export interface JobAttemptInfo {
   attemptsAllowed: number;  // total attempts BullMQ will make
 }
 
+// POOL-WAIT parameters (client 2026-07-07). A clip with no free browser account
+// waits POOL_WAIT_INTERVAL_MS between re-checks, up to POOL_WAIT_MAX_CYCLES times,
+// then flips to the API. The 30-min ceiling reuses HEYGEN_API_SWITCH_AFTER_MINUTES
+// so all three "when to switch to API" numbers live in one place.
+const POOL_WAIT_INTERVAL_MS = env.HEYGEN_POOL_WAIT_INTERVAL_SECONDS * 1000;
+const POOL_WAIT_MAX_CYCLES = env.HEYGEN_POOL_WAIT_MAX_CYCLES;
+const POOL_WAIT_MAX_MS = env.HEYGEN_API_SWITCH_AFTER_MINUTES * 60_000;
+
+// Fields we stash on the avatar job's data across re-deliveries to implement the
+// wait loop (BullMQ preserves job.data through moveToDelayed).
+interface PoolWaitState {
+  poolWaitCycles?: number; // how many times this clip has waited on a busy pool
+  poolWaitStartMs?: number; // wall-clock (ms) of the FIRST wait, for the 30-min rule
+  forceApi?: boolean; // set once threshold is crossed → generateAvatar goes API-only
+}
+
+/**
+ * Handle a PoolBusyError (every account busy). Returns true if the job was
+ * re-queued (either to wait again, or flipped to force-API) so the caller should
+ * treat this run as "not a failure"; false if the clip has already been forced to
+ * the API and STILL couldn't produce output — i.e. a genuine failure to surface.
+ *
+ * The wait threshold is OR'd, per the client rule: switch to the API once EITHER
+ * POOL_WAIT_MAX_CYCLES wait cycles have elapsed OR 30 min has passed since the
+ * clip first started waiting.
+ */
+async function handlePoolBusy(job: Job, name: string, token?: string): Promise<boolean> {
+  const state = (job.data ?? {}) as PoolWaitState & Record<string, unknown>;
+
+  // Without a processing token we cannot moveToDelayed — fail rather than crash the
+  // worker loop. Should not happen (BullMQ supplies it), but guard defensively.
+  if (!token) return false;
+
+  // If we already forced the API on the previous run and are STILL here with a
+  // PoolBusyError, the API path was unusable (flag off / not audio-driven) — stop
+  // waiting and let it fail so the clip surfaces its error instead of looping.
+  if (state.forceApi) return false;
+
+  const now = Date.now();
+  const startMs = state.poolWaitStartMs ?? now;
+  const cycles = (state.poolWaitCycles ?? 0) + 1;
+  const elapsedMs = now - startMs;
+
+  const cyclesHit = POOL_WAIT_MAX_CYCLES > 0 && cycles >= POOL_WAIT_MAX_CYCLES;
+  const timeHit = POOL_WAIT_MAX_MS > 0 && elapsedMs >= POOL_WAIT_MAX_MS;
+
+  if (cyclesHit || timeHit) {
+    // Threshold reached → flip the clip to the API on its NEXT run. Persist
+    // forceApi + reset so generateAvatar skips the pool and renders via the API.
+    await job.updateData({ ...state, forceApi: true, poolWaitCycles: cycles, poolWaitStartMs: startMs });
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "avatar.pool_wait.switch_api",
+      cycles, elapsedMinutes: Math.round(elapsedMs / 60_000),
+      reason: cyclesHit ? `waited ${cycles} cycle(s) (>= ${POOL_WAIT_MAX_CYCLES})` : `waited ${Math.round(elapsedMs / 60_000)} min (>= ${env.HEYGEN_API_SWITCH_AFTER_MINUTES})`,
+    }));
+    // Re-run promptly (short delay) so the API attempt starts without another full
+    // wait interval.
+    await job.moveToDelayed(now + 1_000, token);
+    throw new DelayedError();
+  }
+
+  // Under threshold → wait another interval and re-check the pool.
+  await job.updateData({ ...state, poolWaitCycles: cycles, poolWaitStartMs: startMs });
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "avatar.pool_wait.retry",
+    cycles, waitSeconds: Math.round(POOL_WAIT_INTERVAL_MS / 1000), elapsedMinutes: Math.round(elapsedMs / 60_000),
+  }));
+  await job.moveToDelayed(now + POOL_WAIT_INTERVAL_MS, token);
+  throw new DelayedError();
+}
+
 function startWorker<T>(
   name: string,
   handler: (data: T, attempt: JobAttemptInfo) => Promise<void>,
   c: number
 ): Worker {
-  const w = new Worker<T>(name, async (job) => {
+  const w = new Worker<T>(name, async (job, token) => {
     const t0 = Date.now();
     const attempt: JobAttemptInfo = {
       attemptsMade: (job.attemptsMade ?? 0) + 1,
@@ -90,6 +162,23 @@ function startWorker<T>(
       await handler(job.data, attempt);
       console.log(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.done", ms: Date.now() - t0 }));
     } catch (e) {
+      // POOL CONTENTION WAIT (client 2026-07-07). A PoolBusyError means every
+      // HeyGen account is BUSY rendering another clip — NOT that this clip failed.
+      // Rather than burn a BullMQ attempt, RE-DELAY the job so the clip WAITS in
+      // the queue for an account to free up (a browser render is ~150s, so one
+      // usually frees within a wait cycle → the clip then renders on the cheap
+      // browser path). Only after the client's threshold — POOL_WAIT_MAX_CYCLES
+      // wait cycles OR HEYGEN_API_SWITCH_AFTER_MINUTES elapsed — do we flip the job
+      // to force the API. moveToDelayed + DelayedError re-queues WITHOUT counting a
+      // failed attempt, so pool contention never exhausts a clip's retries.
+      if (isPoolBusyError(e)) {
+        // handlePoolBusy either throws DelayedError (job re-queued to wait or to
+        // force the API next run — BullMQ must see that error to honor the delay)
+        // or returns false, meaning the API was already forced and still produced
+        // nothing → fall through and fail the clip like any other error.
+        await handlePoolBusy(job, name, token);
+        // Returned without throwing → treat as a genuine failure below.
+      }
       console.error(JSON.stringify({ ts: new Date().toISOString(), queue: name, jobId: job.id, msg: "job.failed", attempt, err: (e as Error).message, ms: Date.now() - t0 }));
       throw e;
     } finally {

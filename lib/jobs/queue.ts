@@ -60,7 +60,11 @@ export interface ImageToVideoJobData     { projectId: string; mediaJobId: string
 // the existing avatar video (no HeyGen re-render). Used by "Regenerate image"
 // and the bulk "images" scope so re-testing image prompts never re-renders the
 // (slow, costly) avatar. Ignored for non-split_2 blocks.
-export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; imageOnly?: boolean; }
+// forceApi + poolWait* are set by the avatar worker across re-deliveries while a
+// clip WAITS for a free HeyGen account (pool contention); see worker/index.ts
+// handlePoolBusy. forceApi tells generateAvatar to skip the browser pool and
+// render via the HeyGen API once the wait threshold is crossed.
+export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; imageOnly?: boolean; forceApi?: boolean; poolWaitCycles?: number; poolWaitStartMs?: number; }
 
 // Idle BullMQ workers sit on a long blocking BRPOP. Two distinct teardown
 // causes, depending on how a process reaches Redis:

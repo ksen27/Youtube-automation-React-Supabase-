@@ -2063,8 +2063,21 @@ export async function buildSyntheticTimeline(input: {
   // carved by duration-split like any other image).
   {
     const maxFraction = getEnv().SYNTHETIC_SPLIT2_MAX_FRACTION;
-    const minKeep = getEnv().SYNTHETIC_SPLIT2_MIN_KEEP;
     const minGap = getEnv().SYNTHETIC_SPLIT2_MIN_GAP;
+    // 10-15% BAND (client 2026-07-07). maxFraction (0.15) is the ceiling; the floor
+    // is the LARGER of the fixed MIN_KEEP count and MIN_FRACTION (0.10) of total
+    // blocks — so a plan with plenty of split_2 settles at ~10-15% instead of being
+    // scraped to a token few, while a short video still keeps a couple when 10%
+    // rounds below the fixed count. This only holds split_2 Gemini already chose
+    // (the capper demotes excess, never promotes), so it's a don't-demote-below
+    // floor, not a forced minimum. PRECEDENCE: the MIN_GAP spacing rule still wins
+    // over the floor — a heavily CLUSTERED section can land below 10% because
+    // spreading a clump matters more to the client than hitting the exact band
+    // (they explicitly rejected consecutive split_2). In a normally-spread video
+    // the band binds and split_2 settles at ~10-15%.
+    const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
+    const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
+    const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
     const before = planned.filter((p) => p.blockType === "split_2").length;
     const { segments, demoted } = capSplit2Blocks(planned, maxFraction, minKeep, minGap);
     if (demoted > 0) {
@@ -2072,6 +2085,8 @@ export async function buildSyntheticTimeline(input: {
       planned = segments;
       await logJob({ projectId, jobId }, "synthetic.plan.split2_cap", {
         maxFraction,
+        minFraction,
+        minKeep,
         minGap,
         split2Before: before,
         split2After: before - demoted,
