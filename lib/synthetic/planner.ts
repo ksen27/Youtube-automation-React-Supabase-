@@ -1306,13 +1306,42 @@ export function ensureMinSplit2(
   }
   if (eligibleIdx.length === 0) return { segments: segs, promoted: 0 };
 
-  // Pick `need` (capped by availability) evenly spaced across the eligible list.
+  // Where do EXISTING split_2 already sit? Gemini routinely CLUMPS them at the
+  // start or end of a video, so an even-stride pass that ignores them would pile
+  // promotions on top of the existing cluster and leave the middle empty (client:
+  // "split_2 should appear in the WHOLE video, not only the start or end part").
+  // Instead, greedily promote the eligible image that is FARTHEST from every
+  // already-split_2 block (and from every promotion so far) — a farthest-point
+  // fill that spreads the COMBINED set across the whole timeline regardless of
+  // where Gemini clustered. Distance is measured in block positions.
+  const anchors: number[] = [];
+  for (let i = 0; i < segs.length; i++) if (segs[i].blockType === "split_2") anchors.push(i);
   const take = Math.min(need, eligibleIdx.length);
   const chosen = new Set<number>();
-  for (let k = 0; k < take; k++) {
-    // Even stride through eligibleIdx: positions 0.5/take, 1.5/take, ...
-    const pick = Math.floor(((k + 0.5) / take) * eligibleIdx.length);
-    chosen.add(eligibleIdx[Math.min(pick, eligibleIdx.length - 1)]);
+  // If Gemini produced NO split_2 at all, seed with the eligible midpoint so the
+  // first pick isn't pinned to an edge, then let the farthest-point fill spread
+  // the rest around it.
+  if (anchors.length === 0 && take > 0) {
+    const mid = eligibleIdx[Math.floor(eligibleIdx.length / 2)];
+    chosen.add(mid);
+    anchors.push(mid);
+  }
+  while (chosen.size < take) {
+    let bestIdx = -1;
+    let bestDist = -1;
+    for (const idx of eligibleIdx) {
+      if (chosen.has(idx)) continue;
+      // Distance to the nearest anchor (existing or already-chosen split_2).
+      let nearest = Infinity;
+      for (const a of anchors) nearest = Math.min(nearest, Math.abs(idx - a));
+      if (nearest > bestDist) {
+        bestDist = nearest;
+        bestIdx = idx;
+      }
+    }
+    if (bestIdx < 0) break;
+    chosen.add(bestIdx);
+    anchors.push(bestIdx);
   }
   let promoted = 0;
   const out = segs.map((s, i) => {
@@ -2358,12 +2387,21 @@ export async function buildSyntheticTimeline(input: {
     }
   }
 
-  // split_2 FLOOR. Gemini sometimes returns zero split_2; promote a few
-  // evenly-spaced post-intro 'image' blocks to split_2 so the layout still
-  // appears (client: "why is split_2 not appeared?"). Runs AFTER the visual
-  // balance so the balance pass can't flip a promotion back to image.
+  // split_2 FLOOR. Gemini sometimes returns FAR fewer split_2 than the client's
+  // 10-15% band wants — on a 300-part video it routinely picks just 2-6, so the
+  // layout barely appears (client: "the split count is only 2 or 10 although
+  // there are 250 parts"). Promote evenly-spaced post-intro 'image' blocks up to
+  // the SAME band floor the cap pass uses — max(MIN_KEEP, ceil(total *
+  // MIN_FRACTION)) — so a long video reaches ~10% split_2 instead of the fixed
+  // count of 2. Runs AFTER the visual balance so the balance pass can't flip a
+  // promotion back to image. The cap pass (which only DEMOTES) enforces the
+  // upper 15% edge; this promoter enforces the lower 10% edge. Both must use the
+  // fractional floor or the band only binds from one side (the bug that let long
+  // videos sit at <2% split_2).
   {
-    const minKeep = getEnv().SYNTHETIC_SPLIT2_MIN_KEEP;
+    const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
+    const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
+    const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
     const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
     const haveBefore = planned.filter((p) => p.blockType === "split_2").length;
     const { segments, promoted } = ensureMinSplit2(planned, minKeep, cutoff);
@@ -2371,6 +2409,9 @@ export async function buildSyntheticTimeline(input: {
       planned = segments;
       await logJob({ projectId, jobId }, "synthetic.plan.split2_floor", {
         minKeep,
+        minFraction,
+        fracFloor,
+        totalBlocks: planned.length,
         split2Before: haveBefore,
         promotedFromImage: promoted,
         split2After: haveBefore + promoted,
