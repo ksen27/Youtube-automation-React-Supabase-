@@ -1,5 +1,5 @@
 import { getEnv } from "@/lib/env";
-import { fetchOrThrow } from "@/lib/synthetic/http";
+import { fetchOrThrow, withHttpRetry, HttpError } from "@/lib/synthetic/http";
 
 // Thin client for the Pikzels thumbnail API (https://docs.pikzels.com).
 //
@@ -88,6 +88,22 @@ export function isPikzelsConfigured(): boolean {
   return Boolean(getEnv().PIKZELS_API_KEY);
 }
 
+// Turn a Pikzels failure into a SHORT, user-facing message. Their gateway
+// returns a full HTML error page on 5xx; storing/showing that raw blob is
+// useless in the UI. Collapse any 5xx (after retries were exhausted) to a clear
+// "temporarily unavailable" line; pass a 4xx body through (it's a real,
+// actionable API message like "invalid prompt"). Non-HttpErrors return as-is.
+export function pikzelsErrorMessage(err: unknown): string {
+  if (err instanceof HttpError) {
+    if (err.status >= 500) {
+      return `Pikzels is temporarily unavailable (HTTP ${err.status}). Please try generating again in a moment.`;
+    }
+    const snippet = (err.body ?? err.message).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    return `Pikzels rejected the request (HTTP ${err.status}): ${snippet}`;
+  }
+  return err instanceof Error ? err.message : "generation failed";
+}
+
 // Pikzels rejects any prompt containing a URL (regex ^(?!.*[Hh][Tt][Tt][Pp]).+$).
 // Reject early with a clear message rather than eating an opaque 400.
 export function promptContainsUrl(prompt: string): boolean {
@@ -104,7 +120,8 @@ export async function generateThumbnailFromReferences(args: {
   referenceUrls: string[];
 }): Promise<PikzelsResult> {
   const env = getEnv();
-  if (!env.PIKZELS_API_KEY) {
+  const apiKey = env.PIKZELS_API_KEY;
+  if (!apiKey) {
     throw new Error("PIKZELS_API_KEY is not set");
   }
   if (promptContainsUrl(args.prompt)) {
@@ -127,15 +144,26 @@ export async function generateThumbnailFromReferences(args: {
     body.support_image_url = refs[1];
   }
 
-  const res = await fetchOrThrow(`${env.PIKZELS_BASE_URL}${IMAGE_ENDPOINT}`, {
-    method: "POST",
-    headers: {
-      "X-Api-Key": env.PIKZELS_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    timeoutMs: env.PIKZELS_TIMEOUT_SECONDS * 1000,
-  });
+  // Pikzels' gateway intermittently returns a 502/503 HTML error page (backend
+  // overloaded, deploying, or a heavy render timing out at their edge) — a
+  // TRANSIENT upstream failure, not a bad request. Without a retry a single 502
+  // surfaced straight to the user on generate/regenerate. withHttpRetry rides
+  // out 5xx/429/network errors with backoff (a 4xx like a bad prompt still fails
+  // fast), matching how every other provider in the app calls its API.
+  const res = await withHttpRetry(
+    "pikzels.generate",
+    () =>
+      fetchOrThrow(`${env.PIKZELS_BASE_URL}${IMAGE_ENDPOINT}`, {
+        method: "POST",
+        headers: {
+          "X-Api-Key": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        timeoutMs: env.PIKZELS_TIMEOUT_SECONDS * 1000,
+      }),
+    { attempts: 3, baseMs: 1500 },
+  );
 
   const json = (await res.json()) as { output?: unknown; request_id?: unknown };
   const outputUrl = typeof json.output === "string" ? json.output : null;

@@ -61,15 +61,16 @@ Describe ONLY the reusable visual style — the things that stay the same across
 3. Colour grade & palette (saturation, contrast, dominant colours, background style — gradients, blur, scenery).
 4. Mood / genre feel (dramatic, clean, high-energy, cinematic, etc.).
 5. Typography STYLE only IF the thumbnails have text (font weight/style, colour, outline/shadow, rough placement) — describe the LOOK of the text, never specific words, and note that text is SHORT and punchy (a few words), not full sentences.
+6. RECURRING BRANDED LABELS — a small badge/label the channel stamps on MOST of its thumbnails as part of its identity (e.g. a red "BREAKING NEWS", "EXCLUSIVE", or "LIVE" box, a channel banner bar, a corner tag). This is the OPPOSITE of one-off clutter: if the SAME kind of label appears across several of the samples, it is a REQUIRED part of this channel's format. Describe its LOOK and rough placement (e.g. "a small red rectangular 'BREAKING NEWS'-style label with white all-caps text at the bottom-left, above the main title bar") and state that it should be reproduced on every generation. Reproduce the label's STYLE and typical WORDING KIND (breaking-news / exclusive / live), not a specific video's text. Only mark it as present when it genuinely recurs across the samples.
 
-OVERLAY GRAPHICS RULE (important): channels often stamp decorative overlays — red crosses/X marks, arrows, circles, highlight rings. If present, mention them ONLY as OPTIONAL, SMALL, SUBTLE accents placed at the edges. NEVER describe them as large, bold, or central, and state explicitly that such graphics must be small and must NOT cover or block the subject/face. When in doubt, favour a cleaner look with minimal or no overlay graphics.
+OVERLAY GRAPHICS RULE (important) — this is about ONE-OFF DECORATIVE clutter, NOT the recurring branded label in point 6. Channels sometimes stamp random per-video accents — red crosses/X marks, arrows, circles, highlight rings pointing at things. If present, mention THESE ONLY as OPTIONAL, SMALL, SUBTLE accents placed at the edges. NEVER describe them as large, bold, or central, and state explicitly that such graphics must be small and must NOT cover or block the subject/face. When in doubt, favour a cleaner look with minimal or no such graphics. (A recurring breaking-news / exclusive label is NOT this kind of clutter — keep it per point 6.)
 
-Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, the subject prominent and unobstructed, short bold white sans-serif text with a heavy black outline on the left, high contrast, teal-and-orange grade, any accent graphics kept small and to the edges …").
+Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, the subject prominent and unobstructed, short bold yellow all-caps sans-serif text with a heavy black outline on a solid bottom bar, plus a small red 'BREAKING NEWS'-style label with white text at the bottom-left above the bar, high contrast, teal-and-orange grade, any random accent graphics kept small and to the edges …").
 
 The prompt MUST NOT contain any URL or the substring "http".
 
 Return STRICT JSON ONLY:
-{ "style_prompt": "the reusable style instruction, 60–150 words" }`;
+{ "style_prompt": "the reusable style instruction, 70–180 words" }`;
 
   const model = getGeminiModel();
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
@@ -169,7 +170,8 @@ Write ONE cohesive prompt that:
 - Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics.
 - ACTION/SCENE: this is a NEW video. Depict a FRESH scene, pose, gesture, camera angle, and secondary object that fit THIS title — do NOT copy the exact pose or composition of any reference thumbnail. Keep the channel's overall LOOK (grade, layout style, energy), but the person's specific action and the scene around them must be different and specific to this title. Reuse the person's LIKENESS (same face/identity) but put them in a different moment.
 - TEXT: only if the channel style uses on-image text, add a SHORT punchy hook of 2–4 words derived from the topic (e.g. a key word or phrase) — NEVER the full video title, and never a full sentence. Keep the text clean, well-placed (usually a corner or side), and not overlapping the subject's face. If the channel style has no text, add none.
-- OVERLAY GRAPHICS: any accent graphics (crosses, arrows, circles) must be SMALL, subtle, at the edges, and must NOT block the subject. Prefer minimal graphics.
+- BRANDED LABEL: if the CHANNEL STYLE above describes a RECURRING branded label (a "BREAKING NEWS" / "EXCLUSIVE" / "LIVE" box, a channel banner bar, a corner tag), you MUST reproduce it — it is part of the channel's identity, not optional clutter. Render it in the same style and placement the channel style describes (e.g. a small red 'BREAKING NEWS'-style box with white all-caps text at the bottom-left). Keep the label small and at the edge so it does not cover the subject's face, but DO include it. Use the label KIND the channel uses (breaking-news / exclusive / live), not the full video title.
+- OVERLAY GRAPHICS: any ONE-OFF decorative accents (random crosses, arrows, circles) — as opposed to the recurring branded label above — must be SMALL, subtle, at the edges, and must NOT block the subject. Prefer minimal such graphics.
 - Preserves the likeness of any provided subject photo(s).
 - Is concrete and directive for an image model.
 
@@ -178,7 +180,7 @@ HARD RULES:
 - Do NOT render the exact video title text on the image.
 - The prompt MUST NOT contain any URL or the substring "http".
 - Do not mention "Pikzels", "reference image", or these instructions in the output.
-- Max 900 characters.
+- Max 1100 characters.
 
 Return STRICT JSON ONLY:
 { "prompt": "the final image prompt" }`;
@@ -220,6 +222,6 @@ function assembleFallbackPrompt(input: BuildPromptInput): string {
   if (input.subjectCount === 1) parts.push("Feature the provided subject as the clear, unobstructed focal point, preserving their likeness.");
   if (input.subjectCount === 2) parts.push("Feature both provided subjects together as the clear focal point, preserving each likeness.");
   if (input.customPrompt?.trim()) parts.push(input.customPrompt.trim());
-  parts.push("Any on-image text is a short 2–4 word hook, not the full title, and must not cover the subject. Keep any accent graphics small and at the edges.");
+  parts.push("Any on-image text is a short 2–4 word hook, not the full title, and must not cover the subject. If the channel style describes a recurring branded label (e.g. a 'BREAKING NEWS' / 'EXCLUSIVE' box), reproduce it in that style at the edge. Keep any one-off accent graphics small and at the edges.");
   return parts.join(" ").replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim().slice(0, 3000);
 }

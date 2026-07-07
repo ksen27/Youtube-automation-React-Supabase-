@@ -9,6 +9,7 @@ import {
   pickStyleImage,
   isPikzelsConfigured,
   promptContainsUrl,
+  pikzelsErrorMessage,
 } from "@/lib/thumbnails/pikzels";
 
 export const runtime = "nodejs";
@@ -147,7 +148,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ thumbnail: updated }, { status: 200 });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "generation failed";
+    const message = pikzelsErrorMessage(err);
     await sb
       .from("thumbnails")
       .update({ status: "failed", error: message, updated_at: new Date().toISOString() })
