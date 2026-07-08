@@ -34,6 +34,45 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import { maybeEnqueueMatch } from "./processors/_shared";
 
+// Reconcile a synthetic SEGMENT stuck at 'generating' when its media_job died
+// without reaching the processor's own terminal write.
+//
+// THE GAP THIS CLOSES: the segment's status='failed' write lives ONLY inside
+// the processor body (imageGenProcessor / imageToVideoProcessor / avatarProcessor
+// finishSegment). If the job is hard-killed (OOM, machine eviction) the processor
+// never runs that line, so failJobRow flips the media_job to 'failed' but the
+// synthetic_segments row stays 'generating' — and the review screen (which polls
+// the SEGMENT status) spins forever. This flips the linked segment to 'failed'
+// too, turning an infinite spinner into a visible Regenerate button.
+//
+// Safe against the false-fail hazard called out in _shared.ts: we do NOT sweep
+// segments by staleness. This fires ONLY once the media_job itself is failed,
+// which the job sweep already gates on the 45-min stale window WITH heartbeats
+// (withSegmentHeartbeat) keeping live renders fresh — so a segment that is still
+// rendering is never touched. The status='generating' guard also stops us
+// resurrecting a segment that finished or was already reset for regen.
+async function reconcileSegmentForFailedJob(
+  mediaJobId: string,
+  metadata: unknown,
+  reason: string,
+): Promise<void> {
+  const segmentId = (metadata as { segmentId?: string } | null)?.segmentId;
+  if (!segmentId) return; // non-synthetic job (search/download/clip/render) — no segment
+  const sb = getServerSupabase();
+  const { error } = await sb
+    .from("synthetic_segments")
+    .update({ status: "failed", error: reason })
+    .eq("id", segmentId)
+    // Only reconcile a segment still in flight. A 'ready' segment (job died AFTER
+    // the segment succeeded) or one already reset to 'pending'/'generating' for a
+    // fresh regen must not be clobbered.
+    .eq("status", "generating");
+  if (error) {
+    await logJob({ jobId: mediaJobId },
+      "reconcile.segment.error", { err: error.message, segmentId });
+  }
+}
+
 // Marks a single media_jobs row failed if it is not already in a terminal
 // state. Idempotent — safe to call from the failed-event handler even if a
 // later retry already wrote a terminal status. Returns the project_id + type
@@ -45,7 +84,7 @@ async function failJobRow(
   const sb = getServerSupabase();
   const { data: row } = await sb
     .from("media_jobs")
-    .select("id, project_id, type, status")
+    .select("id, project_id, type, status, metadata")
     .eq("id", mediaJobId)
     .single();
   if (!row) return null;
@@ -66,6 +105,10 @@ async function failJobRow(
       "reconcile.fail_row.error", { err: error.message });
     return null;
   }
+  // Also reconcile the linked synthetic segment so a dead image/clip/avatar job
+  // doesn't leave the segment spinning at 'generating' forever (no-op for
+  // non-synthetic job types, which carry no segmentId).
+  await reconcileSegmentForFailedJob(mediaJobId, row.metadata, reason);
   return { projectId: row.project_id, type: row.type };
 }
 

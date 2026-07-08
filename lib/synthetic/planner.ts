@@ -127,7 +127,22 @@ const SINGLE_SUBJECT_RULE =
   "(a talking presenter beside a separate illustrative still, composited at " +
   "render time), NOT a collage drawn inside one image, so keep choosing split_2 " +
   "whenever the narration calls for it; its imagePrompt still follows this rule " +
-  "(one clean single-subject still for the illustrative half).";
+  "(one clean single-subject still for the illustrative half). " +
+  // Client requirement 2026-07: when the narration names a real/famous/private
+  // person (e.g. "Louise Brown"), naming them in the imagePrompt makes the
+  // image/video provider REFUSE or STALL the job (real-likeness hard-blocks), and
+  // a named private individual's likeness is never reliably reproduced anyway. So
+  // the picture prompt must describe people GENERICALLY by visual traits, never by
+  // name. The SPOKEN narration keeps the name — only the imagePrompt is de-named.
+  "NO REAL NAMES (critical, client requirement): NEVER put a real person's name " +
+  "— famous, private, or public-figure — in the imagePrompt, and never give an " +
+  "unmistakable identifying description of one specific real individual. If the " +
+  "narration names someone, describe them GENERICALLY by the visual traits the " +
+  "scene needs: approximate age, gender, era-appropriate clothing, setting, mood, " +
+  "action. Example: NOT 'Louise Brown with her two sons' but 'an elderly woman " +
+  "with two grown adult sons, smiling together in a 1970s family home, warm " +
+  "nostalgic tone'. The spoken script is unchanged — the name stays in the " +
+  "voiceover; only the picture prompt is de-named.";
 
 // The video's derived niche/world. Filled by deriveVideoTopic() from the
 // project title + a transcript sample so the planner prompt anchors visuals to
