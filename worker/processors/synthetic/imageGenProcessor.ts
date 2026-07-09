@@ -27,6 +27,31 @@ export async function processImageGenJob(
 
   await setMediaJob(mediaJobId, { status: "running", progress: 10, metadata: { segmentId } });
 
+  // ZOMBIE-LOOP FIX: if a PRIOR attempt of this job already submitted a 69labs
+  // generation (recorded here) but its poll timed out, resume polling THAT job
+  // instead of submitting a new one — resubmitting stacks a second generation on
+  // the same account and fills its 7-slot ceiling, which is what causes the
+  // chronic "Concurrent limit reached (7)" 403 under load. Read the recorded
+  // (jobId, keyIdx) off the media_job metadata (setMediaJob merges metadata, so
+  // it survives across BullMQ attempts).
+  const { data: jobRow } = await sb
+    .from("media_jobs")
+    .select("metadata")
+    .eq("id", mediaJobId)
+    .single();
+  const jobMeta = (jobRow?.metadata as { sixtynineJobId?: string; sixtynineKeyIdx?: number } | null) ?? {};
+  const resume = {
+    // A prior attempt's recorded 69labs job, or ("", -1) when there's nothing to
+    // resume — generateImage's canResume guard falls through to a fresh submit in
+    // that case, and onSubmit persists the new (jobId, keyIdx) either way so the
+    // NEXT attempt can resume it.
+    jobId: jobMeta.sixtynineJobId ?? "",
+    keyIdx: typeof jobMeta.sixtynineKeyIdx === "number" ? jobMeta.sixtynineKeyIdx : -1,
+    onSubmit: async (jobId: string, keyIdx: number) => {
+      await setMediaJob(mediaJobId, { metadata: { sixtynineJobId: jobId, sixtynineKeyIdx: keyIdx } });
+    },
+  };
+
   const { data: seg, error } = await sb
     .from("synthetic_segments")
     .select("id, block_type, image_prompt, script, metadata")
@@ -48,7 +73,7 @@ export async function processImageGenJob(
   try {
     const t0 = Date.now();
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
-    const out = await generateImage(prompt);
+    const out = await generateImage(prompt, resume);
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId,
       provider: out.provider, phase: "response",
@@ -75,7 +100,13 @@ export async function processImageGenJob(
       error: null, // clear any prior-attempt / stall-sweep error on success
       ...(isSplit ? { right_image_url: up.publicUrl } : { image_url: up.publicUrl }),
     });
-    await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: out.provider } });
+    // Clear the resume pointer on success so a later regenerate of this segment
+    // starts a fresh generation instead of re-polling this now-consumed job.
+    await setMediaJob(mediaJobId, {
+      status: "completed",
+      progress: 100,
+      metadata: { provider: out.provider, sixtynineJobId: null, sixtynineKeyIdx: null },
+    });
   } catch (err) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.failed", {
       err: (err as Error).message?.slice(0, 200),
