@@ -309,6 +309,19 @@ export interface GenerateImageResult {
   provider: "sixtynine_image" | "fal_flux_image";
 }
 
+// Cross-attempt resume for 69labs image generation (the zombie-loop fix). When a
+// prior BullMQ attempt submitted a generation but its poll timed out, the caller
+// (imageGenProcessor) passes the recorded jobId + the key index it ran on so we
+// RE-POLL that same generation instead of submitting a new one. onSubmit lets the
+// caller persist a freshly-submitted (jobId, keyIdx) so the NEXT attempt can
+// resume it. keyIdx indexes keyPool() (0 = primary), so a resume only re-polls
+// the exact account the job was created on.
+export interface ImageResume {
+  jobId: string;
+  keyIdx: number;
+  onSubmit?: (jobId: string, keyIdx: number) => Promise<void> | void;
+}
+
 // 69labs image generation is an ASYNC JOB API (same lifecycle as TTS):
 //   1. POST /api/v1/images/generate       -> { id, queuePosition }
 //   2. GET  /api/v1/images/status/:jobId  -> PENDING|PROCESSING|...|COMPLETED|
@@ -329,13 +342,27 @@ interface ImageStatusResponse {
 async function generateNanoBananaImage(
   prompt: string,
   key: string,
+  opts: {
+    // A jobId from a PRIOR attempt on THIS key/account. When present we skip the
+    // submit and RESUME polling that existing generation instead of creating a
+    // new one — this is the zombie-loop fix. A poll timeout on attempt N leaves a
+    // generation still running on 69labs' side; resubmitting on attempt N+1
+    // stacks a SECOND generation on the same account and fills its 7-slot ceiling
+    // (→ the chronic "Concurrent limit reached (7)" 403). Re-polling the SAME job
+    // drains the account instead of filling it.
+    resumeJobId?: string;
+    // Called with the freshly-submitted jobId BEFORE polling begins, so the
+    // caller can persist it and resume this exact generation on a retry.
+    onSubmit?: (jobId: string) => Promise<void> | void;
+  } = {},
 ): Promise<{ image: Buffer; contentType: string }> {
   const c = cfg();
   const authJson = { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
   const authOnly = { Authorization: `Bearer ${key}` };
 
-  // 1) Submit the job. 16:9 to match the synthetic canvas; the renderer handles
-  // any cropping/letterboxing, so we request a wide aspect ratio.
+  // 1) Submit the job — UNLESS we're resuming a prior attempt's generation on
+  // this same account (opts.resumeJobId). 16:9 to match the synthetic canvas;
+  // the renderer handles any cropping/letterboxing, so we request a wide aspect.
   //
   // SHORT submit retry budget (2 attempts, ~1s): the GLOBAL Redis limiter already
   // ensures we only submit while holding a real per-account slot, so a 403
@@ -345,25 +372,34 @@ async function generateNanoBananaImage(
   // 5-attempt budget) just holds our slot doing nothing and delays the fal.ai
   // fallback by minutes. Fail fast so generateImage falls over to fal.ai quickly
   // instead of burning the retry budget on an account we can't unstick.
-  const submit = await withHttpRetry("69labs.image.submit", () =>
-    fetchOrThrow(`${c.base}/api/v1/images/generate`, {
-      method: "POST",
-      headers: authJson,
-      body: JSON.stringify({
-        prompt,
-        model: c.imageModel,
-        aspectRatio: "16:9",
-        // Request a higher resolution (1K/2K/4K, Nano Banana Pro) so stills are
-        // sharp at the 1080p render. Omitted when the env value is empty so the
-        // provider default applies. Field name per 69labs' generate contract.
-        ...(c.imageResolution ? { resolution: c.imageResolution } : {}),
+  let jobId: string;
+  if (opts.resumeJobId) {
+    jobId = opts.resumeJobId;
+  } else {
+    const submit = await withHttpRetry("69labs.image.submit", () =>
+      fetchOrThrow(`${c.base}/api/v1/images/generate`, {
+        method: "POST",
+        headers: authJson,
+        body: JSON.stringify({
+          prompt,
+          model: c.imageModel,
+          aspectRatio: "16:9",
+          // Request a higher resolution (1K/2K/4K, Nano Banana Pro) so stills are
+          // sharp at the 1080p render. Omitted when the env value is empty so the
+          // provider default applies. Field name per 69labs' generate contract.
+          ...(c.imageResolution ? { resolution: c.imageResolution } : {}),
+        }),
+        timeoutMs: 60_000,
       }),
-      timeoutMs: 60_000,
-    }),
-    { attempts: 2, baseMs: 1000 },
-  );
-  const { id: jobId } = (await submit.json()) as { id: string; queuePosition?: number };
-  if (!jobId) throw new Error("69labs image: submit returned no job id");
+      { attempts: 2, baseMs: 1000 },
+    );
+    const parsed = (await submit.json()) as { id: string; queuePosition?: number };
+    if (!parsed.id) throw new Error("69labs image: submit returned no job id");
+    jobId = parsed.id;
+    // Persist the jobId before polling so a poll-timeout retry resumes THIS
+    // generation rather than submitting another and filling the account.
+    if (opts.onSubmit) await opts.onSubmit(jobId);
+  }
 
   // 2) Poll status until COMPLETED (or a terminal failure / timeout).
   //
@@ -467,27 +503,45 @@ function isCensored(err: unknown): boolean {
 // GLOBAL per-account slot cap. Throws when every key is exhausted (all accounts
 // down/blocked, persistent rate-limit, poll timeout). This is the PRIMARY path;
 // generateImage wraps it with the fal.ai fallback.
-async function generate69labsImage(prompt: string): Promise<GenerateImageResult> {
+async function generate69labsImage(
+  prompt: string,
+  resume?: ImageResume,
+): Promise<GenerateImageResult> {
   // GLOBAL per-account cap (Redis-coordinated across both worker machines). The
   // old SIXTYNINE_IMAGE_CONCURRENCY was a per-PROCESS semaphore, so cap × machines
   // overshot 69labs' 7-per-account ceiling. withAccountSlot enforces the cap for
   // the WHOLE cluster and blocks (without holding anything) until a slot frees —
   // so many videos share the fixed slots fairly instead of stampeding to a 403.
   const cap = getEnv().SIXTYNINE_ACCOUNT_CONCURRENCY;
+  const pool = keyPool();
 
-  // Try each key in round-robin order. The FIRST key is the load-balanced choice
-  // for this generation; the rest are failover targets used only when a key dies
-  // with a permanent auth 403. The account slot is held only for ITS attempt, so a
-  // busy account never blocks a free slot on another.
-  const order = nextKeyOrder(keyPool());
+  // RESUME PATH: a prior attempt already submitted a 69labs generation on a
+  // specific account (resume.jobId + resume.keyIdx). Re-poll THAT job on THAT
+  // key instead of round-robining a fresh submit — otherwise the retry stacks a
+  // second generation on the account and fills its 7-slot ceiling (the zombie
+  // loop). We only resume when a real jobId was recorded AND the recorded key
+  // still exists in the pool; otherwise fall through to a normal round-robin
+  // submit (onSubmit still fires so the fresh job is persisted for next time).
+  const canResume =
+    !!resume?.jobId && resume.keyIdx >= 0 && resume.keyIdx < pool.length;
+  const order = canResume ? [pool[resume!.keyIdx]] : nextKeyOrder(pool);
   let lastErr: unknown;
   for (let i = 0; i < order.length; i++) {
     const key = order[i];
+    const keyIdx = pool.indexOf(key);
+    // Only pass the resume jobId when we're genuinely resuming AND on the exact
+    // key it was submitted on. Otherwise this is a fresh submit.
+    const resumeJobId = canResume && keyIdx === resume!.keyIdx ? resume!.jobId : undefined;
     try {
       // Hold a GLOBAL account slot for the whole submit→poll→download so each
       // account's cluster-wide in-flight image work stays under the real cap.
       const { image, contentType } = await withAccountSlot(accountIdFor(key), cap, () =>
-        generateNanoBananaImage(prompt, key),
+        generateNanoBananaImage(prompt, key, {
+          resumeJobId,
+          onSubmit: resume?.onSubmit
+            ? (jobId) => resume.onSubmit!(jobId, keyIdx)
+            : undefined,
+        }),
       );
       return { image, contentType, provider: "sixtynine_image" };
     } catch (err) {
@@ -520,12 +574,18 @@ async function generate69labsImage(prompt: string): Promise<GenerateImageResult>
   throw lastErr ?? new Error("generateImage: no 69labs key configured");
 }
 
-export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
+export async function generateImage(
+  basePrompt: string,
+  resume?: ImageResume,
+): Promise<GenerateImageResult> {
   cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
   const prompt = withStylePrompt(basePrompt);
 
   try {
-    return await generate69labsImage(prompt);
+    // The resume path re-polls a prior attempt's 69labs generation instead of
+    // resubmitting (zombie-loop fix). Only the 69labs path resumes — the fal.ai
+    // fallback below always submits fresh (it has no per-account concurrency wall).
+    return await generate69labsImage(prompt, resume);
   } catch (err) {
     // fal.ai FALLBACK: 69labs failed past its retry budget / all accounts are
     // down or blocked. Fall back to fal.ai (FLUX) so a 69labs outage doesn't fail
