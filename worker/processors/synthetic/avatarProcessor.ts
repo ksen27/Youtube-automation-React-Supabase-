@@ -300,15 +300,14 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
           // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
           // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
           aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
-          // Doc-highlight color picked the HeyGen model (red -> Avatar IV,
-          // orange -> Avatar III). Null (legacy rows) defaults to Avatar IV.
-          // split_2 is a GEMINI layout choice, never a colored mark, so it always
-          // stays on Avatar IV (the working split-screen path) — never Avatar III.
-          avatarModel:
-            seg.block_type !== "split_2" &&
-            (seg as { avatar_model?: string | null }).avatar_model === "avatar_iii"
-              ? "avatar_iii"
-              : "avatar_iv",
+          // Client 2026-07-09: EVERY avatar part renders with Avatar III, including
+          // split_2. The doc-highlight color (red or orange) only marks a run as an
+          // avatar part now — it no longer picks the model (see doc-marks). split_2
+          // is a GEMINI layout choice with no colored mark, so its avatar_model is
+          // null; we force it to Avatar III here. On the Avatar Shots page split_2
+          // keeps HeyGen's 9:16 PORTRAIT default (aspectRatio "portrait" below, which
+          // driveAvatarIIIComposer leaves untouched); full-frame parts flip to 16:9.
+          avatarModel: "avatar_iii",
           // Avatar III finds its saved avatar on HeyGen by this user-entered name.
           heygenAvatarName:
             (project as { heygen_avatar_name?: string | null }).heygen_avatar_name ?? null,

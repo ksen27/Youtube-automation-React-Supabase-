@@ -37,13 +37,17 @@ const ServerEnvSchema = z.object({
   // CX is the Programmable Search Engine ID from programmablesearchengine.google.com.
   GOOGLE_SEARCH_API_KEY: z.string().optional(),
   GOOGLE_SEARCH_CX: z.string().optional(),
-  GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+  // Use the "-latest" alias so a Google model retirement can't 404 us: the pinned
+  // gemini-2.5-flash / gemini-2.0-flash were retired (generateContent returns 404
+  // "no longer available") even though ListModels still shows them. -latest always
+  // resolves to the current stable flash model.
+  GEMINI_MODEL: z.string().default("gemini-flash-latest"),
   // Secondary model the planner falls back to when GEMINI_MODEL keeps throwing
   // retryable 503/429 "high demand" errors after its full retry budget. A demand
-  // spike on one Gemini model (e.g. gemini-2.5-flash) usually does NOT hit a
-  // different model, so re-running the call on gemini-2.0-flash turns a Google
-  // outage into a slightly slower success. Set empty to disable the fallback.
-  GEMINI_FALLBACK_MODEL: z.string().default("gemini-2.0-flash"),
+  // spike on one Gemini model usually does NOT hit a different model, so re-running
+  // the call on the lite alias turns a Google outage into a slightly slower success.
+  // Set empty to disable the fallback.
+  GEMINI_FALLBACK_MODEL: z.string().default("gemini-flash-lite-latest"),
   DEEPGRAM_API_KEY: z.string().optional(),
   DEEPGRAM_MODEL: z.string().default("nova-3"),
   REDIS_URL: z.string().default("redis://localhost:6379"),

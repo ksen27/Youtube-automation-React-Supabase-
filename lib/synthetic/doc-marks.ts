@@ -55,16 +55,18 @@ function isOrange(c: { red?: number; green?: number; blue?: number }): boolean {
 }
 
 // Classify a run's foreground color into an avatar model, or null if it is not
-// an avatar highlight. Red -> Avatar IV, orange -> Avatar III. We test orange
-// FIRST because the orange band (high red) partially overlaps the red test's
-// "red dominates" — but isRed() additionally requires green to be LOW
-// (r > g + 0.3), so a true orange (mid green) never satisfies isRed anyway; the
-// explicit order just makes the intent unambiguous.
+// an avatar highlight. BOTH red and orange now map to Avatar III (client
+// 2026-07-09): the client wants every avatar part rendered with the cheaper
+// Avatar-Shots (Avatar III) flow, so the highlight color only marks a run as an
+// avatar part — it no longer selects the model. (split_2 blocks are still forced
+// to Avatar IV downstream in the avatar processor, since Avatar III can't render
+// the split-screen half-cell.) We keep testing orange FIRST purely for clarity;
+// both branches return the same model.
 function avatarModelForRun(run: GoogleDocsTextRun): AvatarModel | null {
   const c = run.textStyle?.foregroundColor?.color?.rgbColor;
   if (!c) return null;
   if (isOrange(c)) return "avatar_iii";
-  if (isRed(c)) return "avatar_iv";
+  if (isRed(c)) return "avatar_iii";
   return null;
 }
 

@@ -1361,7 +1361,11 @@ async function driveAvatarIIIComposer(
   // retry a few times. For the wanted==default case (portrait) the verify still
   // confirms rather than assuming.
   const wantOrientation: "landscape" | "portrait" = wantPortrait ? "portrait" : "landscape";
-  let orientationSet = false;
+  // split_2 wants PORTRAIT, which is exactly HeyGen's Avatar-Shots default. Client
+  // 2026-07-09: for split_2, leave that 9:16 default alone — do NOT touch the
+  // orientation control at all (never open the menu, never click a toggle). Only
+  // full-frame parts need the explicit flip to Landscape.
+  let orientationSet = wantPortrait;
   for (let attempt = 0; attempt < 3 && !orientationSet; attempt++) {
     // Already in the wanted orientation? (Portrait is the default — this skips a
     // needless toggle.) The trigger's own sprite is the source of truth.
