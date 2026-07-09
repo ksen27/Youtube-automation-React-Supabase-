@@ -336,10 +336,15 @@ async function generateNanoBananaImage(
 
   // 1) Submit the job. 16:9 to match the synthetic canvas; the renderer handles
   // any cropping/letterboxing, so we request a wide aspect ratio.
-  // Extra retry budget on submit: a 403 "concurrent limit reached" needs to
-  // wait for OTHER in-flight generations to finish, which can take longer than
-  // a normal transient blip. 5 attempts with a 2s base gives ~2+6+18+54s of
-  // backoff — enough for a burst to drain — before giving up on the segment.
+  //
+  // SHORT submit retry budget (2 attempts, ~1s): the GLOBAL Redis limiter already
+  // ensures we only submit while holding a real per-account slot, so a 403
+  // "concurrent limit reached" here means 69labs' own count is full of
+  // generations WE CAN'T CONTROL (zombies from a prior overload that timed out on
+  // our side but keep running on theirs). Retrying in place for ~80s (the old
+  // 5-attempt budget) just holds our slot doing nothing and delays the fal.ai
+  // fallback by minutes. Fail fast so generateImage falls over to fal.ai quickly
+  // instead of burning the retry budget on an account we can't unstick.
   const submit = await withHttpRetry("69labs.image.submit", () =>
     fetchOrThrow(`${c.base}/api/v1/images/generate`, {
       method: "POST",
@@ -355,7 +360,7 @@ async function generateNanoBananaImage(
       }),
       timeoutMs: 60_000,
     }),
-    { attempts: 5, baseMs: 2000 },
+    { attempts: 2, baseMs: 1000 },
   );
   const { id: jobId } = (await submit.json()) as { id: string; queuePosition?: number };
   if (!jobId) throw new Error("69labs image: submit returned no job id");
@@ -487,16 +492,21 @@ async function generate69labsImage(prompt: string): Promise<GenerateImageResult>
       return { image, contentType, provider: "sixtynine_image" };
     } catch (err) {
       lastErr = err;
-      // Only a PERMANENT auth 403 (revoked/blocked/expired key) is worth failing
-      // over to the next key. Any other error (transient 403 "concurrent limit",
-      // poll timeout, censored, etc.) propagates unchanged — those are ridden out
-      // on the same key by withHttpRetry, or are genuine content errors.
+      // CENSORED is a content rejection — do NOT try other keys (every account
+      // rejects it) and do NOT fall back to fal (see generateImage). Surface it.
+      if (isCensored(err)) throw err;
+      // Try the NEXT account on (a) a permanent auth 403 (dead key) OR (b) the
+      // concurrent-limit 403 / poll timeout — another account may have a free
+      // slot while this one is jammed by zombies. Each key now fails FAST (short
+      // submit retry), so sweeping all 3 accounts costs seconds, not minutes.
+      // When every account is exhausted, the loop throws and generateImage falls
+      // over to fal.ai.
       const hasNext = i < order.length - 1;
-      if (hasNext && isAuthForbidden(err)) {
+      if (hasNext) {
         console.warn(
           JSON.stringify({
             msg: "69labs.image.key_failover",
-            note: "image key returned a permanent auth 403; retrying on next key in pool",
+            note: "image key unavailable (auth/limit/timeout); trying next account in pool",
             err: (err as Error).message?.slice(0, 200),
           }),
         );
