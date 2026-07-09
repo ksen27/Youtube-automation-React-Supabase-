@@ -1,6 +1,15 @@
 import { getEnv } from "@/lib/env";
 import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
+import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
+import { generateFalImage, isFalImageConfigured } from "@/lib/synthetic/falai";
+
+// Stable per-account id for the Redis slot pool. We key by the api key's short
+// prefix (never the full secret) so each 69labs account gets its own global
+// semaphore and the key value itself never lands in a Redis key name or a log.
+function accountIdFor(key: string): string {
+  return key.slice(0, 10);
+}
 
 // 69labs provider: TTS voiceover + nano-banana image generation.
 //
@@ -51,17 +60,10 @@ class KeySemaphore {
   }
 }
 
-// One semaphore per api key, created lazily and keyed by the key string so each
-// account's in-flight image work is bounded independently.
-const imageSemaphores = new Map<string, KeySemaphore>();
-function imageSemaphoreFor(key: string): KeySemaphore {
-  let sem = imageSemaphores.get(key);
-  if (!sem) {
-    sem = new KeySemaphore();
-    imageSemaphores.set(key, sem);
-  }
-  return sem;
-}
+// NOTE: image generation no longer uses a per-process semaphore. Its concurrency
+// is now bounded by the GLOBAL Redis per-account limiter (withAccountSlot in
+// generateImage) so the cap holds across both worker machines. The per-process
+// KeySemaphore below remains for TTS only.
 
 // Separate per-key semaphores for TTS. 69labs meters TTS concurrency separately
 // from image generation, so TTS gets its own slot pools (reusing the image
@@ -302,7 +304,9 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
 export interface GenerateImageResult {
   image: Buffer;
   contentType: string;
-  provider: "sixtynine_image";
+  // "sixtynine_image" for the primary nano-banana path; "fal_flux_image" when the
+  // 69labs pool is exhausted and we fall back to fal.ai (see generateImage).
+  provider: "sixtynine_image" | "fal_flux_image";
 }
 
 // 69labs image generation is an ASYNC JOB API (same lifecycle as TTS):
@@ -379,6 +383,13 @@ async function generateNanoBananaImage(
     // "concurrent limit reached (7)". So give the poll a budget that rides out
     // 429 for most of the poll window (8 attempts ≈ 1+3+9+27...s of backoff)
     // instead of failing a healthy generation on a transient rate-limit.
+    // GLOBAL poll-rate gate (Redis token bucket). The status endpoint is rate-
+    // limited by REQUEST RATE separately from generation; with many jobs polling
+    // at once the combined rate tripped 429 "TOO_MANY_REQUESTS". Take a cluster-
+    // wide token before each poll so total polls/sec stay under budget no matter
+    // how many jobs are in flight. Blocks briefly when the bucket is empty.
+    const env = getEnv();
+    await acquirePollToken("image.status", env.SIXTYNINE_POLL_RATE_PER_SEC, env.SIXTYNINE_POLL_BURST);
     const statusRes = await withHttpRetry("69labs.image.status", () =>
       fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
         headers: authOnly,
@@ -439,24 +450,40 @@ async function generateNanoBananaImage(
  * re-run from the UI once 69labs recovers. The chosen provider is returned for
  * cost attribution (always "sixtynine_image").
  */
-export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
-  cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
-  const prompt = withStylePrompt(basePrompt);
-  const limit = getEnv().SIXTYNINE_IMAGE_CONCURRENCY;
+// A 69labs CENSORED (content-policy) failure. This must NOT trigger the fal.ai
+// fallback: a content rejection would also be rejected by fal.ai, and the real
+// fix is to edit the prompt (see the de-naming rule), not switch provider. Match
+// the CENSORED reason text generateNanoBananaImage throws.
+function isCensored(err: unknown): boolean {
+  return /CENSORED/i.test((err as Error)?.message ?? "");
+}
+
+// Run the 69labs (nano-banana) pool: round-robin across keys, each under the
+// GLOBAL per-account slot cap. Throws when every key is exhausted (all accounts
+// down/blocked, persistent rate-limit, poll timeout). This is the PRIMARY path;
+// generateImage wraps it with the fal.ai fallback.
+async function generate69labsImage(prompt: string): Promise<GenerateImageResult> {
+  // GLOBAL per-account cap (Redis-coordinated across both worker machines). The
+  // old SIXTYNINE_IMAGE_CONCURRENCY was a per-PROCESS semaphore, so cap × machines
+  // overshot 69labs' 7-per-account ceiling. withAccountSlot enforces the cap for
+  // the WHOLE cluster and blocks (without holding anything) until a slot frees —
+  // so many videos share the fixed slots fairly instead of stampeding to a 403.
+  const cap = getEnv().SIXTYNINE_ACCOUNT_CONCURRENCY;
 
   // Try each key in round-robin order. The FIRST key is the load-balanced choice
   // for this generation; the rest are failover targets used only when a key dies
-  // with a permanent auth 403. Each key's slot is held only for ITS attempt, so a
-  // busy key on one account never blocks a free slot on the other.
+  // with a permanent auth 403. The account slot is held only for ITS attempt, so a
+  // busy account never blocks a free slot on another.
   const order = nextKeyOrder(keyPool());
   let lastErr: unknown;
   for (let i = 0; i < order.length; i++) {
     const key = order[i];
-    // Hold a PER-KEY image slot for the whole submit→poll→download so each
-    // account's in-flight image work stays under its own concurrent cap.
-    await imageSemaphoreFor(key).acquire(limit);
     try {
-      const { image, contentType } = await generateNanoBananaImage(prompt, key);
+      // Hold a GLOBAL account slot for the whole submit→poll→download so each
+      // account's cluster-wide in-flight image work stays under the real cap.
+      const { image, contentType } = await withAccountSlot(accountIdFor(key), cap, () =>
+        generateNanoBananaImage(prompt, key),
+      );
       return { image, contentType, provider: "sixtynine_image" };
     } catch (err) {
       lastErr = err;
@@ -476,11 +503,42 @@ export async function generateImage(basePrompt: string): Promise<GenerateImageRe
         continue;
       }
       throw err;
-    } finally {
-      imageSemaphoreFor(key).release();
     }
   }
   // Unreachable when the pool is non-empty (cfg() guarantees a primary), but
   // keeps the type checker happy and surfaces the real cause if it ever is.
   throw lastErr ?? new Error("generateImage: no 69labs key configured");
+}
+
+export async function generateImage(basePrompt: string): Promise<GenerateImageResult> {
+  cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
+  const prompt = withStylePrompt(basePrompt);
+
+  try {
+    return await generate69labsImage(prompt);
+  } catch (err) {
+    // fal.ai FALLBACK: 69labs failed past its retry budget / all accounts are
+    // down or blocked. Fall back to fal.ai (FLUX) so a 69labs outage doesn't fail
+    // the segment. EXCEPT on CENSORED — a content rejection would fail on fal.ai
+    // too; the fix is to edit the prompt, not switch provider. Also skip if fal
+    // isn't configured (then surface the original 69labs error).
+    if (isCensored(err) || !isFalImageConfigured()) throw err;
+    console.warn(
+      JSON.stringify({
+        msg: "69labs.image.fal_fallback",
+        note: "69labs image pool exhausted; falling back to fal.ai FLUX",
+        err: (err as Error).message?.slice(0, 200),
+      }),
+    );
+    try {
+      const out = await generateFalImage(prompt);
+      return { image: out.image, contentType: out.contentType, provider: out.provider };
+    } catch (falErr) {
+      // Both providers failed. Surface a combined reason so the job log shows
+      // WHY each one failed, not just the last.
+      throw new Error(
+        `image generation failed on both providers :: 69labs: ${(err as Error).message?.slice(0, 150)} :: fal.ai: ${(falErr as Error).message?.slice(0, 150)}`,
+      );
+    }
+  }
 }

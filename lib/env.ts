@@ -438,7 +438,7 @@ const ServerEnvSchema = z.object({
   // practice and never need splitting at render time.
   LTX_API_KEY: z.string().optional(),
   LTX_BASE_URL: z.string().url().default("https://api.ltx.video"),
-  LTX_MODEL: z.string().default("ltx-2-3-pro"),
+  LTX_MODEL: z.string().default("ltx-2-fast"),
   LTX_RESOLUTION: z.string().default("1920x1080"),
   // LTX-2 source frame rate. Allowed values are 25 or 50 (NOT 24 — the API
   // rejects fps 24 for ltx-2-fast at 1080p). The render pipeline re-encodes
@@ -454,6 +454,11 @@ const ServerEnvSchema = z.object({
   FAL_AI_BASE_URL: z.string().url().default("https://queue.fal.run"),
   FAL_AI_VEO_MODEL: z.string().default("fal-ai/veo3/fast/image-to-video"),
   FAL_AI_KLING_MODEL: z.string().default("fal-ai/kling-video/v1/standard/image-to-video"),
+  // fal.ai TEXT-TO-IMAGE model — the FALLBACK still provider used only when
+  // 69labs (nano-banana) fails past its retry budget or all accounts are down/
+  // blocked. FLUX schnell is fast + cheap for a fallback still; swap the model id
+  // to trade quality for cost. Uses the same FAL_AI_API_KEY as the video lane.
+  FAL_AI_IMAGE_MODEL: z.string().default("fal-ai/flux/schnell"),
   // Hard timeout (seconds) for a single fal.ai image-to-video job (poll loop).
   FAL_AI_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
   // HeyGen avatar automation (Playwright — NOT the API, per spec).
@@ -656,7 +661,31 @@ const ServerEnvSchema = z.object({
   // This is PER KEY: with a second key (SIXTYNINE_LABS_API_KEY_BACKUP) on a
   // separate account, the cluster runs up to (this × number of keys) concurrent
   // generations — e.g. 4 × 2 = 8 — because each key has its own slot pool.
+  //
+  // NOTE (2026-07-09): this is now a FALLBACK cap only. The real limiter is the
+  // Redis-backed GLOBAL per-account semaphore (SIXTYNINE_ACCOUNT_CONCURRENCY),
+  // which coordinates across BOTH worker machines. The old per-process semaphore
+  // multiplied by machine count and overshot 69labs' 7-per-account ceiling.
   SIXTYNINE_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
+
+  // GLOBAL (cluster-wide, Redis-coordinated) concurrent-generation cap PER 69labs
+  // ACCOUNT. 69labs' real per-account ceiling is 7; we stay one under it so a
+  // stray status/other call never tips an account over. This is the true throttle
+  // that lets MULTIPLE videos generate at once and SHARE the fixed slots (this ×
+  // number of accounts) without the "Concurrent image generation limit reached
+  // (7)" 403 — enforced across all machines/lanes, not per-process. Add more
+  // 69labs accounts (SIXTYNINE_LABS_API_KEY_*) to raise total throughput.
+  SIXTYNINE_ACCOUNT_CONCURRENCY: z.coerce.number().int().positive().default(6),
+
+  // GLOBAL (cluster-wide) 69labs STATUS-poll rate budget, in requests/second and
+  // burst size. The status endpoint is rate-limited SEPARATELY from generation
+  // and returns 429 "TOO_MANY_REQUESTS" when too many polls arrive — which, with
+  // ~74 in-flight jobs each polling on its own timer, is what tripped the 429
+  // storm. This token bucket caps the CLUSTER's combined poll rate regardless of
+  // how many jobs are in flight. ~8/s with a burst of 12 keeps a large batch's
+  // polls under budget while still checking each job every few seconds.
+  SIXTYNINE_POLL_RATE_PER_SEC: z.coerce.number().positive().default(8),
+  SIXTYNINE_POLL_BURST: z.coerce.number().int().positive().default(12),
 
   // Synthetic visual-block pacing. The client's reference video paces every
   // visual block (image / ai_clip / split_2) at ~3-8s. Gemini's planner emits

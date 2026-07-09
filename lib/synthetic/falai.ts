@@ -19,6 +19,7 @@ function cfg() {
     base: env.FAL_AI_BASE_URL.replace(/\/$/, ""),
     veoModel: env.FAL_AI_VEO_MODEL,
     klingModel: env.FAL_AI_KLING_MODEL,
+    imageModel: env.FAL_AI_IMAGE_MODEL,
     pollTimeoutMs: env.FAL_AI_POLL_TIMEOUT_SECONDS * 1000,
   };
 }
@@ -152,4 +153,91 @@ export async function generateClipWithFallback(
   // No try/catch: let the real LTX error propagate so the processor logs the
   // genuine failure reason (LTX job error / poll timeout / bad image url).
   return generateLtxVideo(input);
+}
+
+// ---------------------------------------------------------------------------
+// fal.ai TEXT-TO-IMAGE — the fallback still provider for 69labs (nano-banana).
+// ---------------------------------------------------------------------------
+// Used ONLY when 69labs fails past its retry budget / all accounts are down or
+// blocked (see generateImage in sixtynine-labs.ts). Generates a 16:9 still from
+// a text prompt via fal.ai's FLUX model. Same submit -> poll -> download queue
+// lifecycle as the video lane. The returned bytes flow through the SAME
+// downstream path as a 69labs image (degrade + upload), so the caller treats it
+// identically — only the provider label differs for cost attribution.
+
+export interface GenerateFalImageResult {
+  image: Buffer;
+  contentType: string;
+  provider: "fal_flux_image";
+}
+
+export function isFalImageConfigured(): boolean {
+  return Boolean(getEnv().FAL_AI_API_KEY);
+}
+
+/**
+ * Generate a 16:9 still from a text prompt via fal.ai (FLUX). Throws on any
+ * failure (unconfigured key, job failed, poll timeout, no image url) so the
+ * caller can surface the real reason. The prompt should already carry the style
+ * prompt — this is a drop-in for 69labs' generateNanoBananaImage output.
+ */
+export async function generateFalImage(prompt: string): Promise<GenerateFalImageResult> {
+  const c = cfg();
+  const auth = { Authorization: `Key ${c.key}` };
+  const model = c.imageModel;
+
+  // 1) Submit. FLUX takes image_size as a named enum or {width,height}; we send
+  //    landscape_16_9 to match the synthetic canvas (the renderer crops/letterboxes).
+  const submit = await withHttpRetry("fal.submit.image", () =>
+    fetchOrThrow(`${c.base}/${model}`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        image_size: "landscape_16_9",
+        num_images: 1,
+      }),
+      timeoutMs: 60_000,
+    }),
+  );
+  const sub = (await submit.json()) as {
+    request_id: string;
+    status_url?: string;
+    response_url?: string;
+  };
+  const statusUrl = sub.status_url ?? `${c.base}/${model}/requests/${sub.request_id}/status`;
+  const responseUrl = sub.response_url ?? `${c.base}/${model}/requests/${sub.request_id}`;
+
+  // 2) Poll until COMPLETED / failure / timeout.
+  const deadline = Date.now() + c.pollTimeoutMs;
+  while (Date.now() < deadline) {
+    const statusRes = await fetchOrThrow(statusUrl, { headers: auth, timeoutMs: 30_000 });
+    const st = (await statusRes.json()) as { status?: string };
+    if (st.status === "COMPLETED") break;
+    if (st.status === "FAILED" || st.status === "ERROR") {
+      throw new Error(`fal image: job ${st.status}`);
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  if (Date.now() >= deadline) throw new Error("fal image: poll timed out");
+
+  // 3) Fetch result payload and download the image bytes. FLUX returns
+  //    { images: [{ url, content_type }] }.
+  const resultRes = await fetchOrThrow(responseUrl, { headers: auth, timeoutMs: 30_000 });
+  const result = (await resultRes.json()) as {
+    images?: Array<{ url?: string; content_type?: string }>;
+    image?: { url?: string; content_type?: string };
+  };
+  const img = result.images?.[0] ?? result.image;
+  const imageUrl = img?.url;
+  if (!imageUrl) throw new Error("fal image: no image url in result");
+
+  const dl = await withHttpRetry("fal.download.image", () =>
+    fetchOrThrow(imageUrl, { timeoutMs: 120_000 }),
+  );
+  return {
+    image: Buffer.from(await dl.arrayBuffer()),
+    contentType: dl.headers.get("content-type") || img?.content_type || "image/jpeg",
+    provider: "fal_flux_image",
+  };
 }

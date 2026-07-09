@@ -6598,6 +6598,29 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       .reduce((s, it) => s + Number(it.duration ?? 0), 0);
     const finalDriftSeconds = finalNonIntroSum - voiceoverSeconds;
     const FINAL_TOLERANCE_SECONDS = 3; // mirrors the render-route guard
+
+    // When the pass can't close the drift (usually because the shrinkable
+    // pool is too small — most duration lives in title cards / clamped rows
+    // the pass may not touch), the operator needs to see WHERE the excess
+    // lives. Break the persisted sum down by type and by adjustable vs.
+    // fixed so a failing re-match is self-diagnosing instead of opaque.
+    const durationBreakdown: Record<string, { count: number; dur: number; clamped: number }> = {};
+    let adjustablePoolSeconds = 0;
+    let adjustablePoolCount = 0;
+    for (const it of items) {
+      if (it.type === "intro") continue;
+      const t = String(it.type);
+      const d = Number(it.duration ?? 0);
+      durationBreakdown[t] ??= { count: 0, dur: 0, clamped: 0 };
+      durationBreakdown[t].count++;
+      durationBreakdown[t].dur = Math.round((durationBreakdown[t].dur + d) * 10) / 10;
+      if (isAdjustable(it)) {
+        adjustablePoolSeconds += d;
+        adjustablePoolCount++;
+      } else {
+        durationBreakdown[t].clamped = Math.round((durationBreakdown[t].clamped + d) * 10) / 10;
+      }
+    }
     await logJob({ projectId, jobId: mediaJobId }, "match.final_duration_pass", {
       voiceoverSeconds,
       timelineSumSeconds: Math.round(finalNonIntroSum * 1000) / 1000,
@@ -6605,6 +6628,12 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       orphanedResized,
       orphanedReclaimedSeconds: Math.round(orphanedReclaimedSeconds * 10) / 10,
       itemCount: items.filter((it) => it.type !== "intro").length,
+      // Diagnostics for an unclosable drift: how much room the pass actually
+      // had to shrink/grow, and where the fixed (non-adjustable) time sits.
+      adjustablePoolSeconds: Math.round(adjustablePoolSeconds * 10) / 10,
+      adjustablePoolCount,
+      fixedSeconds: Math.round((finalNonIntroSum - adjustablePoolSeconds) * 10) / 10,
+      durationBreakdown,
     });
 
     // Hard gate: never persist a timeline that the render-route guard would

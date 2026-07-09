@@ -195,3 +195,63 @@ export async function sweepStalledJobs(staleMs: number, onlyTypes?: string[]): P
   }
   return touchedProjects.size;
 }
+
+// Periodic safety net for a DIFFERENT orphan than sweepStalledJobs catches: a
+// synthetic segment stuck at 'generating' whose media_job is ALREADY terminal
+// 'failed'. This happens when the processor marked its OWN job failed (e.g. the
+// provider rejected a celebrity-name prompt — "69labs image: job FAILED") but
+// the paired segment status='failed' write did NOT land (a crash between the two
+// writes, or a segment planned before the reconcile fix shipped). Neither of the
+// two existing paths reaches it: failJobRow early-returns on an already-terminal
+// job, and sweepStalledJobs only looks at 'running' jobs. So the review screen —
+// which polls the SEGMENT status — spins forever on a job that died long ago.
+//
+// We reconcile ONLY segments whose LATEST linked media_job is 'failed'. A segment
+// with a live (queued/running) job is left alone — that's a normal in-flight
+// render, guarded by withSegmentHeartbeat, and must never be false-failed (the
+// hazard _shared.ts warns about). Copies the job's error onto the segment so the
+// UI shows the real reason, then the user can Regenerate.
+export async function sweepOrphanedSegments(): Promise<number> {
+  const sb = getServerSupabase();
+  const { data: segs, error } = await sb
+    .from("synthetic_segments")
+    .select("id, project_id")
+    .eq("status", "generating");
+  if (error) {
+    await logJob({}, "reconcile.segment_sweep.query_error", { err: error.message });
+    return 0;
+  }
+  if (!segs || segs.length === 0) return 0;
+
+  let fixed = 0;
+  for (const seg of segs) {
+    // The most recent media_job for this segment. If it's still queued/running,
+    // the segment is legitimately in flight — skip it.
+    const { data: jobs } = await sb
+      .from("media_jobs")
+      .select("id, status, error")
+      .contains("metadata", { segmentId: seg.id })
+      .order("updated_at", { ascending: false })
+      .limit(1);
+    const job = jobs?.[0];
+    if (!job || job.status !== "failed") continue;
+
+    const reason = (job.error ?? "generation failed").slice(0, 300);
+    const { error: updErr } = await sb
+      .from("synthetic_segments")
+      .update({ status: "failed", error: reason })
+      .eq("id", seg.id)
+      // Re-check status in the write so we never clobber a segment that started a
+      // fresh regen between our read and this update.
+      .eq("status", "generating");
+    if (updErr) {
+      await logJob({ projectId: seg.project_id }, "reconcile.segment_sweep.error",
+        { err: updErr.message, segmentId: seg.id });
+      continue;
+    }
+    fixed++;
+    await logJob({ jobId: job.id, projectId: seg.project_id },
+      "reconcile.marked_failed", { source: "segment_orphan_sweep", segmentId: seg.id });
+  }
+  return fixed;
+}

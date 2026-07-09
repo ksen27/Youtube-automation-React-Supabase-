@@ -12,6 +12,7 @@ export type SyntheticProvider =
   | "sixtynine_tts"
   | "sixtynine_image"
   | "flux_image"
+  | "fal_flux_image"
   | "ltx2"
   | "fal_veo3_fast"
   | "fal_kling"
@@ -25,6 +26,9 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   sixtynine_tts:   { unit: "per_1k_chars", usd: 0.015 },
   sixtynine_image: { unit: "per_image",    usd: 0.04 },
   flux_image:      { unit: "per_image",    usd: 0.05 },
+  // fal.ai FLUX text-to-image — the fallback still when the 69labs pool is
+  // exhausted. FLUX schnell is cheap; tune if FAL_AI_IMAGE_MODEL changes.
+  fal_flux_image:  { unit: "per_image",    usd: 0.01 },
   // LTX-2 bills per second of generated video. Rate tracks LTX_MODEL/resolution:
   // ltx-2-fast @ 1080p = $0.04/sec (current). Was $0.08 (ltx-2-3-pro @ 1080p);
   // bump this back if LTX_MODEL/LTX_RESOLUTION changes.

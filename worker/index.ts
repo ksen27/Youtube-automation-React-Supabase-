@@ -24,7 +24,7 @@ import { processSyntheticPlannerJob } from "./processors/synthetic/plannerProces
 import { processImageGenJob }         from "./processors/synthetic/imageGenProcessor";
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
-import { markJobFailedIfExhausted, sweepStalledJobs } from "./reconcile";
+import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
 import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
@@ -313,6 +313,18 @@ const sweepTimer = setInterval(() => {
       if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
     })
     .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+  // Reconcile synthetic segments orphaned at 'generating' by an ALREADY-failed
+  // media_job — the case sweepStalledJobs can't reach (it only sweeps 'running'
+  // jobs) and failJobRow can't reach (it early-returns on a terminal job). This
+  // is what left celebrity-name ai_clip segments spinning after their 69labs job
+  // failed. Synthetic worker only — segments are a synthetic concept.
+  if (runSynthetic) {
+    void sweepOrphanedSegments()
+      .then((n) => {
+        if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.done", segmentsFailed: n }));
+      })
+      .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.error", err: (e as Error).message })));
+  }
   // Render-cache reaping applies to ANY worker that runs renders. Both roles do
   // now: sourced renders celebrity videos, synthetic renders avatar videos on the
   // avatar worker's own /data volume — so each must reap its own stale cache.
