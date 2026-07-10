@@ -128,6 +128,21 @@ const SINGLE_SUBJECT_RULE =
   "render time), NOT a collage drawn inside one image, so keep choosing split_2 " +
   "whenever the narration calls for it; its imagePrompt still follows this rule " +
   "(one clean single-subject still for the illustrative half). " +
+  // Client requirement 2026-07 (space/Voyager regen): the model kept showing the
+  // subject as a PICTURE OF A PICTURE — a galaxy on a TV/monitor mounted on a
+  // wall, a scientist drawing the sun on a whiteboard, a diagram on a screen —
+  // instead of the real thing. Those read as "a screen/office again", the exact
+  // thing the client rejected, and the whiteboard/diagram also smuggles text
+  // back in. The still must BE the scene, not a depiction of it.
+  "DIRECT SCENE, NOT A DEPICTION (critical, client requirement): show the real " +
+  "subject ITSELF, filling the frame as if photographed on location — NOT the " +
+  "subject shown on a screen, TV, monitor, projector, phone, computer, framed " +
+  "picture, poster, whiteboard, chalkboard, diagram, map, or as an illustration/" +
+  "sketch/painting/hologram. For a space line show actual space (the planet, the " +
+  "spacecraft, the star field), never a galaxy on a wall-mounted screen or a " +
+  "scientist drawing it on a board. A screen/monitor/whiteboard may appear ONLY " +
+  "when the narration is literally about that device or about someone working at " +
+  "it. " +
   // Client requirement 2026-07: when the narration names a real/famous/private
   // person (e.g. "Louise Brown"), naming them in the imagePrompt makes the
   // image/video provider REFUSE or STALL the job (real-likeness hard-blocks), and
