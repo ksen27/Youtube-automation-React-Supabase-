@@ -36,7 +36,12 @@ export function isRetryableGeminiError(err: unknown): boolean {
     msg.includes("500") ||
     /UNAVAILABLE/i.test(msg) ||
     /RESOURCE_EXHAUSTED/i.test(msg) ||
-    /high demand/i.test(msg)
+    /high demand/i.test(msg) ||
+    // A MAX_TOKENS / mid-stream truncation is model-specific (the current
+    // gemini-flash-latest overruns its output budget where the lite fallback
+    // does not), so treat it like an outage: retry, then fail over to the other
+    // model. Callers signal it by throwing an error tagged GEMINI_TRUNCATED.
+    /GEMINI_TRUNCATED/.test(msg)
   );
 }
 

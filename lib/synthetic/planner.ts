@@ -317,6 +317,17 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
         "subject. When a line is abstract or has no literal scene, invent a visual",
         "from THIS niche (an on-topic object, tool, part, or place), never a",
         "generic unrelated one.",
+        // When the subject's world is a remote / non-filmable place (space, the
+        // deep sea, Antarctica, wilderness, ancient history), the visuals live in
+        // THAT place, not at a desk. This is the fix for space/Antarctica videos
+        // that collapsed to wall-to-wall 'man in an office on a computer' — an
+        // office is NOT the subject's world for these topics.
+        "If this subject's world is a place that cannot be filmed at home (space,",
+        "the deep sea, Antarctica / the poles, wilderness, ancient history, an",
+        "unexplained-mystery topic), the visuals MUST be set in THAT real world",
+        "(the planets, the spacecraft, the ice, the ocean, the site) — do NOT",
+        "default to a person talking at a desk, on a computer, or in an office. Show",
+        "an office/desk ONLY if the narration is genuinely about office or desk work.",
         "",
       ].filter(Boolean)
     : [
@@ -557,17 +568,54 @@ export async function regenerateSegmentPrompt(input: {
   }
   if (!script.trim()) throw new Error("regenerateSegmentPrompt: empty script");
 
-  const { result: res, model: usedModel } = await withGeminiModelFallback(
+  // Parse INSIDE the model callback so a truncated / MAX_TOKENS response is
+  // thrown as a retryable GEMINI_TRUNCATED error — that lets withGeminiModelFallback
+  // retry and fail over to the lite model (which does NOT overrun the budget),
+  // instead of a hard "returned non-JSON" throw that never retries. This was the
+  // cause of the per-segment Regenerate-prompt button failing on the current
+  // gemini-flash-latest while the same call succeeded on the fallback model.
+  const { result: safe, model: usedModel } = await withGeminiModelFallback(
     "regenerateSegmentPrompt",
-    (model) =>
-      model.generateContent({
+    async (model) => {
+      const res = await model.generateContent({
         contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? []) }] }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
-      }),
-    // SHORT primary ladder: during a broad gemini-2.5-flash 503 spike (the cause
-    // of the 2026-07 planner slowdown) we don't want each of the ~74 regen calls
-    // to burn ~20s exhausting the dead primary. 2 quick attempts, then fail over
-    // to the healthy fallback which gets the fuller budget.
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.4,
+          // One block's prompt is tiny (imagePrompt + optional shotType +
+          // animationPrompt), but leave clear headroom so a verbose scene
+          // description can't truncate mid-string.
+          maxOutputTokens: 2048,
+          // The current Gemini model can spend its whole output budget on
+          // internal reasoning before emitting JSON (see buildSyntheticTimeline);
+          // we don't need chain-of-thought to write one scene prompt.
+          thinkingConfig: { thinkingBudget: 0 },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      });
+      const txt = res.response.text();
+      const finishReason = res.response.candidates?.[0]?.finishReason;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(txt);
+      } catch {
+        // Retryable so the fallback model gets a turn; tag carries the reason.
+        throw new Error(
+          `GEMINI_TRUNCATED regenerateSegmentPrompt non-JSON (finishReason=${finishReason}, chars=${txt.length}): ${txt.slice(0, 120)}`,
+        );
+      }
+      const parsedSafe = SingleSegmentSchema.safeParse(parsed);
+      if (!parsedSafe.success) {
+        // A complete-but-wrong-shape response is a real schema error, not an
+        // outage — do NOT tag it retryable.
+        throw new Error(`regenerateSegmentPrompt: schema: ${JSON.stringify(parsedSafe.error.flatten()).slice(0, 200)}`);
+      }
+      return parsedSafe.data;
+    },
+    // SHORT primary ladder: during a broad primary 503 spike (the cause of the
+    // 2026-07 planner slowdown) we don't want each of the ~74 regen calls to
+    // burn ~20s exhausting the dead primary. 2 quick attempts, then fail over to
+    // the healthy fallback which gets the fuller budget.
     { attempts: 2, baseMs: 800 },
     { attempts: 4, baseMs: 1500 },
   );
@@ -575,24 +623,13 @@ export async function regenerateSegmentPrompt(input: {
     await logJob({ projectId, jobId }, "synthetic.prompt_regen.model_fallback", { model: usedModel });
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(res.response.text());
-  } catch {
-    throw new Error(`regenerateSegmentPrompt: Gemini returned non-JSON: ${res.response.text().slice(0, 200)}`);
-  }
-  const safe = SingleSegmentSchema.safeParse(parsed);
-  if (!safe.success) {
-    throw new Error(`regenerateSegmentPrompt: schema: ${JSON.stringify(safe.error.flatten()).slice(0, 200)}`);
-  }
-
   return {
     // Compose the base in front exactly like persist does, so the stored prompt
     // carries the recurring world (composePrompt is the same helper).
     imagePrompt:
-      composePrompt(basePrompt, safe.data.imagePrompt.trim(), safe.data.shotType?.trim() || null) ??
-      safe.data.imagePrompt.trim(),
-    animationPrompt: blockType === "ai_clip" ? (safe.data.animationPrompt?.trim() || null) : null,
+      composePrompt(basePrompt, safe.imagePrompt.trim(), safe.shotType?.trim() || null) ??
+      safe.imagePrompt.trim(),
+    animationPrompt: blockType === "ai_clip" ? (safe.animationPrompt?.trim() || null) : null,
   };
 }
 
@@ -1797,6 +1834,21 @@ async function deriveVideoTopic(input: {
     "physical craft, prefer a niche/setting drawn from what the narration actually",
     "shows (e.g. a health & wellness routine filmed around a home's kitchen,",
     "living room, and neighbourhood) rather than forcing a generic backyard.",
+    "",
+    "REMOTE / NON-FILMABLE SUBJECTS (important): some videos are about a world that",
+    "canNOT be filmed in a home, garage, kitchen, or office — e.g. space and",
+    "astronomy (planets, spacecraft, deep space), the deep ocean, Antarctica / the",
+    "poles, wilderness, history / ancient sites, or unexplained-mystery / cryptid",
+    "topics. For these, the `setting` and `environmentExamples` MUST be the REAL",
+    "subject environment itself, NOT a person's home/office/studio. A commentary or",
+    "documentary-style narration ABOUT such a subject still lives in that subject's",
+    "world on screen. Examples of the CORRECT world for these: for a Voyager /",
+    "space video — \"deep space, planets and their moons, the spacecraft drifting",
+    "past worlds, star fields, mission control\"; for an Antarctica mystery video —",
+    "\"antarctic ice and open ocean, the frozen coast, the deep sea, the creature in",
+    "its habitat\". Do NOT fall back to \"a man talking at a desk / on a computer /",
+    "in an office\" as the setting for these subjects — an office is only correct",
+    "when the video is genuinely about office/desk work.",
     "Keep each field short (a phrase, not a sentence). No commentary.",
     "",
     `TITLE: ${title.trim() || "(none)"}`,

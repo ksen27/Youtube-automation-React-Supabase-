@@ -452,6 +452,11 @@ interface HeygenProjectItem {
   video_id: string;
   status: string; // "completed" | "processing" | "pending" | "failed" | ...
   duration?: number;
+  // HeyGen inserts a PLACEHOLDER row the instant Generate is clicked: it has a
+  // created_ts but NO video_id and a null/processing status, and is promoted to a
+  // real video_id ~10s+ later (longer under load). We treat a fresh placeholder as
+  // proof OUR render started — see awaitNewItemId / everSawOurs. Verified against
+  // the live /v1/project/items API 2026-07-10.
   created_ts?: number;
   video_url?: string;
   video_download_url?: string;
@@ -493,8 +498,10 @@ async function baselineItemIds(context: BrowserContext): Promise<Set<string>> {
 
 // After Generate, poll the list until a NEW video_id (not in the pre-generate
 // baseline set) appears, and return it. This is OUR render's stable id. Polls
-// within `appearMs` — HeyGen registers the new project row a few seconds after
-// the click. Returns "" if none appears (caller falls back to the gated
+// within `appearMs` — but note HeyGen first inserts a null-id PLACEHOLDER and only
+// promotes it to a real video_id ~10s+ later (much longer under load), so callers
+// must allow a generous appearMs (~120s) or the pin misses on a slow promotion.
+// Returns "" if no real video_id appears (caller falls back to the gated
 // newest-non-baseline retrieval, so a missed pin degrades, never hard-fails).
 async function awaitNewItemId(
   context: BrowserContext,
@@ -658,6 +665,31 @@ async function retrieveRenderedVideo(
         // Generate click — the created_ts guard stops the shared-account list
         // from handing us a previous project's render on the fallback path.
         items.filter((it) => it.video_id && it.video_id !== baselineId && createdOk(it));
+
+    // PLACEHOLDER PRESENT = our render started. HeyGen inserts a null-id row at
+    // Generate time and promotes it to a real video_id ~10s+ later. That row has
+    // NO video_id (so it's not a `candidate` above), but a created_ts at/after our
+    // click uniquely identifies it as OURS on a per-account render (avatar
+    // concurrency is 1). Seeing it means generation IS running — so we must NOT
+    // trip the "never appeared … generation likely never started" early-exit while
+    // it's still promoting. Only meaningful with the created_ts guard on.
+    if (minCreatedTs > 0 && !everSawOurs) {
+      const sawPlaceholder = items.some((it) => {
+        if (it.video_id) return false; // real rows are handled as candidates
+        const ts = createdSeconds(it);
+        return ts !== null && ts >= minCreatedTs;
+      });
+      if (sawPlaceholder) {
+        everSawOurs = true;
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            msg: "synthetic.heygen.render_placeholder_seen",
+            note: "HeyGen placeholder row present — render started, awaiting video_id promotion",
+          }),
+        );
+      }
+    }
     const completed = candidates.filter((it) => {
       const s = (it.status ?? "").toLowerCase();
       return s === "completed" || s === "success" || s === "done";
@@ -1490,10 +1522,17 @@ async function finishRenderRetrieval(
 
   // PIN our exact render: the ONE video_id that appeared since the pre-generate
   // snapshot. "" degrades to the gated newest-non-baseline scan.
+  //
+  // WINDOW: HeyGen first inserts a null-id PLACEHOLDER and only promotes it to a
+  // real video_id ~10s+ later — much longer when the account/HeyGen is under load
+  // (measured against the live items API 2026-07-10). A 30s window was too tight:
+  // a slow promotion left pinned:false, and the retrieval below then false-failed
+  // with "never appeared", burning an ~8-min attempt before rotating. 120s covers
+  // the slow-promotion tail so we pin on the first attempt instead of retrying.
   const pinnedVideoId = await awaitNewItemId(
     context,
     baselineIds,
-    30_000,
+    120_000,
     3000,
     (ms) => p.waitForTimeout(ms),
     genClickTs,
