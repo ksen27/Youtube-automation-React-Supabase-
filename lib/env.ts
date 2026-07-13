@@ -441,8 +441,17 @@ const ServerEnvSchema = z.object({
   // ~8s (SYNTHETIC_BLOCK_SPLIT_THRESHOLD below), clips land on 6 or 8 in
   // practice and never need splitting at render time.
   LTX_API_KEY: z.string().optional(),
+  // Optional EXTRA LTX accounts for a key POOL (mirrors the 69labs pool). Each
+  // distinct key is a separate LTX account, and clip generations round-robin
+  // across the pool with per-run failover — so N accounts render clips IN
+  // PARALLEL and one account draining credits / rate-limiting hops to the next.
+  // Empty = single-key behaviour (identical to before). Named 2nd/3rd keys plus
+  // an optional comma/newline list for a 4th+ (no code change to extend).
+  LTX_API_KEY_2: z.string().optional(),
+  LTX_API_KEY_3: z.string().optional(),
+  LTX_API_KEYS: z.string().optional(),
   LTX_BASE_URL: z.string().url().default("https://api.ltx.video"),
-  LTX_MODEL: z.string().default("ltx-2-fast"),
+  LTX_MODEL: z.string().default("ltx-2-3-fast"),
   LTX_RESOLUTION: z.string().default("1920x1080"),
   // LTX-2 source frame rate. Allowed values are 25 or 50 (NOT 24 — the API
   // rejects fps 24 for ltx-2-fast at 1080p). The render pipeline re-encodes

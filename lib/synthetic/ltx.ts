@@ -1,5 +1,5 @@
 import { getEnv } from "@/lib/env";
-import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
+import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/http";
 import type { GenerateClipInput, GenerateClipResult } from "@/lib/synthetic/falai";
 
 // LTX-2 (api.ltx.video) image-to-video provider. PRIMARY clip provider for the
@@ -26,8 +26,10 @@ export const LTX_DURATION_TIERS = [6, 8, 10, 12, 14, 16, 18, 20];
 function cfg() {
   const env = getEnv();
   if (!env.LTX_API_KEY) throw new Error("LTX_API_KEY not configured (synthetic engine)");
+  // NOTE: the api key is NOT returned here. Key selection (round-robin + failover
+  // across the pool) lives in keyPool()/nextKeyOrder() and is passed explicitly to
+  // generateLtxVideoWithKey. cfg() only carries the non-secret request config.
   return {
-    key: env.LTX_API_KEY,
     base: env.LTX_BASE_URL.replace(/\/$/, ""),
     model: env.LTX_MODEL,
     resolution: env.LTX_RESOLUTION,
@@ -37,8 +39,52 @@ function cfg() {
   };
 }
 
+// The ordered LTX key pool: primary first, then the optional 2nd/3rd named keys,
+// then any extra keys from the LTX_API_KEYS list. Empties filtered, duplicates
+// dropped — a single configured key yields a 1-element pool (identical to the old
+// single-key behaviour: no round-robin, no failover). Each DISTINCT key is a
+// separate LTX account, so N keys render clips in parallel across N accounts.
+function keyPool(): string[] {
+  const env = getEnv();
+  const extra = (env.LTX_API_KEYS || "").split(/[\n,]/).map((k) => k.trim());
+  const seen = new Set<string>();
+  const pool: string[] = [];
+  for (const k of [env.LTX_API_KEY, env.LTX_API_KEY_2, env.LTX_API_KEY_3, ...extra]) {
+    const key = (k || "").trim();
+    if (key.length > 0 && !seen.has(key)) {
+      seen.add(key);
+      pool.push(key);
+    }
+  }
+  return pool;
+}
+
+// Round-robin cursor for balancing clip generations across the key pool. A plain
+// process-wide counter is enough: it just spreads starts across keys. Each call
+// reads-then-increments, so consecutive clips start on alternating accounts; the
+// remaining keys follow as ordered failover candidates.
+let rrCursor = 0;
+function nextKeyOrder(pool: string[]): string[] {
+  if (pool.length <= 1) return pool;
+  const start = rrCursor++ % pool.length;
+  return [...pool.slice(start), ...pool.slice(0, start)];
+}
+
 export function isLtxConfigured(): boolean {
   return Boolean(getEnv().LTX_API_KEY);
+}
+
+// The LTX model the clip lane will actually request (from LTX_MODEL). Exposed so
+// the processor can log which model each clip ran with — the provider label
+// ("ltx2") doesn't distinguish ltx-2-fast from ltx-2-3-fast.
+export function ltxModel(): string {
+  return getEnv().LTX_MODEL;
+}
+
+// Number of distinct LTX accounts configured (pool size). Logged so ops can see
+// how many accounts are actually load-balancing clips.
+export function ltxPoolSize(): number {
+  return keyPool().length;
 }
 
 // A PERMANENT LTX failure that retrying cannot fix: the account is out of money
@@ -92,10 +138,57 @@ export function snapDuration(requested: number, maxDuration: number): number {
 /**
  * LTX-2 image-to-video (no audio). Primary clip provider; on failure the caller
  * (generateClipWithFallback) falls through to fal.ai Veo, then Kling.
+ *
+ * KEY-POOL ROUND-ROBIN + FAILOVER (mirrors the 69labs image pool): clip jobs are
+ * load-balanced across the LTX key pool, so multiple LTX accounts render clips in
+ * parallel. If the chosen account is DEAD or BROKE — a permanent auth failure
+ * (401/403) or an "insufficient funds"/quota wall (isLtxPermanentFailure) — the
+ * run retries on the next key in the pool. Any other error (transient, poll
+ * timeout, content-policy job failure) propagates unchanged so generateClipWith-
+ * Fallback can fall over to fal.ai. A single configured key = no failover (the
+ * pool has one element), identical to the old behaviour.
  */
 export async function generateLtxVideo(input: GenerateClipInput): Promise<GenerateClipResult> {
+  const order = nextKeyOrder(keyPool());
+  if (order.length === 0) throw new Error("LTX_API_KEY not configured (synthetic engine)");
+  let lastErr: unknown;
+  for (let i = 0; i < order.length; i++) {
+    const key = order[i];
+    try {
+      return await generateLtxVideoWithKey(input, key);
+    } catch (err) {
+      lastErr = err;
+      // Only hop to the next account when THIS one is unusable: a dead key
+      // (permanent auth 401/403) or a broke/over-quota account (insufficient
+      // funds). A transient failure or a content-policy job failure would fail on
+      // every account too, so let it propagate to the fal.ai fallback instead.
+      const deadAccount = isAuthForbidden(err) || isLtxPermanentFailure(err);
+      const hasNext = i < order.length - 1;
+      if (hasNext && deadAccount) {
+        console.warn(
+          JSON.stringify({
+            msg: "ltx.key_failover",
+            note: "LTX account unusable (auth/funds); retrying on next key in pool",
+            err: (err as Error).message?.slice(0, 200),
+          }),
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr ?? new Error("generateLtxVideo: no LTX key configured");
+}
+
+// One LTX image-to-video run (submit -> poll -> download) on a SPECIFIC account
+// key. The key is passed in (not read from cfg) so generateLtxVideo can re-run
+// this on the next pool key when an account is dead/broke.
+async function generateLtxVideoWithKey(
+  input: GenerateClipInput,
+  key: string,
+): Promise<GenerateClipResult> {
   const c = cfg();
-  const auth = { Authorization: `Bearer ${c.key}` };
+  const auth = { Authorization: `Bearer ${key}` };
   const requested = input.durationSeconds ?? 6;
   const duration = snapDuration(requested, c.maxDuration);
 

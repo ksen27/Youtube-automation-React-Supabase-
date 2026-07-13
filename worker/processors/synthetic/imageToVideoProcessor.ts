@@ -5,7 +5,7 @@ import { uploadBuffer } from "@/lib/storage";
 import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
-import { isLtxConfigured, isLtxPermanentFailure } from "@/lib/synthetic/ltx";
+import { isLtxConfigured, isLtxPermanentFailure, ltxModel, ltxPoolSize } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
@@ -95,7 +95,12 @@ export async function processImageToVideoJob(
     // the configured primary so the two lines line up when LTX succeeds.
     const primaryProvider = isLtxConfigured() ? "ltx2" : "fal_veo3_fast";
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: primaryProvider, phase: "request",
-      extra: { durationSeconds: duration } });
+      // Log the actual LTX model + pool size so the request line proves which
+      // model ran (the "ltx2" provider label alone can't distinguish
+      // ltx-2-fast from ltx-2-3-fast) and how many accounts are balancing.
+      extra: isLtxConfigured()
+        ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize() }
+        : { durationSeconds: duration } });
     // Heartbeat the segment's updated_at across the ~60-95s LTX-2 render so the
     // stall sweeper can't false-fail a segment that is alive and rendering.
     const clip = await withSegmentHeartbeat(segmentId, () =>

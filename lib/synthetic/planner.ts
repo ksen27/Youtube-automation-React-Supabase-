@@ -407,6 +407,21 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
     "framing comes from each block's shotType and the subject from each block's",
     "imagePrompt, both of which MUST vary block to block. Do NOT include camera or",
     "film-grain styling — that is appended separately.",
+    // The basePrompt is appended to EVERY block, so a drifted base poisons the
+    // whole video. For a non-filmable subject (space, deep sea, Antarctica, …)
+    // the model kept inventing an earthbound ROOM for the 'recurring setting' —
+    // e.g. 'a 1970s NASA mission control center', 'a dim server room' — which
+    // then dragged every block into that room. The recurring WORLD for these
+    // subjects IS the subject's real environment, not a control room / office /
+    // studio the footage is 'presented' from.
+    "IMPORTANT — the basePrompt's SETTING: if this video's subject cannot be",
+    "filmed in a home/office/studio (space, the deep sea, Antarctica / the poles,",
+    "wilderness, ancient history, an unexplained mystery), the recurring setting",
+    "MUST be that real subject world itself (e.g. for a space video: 'deep space,",
+    "planets and star fields, the spacecraft among them'), NOT a mission-control",
+    "room, server room, laboratory, office, or studio the subject is merely",
+    "observed or narrated from. Do NOT put a control room / desk / screens in the",
+    "basePrompt unless the video is literally about that room.",
     "",
     "THEN segment the transcript. For EVERY image/ai_clip/split_2 block, write a",
     "concrete `imagePrompt`: ONLY the scene-specific detail for THIS block (the",
@@ -1885,7 +1900,12 @@ async function deriveVideoTopic(input: {
             thinkingConfig: { thinkingBudget: 0 },
           } as any,
         }),
-      { attempts: 3, baseMs: 1000 },
+      // Short PRIMARY ladder so a broad primary outage (whole model 503ing)
+      // fails over to the healthy fallback fast instead of burning ~13s on a
+      // dead model; a slightly fuller FALLBACK ladder tries harder on the model
+      // that's actually answering. See withGeminiModelFallback's contract.
+      { attempts: 2, baseMs: 800 },
+      { attempts: 3, baseMs: 800 },
     );
     const parsed = VideoTopicSchema.safeParse(JSON.parse(res.response.text()));
     if (!parsed.success) return EMPTY_TOPIC;
@@ -1947,7 +1967,13 @@ async function planTranscriptChunk(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any,
       }),
-    { attempts: 6, baseMs: 2000 },
+    // Short PRIMARY ladder: when gemini-flash-latest is in a broad outage the
+    // old { attempts: 6, baseMs: 2000 } ladder waited 2→6→18→54→162→486s
+    // (+jitter) ≈ up to ~12 min on the DEAD primary before even reaching the
+    // healthy fallback — and repeated it per chunk (the 2026-07 planner
+    // slowdown). Fail over fast, then try harder on the model that's answering.
+    { attempts: 2, baseMs: 1500 },
+    { attempts: 5, baseMs: 1500 },
   );
   if (usedModel !== getEnv().GEMINI_MODEL) {
     await logJob(ctx, "synthetic.plan.model_fallback", { model: usedModel, chunk: chunkLabel });
