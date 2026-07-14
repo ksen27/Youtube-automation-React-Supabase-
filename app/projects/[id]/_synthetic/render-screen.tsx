@@ -1,7 +1,7 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { Download, Film, Loader2 } from "lucide-react";
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { Download, Film, Loader2, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -43,6 +43,18 @@ export function SyntheticRenderScreen({
   const progress = render?.progress ?? 5;
   const done = status === "completed" && render?.output_url;
 
+  // Re-render kicks a fresh render job. The /render route refuses one only while
+  // a render_job is queued/running, so this is safe once the current job is
+  // terminal (completed / failed / manually cancelled). Used to recover a render
+  // that got stuck on the worker and was cancelled.
+  const rerender = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/render`, { method: "POST" });
+      if (!r.ok) throw new Error((await r.json()).error ?? `render failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <Card>
@@ -53,7 +65,14 @@ export function SyntheticRenderScreen({
         </CardHeader>
         <CardContent className="space-y-4">
           {status === "failed" ? (
-            <p className="text-sm text-danger">{render?.error ?? "Render failed."}</p>
+            <div className="space-y-3">
+              <p className="text-sm text-danger">{render?.error ?? "Render failed."}</p>
+              <Button type="button" variant="gradient" disabled={rerender.isPending} onClick={() => rerender.mutate()}>
+                <RotateCcw className={`h-4 w-4 ${rerender.isPending ? "animate-spin" : ""}`} />
+                {rerender.isPending ? "Starting render…" : "Re-render"}
+              </Button>
+              {rerender.error && <p className="text-xs text-danger">{(rerender.error as Error).message}</p>}
+            </div>
           ) : done ? (
             <>
               {/* eslint-disable-next-line jsx-a11y/media-has-caption */}

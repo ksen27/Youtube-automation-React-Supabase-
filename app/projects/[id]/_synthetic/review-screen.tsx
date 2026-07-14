@@ -87,6 +87,24 @@ export function SyntheticReviewScreen({
     onSuccess: onChange,
   });
 
+  // Bulk-retry every STUCK segment: one whose status is 'generating' but whose
+  // render already died (its latest job is terminal) so it will never advance on
+  // its own. Without this the block spins forever with no Retry affordance —
+  // it's neither 'failed' (so "Retry all failed" skips it) nor actually in
+  // flight. Server-side "stuck" scope re-checks the job so a live render is never
+  // clobbered.
+  const regenerateStuck = useMutation({
+    mutationFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/synthetic/regenerate-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope: "stuck" }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error ?? `regenerate failed (${r.status})`);
+    },
+    onSuccess: onChange,
+  });
+
   // Regenerate EVERY image-bearing block (image / ai_clip / split_2) against the
   // CURRENT prompts — even ones already 'ready'. This re-runs the image
   // generation with the latest STYLE_PROMPT, so a prompt change (e.g. the
@@ -123,10 +141,31 @@ export function SyntheticReviewScreen({
   // A render is already running for this project. The render route refuses a
   // second one (409 "render already in progress"), so when the user steps back
   // here mid-render we offer navigation to the render step instead of a re-POST.
-  const isRendering = resp.project.status === "rendering";
+  //
+  // But project.status alone is unreliable: a render can be manually cancelled
+  // (e.g. stuck on the fly.io worker) — the render/media job goes terminal while
+  // projects.status is still "rendering". In that case there's no live render to
+  // "view", and re-POSTing /render succeeds (the route only 409s on a
+  // queued/running render_job). So we treat it as re-renderable unless a render
+  // job is ACTUALLY in flight. media_jobs carries the render job's live status.
+  const hasLiveRender = (resp.media_jobs ?? []).some(
+    (j) => j.type === "render" && (j.status === "queued" || j.status === "running"),
+  );
+  const isRendering = resp.project.status === "rendering" && hasLiveRender;
+  // Stuck: status says rendering but the render job is dead/cancelled. Offer a
+  // real re-render instead of a dead-end "View render".
+  const isStuckRendering = resp.project.status === "rendering" && !hasLiveRender;
   const generatingCount = segs.filter((s) => s.status === "generating" || s.status === "pending").length;
   const failedCount = segs.filter((s) => s.status === "failed").length;
   const allReady = segs.length > 0 && segs.every((s) => s.status === "ready" || s.status === "skipped");
+
+  // Stuck segments: 'generating' but their render already died. A segment is
+  // stuck when its status is 'generating' AND its latest linked media_job is
+  // terminal (failed/completed) — no live job will ever advance it, so the row
+  // would otherwise spin forever with no Retry. Computed here from media_jobs so
+  // both the toolbar "Retry all stuck" button and each SegmentRow can react.
+  const stuckSegmentIds = computeStuckSegmentIds(segs, resp.media_jobs);
+  const stuckCount = stuckSegmentIds.size;
 
   // Re-plan is available in ALL states (not just the plan gate) — re-segmenting
   // is useful even after generation started (e.g. to fix avatar marks). It
@@ -147,7 +186,7 @@ export function SyntheticReviewScreen({
           <p className="text-xs text-fg-subtle">
             {segs.length} blocks{isPlanGate
               ? " · edit types/prompts before generating"
-              : ` · ${resp.summary.ready} ready · ${resp.summary.failed} failed${isGenerating ? ` · ${generatingCount} generating` : ""}`}
+              : ` · ${resp.summary.ready} ready · ${resp.summary.failed} failed${isGenerating ? ` · ${generatingCount} generating` : ""}${stuckCount > 0 ? ` · ${stuckCount} stuck` : ""}`}
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -157,6 +196,16 @@ export function SyntheticReviewScreen({
             <Button type="button" variant="gradient" size="sm" disabled={regenerateAll.isPending} onClick={() => regenerateAll.mutate()}>
               <RefreshCw className={`h-4 w-4 ${regenerateAll.isPending ? "animate-spin" : ""}`} />
               {regenerateAll.isPending ? "Retrying…" : `Retry all failed (${failedCount})`}
+            </Button>
+          )}
+          {/* Bulk-retry blocks stuck at 'generating' whose render died (latest
+              job terminal). These aren't 'failed', so the button above skips
+              them — without this they'd spin forever and keep the Render button
+              disabled. Shown outside the plan gate whenever any block is stuck. */}
+          {!isPlanGate && stuckCount > 0 && (
+            <Button type="button" variant="gradient" size="sm" disabled={regenerateStuck.isPending} onClick={() => regenerateStuck.mutate()}>
+              <RefreshCw className={`h-4 w-4 ${regenerateStuck.isPending ? "animate-spin" : ""}`} />
+              {regenerateStuck.isPending ? "Retrying…" : `Retry all stuck (${stuckCount})`}
             </Button>
           )}
           {/* Regenerate all images against the current prompts — re-tests a
@@ -189,6 +238,13 @@ export function SyntheticReviewScreen({
           <Button type="button" variant="gradient" onClick={() => onGoToRender?.()}>
             <Film className="h-4 w-4" /> View render
           </Button>
+        ) : isStuckRendering ? (
+          // status is "rendering" but the render job is dead/cancelled (e.g.
+          // stuck on the fly.io worker). Offer a real re-render — /render accepts
+          // it since no render_job is queued/running.
+          <Button type="button" variant="gradient" disabled={render.isPending} onClick={() => render.mutate()}>
+            <Film className="h-4 w-4" /> {render.isPending ? "Starting render…" : "Re-render video"}
+          </Button>
         ) : (
           <Button type="button" variant="gradient" disabled={!allReady || render.isPending} onClick={() => render.mutate()}>
             <Film className="h-4 w-4" /> {render.isPending ? "Starting render…" : "Render video"}
@@ -200,6 +256,7 @@ export function SyntheticReviewScreen({
       {render.error && <p className="text-xs text-danger">{(render.error as Error).message}</p>}
       {replan.error && <p className="text-xs text-danger">{(replan.error as Error).message}</p>}
       {regenerateAll.error && <p className="text-xs text-danger">{(regenerateAll.error as Error).message}</p>}
+      {regenerateStuck.error && <p className="text-xs text-danger">{(regenerateStuck.error as Error).message}</p>}
       {regenerateImages.error && <p className="text-xs text-danger">{(regenerateImages.error as Error).message}</p>}
 
       {/* Master voiceover — listen before committing to asset generation/render. */}
@@ -244,7 +301,7 @@ export function SyntheticReviewScreen({
 
       <div className="space-y-3">
         {segs.map((s) => (
-          <SegmentRow key={s.id} projectId={projectId} segment={s} onChange={onChange} />
+          <SegmentRow key={s.id} projectId={projectId} segment={s} isStuck={stuckSegmentIds.has(s.id)} onChange={onChange} />
         ))}
       </div>
     </div>
@@ -253,6 +310,39 @@ export function SyntheticReviewScreen({
 
 function thumbUrl(s: SyntheticSegmentRow): string | null {
   return s.image_url ?? s.right_image_url ?? null;
+}
+
+// A media_job that can no longer advance its segment. queued/running are still
+// live (an in-flight render kept fresh by the server's heartbeat), so a segment
+// waiting on one is NOT stuck.
+const TERMINAL_JOB_STATUSES = new Set(["failed", "completed"]);
+
+// Ids of segments stuck at 'generating' whose render already died: status is
+// 'generating' but the LATEST linked media_job is terminal, so nothing will ever
+// flip the segment to 'ready'/'failed'. Mirrors the server's "stuck" scope so the
+// UI shows the same set the bulk-retry acts on. A generating segment with a live
+// job — or none yet — is not stuck.
+function computeStuckSegmentIds(
+  segments: SyntheticSegmentRow[],
+  mediaJobs: SyntheticResp["media_jobs"],
+): Set<string> {
+  const generating = segments.filter((s) => s.status === "generating");
+  if (generating.length === 0) return new Set();
+
+  // media_jobs arrive ordered by created_at asc, so the last write per segment
+  // is its latest job.
+  const latestBySegment = new Map<string, string>();
+  for (const j of mediaJobs) {
+    const segId = (j.metadata as { segmentId?: string } | null)?.segmentId;
+    if (segId) latestBySegment.set(segId, j.status);
+  }
+
+  const stuck = new Set<string>();
+  for (const s of generating) {
+    const jobStatus = latestBySegment.get(s.id);
+    if (jobStatus !== undefined && TERMINAL_JOB_STATUSES.has(jobStatus)) stuck.add(s.id);
+  }
+  return stuck;
 }
 
 // Seconds -> "m:ss" for the pitch-video card.
@@ -320,10 +410,14 @@ function HistoryVersion({
 function SegmentRow({
   projectId,
   segment,
+  isStuck,
   onChange,
 }: {
   projectId: string;
   segment: SyntheticSegmentRow;
+  // 'generating' but its render already died (latest job terminal). Rendered as
+  // a retryable dead state instead of an endless spinner.
+  isStuck: boolean;
   onChange: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -393,9 +487,16 @@ function SegmentRow({
   const history = segment.asset_history ?? [];
 
   const thumb = thumbUrl(segment);
+  // A stuck segment is 'generating' in the DB but its render is dead — surface it
+  // like a failure (destructive badge, "stuck" label, Retry) rather than a live
+  // spinner. isSpinning is the genuine in-flight case (generating, not stuck).
+  const isSpinning = segment.status === "generating" && !isStuck;
   const statusVariant =
-    segment.status === "ready" ? "success" : segment.status === "failed" ? "destructive" : segment.status === "generating" ? "info" : "secondary";
-  const isGenerating = segment.status === "generating";
+    segment.status === "ready" ? "success"
+      : segment.status === "failed" || isStuck ? "destructive"
+        : segment.status === "generating" ? "info"
+          : "secondary";
+  const isGenerating = isSpinning;
   const isFailed = segment.status === "failed";
   // Every segment type can be reviewed at full size: video blocks (avatar /
   // ai_clip) play their mp4; image blocks enlarge the still. The thumbnail is
@@ -413,7 +514,7 @@ function SegmentRow({
     segment.block_type === "split_2" ? (segment.right_image_url ?? null) : null;
 
   return (
-    <Card className={isFailed ? "border-danger/40" : undefined}>
+    <Card className={isFailed || isStuck ? "border-danger/40" : undefined}>
       <CardContent className="flex gap-4 p-3">
         {/* Thumbnail — click to review the asset (video or still) in a dialog. */}
         {previewKind ? (
@@ -444,6 +545,8 @@ function SegmentRow({
               <Loader2 className="h-5 w-5 animate-spin text-brand-300" />
             ) : isFailed ? (
               <span className="text-[10px] text-danger">failed</span>
+            ) : isStuck ? (
+              <span className="text-[10px] text-danger">stuck</span>
             ) : (
               <span className="text-[10px] text-fg-subtle">no preview</span>
             )}
@@ -503,7 +606,7 @@ function SegmentRow({
           <div className="flex items-center gap-2">
             <span className="text-xs tabular-nums text-fg-subtle">#{segment.position + 1}</span>
             <Badge variant="outline">{segment.block_type}</Badge>
-            <Badge variant={statusVariant as "success" | "destructive" | "info" | "secondary"}>{segment.status}</Badge>
+            <Badge variant={statusVariant as "success" | "destructive" | "info" | "secondary"}>{isStuck ? "stuck" : segment.status}</Badge>
             <span className="text-[11px] text-fg-subtle tabular-nums">{segment.duration.toFixed(1)}s</span>
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
             {/* split_2: a quick way to inspect the IMAGE half (the thumbnail
@@ -550,14 +653,20 @@ function SegmentRow({
               )}
               <Button
                 type="button"
-                variant={isFailed ? "gradient" : "soft"}
+                variant={isFailed || isStuck ? "gradient" : "soft"}
                 size="xs"
                 disabled={regenerate.isPending || isGenerating}
                 onClick={() => regenerate.mutate()}
-                title={segment.block_type === "split_2" ? "Regenerate the avatar video AND the image" : undefined}
+                title={
+                  isStuck
+                    ? "This block's render died — retry it"
+                    : segment.block_type === "split_2"
+                      ? "Regenerate the avatar video AND the image"
+                      : undefined
+                }
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${regenerate.isPending ? "animate-spin" : ""}`} />
-                {isFailed ? "Retry" : segment.block_type === "split_2" ? "Regenerate all" : "Regenerate"}
+                {isFailed || isStuck ? "Retry" : segment.block_type === "split_2" ? "Regenerate all" : "Regenerate"}
               </Button>
               <Button type="button" variant="ghost" size="xs" onClick={() => del.mutate()} disabled={del.isPending}>
                 <Trash2 className="h-3.5 w-3.5 text-danger" />
@@ -597,6 +706,14 @@ function SegmentRow({
               {regenerateImage.error && <p className="text-[11px] text-danger line-clamp-1">{(regenerateImage.error as Error).message}</p>}
               {restore.error && <p className="text-[11px] text-danger line-clamp-1">{(restore.error as Error).message}</p>}
               {segment.error && <p className="text-[11px] text-danger line-clamp-1">{segment.error}</p>}
+              {/* Stuck-but-no-error: the render died without writing an error onto
+                  the segment (e.g. a regen job that exhausted its retries). Tell
+                  the user why it's not spinning and that Retry will requeue it. */}
+              {isStuck && !segment.error && (
+                <p className="text-[11px] text-danger line-clamp-2">
+                  Stuck — its render stopped without finishing. Click Retry to requeue this block.
+                </p>
+              )}
 
               {/* Previous versions. Each regenerate archives the prior asset here
                   (newest last), so the user can preview and restore an old one. */}
