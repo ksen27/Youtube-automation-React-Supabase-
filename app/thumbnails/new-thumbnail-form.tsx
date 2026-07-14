@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
-import { Image as ImageIcon, Loader2, Plus, Sparkles, Upload, Wand2, X } from "lucide-react";
+import { Image as ImageIcon, LayoutTemplate, Loader2, Plus, Sparkles, Upload, Wand2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -29,6 +29,12 @@ export interface ChannelRow {
 // YouTube/image URL or an uploaded image (re-hosted to R2 → becomes a URL).
 const MAX_SUBJECTS = 2;
 
+// Up to 3 uploaded example images teaching a SPECIFIC thumbnail FORMAT/layout
+// (e.g. a two-celebrity split, a breaking-news banner). Optional: when used, the
+// tool learns that exact layout and generates in it instead of the averaged
+// channel style. Kept in sync with MAX_FORMAT_IMAGES on the server.
+const MAX_FORMAT_IMAGES = 3;
+
 interface Subject {
   id: number;
   url: string;
@@ -36,6 +42,14 @@ interface Subject {
 }
 let nextId = 1;
 const newSubject = (): Subject => ({ id: nextId++, url: "", uploading: false });
+
+// A single uploaded format example. url is the R2 URL once the upload finishes.
+interface FormatImage {
+  id: number;
+  url: string;
+  uploading: boolean;
+}
+const newFormatImage = (): FormatImage => ({ id: nextId++, url: "", uploading: false });
 
 export function NewThumbnailForm({ channels: initialChannels }: { channels: ChannelRow[] }) {
   const router = useRouter();
@@ -50,16 +64,25 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
   const [title, setTitle] = useState("");
   const [customPrompt, setCustomPrompt] = useState("");
   const [subjects, setSubjects] = useState<Subject[]>([newSubject()]);
+  // Optional format examples (learn a specific layout). Off by default; the user
+  // opts in via the "Use a specific format" toggle.
+  const [useFormat, setUseFormat] = useState(false);
+  const [formatImages, setFormatImages] = useState<FormatImage[]>([newFormatImage()]);
   const [prompt, setPrompt] = useState("");
+  // Non-error notice about the last build (e.g. AI fallback / format not learned).
+  const [notice, setNotice] = useState<string | null>(null);
   const [building, setBuilding] = useState(false);
   const [generating, setGenerating] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const fileInputs = useRef<Record<number, HTMLInputElement | null>>({});
+  const formatFileInputs = useRef<Record<number, HTMLInputElement | null>>({});
 
   const selected = channels.find((c) => c.id === selectedId) ?? null;
   const filledSubjects = subjects.filter((s) => s.url.trim().length > 0);
-  const anyUploading = subjects.some((s) => s.uploading);
+  const filledFormatImages = formatImages.filter((f) => f.url.trim().length > 0);
+  const anyUploading =
+    subjects.some((s) => s.uploading) || formatImages.some((f) => f.uploading);
 
   // ----- Step 1: analyze a channel -----
   // `force` re-learns the style even if the channel is already saved (spends
@@ -132,11 +155,38 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
     }
   }
 
+  // ----- format example images (optional) -----
+  function updateFormatImage(id: number, patch: Partial<FormatImage>) {
+    setFormatImages((fs) => fs.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  }
+  function addFormatImage() {
+    setFormatImages((fs) => (fs.length >= MAX_FORMAT_IMAGES ? fs : [...fs, newFormatImage()]));
+  }
+  function removeFormatImage(id: number) {
+    setFormatImages((fs) => (fs.length <= 1 ? [newFormatImage()] : fs.filter((f) => f.id !== id)));
+  }
+  async function onUploadFormat(id: number, file: File) {
+    setError(null);
+    updateFormatImage(id, { uploading: true });
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const r = await fetch("/api/thumbnails/upload", { method: "POST", body: fd });
+      if (!r.ok) throw new Error((await r.json()).error ?? `Upload failed (${r.status})`);
+      const { url } = await r.json();
+      updateFormatImage(id, { url, uploading: false });
+    } catch (err) {
+      updateFormatImage(id, { uploading: false });
+      setError(err instanceof Error ? err.message : "Upload failed");
+    }
+  }
+
   // ----- Step 2a: build the editable prompt -----
   async function onBuildPrompt() {
-    if (!selectedId || !title.trim() || building) return;
+    if (!selectedId || !title.trim() || building || anyUploading) return;
     setBuilding(true);
     setError(null);
+    setNotice(null);
     try {
       const r = await fetch("/api/thumbnails/preview", {
         method: "POST",
@@ -146,11 +196,27 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
           title: title.trim(),
           customPrompt: customPrompt.trim(),
           subjects: filledSubjects.map((s) => s.url.trim()),
+          formatImages: useFormat ? filledFormatImages.map((f) => f.url.trim()) : [],
         }),
       });
       const json = await r.json();
       if (!r.ok) throw new Error(json.error ?? `Build failed (${r.status})`);
       setPrompt(json.prompt as string);
+
+      // Surface build caveats so a title-less/format-less copy is never mistaken
+      // for a real AI build (the original "it just copies the style" bug).
+      const notices: string[] = [];
+      if (json.usedFallback) {
+        notices.push(
+          json.fallbackReason === "gemini_not_configured"
+            ? "AI prompt-writing is not configured, so the title was not applied — this is just the channel style. Set GEMINI_API_KEY."
+            : "AI prompt-writing failed, so the title was not woven in (this is a fallback). Try Build prompt again.",
+        );
+      }
+      if (json.formatFailed) {
+        notices.push("Couldn't read the uploaded format images — the chosen format was not applied.");
+      }
+      setNotice(notices.length ? notices.join(" ") : null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to build prompt");
     } finally {
@@ -180,7 +246,10 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
       setTitle("");
       setCustomPrompt("");
       setSubjects([newSubject()]);
+      setFormatImages([newFormatImage()]);
+      setUseFormat(false);
       setPrompt("");
+      setNotice(null);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Generation failed");
@@ -208,7 +277,7 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
           </Button>
         </div>
         <p className="text-xs text-fg-subtle">
-          We read ~10 of the channel&apos;s recent thumbnails and learn its style. Saved and reusable.
+          We read the channel&apos;s recent thumbnails and learn its style. Saved and reusable.
         </p>
       </form>
 
@@ -269,7 +338,7 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                 />
                 {selected.sample_urls?.length > 0 && (
                   <div className="flex gap-1.5 overflow-x-auto pb-1">
-                    {selected.sample_urls.slice(0, 10).map((u) => (
+                    {selected.sample_urls.slice(0, 24).map((u) => (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         key={u}
@@ -382,6 +451,100 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                 </p>
               </div>
 
+              {/* Optional: upload a specific thumbnail FORMAT to learn its layout.
+                  Off by default — a channel can run several distinct formats
+                  (two-celebrity split, breaking-news banner, single shocked
+                  face) that the averaged channel style can't capture. */}
+              <div className="space-y-2 rounded-lg border border-border bg-surface/40 p-3">
+                <label className="flex items-start gap-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 accent-brand-500"
+                    checked={useFormat}
+                    onChange={(e) => setUseFormat(e.target.checked)}
+                  />
+                  <span>
+                    <span className="flex items-center gap-1.5 text-sm font-medium text-fg">
+                      <LayoutTemplate className="h-4 w-4 text-brand-300" />
+                      Use a specific thumbnail format (optional)
+                    </span>
+                    <span className="mt-0.5 block text-xs text-fg-subtle">
+                      Upload 1–{MAX_FORMAT_IMAGES} example thumbnails of ONE format (e.g. a two-person split, a
+                      breaking-news banner). The tool learns that exact layout and generates in it — instead of
+                      the channel&apos;s averaged style.
+                    </span>
+                  </span>
+                </label>
+
+                {useFormat && (
+                  <div className="space-y-2 pl-6">
+                    {formatImages.map((f, i) => (
+                      <div key={f.id} className="flex items-center gap-2">
+                        <div className="h-10 w-[71px] shrink-0 rounded-md border border-border bg-surface-hover overflow-hidden grid place-items-center">
+                          {f.url ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img src={f.url} alt="" className="h-full w-full object-cover" />
+                          ) : (
+                            <LayoutTemplate className="h-3.5 w-3.5 text-fg-subtle" />
+                          )}
+                        </div>
+                        <Input
+                          value={f.url}
+                          onChange={(e) => updateFormatImage(f.id, { url: e.target.value })}
+                          placeholder={
+                            i === 0
+                              ? "Format example — image URL or upload"
+                              : "Another example of the SAME format (optional)"
+                          }
+                          disabled={f.uploading}
+                        />
+                        <input
+                          ref={(el) => {
+                            formatFileInputs.current[f.id] = el;
+                          }}
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (file) onUploadFormat(f.id, file);
+                            e.target.value = "";
+                          }}
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          title="Upload image"
+                          disabled={f.uploading}
+                          onClick={() => formatFileInputs.current[f.id]?.click()}
+                        >
+                          {f.uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          title="Remove"
+                          onClick={() => removeFormatImage(f.id)}
+                        >
+                          <X className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ))}
+                    {formatImages.length < MAX_FORMAT_IMAGES && (
+                      <Button type="button" variant="ghost" size="sm" onClick={addFormatImage}>
+                        <Plus className="h-4 w-4" /> Add example
+                      </Button>
+                    )}
+                    <p className="text-xs text-fg-subtle">
+                      All examples should share the same layout. The tool describes that layout and reproduces it
+                      for your title.
+                    </p>
+                  </div>
+                )}
+              </div>
+
               {/* Build prompt */}
               <div>
                 <Button
@@ -394,6 +557,14 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                   {building ? "Building prompt…" : "Build prompt"}
                 </Button>
               </div>
+
+              {/* Build caveat (AI fallback / format not learned) — a warning,
+                  not a hard error, so the user knows the output is degraded. */}
+              {notice && (
+                <p className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+                  {notice}
+                </p>
+              )}
 
               {/* Generated prompt (editable) */}
               {prompt && (

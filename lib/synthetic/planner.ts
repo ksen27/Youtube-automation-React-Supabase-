@@ -2624,6 +2624,41 @@ export async function buildSyntheticTimeline(input: {
   // after the distinct-scene pass so no later pass can re-lengthen a split_2.
   await runSplit2DurationCap("final");
 
+  // ZERO-WINDOW GUARD (avatar-bearing blocks). An avatar / split_2 block renders
+  // via HeyGen Avatar III, which lip-syncs to an audio slice cut from the master
+  // voiceover across [startTime, endTime]. If that window is degenerate
+  // (endTime <= startTime + a hair), the slice is empty and Avatar III has NO
+  // script fallback — the avatar job fails hard across every account (observed:
+  // a split_2 with start_time == end_time == 178.08). Such a block can't be a
+  // talking head, so demote it to a still IMAGE (needs no audio); the block's
+  // illustrative prompt already describes a frame. A bare avatar has no prompt to
+  // fall back to, so we log it — it should never occur (avatars come from
+  // non-empty marked runs), but we surface it rather than emit a doomed block.
+  {
+    const AVATAR_MIN_WINDOW = 0.2; // seconds; below this the audio slice is unusable
+    let demotedZeroWindow = 0;
+    for (const p of planned) {
+      const window = p.endTime - p.startTime;
+      if (window > AVATAR_MIN_WINDOW) continue;
+      if (p.blockType === "split_2") {
+        p.blockType = "image";
+        p.animationPrompt = null;
+        p.avatarModel = null;
+        demotedZeroWindow++;
+      } else if (p.blockType === "avatar") {
+        await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window", {
+          position: p.position, startTime: p.startTime, endTime: p.endTime,
+          script: (p.script ?? "").slice(0, 80),
+        });
+      }
+    }
+    if (demotedZeroWindow > 0) {
+      await logJob({ projectId, jobId }, "synthetic.plan.zero_window_split2_demoted", {
+        count: demotedZeroWindow, minWindowSeconds: AVATAR_MIN_WINDOW,
+      });
+    }
+  }
+
   // Persist. Clear any prior plan first so retries don't accumulate.
   const sb = getServerSupabase();
   await sb.from("synthetic_segments").delete().eq("project_id", projectId);

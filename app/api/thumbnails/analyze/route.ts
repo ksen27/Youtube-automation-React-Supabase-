@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
 import { fetchChannelThumbnails } from "@/lib/thumbnails/youtube";
-import { analyzeChannelStyle } from "@/lib/thumbnails/gemini";
+import { analyzeChannelStyle, STYLE_SAMPLE_LIMIT } from "@/lib/thumbnails/gemini";
 import { getEnv } from "@/lib/env";
 
 export const runtime = "nodejs";
@@ -70,7 +70,7 @@ export async function POST(req: NextRequest) {
   // Resolve + pull thumbnails (cheap: ~2 units for an @handle / channel URL).
   let channel;
   try {
-    channel = await fetchChannelThumbnails(parsed.data.channel, 10);
+    channel = await fetchChannelThumbnails(parsed.data.channel, STYLE_SAMPLE_LIMIT);
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "failed to read channel" },

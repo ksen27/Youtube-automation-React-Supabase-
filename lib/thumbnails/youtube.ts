@@ -145,13 +145,14 @@ async function resolveChannelForThumbnails(
 // cheap uploads-playlist recall (~1 quota unit for the playlist), so a normal
 // @handle/channel-URL analyze costs only a couple of units.
 //
-// `count` caps how many thumbnails we collect (client wants ~5–10). We derive
-// each thumbnail from its videoId at a stable, always-present resolution
-// (hqdefault) so a missing maxres never leaves a gap. Throws when the channel
+// `count` caps how many thumbnails we collect. We derive each thumbnail from
+// its videoId at a stable, always-present resolution (hqdefault) so a missing
+// maxres never leaves a gap. The playlistItems page returns at most 50 in one
+// unit, so count is clamped to 50 below (no pagination). Throws when the channel
 // can't be resolved or has no uploads.
 export async function fetchChannelThumbnails(
   channelInput: string,
-  count = 10,
+  count = 35,
 ): Promise<ChannelThumbnails> {
   const key = thumbnailYoutubeKey();
   const resolved = await resolveChannelForThumbnails(channelInput);

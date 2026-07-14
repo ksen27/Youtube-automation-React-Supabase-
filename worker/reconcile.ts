@@ -33,6 +33,7 @@
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import { maybeEnqueueMatch } from "./processors/_shared";
+import { dispatchSegments } from "./processors/synthetic/_shared";
 
 // Reconcile a synthetic SEGMENT stuck at 'generating' when its media_job died
 // without reaching the processor's own terminal write.
@@ -254,4 +255,77 @@ export async function sweepOrphanedSegments(): Promise<number> {
       "reconcile.marked_failed", { source: "segment_orphan_sweep", segmentId: seg.id });
   }
   return fixed;
+}
+
+// Periodic safety net for STRANDED segments — the opposite orphan from the two
+// sweeps above. Those handle segments that were dispatched (a media_job exists)
+// but got stuck; THIS handles segments that were NEVER dispatched at all.
+//
+// THE GAP THIS CLOSES: dispatchSegments() fans a project's segments out in a
+// SYNCHRONOUS per-segment loop inside the POST /generate-assets HTTP request
+// (create media_job → flip segment to 'generating' → enqueue, ~3 awaited
+// round-trips each). On a large project (hundreds of blocks) that request can
+// die partway — a serverless/HTTP timeout or a transient blip — after enqueuing
+// only the first N. The segments it reached run to completion; the REST stay
+// 'pending' with NO media_job forever, and the project sits in generating_*
+// with a permanent spinner (observed 2026-07-14: a 283-block project stranded
+// at 66 ready / 217 pending, every media_job completed, worker idle). Neither
+// job sweep touches these — there is no media_job to sweep — and the segment
+// sweep only looks at 'generating' rows.
+//
+// dispatchSegments is idempotent (it only picks up 'pending' segments), so the
+// recovery is simply to re-run it. We gate carefully to avoid re-dispatching a
+// project that is still legitimately mid-dispatch:
+//   - only projects in a generating_* status (asset generation is supposed to
+//     be in flight);
+//   - only when the project has NO live (queued/running) asset media_job — a
+//     live job means dispatch is either still running or genuinely working, so
+//     we leave it alone (mirrors the /generate-assets 409 guard);
+//   - only projects whose pending segments have been stranded a while
+//     (updated_at older than a grace window) so a dispatch loop actively
+//     mid-flight is never pre-empted.
+const STRANDED_GRACE_MS = 10 * 60_000; // 10 min since the pending row last moved
+
+export async function sweepUndispatchedSegments(): Promise<number> {
+  const sb = getServerSupabase();
+  const cutoff = new Date(Date.now() - STRANDED_GRACE_MS).toISOString();
+
+  // Candidate projects: currently generating assets AND holding at least one
+  // 'pending' segment that has sat untouched past the grace window.
+  const { data: stranded, error } = await sb
+    .from("synthetic_segments")
+    .select("project_id, projects!inner(status)")
+    .eq("status", "pending")
+    .lt("updated_at", cutoff)
+    .in("projects.status", ["generating_images", "generating_clips", "generating_avatars"]);
+  if (error) {
+    await logJob({}, "reconcile.undispatched_sweep.query_error", { err: error.message });
+    return 0;
+  }
+  if (!stranded || stranded.length === 0) return 0;
+
+  const projectIds = [...new Set(stranded.map((r) => r.project_id as string))];
+  let redispatched = 0;
+  for (const projectId of projectIds) {
+    // A live asset job means dispatch is still running OR generation is genuinely
+    // in flight — leave it alone (same guard as POST /generate-assets). Only a
+    // project whose asset jobs have ALL drained (or none exist) is truly stranded.
+    const { data: open } = await sb
+      .from("media_jobs").select("id")
+      .eq("project_id", projectId)
+      .in("type", ["image_gen", "image_to_video", "avatar"])
+      .in("status", ["queued", "running"]).limit(1);
+    if ((open ?? []).length > 0) continue;
+
+    const enqueued = await dispatchSegments(projectId).catch(async (e) => {
+      await logJob({ projectId }, "reconcile.undispatched_sweep.dispatch_error",
+        { err: (e as Error).message });
+      return 0;
+    });
+    if (enqueued > 0) {
+      redispatched++;
+      await logJob({ projectId }, "reconcile.undispatched_sweep.redispatched", { enqueued });
+    }
+  }
+  return redispatched;
 }

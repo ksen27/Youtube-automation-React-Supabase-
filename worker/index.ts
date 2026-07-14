@@ -24,7 +24,7 @@ import { processSyntheticPlannerJob } from "./processors/synthetic/plannerProces
 import { processImageGenJob }         from "./processors/synthetic/imageGenProcessor";
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
-import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments } from "./reconcile";
+import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
 import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
@@ -324,6 +324,15 @@ const sweepTimer = setInterval(() => {
         if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.done", segmentsFailed: n }));
       })
       .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.segment_sweep.error", err: (e as Error).message })));
+    // Recover STRANDED segments — 'pending' with no media_job because
+    // dispatchSegments died partway through the /generate-assets request. Left
+    // alone these spin forever (no job for a sweep to fail). Re-dispatches the
+    // project (idempotent — only 'pending' segments) once its asset queue drains.
+    void sweepUndispatchedSegments()
+      .then((n) => {
+        if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.undispatched_sweep.done", projectsRedispatched: n }));
+      })
+      .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.undispatched_sweep.error", err: (e as Error).message })));
   }
   // Render-cache reaping applies to ANY worker that runs renders. Both roles do
   // now: sourced renders celebrity videos, synthetic renders avatar videos on the

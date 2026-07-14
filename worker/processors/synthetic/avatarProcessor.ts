@@ -278,6 +278,50 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
     audio = null;
   }
 
+  // NO AUDIO SLICE → Avatar III can't render (it lip-syncs to the slice; there is
+  // NO script-text fallback for Avatar III — generateAvatar throws hard). This
+  // happens when the block's spoken window is empty/degenerate, e.g. a planner
+  // gave a split_2 start_time == end_time (zero-length), so stageAvatarAudio
+  // returns null. Rather than burning all 5 accounts on a render that can never
+  // succeed, degrade gracefully:
+  //   - split_2: it already has (or can make) a right-half still — drop the
+  //     avatar half and render it as an IMAGE-only block (the still fills frame).
+  //   - full avatar: there is no still to fall back to, so fail with a clear,
+  //     actionable message instead of the opaque "failed across 5 accounts".
+  if (!audio) {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.no_audio_degrade", {
+      blockType: seg.block_type,
+      startTime: seg.start_time,
+      endTime: seg.end_time,
+    });
+    if (seg.block_type === "split_2") {
+      // Ensure the illustrative still exists (idempotent — reused if already made),
+      // then convert the block to an image so the render uses the still full-frame
+      // and never expects an avatar video_url for this segment.
+      if (!seg.right_image_url) {
+        await generateSplitRightImage(projectId, mediaJobId, segmentId, seg);
+      }
+      await sb.from("synthetic_segments")
+        .update({ block_type: "image", animation_prompt: null })
+        .eq("id", segmentId);
+      // Promote the right-half still to the block's primary image so the image
+      // renderer has an image_url to show (right_image_url is a split-only field).
+      const { data: fresh } = await sb.from("synthetic_segments")
+        .select("right_image_url, image_url").eq("id", segmentId).single();
+      const still = fresh?.image_url ?? fresh?.right_image_url ?? null;
+      await finishSegment(segmentId, { status: "ready", image_url: still, video_url: null, provider: "sixtynine_image", error: null });
+      await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { degraded: "no_audio_split2_to_image" } });
+      await maybeFinalizeSynthetic(projectId);
+      return;
+    }
+    // Full avatar block with no audio window — nothing to fall back to.
+    const msg = "This avatar block has an empty spoken window (no audio to lip-sync). Re-plan to fix the block timing, then regenerate.";
+    await finishSegment(segmentId, { status: "failed", error: msg });
+    await setMediaJob(mediaJobId, { status: "failed", progress: 100, error: msg });
+    await maybeFinalizeSynthetic(projectId);
+    return;
+  }
+
   try {
     // Heartbeat the segment's updated_at across the multi-minute HeyGen render
     // so the stall sweeper can't false-fail an avatar that is alive and

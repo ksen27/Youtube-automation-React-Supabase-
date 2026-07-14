@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getGeminiModel, withGeminiRetry } from "@/lib/ai/gemini";
+import { withGeminiModelFallback } from "@/lib/ai/gemini";
 import { getEnv } from "@/lib/env";
 
 // Gemini calls for the /thumbnails feature.
@@ -9,8 +9,21 @@ import { getEnv } from "@/lib/env";
 //   buildThumbnailPrompt — merge that style prompt + the new video title (+ any
 //                          subject images) into the FINAL prompt for Pikzels.
 //
-// Both reuse the video engine's configured Gemini model + retry ladder
-// (getGeminiModel / withGeminiRetry) so behaviour matches the rest of the app.
+// Both reuse the video engine's configured Gemini model + retry/fallback ladder
+// (withGeminiModelFallback) so behaviour matches the rest of the app — including
+// failing over to GEMINI_FALLBACK_MODEL when the primary model is overloaded.
+
+// How many of a channel's recent thumbnails we send to Gemini when learning its
+// style. Client asked to expand beyond the original 10 for a more representative
+// sample; kept under YouTube's 50-per-page playlist limit so no pagination is
+// needed (see fetchChannelThumbnails). Analyze fetches this many; the fetch
+// helper defaults to the same value.
+export const STYLE_SAMPLE_LIMIT = 35;
+
+// How many "format" reference images a user may upload to teach a SPECIFIC
+// thumbnail layout (e.g. a two-celebrity split, a breaking-news banner). Small
+// on purpose — a few clear examples define a format; more just cost quota.
+export const MAX_FORMAT_IMAGES = 3;
 
 // Fetch a remote image and return base64 + mime for Gemini inline parts. Mirrors
 // the helper in lib/ai/gemini.ts (kept local so this module stays standalone).
@@ -49,7 +62,7 @@ export async function analyzeChannelStyle(thumbnailUrls: string[]): Promise<stri
   if (!env.GEMINI_API_KEY) return "";
   if (thumbnailUrls.length === 0) return "";
 
-  const fetched = await Promise.all(thumbnailUrls.slice(0, 10).map(fetchImageAsBase64));
+  const fetched = await Promise.all(thumbnailUrls.slice(0, STYLE_SAMPLE_LIMIT).map(fetchImageAsBase64));
   const images = fetched.filter((x): x is NonNullable<typeof x> => x !== null);
   if (images.length === 0) return "";
 
@@ -72,7 +85,6 @@ The prompt MUST NOT contain any URL or the substring "http".
 Return STRICT JSON ONLY:
 { "style_prompt": "the reusable style instruction, 70–180 words" }`;
 
-  const model = getGeminiModel();
   const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
     { text: prompt },
   ];
@@ -80,9 +92,9 @@ Return STRICT JSON ONLY:
 
   let txt: string;
   try {
-    const res = await withGeminiRetry(
+    const { result: res } = await withGeminiModelFallback(
       "analyzeChannelStyle",
-      () => model.generateContent({
+      (model) => model.generateContent({
         contents: [{ role: "user", parts }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
       }),
@@ -110,6 +122,83 @@ Return STRICT JSON ONLY:
 }
 
 // ---------------------------------------------------------------------------
+// Step 1b — specific FORMAT analysis (optional, from user-uploaded examples)
+// ---------------------------------------------------------------------------
+
+const FormatSchema = z.object({
+  format_prompt: z.string().min(1),
+});
+
+// Learn ONE specific thumbnail FORMAT from 1–3 example images the user uploaded.
+//
+// The channel-style analysis above averages a channel's whole look. Many
+// channels run SEVERAL distinct formats (a two-celebrity split with yellow
+// text, a red "BREAKING NEWS" banner, a single shocked face, …) that an average
+// blurs together. This learns ONE of those layouts from concrete examples so a
+// new thumbnail can be generated in that EXACT format for a new title.
+//
+// Returns "" when Gemini isn't configured, no images load, or the call fails —
+// the caller treats "" as "format learning unavailable" and surfaces an error.
+export async function analyzeFormatImages(imageUrls: string[]): Promise<string> {
+  const env = getEnv();
+  if (!env.GEMINI_API_KEY) return "";
+  if (imageUrls.length === 0) return "";
+
+  const fetched = await Promise.all(imageUrls.slice(0, MAX_FORMAT_IMAGES).map(fetchImageAsBase64));
+  const images = fetched.filter((x): x is NonNullable<typeof x> => x !== null);
+  if (images.length === 0) return "";
+
+  const prompt = `You are a YouTube thumbnail art director. You are shown ${images.length} example thumbnail(s) that all use ONE specific FORMAT. Write a single reusable "format prompt" that captures this exact LAYOUT/FORMAT, so a new thumbnail can be generated in the identical format for a different video.
+
+Capture the reusable FORMAT precisely — the structural things that define this layout:
+1. Composition & layout: how many subjects and WHERE they sit (e.g. two people side-by-side each filling half the frame; one subject on the right third; a centred close-up). Be specific about the split/arrangement.
+2. Subject treatment: cut-out vs in-scene, framing (head-and-shoulders vs full), expression tendencies. The subject(s) stay the clear, unobstructed HERO.
+3. Text: IF present, the text's LOOK and PLACEMENT (font weight/style, colour, outline/shadow, where it sits — e.g. "large yellow all-caps text with a black outline across the bottom"). Describe the style, never the specific words, and note text is SHORT (a few words), not a sentence.
+4. Branded label / banner: any recurring badge or bar that is part of the format (e.g. a red "BREAKING NEWS" box, a "VS" divider between two people, a corner tag). Describe its LOOK and placement and state it must be reproduced.
+5. Colour grade & background: palette, contrast, background style (blur, gradient, scenery).
+
+Describe ONLY the reusable format — NOT the one-off subjects or titles of the examples (no names, no specific topics). Write it as a direct instruction a text-to-image model can follow.
+
+The prompt MUST NOT contain any URL or the substring "http".
+
+Return STRICT JSON ONLY:
+{ "format_prompt": "the reusable format instruction, 60–160 words" }`;
+
+  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
+    { text: prompt },
+  ];
+  for (const img of images) parts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
+
+  let txt: string;
+  try {
+    const { result: res } = await withGeminiModelFallback(
+      "analyzeFormatImages",
+      (model) => model.generateContent({
+        contents: [{ role: "user", parts }],
+        generationConfig: { responseMimeType: "application/json", temperature: 0.3 },
+      }),
+      { attempts: 2, baseMs: 500 },
+    );
+    txt = res.response.text();
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "analyzeFormatImages.gemini_failed", err: (e as Error).message }));
+    return "";
+  }
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(txt); } catch {
+    console.error(JSON.stringify({ msg: "analyzeFormatImages.parse_failed", raw: txt.slice(0, 300) }));
+    return "";
+  }
+  const safe = FormatSchema.safeParse(parsed);
+  if (!safe.success) {
+    console.error(JSON.stringify({ msg: "analyzeFormatImages.schema_failed", raw: txt.slice(0, 300) }));
+    return "";
+  }
+  return safe.data.format_prompt.replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------------
 // Step 2 — final prompt build
 // ---------------------------------------------------------------------------
 
@@ -120,6 +209,11 @@ const FinalPromptSchema = z.object({
 export interface BuildPromptInput {
   stylePrompt: string;
   title: string;
+  // Optional SPECIFIC format learned from user-uploaded example images
+  // (analyzeFormatImages). When present it OVERRIDES the averaged channel style
+  // for layout/composition — the user picked this exact format on purpose.
+  // Empty when the user didn't upload a format.
+  formatPrompt?: string;
   // Optional free-text changes the user wants applied on top of the channel
   // style + title (e.g. "make it darker", "shocked face"). Empty when unused.
   customPrompt?: string;
@@ -132,13 +226,29 @@ export interface BuildPromptInput {
   styleImageSent: boolean;
 }
 
-// Merge the saved channel style prompt + the new video title (+ subject-image
-// context) into the FINAL prompt string for Pikzels. Returns a deterministic
-// fallback assembly when Gemini is unavailable so generation still works.
-export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<string> {
+// Result of a prompt build. `usedFallback` is TRUE whenever Gemini could not
+// produce the prompt (unconfigured, or the call/parse/validate failed) and we
+// fell back to the deterministic assembly — which does NOT weave in the title.
+// The caller surfaces this so a title-less copy is never mistaken for a real
+// AI build (the "it just copies the style prompt" bug the client reported).
+export interface BuildPromptResult {
+  prompt: string;
+  usedFallback: boolean;
+  // Short machine-ish reason when usedFallback is true (for the UI + logs).
+  fallbackReason?: "gemini_not_configured" | "gemini_failed" | "parse_failed" | "invalid_output";
+}
+
+// Merge the saved channel style prompt + the new video title (+ an optional
+// learned format + subject-image context) into the FINAL prompt for Pikzels.
+// Falls back to a deterministic assembly when Gemini is unavailable so
+// generation still works — but flags it via usedFallback so the UI can warn
+// that the title was NOT applied (see BuildPromptResult).
+export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<BuildPromptResult> {
   const env = getEnv();
   const fallback = assembleFallbackPrompt(input);
-  if (!env.GEMINI_API_KEY) return fallback;
+  if (!env.GEMINI_API_KEY) {
+    return { prompt: fallback, usedFallback: true, fallbackReason: "gemini_not_configured" };
+  }
 
   const subjectClause =
     input.subjectCount === 0
@@ -155,18 +265,25 @@ export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<str
     ? `\nUSER CHANGES (apply these on top of the style — they take priority): "${input.customPrompt.trim()}"\n`
     : "";
 
+  // When the user uploaded a specific format, it takes priority over the
+  // averaged channel style for LAYOUT/composition. The channel style still
+  // supplies grade/mood; the format dictates the arrangement.
+  const formatClause = input.formatPrompt?.trim()
+    ? `\nCHOSEN FORMAT (the user picked this SPECIFIC layout — its composition/arrangement OVERRIDES the channel style above; follow it exactly for layout, subject placement, text placement, and any banner/label):\n"""${input.formatPrompt.trim()}"""\n`
+    : "";
+
   const prompt = `You are writing the final text-to-image prompt for a YouTube thumbnail generator (Pikzels).
 
-CHANNEL STYLE (reuse this exact look):
+CHANNEL STYLE (reuse this look — grade, mood, energy):
 """${input.stylePrompt}"""
-
+${formatClause}
 NEW VIDEO TITLE (use ONLY as a hint for the scene/subject — do NOT put this full title on the image): "${input.title}"
 ${customClause}
 ${subjectClause}
 ${styleImageClause}
 
 Write ONE cohesive prompt that:
-- Renders a 16:9 YouTube thumbnail in the CHANNEL STYLE above.
+- Renders a 16:9 YouTube thumbnail in the CHANNEL STYLE above${input.formatPrompt?.trim() ? ", using the CHOSEN FORMAT's layout/composition" : ""}.
 - Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics.
 - ACTION/SCENE: this is a NEW video. Depict a FRESH scene, pose, gesture, camera angle, and secondary object that fit THIS title — do NOT copy the exact pose or composition of any reference thumbnail. Keep the channel's overall LOOK (grade, layout style, energy), but the person's specific action and the scene around them must be different and specific to this title. Reuse the person's LIKENESS (same face/identity) but put them in a different moment.
 - TEXT: only if the channel style uses on-image text, add a SHORT punchy hook of 2–4 words derived from the topic (e.g. a key word or phrase) — NEVER the full video title, and never a full sentence. Keep the text clean, well-placed (usually a corner or side), and not overlapping the subject's face. If the channel style has no text, add none.
@@ -185,31 +302,83 @@ HARD RULES:
 Return STRICT JSON ONLY:
 { "prompt": "the final image prompt" }`;
 
-  const model = getGeminiModel();
   let txt: string;
   try {
-    const res = await withGeminiRetry(
+    // Retry the primary model, then fail over to GEMINI_FALLBACK_MODEL on a
+    // genuine outage (503 "high demand" / 429 / truncation). The primary
+    // gemini-flash-latest intermittently returns 503s that exhausted the retry
+    // ladder and dropped the build to a title-less fallback — the "just copies
+    // the style" bug. withGeminiModelFallback rides those out on the secondary
+    // model instead.
+    const { result: res } = await withGeminiModelFallback(
       "buildThumbnailPrompt",
-      () => model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.4 },
-      }),
-      { attempts: 2, baseMs: 500 },
+      async (model) => {
+        // Cap output so a chatty model can't run past its budget and truncate
+        // the JSON mid-string (a second cause of the same bug). A thumbnail
+        // prompt is ~1100 chars (~400 tokens); 2048 is ample. On MAX_TOKENS,
+        // throw GEMINI_TRUNCATED so the retry/fallback ladder handles it.
+        const r = await model.generateContent({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.4,
+            maxOutputTokens: 2048,
+          },
+        });
+        if (r.response.candidates?.[0]?.finishReason === "MAX_TOKENS") {
+          throw new Error("GEMINI_TRUNCATED buildThumbnailPrompt hit MAX_TOKENS");
+        }
+        return r;
+      },
+      { attempts: 3, baseMs: 500 },
     );
     txt = res.response.text();
   } catch (e) {
     console.error(JSON.stringify({ msg: "buildThumbnailPrompt.gemini_failed", err: (e as Error).message }));
-    return fallback;
+    return { prompt: fallback, usedFallback: true, fallbackReason: "gemini_failed" };
   }
 
   let parsed: unknown;
   try { parsed = JSON.parse(txt); } catch {
-    return fallback;
+    // Salvage a truncated response: if the JSON was cut off mid-string, the
+    // "prompt" field value is still usable text. Pull it out rather than losing
+    // the whole (title-woven) prompt to the fallback. Only when it's long
+    // enough to be a real prompt, not a stub.
+    const salvaged = salvagePromptField(txt);
+    if (salvaged && salvaged.length >= 80) {
+      console.error(JSON.stringify({ msg: "buildThumbnailPrompt.parse_salvaged", chars: salvaged.length }));
+      return { prompt: salvaged.slice(0, 3000), usedFallback: false };
+    }
+    console.error(JSON.stringify({ msg: "buildThumbnailPrompt.parse_failed", raw: txt.slice(0, 300) }));
+    return { prompt: fallback, usedFallback: true, fallbackReason: "parse_failed" };
   }
   const safe = FinalPromptSchema.safeParse(parsed);
-  if (!safe.success) return fallback;
-  const cleaned = safe.data.prompt.replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim();
-  return cleaned.slice(0, 3000) || fallback;
+  if (!safe.success) {
+    console.error(JSON.stringify({ msg: "buildThumbnailPrompt.schema_failed", raw: txt.slice(0, 300) }));
+    return { prompt: fallback, usedFallback: true, fallbackReason: "invalid_output" };
+  }
+  const cleaned = safe.data.prompt.replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim().slice(0, 3000);
+  if (!cleaned) return { prompt: fallback, usedFallback: true, fallbackReason: "invalid_output" };
+  return { prompt: cleaned, usedFallback: false };
+}
+
+// Best-effort extraction of the "prompt" string field from a JSON response that
+// was CUT OFF mid-stream (no closing quote/brace), so JSON.parse threw. Matches
+// the opening `"prompt": "` and takes everything after it, dropping a dangling
+// trailing quote/brace and any URL. Returns "" when the field isn't present.
+function salvagePromptField(raw: string): string {
+  const m = /"prompt"\s*:\s*"/.exec(raw);
+  if (!m) return "";
+  let body = raw.slice(m.index + m[0].length);
+  // Cut at an unescaped closing quote if the field actually terminated.
+  const end = body.search(/(?<!\\)"/);
+  if (end !== -1) body = body.slice(0, end);
+  return body
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, " ")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Deterministic prompt assembly used when Gemini is unavailable. Keeps the
@@ -219,6 +388,7 @@ Return STRICT JSON ONLY:
 // stay small.
 function assembleFallbackPrompt(input: BuildPromptInput): string {
   const parts = [input.stylePrompt.trim()];
+  if (input.formatPrompt?.trim()) parts.push(`Use this exact layout/format: ${input.formatPrompt.trim()}`);
   if (input.subjectCount === 1) parts.push("Feature the provided subject as the clear, unobstructed focal point, preserving their likeness.");
   if (input.subjectCount === 2) parts.push("Feature both provided subjects together as the clear focal point, preserving each likeness.");
   if (input.customPrompt?.trim()) parts.push(input.customPrompt.trim());
