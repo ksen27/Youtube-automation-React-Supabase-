@@ -51,11 +51,21 @@ export function pickStyleImage(sampleUrls: string[], rotation: number): string |
 // exactly two image slots; the channel style ALSO rides in the text prompt, so
 // a style image is optional reinforcement:
 //   0 subjects -> [styleImage]                 (base = channel style thumbnail)
-//   1 subject  -> [subject, styleImage]        (base = subject, support = style)
+//   1 subject  -> [subject]                     (base = subject; NO style image)
 //   2 subjects -> [subject1, subject2]         (both slots subjects; NO style
 //                                               image — style is text-only)
-// styleImageSent reflects whether slot 2 (or 1, when no subjects) holds a style
-// image, so the prompt builder can be told to fully carry the style in text.
+// styleImageSent reflects whether a slot holds a channel style image, so the
+// prompt builder can be told to fully carry the style in text.
+//
+// WHY no style image once a subject is uploaded: Pikzels derives IDENTITY from
+// BOTH image slots (base and support), not just the base. When the user uploads
+// a NEW face (e.g. changing a channel's AI avatar to a new Ruth Yoder), sending
+// the channel's OLD avatar thumbnail in the support slot pulls the output's face
+// back toward the old avatar — the exact "it kept the old face" bug. So the
+// moment ANY subject face is supplied, the uploaded face(s) are the ONLY image
+// input; the channel style is carried by the text prompt alone. The style image
+// only rides along in the 0-subject case, where the channel's own thumbnail IS
+// the intended face.
 export function buildChannelReferenceUrls(args: {
   subjectUrls: string[];
   styleImageUrl: string | null;
@@ -63,20 +73,17 @@ export function buildChannelReferenceUrls(args: {
   const subjects = args.subjectUrls.filter(Boolean).slice(0, MAX_REFERENCES);
   const style = args.styleImageUrl?.trim() || null;
 
-  if (subjects.length >= MAX_REFERENCES) {
-    // Two subjects fill both slots — no room for a style image.
+  if (subjects.length > 0) {
+    // Any uploaded subject face is the sole identity source — never send the
+    // channel style image alongside it (it would contaminate the face). Style
+    // lives in the text prompt only.
     return { referenceUrls: subjects.slice(0, MAX_REFERENCES), styleImageSent: false };
   }
-  if (subjects.length === 0) {
-    // No subjects: the style image becomes the base image (if we have one).
-    return style
-      ? { referenceUrls: [style], styleImageSent: true }
-      : { referenceUrls: [], styleImageSent: false };
-  }
-  // One subject: subject is base, style image (if any) is the support slot.
+  // No subjects: the channel style image becomes the base image (if we have
+  // one) — here the channel's own avatar IS the intended face.
   return style
-    ? { referenceUrls: [...subjects, style], styleImageSent: true }
-    : { referenceUrls: subjects, styleImageSent: false };
+    ? { referenceUrls: [style], styleImageSent: true }
+    : { referenceUrls: [], styleImageSent: false };
 }
 
 export interface PikzelsResult {

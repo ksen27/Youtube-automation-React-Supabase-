@@ -254,8 +254,8 @@ export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<Bui
     input.subjectCount === 0
       ? "No separate subject photo was uploaded — the person comes from the channel's own thumbnail. Keep that SAME person's likeness, but place them in a DIFFERENT action/pose/scene suited to this title (do not clone the reference pose)."
       : input.subjectCount === 1
-        ? "ONE subject photo is provided as the base image — feature that exact person/subject, preserving their likeness, styled to match the channel."
-        : "TWO subject photos are provided as the images — feature BOTH people together, preserving each likeness. No separate style reference image is sent, so the channel style below must be fully expressed in this text.";
+        ? "ONE subject photo is provided as the base image — feature THAT EXACT person, preserving their likeness precisely. This uploaded face is the ONLY identity source: do NOT blend in, revert to, or borrow the face of any person from the channel's own thumbnails — the channel supplies STYLE only, never the face. No separate style reference image is sent, so the channel style below must be fully expressed in this text."
+        : "TWO subject photos are provided as the images — feature BOTH people together, preserving each likeness precisely. These uploaded faces are the ONLY identity sources: do NOT blend in or revert to any face from the channel's own thumbnails — the channel supplies STYLE only. No separate style reference image is sent, so the channel style below must be fully expressed in this text.";
 
   const styleImageClause = input.styleImageSent
     ? "A representative channel thumbnail is also provided as a style reference image; reinforce it."

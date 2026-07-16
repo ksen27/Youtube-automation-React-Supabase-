@@ -11,6 +11,7 @@ import { logJob } from "@/lib/jobs/db";
 export type SyntheticProvider =
   | "sixtynine_tts"
   | "sixtynine_image"
+  | "gemini_image"
   | "flux_image"
   | "fal_flux_image"
   | "ltx2"
@@ -25,6 +26,10 @@ export type SyntheticProvider =
 const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   sixtynine_tts:   { unit: "per_1k_chars", usd: 0.015 },
   sixtynine_image: { unit: "per_image",    usd: 0.04 },
+  // Gemini's own nano-banana image model — the PREFERRED still fallback when the
+  // 69labs pool is exhausted (same model 69labs resells, so matching look).
+  // Google bills per image; tune if GEMINI_IMAGE_MODEL changes to a Pro tier.
+  gemini_image:    { unit: "per_image",    usd: 0.04 },
   flux_image:      { unit: "per_image",    usd: 0.05 },
   // fal.ai FLUX text-to-image — the fallback still when the 69labs pool is
   // exhausted. FLUX schnell is cheap; tune if FAL_AI_IMAGE_MODEL changes.

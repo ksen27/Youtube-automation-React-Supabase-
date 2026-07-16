@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2 } from "lucide-react";
+import { ChevronLeft, Loader2 } from "lucide-react";
 import { WorkspaceLayout } from "@/components/shell/workspace-layout";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Badge } from "@/components/ui/badge";
@@ -84,6 +85,13 @@ export function SyntheticWorkspace({ projectId }: { projectId: string }) {
     <WorkspaceLayout
       header={
         <header className="flex items-center gap-3 border-b border-border px-6 lg:px-8 py-4">
+          <Link
+            href="/dashboard"
+            className="grid place-items-center h-7 w-7 shrink-0 rounded-md text-fg-muted hover:bg-surface-hover hover:text-fg transition-colors"
+            aria-label="Back to dashboard"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </Link>
           <h1 className="text-sm font-semibold text-fg truncate">{resp.project.title}</h1>
           <Badge variant="info">Synthetic</Badge>
           <Badge variant="secondary">{resp.project.status.replace(/_/g, " ")}</Badge>

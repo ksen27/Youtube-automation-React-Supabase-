@@ -3,6 +3,7 @@ import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/ht
 import { withStylePrompt } from "@/lib/synthetic/constants";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
 import { generateFalImage, isFalImageConfigured } from "@/lib/synthetic/falai";
+import { generateGeminiImage, isGeminiImageConfigured } from "@/lib/synthetic/gemini-image";
 
 // Stable per-account id for the Redis slot pool. We key by the api key's short
 // prefix (never the full secret) so each 69labs account gets its own global
@@ -304,9 +305,10 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
 export interface GenerateImageResult {
   image: Buffer;
   contentType: string;
-  // "sixtynine_image" for the primary nano-banana path; "fal_flux_image" when the
-  // 69labs pool is exhausted and we fall back to fal.ai (see generateImage).
-  provider: "sixtynine_image" | "fal_flux_image";
+  // "sixtynine_image" for the primary nano-banana path; on 69labs-pool exhaustion
+  // the fallback is "gemini_image" (Gemini's own nano-banana, same look) when
+  // configured, else "fal_flux_image" (fal.ai FLUX). See generateImage.
+  provider: "sixtynine_image" | "gemini_image" | "fal_flux_image";
 }
 
 // Cross-attempt resume for 69labs image generation (the zombie-loop fix). When a
@@ -587,12 +589,54 @@ export async function generateImage(
     // fallback below always submits fresh (it has no per-account concurrency wall).
     return await generate69labsImage(prompt, resume);
   } catch (err) {
-    // fal.ai FALLBACK: 69labs failed past its retry budget / all accounts are
-    // down or blocked. Fall back to fal.ai (FLUX) so a 69labs outage doesn't fail
-    // the segment. EXCEPT on CENSORED — a content rejection would fail on fal.ai
-    // too; the fix is to edit the prompt, not switch provider. Also skip if fal
-    // isn't configured (then surface the original 69labs error).
-    if (isCensored(err) || !isFalImageConfigured()) throw err;
+    // FALLBACK: 69labs failed past its retry budget / all accounts are down or
+    // blocked. EXCEPT on CENSORED — a content rejection would fail on any provider
+    // too; the fix is to edit the prompt, not switch provider. Surface it.
+    if (isCensored(err)) throw err;
+
+    // PREFERRED fallback is Gemini's own image model: 69labs resells Google's
+    // nano-banana, so a Gemini still matches the 69labs look (fal.ai FLUX reads
+    // different) while sidestepping 69labs' credit/slot limits. Fall through to
+    // fal.ai only when Gemini is unconfigured or itself fails.
+    if (isGeminiImageConfigured()) {
+      console.warn(
+        JSON.stringify({
+          msg: "69labs.image.gemini_fallback",
+          note: "69labs image pool exhausted; falling back to Gemini (nano-banana)",
+          err: (err as Error).message?.slice(0, 200),
+        }),
+      );
+      try {
+        const out = await generateGeminiImage(prompt);
+        return { image: out.image, contentType: out.contentType, provider: out.provider };
+      } catch (geminiErr) {
+        // Gemini also failed. Try fal.ai as a last resort if configured;
+        // otherwise surface a combined 69labs+Gemini reason.
+        if (!isFalImageConfigured()) {
+          throw new Error(
+            `image generation failed :: 69labs: ${(err as Error).message?.slice(0, 120)} :: gemini: ${(geminiErr as Error).message?.slice(0, 120)}`,
+          );
+        }
+        console.warn(
+          JSON.stringify({
+            msg: "69labs.image.fal_fallback",
+            note: "69labs + Gemini failed; falling back to fal.ai FLUX",
+            err: (geminiErr as Error).message?.slice(0, 200),
+          }),
+        );
+        try {
+          const out = await generateFalImage(prompt);
+          return { image: out.image, contentType: out.contentType, provider: out.provider };
+        } catch (falErr) {
+          throw new Error(
+            `image generation failed on all providers :: 69labs: ${(err as Error).message?.slice(0, 100)} :: gemini: ${(geminiErr as Error).message?.slice(0, 100)} :: fal.ai: ${(falErr as Error).message?.slice(0, 100)}`,
+          );
+        }
+      }
+    }
+
+    // Gemini not configured — original fal.ai-only fallback path.
+    if (!isFalImageConfigured()) throw err;
     console.warn(
       JSON.stringify({
         msg: "69labs.image.fal_fallback",

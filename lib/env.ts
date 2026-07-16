@@ -474,6 +474,28 @@ const ServerEnvSchema = z.object({
   FAL_AI_IMAGE_MODEL: z.string().default("fal-ai/flux/schnell"),
   // Hard timeout (seconds) for a single fal.ai image-to-video job (poll loop).
   FAL_AI_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // Gemini TEXT-TO-IMAGE — the still-image FALLBACK used when the 69labs
+  // (nano-banana) pool is exhausted, in place of fal.ai FLUX. 69labs resells
+  // Google's nano-banana model, so calling Gemini's own image model directly
+  // yields the SAME look as 69labs (unlike FLUX, which reads differently) while
+  // sidestepping 69labs' per-account credit/slot limits. Reuses GEMINI_API_KEY.
+  // Enabled only when GEMINI_IMAGE_ENABLED is on AND GEMINI_API_KEY is set; when
+  // off, the fallback stays fal.ai. Preferred over fal when both are configured.
+  GEMINI_IMAGE_ENABLED: z.coerce.boolean().default(true),
+  // Image model id. Default is the established "nano-banana" (gemini-2.5-flash-
+  // image). Bump to a newer image model (e.g. gemini-3-pro-image) via env once
+  // confirmed live on the key — no code change needed. The "-latest"-style
+  // aliases used for text models do not exist for image models, so this is pinned.
+  GEMINI_IMAGE_MODEL: z.string().default("gemini-2.5-flash-image"),
+  // The Gemini IMAGE API is geo-restricted (UK/EU return 400 "User location is
+  // not supported"), and the workers run in lhr (London). So the image call must
+  // egress through a proxy whose exit IP is in a SUPPORTED region (e.g. US).
+  // Format is a single `ip:port:user:pass` entry (Webshare-style), same as the
+  // other proxy pools. When unset, the code falls back to the FIRST entry of
+  // YTDLP_PROXIES — BUT only reuse that if those IPs are US/supported-region;
+  // a UK residential proxy will NOT lift the block. Empty + no pool = direct
+  // egress (works only from a supported region, e.g. local dev in the US).
+  GEMINI_IMAGE_PROXY: z.string().optional(),
   // HeyGen avatar automation (Playwright — NOT the API, per spec).
   HEYGEN_BASE_URL: z.string().url().default("https://app.heygen.com"),
   // 64-hex-char (32-byte) AES-256-GCM key encrypting heygen_accounts secrets

@@ -454,12 +454,22 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // transition partners treat them identically.
         const headLeft = headroomFor(i - 1);
         const headRight = headroomFor(i + 1);
-        const renderDur = plannedDur + headLeft + headRight;
         const meta = (it.metadata ?? {}) as Record<string, unknown>;
         // SYNTHETIC split: avatar VIDEO (video_url) left + still (right_image_url)
         // right. SOURCED split: still (image_url) left + still (meta.right_image_url)
         // right. Detected by the presence of video_url.
         const isSyntheticSplit = !!it.video_url;
+        // A synthetic split carries a HeyGen avatar (25fps -> 30fps), so it has
+        // the same sub-frame `-t` floor drift the full-frame avatar branch fixes:
+        // buildSplitScreenAvatarVideo bounds the avatar with `-t`/trim on a 30fps
+        // stream (floors to floor(dur*30) frames) while slotDurations recorded the
+        // un-floored float, overstating each block by up to ~33ms. Snap the pin
+        // target to a mid-frame value so the floor lands on exactly renderFrames
+        // and slotDurations is truthful. Sourced splits (still images, exact
+        // length) keep the raw float — behavior byte-identical to before.
+        const rawSplitDur = plannedDur + headLeft + headRight;
+        const splitFrames = Math.max(1, Math.round(rawSplitDur * 30));
+        const renderDur = isSyntheticSplit ? (splitFrames + 0.5) / 30 : rawSplitDur;
         const leftUrl = isSyntheticSplit ? (it.video_url as string) : (it.image_url as string);
         const rightUrl = isSyntheticSplit
           ? (it.right_image_url as string)
@@ -503,7 +513,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             });
           }
           slots[i] = out;
-          slotDurations[i] = renderDur;
+          // For a synthetic (avatar) split the file is exactly splitFrames/30
+          // after the `-t` floor; record that, not the mid-frame pin value.
+          // Sourced splits build exact-length stills, so renderDur is truthful.
+          slotDurations[i] = isSyntheticSplit ? splitFrames / 30 : renderDur;
           slotContentDurations[i] = plannedDur;
           imageRendered++;
         } catch (e) {
@@ -563,7 +576,27 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // concat time, so these segments are silent like every other one.
         const headLeft = headroomFor(i - 1);
         const headRight = headroomFor(i + 1);
-        const renderDur = plannedDur + headLeft + headRight;
+        // Snap the pin target to a whole 30fps frame count. The clip is pinned
+        // with `-t renderDur` twice (normalizeClip below, then padVideoToLength on
+        // a short clip), and `-t` on a 30fps CFR stream FLOORS to floor(sec*30)
+        // frames. A raw float renderDur never lands on a frame boundary, so every
+        // avatar clip (HeyGen renders 25fps, converted to 30) came back 0-33ms
+        // short of renderDur in the SAME direction, was recorded into
+        // slotDurations[i], and the sub-frame shortfalls accumulated — later
+        // avatar lips finished ahead of their words, worse toward the end of the
+        // video (measured on 2856195f: every avatar delta negative). We round to
+        // the nearest whole frame COUNT and hand `-t` a value sitting mid-frame
+        // ((frames+0.5)/30): flooring it always yields exactly `frames`, immune to
+        // padVideoToLength's `.toFixed(3)` rounding (a value like 6.0333 would
+        // else round to 6.033 and floor back to 180 frames, re-losing one). Both
+        // pins then emit exactly `frames` frames, the rendered file equals
+        // renderDur to the millisecond, and slotDurations[i]=renderDur is
+        // truthful — interior drift is zero by construction. Round-to-nearest
+        // (not ceil) keeps the summed timeline on the voiceover grid; the final
+        // total-length pin absorbs any half-frame residual. avatar/ai_clip only;
+        // sourced footage untouched.
+        const renderFrames = Math.max(1, Math.round((plannedDur + headLeft + headRight) * 30));
+        const renderDur = (renderFrames + 0.5) / 30;
 
         if (it.video_url) {
           const localPre = path.join(tmp, `synvid_${idx}.mp4`);
@@ -639,15 +672,20 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // image block (client wants zoom, no pan — see the image branch).
           const MOTION_CYCLE = ["in", "out"] as const;
           const localImg = path.join(tmp, `synimg_${idx}`);
+          // buildStillVideo builds an EXACT-length still (no `-t` floor problem),
+          // so pass the clean frame-aligned duration rather than the mid-frame pin
+          // value renderDur uses for the video path — otherwise round(x.5) rounds
+          // up and the still runs one frame long while slotDurations understates.
+          const stillDur = renderFrames / 30;
           try {
             await downloadHttp(it.image_url as string, localImg);
             await buildStillVideo({
               vcodecArgs: vcodec,
-              inputImagePath: localImg, outputPath: out, durationSeconds: renderDur,
+              inputImagePath: localImg, outputPath: out, durationSeconds: stillDur,
               width: outW, height: outH, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
             });
             slots[i] = out;
-            slotDurations[i] = renderDur;
+            slotDurations[i] = stillDur;
             slotContentDurations[i] = plannedDur;
             imageRendered++;
           } catch (e) {

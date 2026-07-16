@@ -446,8 +446,10 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                   </Button>
                 )}
                 <p className="text-xs text-fg-subtle">
-                  Add a celebrity/person or your AI avatar. With two people, the channel style is applied
-                  from the text prompt only (both image slots hold the people).
+                  Add a celebrity/person or your AI avatar face here to use THAT exact face. When you add a
+                  face, only the uploaded face is used for identity — the channel supplies the style only, so
+                  a new/changed avatar face won&apos;t revert to the channel&apos;s old face. Leave empty to reuse the
+                  channel&apos;s own face from its thumbnails.
                 </p>
               </div>
 
