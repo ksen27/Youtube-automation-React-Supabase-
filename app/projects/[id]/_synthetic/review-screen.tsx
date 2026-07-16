@@ -603,12 +603,20 @@ function SegmentRow({
         )}
 
         <div className="flex-1 min-w-0 space-y-2">
-          <div className="flex items-center gap-2">
+          {/* Meta line: identity + status only. Actions moved to their own row
+              below so the many per-type buttons (esp. split_2) no longer cram
+              onto the same line and overflow. */}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-xs tabular-nums text-fg-subtle">#{segment.position + 1}</span>
             <Badge variant="outline">{segment.block_type}</Badge>
             <Badge variant={statusVariant as "success" | "destructive" | "info" | "secondary"}>{isStuck ? "stuck" : segment.status}</Badge>
             <span className="text-[11px] text-fg-subtle tabular-nums">{segment.duration.toFixed(1)}s</span>
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
+          </div>
+
+          {/* Action row: wraps on its own line, so buttons flow instead of
+              overflowing the header. Delete is pushed to the far right. */}
+          <div className="flex flex-wrap items-center gap-1">
             {/* split_2: a quick way to inspect the IMAGE half (the thumbnail
                 shows the avatar video). */}
             {splitRightImage && (
@@ -616,62 +624,60 @@ function SegmentRow({
                 <Images className="h-3.5 w-3.5" /> View image
               </Button>
             )}
-            <div className="ml-auto flex items-center gap-1">
-              <Button type="button" variant="ghost" size="xs" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</Button>
-              {/* AI-regenerate this segment's image prompt (Gemini rewrites the
-                  scene with the single-subject/no-text rules). Non-avatar only —
-                  avatars have no image prompt. Rewrites the prompt only; click
-                  Regenerate after to rebuild the image. */}
-              {segment.block_type !== "avatar" && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  disabled={regeneratePrompt.isPending || isGenerating}
-                  onClick={() => regeneratePrompt.mutate()}
-                  title="Re-run AI to rewrite this segment's image prompt"
-                >
-                  <Sparkles className={`h-3.5 w-3.5 ${regeneratePrompt.isPending ? "animate-spin" : ""}`} />
-                  {regeneratePrompt.isPending ? "Rewriting…" : "Regenerate prompt"}
-                </Button>
-              )}
-              {/* split_2 only: regenerate just the right image, keep the avatar
-                  video. The full Regenerate to the right redoes BOTH (incl. a
-                  HeyGen avatar render). */}
-              {segment.block_type === "split_2" && (
-                <Button
-                  type="button"
-                  variant="soft"
-                  size="xs"
-                  disabled={regenerateImage.isPending || isGenerating}
-                  onClick={() => regenerateImage.mutate()}
-                  title="Regenerate only the image half (keep the avatar video)"
-                >
-                  <Images className={`h-3.5 w-3.5 ${regenerateImage.isPending ? "animate-spin" : ""}`} />
-                  {regenerateImage.isPending ? "Image…" : "Regenerate image"}
-                </Button>
-              )}
+            <Button type="button" variant="ghost" size="xs" onClick={() => setEditing((v) => !v)}>{editing ? "Cancel" : "Edit"}</Button>
+            {/* AI-regenerate this segment's image prompt (Gemini rewrites the
+                scene with the single-subject/no-text rules). Non-avatar only —
+                avatars have no image prompt. Rewrites the prompt only; click
+                Regenerate after to rebuild the image. */}
+            {segment.block_type !== "avatar" && (
               <Button
                 type="button"
-                variant={isFailed || isStuck ? "gradient" : "soft"}
+                variant="ghost"
                 size="xs"
-                disabled={regenerate.isPending || isGenerating}
-                onClick={() => regenerate.mutate()}
-                title={
-                  isStuck
-                    ? "This block's render died — retry it"
-                    : segment.block_type === "split_2"
-                      ? "Regenerate the avatar video AND the image"
-                      : undefined
-                }
+                disabled={regeneratePrompt.isPending || isGenerating}
+                onClick={() => regeneratePrompt.mutate()}
+                title="Re-run AI to rewrite this segment's image prompt"
               >
-                <RefreshCw className={`h-3.5 w-3.5 ${regenerate.isPending ? "animate-spin" : ""}`} />
-                {isFailed || isStuck ? "Retry" : segment.block_type === "split_2" ? "Regenerate all" : "Regenerate"}
+                <Sparkles className={`h-3.5 w-3.5 ${regeneratePrompt.isPending ? "animate-spin" : ""}`} />
+                {regeneratePrompt.isPending ? "Rewriting…" : "Regenerate prompt"}
               </Button>
-              <Button type="button" variant="ghost" size="xs" onClick={() => del.mutate()} disabled={del.isPending}>
-                <Trash2 className="h-3.5 w-3.5 text-danger" />
+            )}
+            {/* split_2 only: regenerate just the right image, keep the avatar
+                video. The full Regenerate to the right redoes BOTH (incl. a
+                HeyGen avatar render). */}
+            {segment.block_type === "split_2" && (
+              <Button
+                type="button"
+                variant="soft"
+                size="xs"
+                disabled={regenerateImage.isPending || isGenerating}
+                onClick={() => regenerateImage.mutate()}
+                title="Regenerate only the image half (keep the avatar video)"
+              >
+                <Images className={`h-3.5 w-3.5 ${regenerateImage.isPending ? "animate-spin" : ""}`} />
+                {regenerateImage.isPending ? "Image…" : "Regenerate image"}
               </Button>
-            </div>
+            )}
+            <Button
+              type="button"
+              variant={isFailed || isStuck ? "gradient" : "soft"}
+              size="xs"
+              disabled={regenerate.isPending || isGenerating}
+              onClick={() => regenerate.mutate()}
+              title={
+                isStuck
+                  ? "This block's render died — retry it"
+                  : segment.block_type === "split_2"
+                    ? "Regenerate the avatar video AND the image"
+                    : undefined
+              }
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${regenerate.isPending ? "animate-spin" : ""}`} />
+              {isFailed || isStuck ? "Retry" : segment.block_type === "split_2" ? "Regenerate all" : "Regenerate"}
+            </Button>
+            <Button type="button" variant="ghost" size="xs" className="ml-auto" onClick={() => del.mutate()} disabled={del.isPending} title="Delete this block">
+              <Trash2 className="h-3.5 w-3.5 text-danger" />
+            </Button>
           </div>
 
           {editing ? (

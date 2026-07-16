@@ -11,6 +11,7 @@ import {
   promptContainsUrl,
   pikzelsErrorMessage,
 } from "@/lib/thumbnails/pikzels";
+import { resolvePersonaForFace } from "@/lib/thumbnails/persona";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -121,8 +122,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: insErr?.message ?? "failed to create row" }, { status: 500 });
   }
 
+  // Identity lock: when the user uploaded a face (subject), build/reuse a
+  // Pikzels persona from it so the EXACT face is preserved instead of Pikzels
+  // regenerating a new person (the "avatar face was ignored" bug). The first
+  // subject is the face we lock onto. Returns null (silent fallback to the
+  // plain uploaded-face-as-base path) when personas are disabled or the build
+  // doesn't finish in the poll budget.
+  let personaId: string | null = null;
+  if (subjectUrls.length > 0) {
+    personaId = await resolvePersonaForFace(sb, subjectUrls[0], title);
+  }
+
   try {
-    const result = await generateThumbnailFromReferences({ prompt, referenceUrls });
+    const result = await generateThumbnailFromReferences({ prompt, referenceUrls, personaId });
 
     // Re-host the CDN output to R2 — the Pikzels URL expires in ~24h.
     const imgRes = await fetch(result.outputUrl);

@@ -882,6 +882,17 @@ const ServerEnvSchema = z.object({
   PIKZELS_MODEL: z.enum(["pkz_2", "pkz_3", "pkz_4", "pkz_4_5"]).default("pkz_4_5"),
   // Aspect ratio. Enum per docs: 16:9 (YouTube) | 9:16 | 1:1.
   PIKZELS_FORMAT: z.enum(["16:9", "9:16", "1:1"]).default("16:9"),
+  // PERSONA (identity lock). When a user uploads a face, we build a Pikzels
+  // "persona" (POST /v2/pikzonality/persona, 3 face images) and pass its id to
+  // the generate call so the EXACT face is preserved (instead of Pikzels
+  // regenerating a new person). Persona creation is ASYNC — we poll
+  // GET /v2/pikzonality/{id} until status='completed'. These knobs bound the
+  // poll; a probe measured ~60s to completed, so ~4 min of budget is ample.
+  // Set PIKZELS_PERSONA_ENABLED=false to disable the face-lock path and fall
+  // back to the plain uploaded-face-as-base behavior.
+  PIKZELS_PERSONA_ENABLED: z.coerce.boolean().default(true),
+  PIKZELS_PERSONA_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  PIKZELS_PERSONA_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(240000),
 
   // =======================================================================
   // HEYGEN API FALLBACK. When the headless-browser HeyGen automation exhausts

@@ -23,6 +23,18 @@ import { fetchOrThrow, withHttpRetry, HttpError } from "@/lib/synthetic/http";
 // Auth: the `X-Api-Key` header. Keys look like `pkz_...`.
 const IMAGE_ENDPOINT = "/v2/thumbnail/image";
 
+// Persona ("pikzonality") endpoints — Pikzels' identity-lock. create-persona
+// takes EXACTLY 3 face images and returns an id; the persona builds ASYNChronously
+// (poll GET until status='completed'); the id is then passed as `persona` to the
+// generate call to preserve that exact face.
+const PERSONA_CREATE_ENDPOINT = "/v2/pikzonality/persona";
+const PERSONA_GET_ENDPOINT = (id: string) => `/v2/pikzonality/${id}`;
+
+// create-persona requires exactly this many face images. When the user uploads
+// a single face we duplicate it to fill the three slots (Pikzels accepts the
+// same URL repeated — verified against the live API and shown in their docs).
+export const PERSONA_FACE_COUNT = 3;
+
 // support_image_url is only honored by pkz_4 / pkz_4_5. On pkz_2 / pkz_3 it is
 // ignored, so we only send it for the supporting models.
 const SUPPORT_IMAGE_MODELS = new Set(["pkz_4", "pkz_4_5"]);
@@ -119,12 +131,17 @@ export function promptContainsUrl(prompt: string): boolean {
 
 // Generate a thumbnail from 1–2 reference image URLs + a prompt. The first
 // reference becomes the base image_url; the second (if any) becomes the
-// support/style image (pkz_4 / pkz_4_5 only). Throws when the API is
+// support/style image (pkz_4 / pkz_4_5 only). Optionally locks the person's
+// identity via a `persona` id (see buildOrReusePersona) so the EXACT uploaded
+// face is preserved rather than regenerated. Throws when the API is
 // unconfigured or the request fails (HttpError carries the status + response
 // body so the route can surface a useful message).
 export async function generateThumbnailFromReferences(args: {
   prompt: string;
   referenceUrls: string[];
+  // Pikzels persona id — when set, the generated person's face is locked to the
+  // persona's identity. The base image still supplies pose/scene context.
+  personaId?: string | null;
 }): Promise<PikzelsResult> {
   const env = getEnv();
   const apiKey = env.PIKZELS_API_KEY;
@@ -149,6 +166,11 @@ export async function generateThumbnailFromReferences(args: {
   // Second reference -> support/style image, only for models that honor it.
   if (refs[1] && SUPPORT_IMAGE_MODELS.has(env.PIKZELS_MODEL)) {
     body.support_image_url = refs[1];
+  }
+  // Identity lock: when a persona is supplied, Pikzels preserves that exact
+  // face instead of regenerating a new person from the prompt.
+  if (args.personaId) {
+    body.persona = args.personaId;
   }
 
   // Pikzels' gateway intermittently returns a 502/503 HTML error page (backend
@@ -182,4 +204,107 @@ export async function generateThumbnailFromReferences(args: {
     outputUrl,
     requestId: typeof json.request_id === "string" ? json.request_id : null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Persona (identity lock) — create + poll
+// ---------------------------------------------------------------------------
+
+export type PersonaStatus = "processing" | "completed" | "failed";
+
+// Whether the persona (face-lock) path is usable — needs the feature flag on
+// AND an API key. When off, callers fall back to the plain uploaded-face-as-base
+// behavior (no exact identity guarantee).
+export function isPersonaEnabled(): boolean {
+  const env = getEnv();
+  return env.PIKZELS_PERSONA_ENABLED && Boolean(env.PIKZELS_API_KEY);
+}
+
+// Expand 1–3 supplied face urls to EXACTLY PERSONA_FACE_COUNT by repeating the
+// last one — create-persona requires exactly 3, and Pikzels accepts the same
+// url repeated (verified live + shown in their docs). Returns null when there's
+// no usable face url at all.
+export function padFaceUrls(faceUrls: string[]): string[] | null {
+  const urls = faceUrls.map((u) => u.trim()).filter(Boolean).slice(0, PERSONA_FACE_COUNT);
+  if (urls.length === 0) return null;
+  while (urls.length < PERSONA_FACE_COUNT) urls.push(urls[urls.length - 1]);
+  return urls;
+}
+
+// Kick off persona creation from 3 face urls. Returns the persona id (build is
+// ASYNC — poll pollPersona until it completes). Throws (HttpError) on failure.
+export async function createPersona(args: {
+  name: string;
+  faceUrls: string[];
+}): Promise<{ personaId: string; requestId: string | null }> {
+  const env = getEnv();
+  const apiKey = env.PIKZELS_API_KEY;
+  if (!apiKey) throw new Error("PIKZELS_API_KEY is not set");
+
+  const faces = padFaceUrls(args.faceUrls);
+  if (!faces) throw new Error("at least one face image is required to build a persona");
+
+  // Persona name: letters/numbers/spaces/hyphens/underscores, 1–25 chars (API
+  // rule). Sanitize + clamp so an odd title/label can't 400 the create call.
+  const name = (args.name || "avatar").replace(/[^A-Za-z0-9 _-]/g, "").trim().slice(0, 25) || "avatar";
+
+  const res = await withHttpRetry(
+    "pikzels.createPersona",
+    () =>
+      fetchOrThrow(`${env.PIKZELS_BASE_URL}${PERSONA_CREATE_ENDPOINT}`, {
+        method: "POST",
+        headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ name, image_urls: faces }),
+        timeoutMs: env.PIKZELS_TIMEOUT_SECONDS * 1000,
+      }),
+    { attempts: 3, baseMs: 1500 },
+  );
+
+  const json = (await res.json()) as { id?: unknown; request_id?: unknown };
+  const personaId = typeof json.id === "string" ? json.id : null;
+  if (!personaId) {
+    throw new Error(`Pikzels create-persona response missing "id": ${JSON.stringify(json).slice(0, 200)}`);
+  }
+  return { personaId, requestId: typeof json.request_id === "string" ? json.request_id : null };
+}
+
+// Read a persona's current build status (single GET, no waiting).
+export async function getPersonaStatus(personaId: string): Promise<PersonaStatus> {
+  const env = getEnv();
+  const apiKey = env.PIKZELS_API_KEY;
+  if (!apiKey) throw new Error("PIKZELS_API_KEY is not set");
+
+  const res = await withHttpRetry(
+    "pikzels.getPersona",
+    () =>
+      fetchOrThrow(`${env.PIKZELS_BASE_URL}${PERSONA_GET_ENDPOINT(personaId)}`, {
+        method: "GET",
+        headers: { "X-Api-Key": apiKey },
+        timeoutMs: env.PIKZELS_TIMEOUT_SECONDS * 1000,
+      }),
+    { attempts: 3, baseMs: 1500 },
+  );
+  const json = (await res.json()) as { status?: unknown };
+  const status = json.status;
+  if (status === "processing" || status === "completed" || status === "failed") return status;
+  // Unknown status — treat as still processing so the poller keeps waiting
+  // rather than declaring a spurious failure.
+  return "processing";
+}
+
+// Poll a persona until it reaches a terminal state or the timeout elapses.
+// Returns the final status ('completed' on success). 'processing' is returned
+// only when the poll budget runs out before completion (caller treats that as
+// "not ready yet" — fall back rather than block generation forever).
+export async function pollPersona(personaId: string): Promise<PersonaStatus> {
+  const env = getEnv();
+  const interval = env.PIKZELS_PERSONA_POLL_INTERVAL_MS;
+  const deadline = Date.now() + env.PIKZELS_PERSONA_POLL_TIMEOUT_MS;
+
+  let status = await getPersonaStatus(personaId);
+  while (status === "processing" && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, interval));
+    status = await getPersonaStatus(personaId);
+  }
+  return status;
 }

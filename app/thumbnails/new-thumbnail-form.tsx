@@ -446,9 +446,10 @@ export function NewThumbnailForm({ channels: initialChannels }: { channels: Chan
                   </Button>
                 )}
                 <p className="text-xs text-fg-subtle">
-                  Add a celebrity/person or your AI avatar face here to use THAT exact face. When you add a
-                  face, only the uploaded face is used for identity — the channel supplies the style only, so
-                  a new/changed avatar face won&apos;t revert to the channel&apos;s old face. Leave empty to reuse the
+                  Add a celebrity/person or your AI avatar face here to use THAT exact face. The uploaded face
+                  is locked in (via a face identity profile), so a new/changed avatar keeps its own face
+                  instead of reverting to the channel&apos;s old one. The first generation with a new face takes
+                  ~1 min longer while the face is learned; later ones reuse it. Leave empty to reuse the
                   channel&apos;s own face from its thumbnails.
                 </p>
               </div>

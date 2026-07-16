@@ -11,6 +11,7 @@ import {
   promptContainsUrl,
   pikzelsErrorMessage,
 } from "@/lib/thumbnails/pikzels";
+import { resolvePersonaForFace } from "@/lib/thumbnails/persona";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -127,11 +128,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     );
   }
 
+  // Identity lock: reuse (or build) the persona for the original uploaded face
+  // so a re-render keeps the SAME exact face as the first generation. The
+  // persona is cached by face url, so a re-render of a previously-generated
+  // thumbnail is a cache hit (no rebuild). Null = silent fallback.
+  let personaId: string | null = null;
+  if (subjectUrls.length > 0) {
+    personaId = await resolvePersonaForFace(sb, subjectUrls[0], (row.title as string) || "avatar");
+  }
+
   // Mark regenerating so the gallery shows a spinner if it re-reads mid-flight.
   await sb.from("thumbnails").update({ status: "pending", error: null, prompt }).eq("id", id);
 
   try {
-    const result = await generateThumbnailFromReferences({ prompt, referenceUrls });
+    const result = await generateThumbnailFromReferences({ prompt, referenceUrls, personaId });
     const imgRes = await fetch(result.outputUrl);
     if (!imgRes.ok) throw new Error(`failed to download generated image (${imgRes.status})`);
     const contentType = imgRes.headers.get("content-type") || "image/jpeg";
