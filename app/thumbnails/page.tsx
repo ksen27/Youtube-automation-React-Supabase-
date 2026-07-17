@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { NewThumbnailForm, type ChannelRow } from "./new-thumbnail-form";
+import { BatchThumbnailForm } from "./batch-thumbnail-form";
 import { ThumbnailCard, type ThumbnailRow } from "./thumbnail-card";
 
 export const dynamic = "force-dynamic";
@@ -98,6 +99,22 @@ export default async function ThumbnailsPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Batch — generate several independent thumbnails at once (fire-and-poll) */}
+      {ready && channels.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Generate several at once</CardTitle>
+            <CardDescription>
+              Queue up to 4 independent thumbnails — each with its own channel, title, and prompt. They
+              render in the background and appear in the gallery as they finish.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <BatchThumbnailForm channels={channels} />
+          </CardContent>
+        </Card>
+      )}
 
       {/* Gallery */}
       <section>

@@ -245,6 +245,14 @@ export async function buildStillVideo(opts: {
   lowerThird?: { text: string; startOffsetSeconds?: number };
   vcodecArgs?: string[]; // per-render codec flags; defaults to sourced (see segmentVcodecArgsFor)
   signal?: AbortSignal;
+  // Pin the output to exactly this many frames (-frames:v). The input-side
+  // `-t` on the looped image sits EXACTLY on a frame boundary once durations
+  // are frame-snapped, and float rounding then decides whether ffmpeg emits N
+  // or N+1 frames — measured 2026-07-17 (render.concat.timeline): +586ms of
+  // unrecorded video spread across the still blocks of a 250-block synthetic
+  // render, the third instance of the same emit-vs-record leak. Synthetic
+  // callers must pass it; sourced callers omit it and keep exact old behavior.
+  exactFrames?: number;
 }): Promise<void> {
   const env = getEnv();
   const w = opts.width ?? 1280;
@@ -399,6 +407,11 @@ export async function buildStillVideo(opts: {
     // other segment encoder (segmentVcodecArgs()).
     ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
+    // Exact frame-count cap for frame-snapped callers — see exactFrames doc.
+    // The looped input supplies unlimited frames, so this is always reachable.
+    ...(typeof opts.exactFrames === "number" && opts.exactFrames > 0
+      ? ["-frames:v", String(Math.round(opts.exactFrames))]
+      : []),
     // Force a keyframe at the start of every segment so concat boundaries
     // are clean on stream-copy. Without this, x264's adaptive GOP can put
     // the first keyframe a few frames in, causing the demuxer to drop or
@@ -482,15 +495,24 @@ export async function padVideoToLength(opts: {
   fps?: number;
   vcodecArgs?: string[];
   signal?: AbortSignal;
+  // Exact frame-count pin. `-t` keeps every frame whose PTS starts BEFORE t, so
+  // a mid-frame target like (N+0.5)/fps emits N+1 frames, not N — measured on
+  // 2026-07-17 (render.concat.timeline): every avatar/ai_clip slot shipped one
+  // frame (~33ms) longer than slotDurations recorded, summing to +2.36s of
+  // video over the voiceover on a 250-block render, chopped off the tail by the
+  // final mux's -t so totals looked right while every avatar's lips lagged.
+  // `-frames:v N` emits exactly N frames and cannot be misread; callers that
+  // know their frame count should always pass it.
+  targetFrames?: number;
 }): Promise<void> {
   const env = getEnv();
   const fps = opts.fps ?? 30;
   const target = Math.max(0.1, opts.targetSeconds);
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
-  // tpad clones the last frame to extend the stream, then `-t` pins the exact
-  // length. setsar=1 keeps SAR identical to the other segments. The input may
-  // carry audio (avatar/split_2 clips do); we drop it with -an because the
-  // master voiceover is the only audio track the concat mixes in.
+  // tpad clones the last frame to extend the stream, then the -frames:v/-t pin
+  // caps the exact length. setsar=1 keeps SAR identical to the other segments.
+  // The input may carry audio (avatar/split_2 clips do); we drop it with -an
+  // because the master voiceover is the only audio track the concat mixes in.
   const vf = `tpad=stop_mode=clone:stop_duration=${target.toFixed(3)},setsar=1`;
   const args = [
     "-y",
@@ -500,7 +522,9 @@ export async function padVideoToLength(opts: {
     "-vf", vf,
     ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
-    "-t", target.toFixed(3),
+    ...(typeof opts.targetFrames === "number" && opts.targetFrames > 0
+      ? ["-frames:v", String(Math.round(opts.targetFrames))]
+      : ["-t", target.toFixed(3)]),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
     opts.outputPath,
@@ -754,6 +778,10 @@ export async function buildSplitScreenAvatarVideo(opts: {
   lowerThird?: { text: string; startOffsetSeconds?: number };
   vcodecArgs?: string[]; // per-render codec flags; defaults to sourced (see segmentVcodecArgsFor)
   signal?: AbortSignal;
+  // Pin the output to exactly this many frames (-frames:v). Callers that record
+  // a frame count into the timeline bookkeeping must pass it, or the trim/fps
+  // chain's own quantization ships a file that disagrees with the record.
+  exactFrames?: number;
 }): Promise<void> {
   const env = getEnv();
   const w = opts.width ?? 1280;
@@ -808,6 +836,15 @@ export async function buildSplitScreenAvatarVideo(opts: {
     "-map", "[v]",
     ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
     "-r", String(fps),
+    // Exact frame-count cap. The trim/fps chain quantizes on its own grid and
+    // was measured emitting one frame fewer than the caller recorded (149 vs
+    // the 150 in slotDurations, render.concat.timeline 2026-07-17), the same
+    // class of leak as the avatar branch's mid-frame `-t`. The looped inputs
+    // always supply enough frames, so -frames:v lands the file on exactly the
+    // count the timeline bookkeeping assumes.
+    ...(typeof opts.exactFrames === "number" && opts.exactFrames > 0
+      ? ["-frames:v", String(Math.round(opts.exactFrames))]
+      : []),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
     opts.outputPath,
@@ -1402,6 +1439,14 @@ export interface NormalizeOptions {
   // copy-cut's over-included GOP. Leave undefined for image/title builders;
   // they're CFR-clean from frame 0 and need no pin.
   pinDurationSeconds?: number;
+  // Pin the output to EXACTLY this many frames via `-frames:v`. Takes
+  // precedence over pinDurationSeconds. Prefer this whenever the caller knows
+  // its frame count: `-t` keeps every frame whose PTS starts before t, so a
+  // mid-frame duration like (N+0.5)/30 emits N+1 frames — the one-frame-per-
+  // block leak behind the 2026-07-17 avatar lip-lag (+2.36s of excess video
+  // across a 250-block render, invisible in totals because the final mux
+  // trimmed it off the tail).
+  pinFrames?: number;
   // Skip this many seconds at the head of the input before encoding.
   // cutClip's input-side -ss with -c:v copy starts the cut at the nearest
   // keyframe AT OR BEFORE the requested start, so the requested window sits
@@ -1629,9 +1674,18 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     // before -movflags so it caps the muxed output. Emitted only when the
     // caller pins a target (the footage path); image/title callers leave it
     // undefined and keep their exact builder length.
-    ...(typeof opts.pinDurationSeconds === "number" && opts.pinDurationSeconds > 0
-      ? ["-t", String(opts.pinDurationSeconds)]
-      : []),
+    //
+    // pinFrames wins over pinDurationSeconds: `-t` keeps every frame whose PTS
+    // starts before t, so a mid-frame duration emits ONE MORE frame than the
+    // caller intended (the +33ms-per-block leak measured 2026-07-17 in
+    // render.concat.timeline — +2.36s of excess video on a 250-block synthetic
+    // render, silently chopped off the tail by the final mux). `-frames:v`
+    // emits an exact count and has no such ambiguity.
+    ...(typeof opts.pinFrames === "number" && opts.pinFrames > 0
+      ? ["-frames:v", String(Math.round(opts.pinFrames))]
+      : typeof opts.pinDurationSeconds === "number" && opts.pinDurationSeconds > 0
+        ? ["-t", String(opts.pinDurationSeconds)]
+        : []),
     "-movflags", "+faststart",
     opts.outputPath,
   ];

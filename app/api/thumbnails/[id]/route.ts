@@ -1,17 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
-import { uploadBuffer, removeFiles } from "@/lib/storage";
-import { resolveReferenceUrl } from "@/lib/thumbnails/youtube";
+import { removeFiles } from "@/lib/storage";
 import {
-  generateThumbnailFromReferences,
-  buildChannelReferenceUrls,
-  pickStyleImage,
   isPikzelsConfigured,
   promptContainsUrl,
-  pikzelsErrorMessage,
 } from "@/lib/thumbnails/pikzels";
-import { resolvePersonaForFace } from "@/lib/thumbnails/persona";
+import { renderThumbnailRow } from "@/lib/thumbnails/render";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -94,82 +89,20 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
   }
 
   const sb = getServerSupabase();
-  const { data: row } = await sb.from("thumbnails").select(THUMB_COLS).eq("id", id).maybeSingle();
+  const { data: row } = await sb.from("thumbnails").select("id").eq("id", id).maybeSingle();
   if (!row) return NextResponse.json({ error: "not found" }, { status: 404 });
 
-  // Rebuild the Pikzels image slots exactly as the original generation did:
-  // the same subject images, plus a rotated channel style image.
-  const subjectUrls: string[] = [];
-  for (const raw of (row.subject_urls as string[] | null) ?? []) {
-    const url = resolveReferenceUrl(raw);
-    if (url) subjectUrls.push(url);
-  }
-  let styleImageUrl: string | null = null;
-  if (row.channel_id) {
-    const { data: channel } = await sb
-      .from("thumbnail_channels")
-      .select("sample_urls")
-      .eq("id", row.channel_id)
-      .maybeSingle();
-    const samples = Array.isArray(channel?.sample_urls) ? (channel!.sample_urls as string[]) : [];
-    // Rotate off the current thumbnail count so a re-generate can land on a
-    // different sample pose than the original.
-    const { count } = await sb
-      .from("thumbnails")
-      .select("id", { count: "exact", head: true })
-      .eq("channel_id", row.channel_id);
-    styleImageUrl = pickStyleImage(samples, count ?? 0);
-  }
-  const { referenceUrls } = buildChannelReferenceUrls({ subjectUrls, styleImageUrl });
-  if (referenceUrls.length === 0) {
-    return NextResponse.json(
-      { error: "No image to base the thumbnail on. Add a subject image or re-analyze the channel." },
-      { status: 400 },
-    );
-  }
-
-  // Identity lock: reuse (or build) the persona for the original uploaded face
-  // so a re-render keeps the SAME exact face as the first generation. The
-  // persona is cached by face url, so a re-render of a previously-generated
-  // thumbnail is a cache hit (no rebuild). Null = silent fallback.
-  let personaId: string | null = null;
-  if (subjectUrls.length > 0) {
-    personaId = await resolvePersonaForFace(sb, subjectUrls[0], (row.title as string) || "avatar");
-  }
-
-  // Mark regenerating so the gallery shows a spinner if it re-reads mid-flight.
+  // Store the edited prompt and mark pending, then re-render via the shared
+  // renderer. The renderer rebuilds references (same subjects + a rotated
+  // channel style pose) and persona from the row, so a re-generate can land on
+  // a different sample pose than the original. It never throws.
   await sb.from("thumbnails").update({ status: "pending", error: null, prompt }).eq("id", id);
 
-  try {
-    const result = await generateThumbnailFromReferences({ prompt, referenceUrls, personaId });
-    const imgRes = await fetch(result.outputUrl);
-    if (!imgRes.ok) throw new Error(`failed to download generated image (${imgRes.status})`);
-    const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-    const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-    const buf = Buffer.from(await imgRes.arrayBuffer());
-    const key = `thumbnails/output/${id}.${ext}`;
-    const up = await uploadBuffer(buf, key, contentType);
-
-    const { data: updated, error: updErr } = await sb
-      .from("thumbnails")
-      .update({
-        status: "completed",
-        output_url: up.publicUrl,
-        request_id: result.requestId,
-        reference_urls: referenceUrls,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", id)
-      .select(THUMB_COLS)
-      .single();
-    if (updErr) throw new Error(updErr.message);
-    return NextResponse.json({ thumbnail: updated }, { status: 200 });
-  } catch (err) {
-    const message = pikzelsErrorMessage(err);
-    await sb
-      .from("thumbnails")
-      .update({ status: "failed", error: message, updated_at: new Date().toISOString() })
-      .eq("id", id);
-    return NextResponse.json({ error: message }, { status: 502 });
+  const result = await renderThumbnailRow(sb, id);
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error ?? "generation failed" }, { status: 502 });
   }
+
+  const { data: updated } = await sb.from("thumbnails").select(THUMB_COLS).eq("id", id).single();
+  return NextResponse.json({ thumbnail: updated }, { status: 200 });
 }

@@ -206,6 +206,72 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     }
   }
 
+  // Snap every planned duration onto the 30fps frame grid, carrying the rounding
+  // error forward so the RUNNING SUM stays pinned to the voiceover.
+  //
+  // Block durations arrive as raw floats (narration windows divided into slots:
+  // 4.958333333333332, 5.648750749999998, ...). Every renderer pins its block
+  // with `-t`, which FLOORS to floor(sec*30) frames — so each block ships 0-33ms
+  // short, always in the same direction. The avatar branch already snaps its own
+  // pin (see ~line 598), but that only fixes the 10 avatar blocks: on project
+  // 81ad97bc 236 of 250 blocks were off-grid (143 image, 60 ai_clip, 24 split_2,
+  // 9 avatar) and the summed timeline came out 1531.000s against a true
+  // voiceover of 1531.263s. Since the master voiceover is laid down as ONE
+  // continuous track while the video is assembled by summing slots, each lost
+  // fraction shifts every LATER avatar earlier against its words — sync is right
+  // at the first avatar and degrades with position (~300ms by the end, reported
+  // 2026-07-17). The final-length pin (~line 2357) then stretches the last frame
+  // so the FILE length matches the audio, which hid the interior error from every
+  // whole-file check and is why this bug kept "coming back".
+  //
+  // Rounding each block independently would leave the same one-way leak (just
+  // smaller). Instead we track the accumulated error and let it steer each
+  // block's rounding: a block is snapped to whatever whole-frame count keeps the
+  // running sum closest to the true cumulative float time. Errors alternate sign
+  // and cancel instead of compounding, so Σ durations is frame-exact AND tracks
+  // the voiceover to within half a frame at EVERY block boundary, not just at the
+  // end. `-t` then has nothing left to truncate.
+  //
+  // FLOOR_SECONDS is a whole frame count at 30fps (0.5*30 = 15), so snapping can
+  // never push a floored block back under the fade minimum.
+  //
+  // SYNTHETIC ONLY. The measured bug is the AI-Avatar engine's (its continuous
+  // master voiceover is what the lips are judged against), and celebrity/sourced
+  // renders are deliberately left byte-for-byte unchanged — the same containment
+  // the PERFORMANCE_MODE and subtle-motion changes keep.
+  const FRAME_RATE = 30;
+  if (isSyntheticRender) {
+    let exactSum = 0;   // running sum of the raw float durations (the truth)
+    let snappedSum = 0; // running sum of what we actually render
+    let maxAbsErrMs = 0;
+    let offGridBlocks = 0;
+    for (let i = 0; i < plannedDurations.length; i++) {
+      const raw = plannedDurations[i];
+      if (Math.abs(raw * FRAME_RATE - Math.round(raw * FRAME_RATE)) > 1e-6) offGridBlocks++;
+      exactSum += raw;
+      // Choose the frame count that lands the running total nearest the truth,
+      // absorbing the previous block's rounding error rather than repeating it.
+      // Never below one frame, and never below the fade floor for a block that
+      // the floor/repay pass above already raised to FLOOR_SECONDS.
+      const minFrames = raw >= FLOOR_SECONDS ? Math.round(FLOOR_SECONDS * FRAME_RATE) : 1;
+      const frames = Math.max(minFrames, Math.round((exactSum - snappedSum) * FRAME_RATE));
+      const snapped = frames / FRAME_RATE;
+      plannedDurations[i] = snapped;
+      snappedSum += snapped;
+      maxAbsErrMs = Math.max(maxAbsErrMs, Math.abs(snappedSum - exactSum) * 1000);
+    }
+    await logJob({ projectId, jobId: mediaJobId }, "render.duration_frame_snap", {
+      fps: FRAME_RATE,
+      blocks: plannedDurations.length,
+      offGridBlocksBefore: offGridBlocks,
+      exactSumSeconds: Math.round(exactSum * 1000) / 1000,
+      snappedSumSeconds: Math.round(snappedSum * 1000) / 1000,
+      residualMs: Math.round((snappedSum - exactSum) * 1000),
+      maxRunningErrorMs: Math.round(maxAbsErrMs),
+      note: "planned durations pinned to the frame grid; running sum tracks the voiceover within half a frame at every block",
+    });
+  }
+
   // Diagnostic: count how many renderable items carry a lower_third overlay
   // and from which source. Helps verify the matcher's lower_third stamping
   // survived the round-trip from match step to render step. If this number
@@ -407,6 +473,17 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // across ~50 cached blocks that drifted the video ~22s past the
           // voiceover. Keying on the mode forces a clean re-render per mode.
           performanceMode,
+          // Frame-exact pin generation. Clips cached before the -frames:v fix
+          // (2026-07-17) are one frame LONGER than their recorded duration —
+          // the lip-lag leak — and share every other signature field with the
+          // fixed ones, so they must never be served again. Bump on any future
+          // change to how a slot's length is pinned.
+          // v2: the 12:30 frames_v1 render cached avatar slots one frame SHORT
+          // (pad threshold missed a one-frame gap); those must not be reused.
+          // v3: the 13:06 frames_v2 render cached still/image slots N±1 frames
+          // long (buildStillVideo's on-boundary input -t); superseded by the
+          // exactFrames pin on buildStillVideo.
+          pin: "frames_v3",
         },
       });
 
@@ -495,6 +572,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               outputPath: out,
               durationSeconds: renderDur,
               width: outW, height: outH, fps: 30,
+              // Exact frame pin so the file matches the splitFrames/30 recorded
+              // below — without it the builder shipped one frame short (149 vs
+              // 150, render.concat.timeline 2026-07-17).
+              exactFrames: splitFrames,
               lowerThird: splitLt?.text
                 ? { text: splitLt.text, startOffsetSeconds: splitLtOffset }
                 : undefined,
@@ -513,8 +594,8 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             });
           }
           slots[i] = out;
-          // For a synthetic (avatar) split the file is exactly splitFrames/30
-          // after the `-t` floor; record that, not the mid-frame pin value.
+          // For a synthetic (avatar) split the file is exactly splitFrames/30 —
+          // pinned by exactFrames above; record that, not the mid-frame value.
           // Sourced splits build exact-length stills, so renderDur is truthful.
           slotDurations[i] = isSyntheticSplit ? splitFrames / 30 : renderDur;
           slotContentDurations[i] = plannedDur;
@@ -603,7 +684,67 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           const trimmed = path.join(tmp, `synvid_cut_${idx}.mp4`);
           try {
             await downloadHttp(it.video_url as string, localPre);
+            // DIAGNOSTIC (avatar lip-sync hunt, 2026-07-17). Trace the FULL chain for
+            // every avatar block: the voiceover window HeyGen was lip-synced to, the
+            // clip it returned, and what each ffmpeg stage does to that clip's timing.
+            // Everything measured from outside the worker so far says the pipeline is
+            // correct (placement exact, HeyGen audio bit-identical to the master VO
+            // slice at r=1.0000, sources clean CFR 25fps, totals matched) while the
+            // avatars still read out of sync — so the mismatch has to appear at one of
+            // these seams, which nothing currently observes. Probes are per-avatar
+            // only (10 blocks on a 250-block render), so the cost is negligible.
+            if (it.type === "avatar") {
+              try {
+                const src = await probeFile(localPre);
+                const seg = it.synthetic_segment_id
+                  ? (await sb.from("synthetic_segments")
+                      .select("start_time, end_time, provider, avatar_model")
+                      .eq("id", it.synthetic_segment_id as string).maybeSingle()).data
+                  : null;
+                const segStart = seg?.start_time != null ? Number(seg.start_time) : null;
+                const segEnd = seg?.end_time != null ? Number(seg.end_time) : null;
+                await logJob({ projectId, jobId: mediaJobId }, "render.avatar.chain.source", {
+                  idx: i,
+                  // Which HeyGen path produced this clip. The API-fallback path
+                  // (`_api_` in the key) is normally gated off and is the one lead
+                  // never chased — if the out-of-sync avatars are all `_api_`, that
+                  // localises the bug immediately.
+                  heygenPath: /_api_/.test(String(it.video_url)) ? "api_fallback" : "browser",
+                  provider: seg?.provider ?? null,
+                  avatarModel: seg?.avatar_model ?? null,
+                  // The voiceover window the lips were synced to.
+                  segStartSeconds: segStart,
+                  segEndSeconds: segEnd,
+                  voWindowSeconds: segStart != null && segEnd != null
+                    ? Math.round((segEnd - segStart) * 1000) / 1000 : null,
+                  // What HeyGen actually returned.
+                  heygenDurationSeconds: Math.round(src.durationSeconds * 1000) / 1000,
+                  // Positive = HeyGen clip is SHORTER than the audio it was given.
+                  heygenVsVoWindowMs: segStart != null && segEnd != null
+                    ? Math.round(((segEnd - segStart) - src.durationSeconds) * 1000) : null,
+                  plannedDurationSeconds: Math.round(plannedDur * 1000) / 1000,
+                  headLeftSeconds: headLeft,
+                  headRightSeconds: headRight,
+                  renderTargetSeconds: Math.round(renderDur * 1000) / 1000,
+                  renderFrames,
+                });
+              } catch (e) {
+                await logJob({ projectId, jobId: mediaJobId }, "render.avatar.chain.source_probe_failed",
+                  { idx: i, err: (e as Error).message });
+              }
+            }
             await cutClip({ inputPath: localPre, outputPath: trimmed, startSeconds: 0, durationSeconds: renderDur, keepAudio: false });
+            if (it.type === "avatar") {
+              try {
+                const cut = await probeFile(trimmed);
+                await logJob({ projectId, jobId: mediaJobId }, "render.avatar.chain.after_cut", {
+                  idx: i,
+                  afterCutSeconds: Math.round(cut.durationSeconds * 1000) / 1000,
+                  targetSeconds: Math.round(renderDur * 1000) / 1000,
+                  deltaMs: Math.round((cut.durationSeconds - renderDur) * 1000),
+                });
+              } catch { /* diagnostic only */ }
+            }
             // Pin the normalize re-encode to renderDur. cutClip's stream-copy
             // overshoots to the next keyframe (60-180ms), and HeyGen/LTX clips
             // already run a few frames longer than their audio slice. Without
@@ -614,13 +755,48 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             // passed:false). The video then runs longer than the voiceover and
             // each avatar part's last words drift past their lip movement. This
             // is the same overshoot the footage branch pins out below (line ~972).
-            await normalizeClip({ inputPath: trimmed, outputPath: out, width: outW, height: outH, fps: 30, keepAudio: false, vcodecArgs: vcodec, pinDurationSeconds: renderDur });
+            // Pin by EXACT FRAME COUNT, not by `-t`. The mid-frame renderDur
+            // handed to `-t` emitted renderFrames+1 frames (ffmpeg keeps the
+            // frame that STARTS before t), so every avatar/ai_clip slot shipped
+            // one frame (~33ms) longer than slotDurations recorded — measured
+            // 2026-07-17 in render.concat.timeline as +2.36s of excess video
+            // over the voiceover on this 250-block render, growing lip-lag at
+            // every avatar, with the surplus invisibly chopped off the tail by
+            // the final mux's -t. -frames:v renderFrames emits exactly
+            // renderFrames frames; the slot's true length is renderFrames/30.
+            await normalizeClip({ inputPath: trimmed, outputPath: out, width: outW, height: outH, fps: 30, keepAudio: false, vcodecArgs: vcodec, pinDurationSeconds: renderDur, pinFrames: renderFrames });
+            if (it.type === "avatar") {
+              try {
+                const norm = await probeFile(out);
+                // The 25->30fps conversion happens HERE (normalizeClip's fps filter).
+                // If the face's motion is re-timed rather than resampled, this is the
+                // stage that does it: compare the frame count actually emitted against
+                // what the duration implies at 30fps. A mismatch means frames were
+                // duplicated/dropped unevenly and the mouth no longer tracks the audio
+                // it was synced to.
+                const impliedFrames = norm.durationSeconds * 30;
+                await logJob({ projectId, jobId: mediaJobId }, "render.avatar.chain.after_normalize", {
+                  idx: i,
+                  afterNormalizeSeconds: Math.round(norm.durationSeconds * 1000) / 1000,
+                  targetSeconds: Math.round(renderDur * 1000) / 1000,
+                  deltaMs: Math.round((norm.durationSeconds - renderDur) * 1000),
+                  impliedFramesAt30: Math.round(impliedFrames * 100) / 100,
+                  expectedFrames: renderFrames,
+                  frameDelta: Math.round(impliedFrames - renderFrames),
+                });
+              } catch { /* diagnostic only */ }
+            }
             slots[i] = out;
-            let actualDur = renderDur;
-            // Probe is now only ever ≤ renderDur (the pin caps the upper end);
-            // it still detects a clip that came back SHORT so the pad-up branch
-            // below can hold the last frame to fill the planned window.
-            try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = Math.min(p.durationSeconds, renderDur); } catch { /* fallback */ }
+            // The slot's intended length is a WHOLE number of frames. renderDur
+            // is the mid-frame value ((frames+0.5)/30) used only as a cut/pad
+            // ceiling; recording it into slotDurations would overstate every
+            // block by 16.7ms — half the one-frame leak this fix removes.
+            const exactDur = renderFrames / 30;
+            let actualDur = exactDur;
+            // Probe the file we actually built and record THAT. -frames:v caps
+            // the upper end at renderFrames, so the probe only ever detects a
+            // clip that came back SHORT, which the pad-up branch below fills.
+            try { const p = await probeFile(out); if (p.durationSeconds > 0) actualDur = Math.min(p.durationSeconds, exactDur); } catch { /* fallback */ }
             // HeyGen/LTX often return a clip SHORTER than the narration window
             // it was planned for (cutClip can't extend, only trim). Summing the
             // short actual duration drags the whole video below the voiceover
@@ -639,22 +815,36 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             // finish ahead of its words. Pad on any shortfall past one frame
             // (~33ms at 30fps): padVideoToLength pins to exact renderDur, so
             // filling even a 40ms gap is free and keeps cumulative drift at zero.
-            if (renderDur - actualDur > 0.034) {
+            // Compare FRAME COUNTS, not seconds. A one-frame shortfall is
+            // exactly 33.3ms, which the old `> 0.034` seconds threshold let
+            // slip through once the target became exactDur (with the mid-frame
+            // renderDur the same gap read 49ms and padded fine) — caught live
+            // on the 2026-07-17 12:30 render: every avatar emitted 580/581
+            // frames and skipped the pad. Any missing whole frame must pad;
+            // -frames:v can only cap, tpad is what creates the missing frame.
+            const actualFrames = Math.round(actualDur * 30);
+            if (actualFrames < renderFrames) {
               const padOut = path.join(tmp, `synvid_pad_${idx}.mp4`);
               try {
-                await padVideoToLength({ inputPath: out, outputPath: padOut, targetSeconds: renderDur, fps: 30, vcodecArgs: vcodec });
+                // targetFrames pins the pad to exactly renderFrames frames;
+                // targetSeconds only sizes tpad's clone reservoir.
+                await padVideoToLength({ inputPath: out, outputPath: padOut, targetSeconds: renderDur, fps: 30, vcodecArgs: vcodec, targetFrames: renderFrames });
                 await safeUnlink(out);
                 slots[i] = padOut;
-                if (renderDur - actualDur >= 3) {
+                if (exactDur - actualDur >= 3) {
                   await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_video.gross_short", {
                     idx: i, type: it.type,
-                    plannedSeconds: Math.round(renderDur * 100) / 100,
+                    plannedSeconds: Math.round(exactDur * 100) / 100,
                     renderedSeconds: Math.round(actualDur * 100) / 100,
-                    shortfallSeconds: Math.round((renderDur - actualDur) * 100) / 100,
+                    shortfallSeconds: Math.round((exactDur - actualDur) * 100) / 100,
                     note: "held last frame to fill slot; regenerate this block for true sync",
                   });
                 }
-                actualDur = renderDur;
+                // Record what the pad actually produced, not what we asked for
+                // — trusting the intent here is exactly how the one-frame leak
+                // stayed invisible (slotDurations said 19.383s, file was 19.4s).
+                actualDur = exactDur;
+                try { const pp = await probeFile(padOut); if (pp.durationSeconds > 0) actualDur = pp.durationSeconds; } catch { /* keep exactDur */ }
               } catch (e) {
                 await logJob({ projectId, jobId: mediaJobId }, "render.synthetic_video.pad_failed", { idx: i, err: (e as Error).message });
               }
@@ -683,6 +873,9 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               vcodecArgs: vcodec,
               inputImagePath: localImg, outputPath: out, durationSeconds: stillDur,
               width: outW, height: outH, fps: 30, motionDirection: MOTION_CYCLE[i % MOTION_CYCLE.length],
+              // Frame-exact: stillDur sits ON a frame boundary, where the
+              // looped input's -t emits N or N+1 frames on float luck.
+              exactFrames: renderFrames,
             });
             slots[i] = out;
             slotDurations[i] = stillDur;
@@ -766,6 +959,12 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // from moving identically while staying pan-free.
           const MOTION_CYCLE = ["in", "out"] as const;
           const motion = MOTION_CYCLE[i % MOTION_CYCLE.length];
+          // Synthetic: pin to an exact frame count and record frames/30. The
+          // frame-snap puts renderDur ON a frame boundary, where the builder's
+          // input-side -t emits N or N+1 frames on float luck — the +586ms of
+          // unrecorded still-block video measured 2026-07-17. Sourced renders
+          // omit the pin and keep byte-identical behavior.
+          const imgFrames = Math.max(1, Math.round(renderDur * 30));
           await buildStillVideo({
             vcodecArgs: vcodec,
             inputImagePath: localImg,
@@ -773,12 +972,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
             durationSeconds: renderDur,
             width: outW, height: outH, fps: 30,
             motionDirection: motion,
+            exactFrames: isSyntheticRender ? imgFrames : undefined,
             lowerThird: imgLt?.text
               ? { text: imgLt.text, startOffsetSeconds: imgLtOffset }
               : undefined,
           });
           slots[i] = out;
-          slotDurations[i] = renderDur;
+          slotDurations[i] = isSyntheticRender ? imgFrames / 30 : renderDur;
           slotContentDurations[i] = plannedDur;
           imageRendered++;
           await safeUnlink(localImg);
@@ -2061,10 +2261,67 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const introAudioOverlap = introAudioPath && introDurationActual > 0
       ? INTRO_ACROSSFADE_SECONDS
       : 0;
-    const totalVideoDurationSeconds =
+    // The rendered-slot sum is the WRONG target for a synthetic render. Every
+    // avatar/ai_clip/split_2 slot lands a few ms off its planned narration
+    // window (25fps HeyGen source, computed xfade durations, frame quantization
+    // on `-c:v copy`); those residuals are same-signed enough to accumulate, so
+    // sum(mergedDurations) drifts from the true voiceover by hundreds of ms
+    // (measured +567ms on an 1668s render). Because the concat apad's the
+    // voiceover UP to totalVideoDurationSeconds and pins the file with `-t`, a
+    // slot-sum target STRETCHES the video timeline the audio is laid onto — the
+    // narration then trails its visuals progressively, worst at the end (the
+    // accumulating avatar lip-sync drift). The authoritative length is the
+    // voiceover itself: it's one continuous track the lips must follow, and the
+    // planner already sizes the timeline to it. So for a synthetic render we
+    // target the PROBED voiceover duration (+intro prefix, +pitch/own-audio
+    // blocks that add timeline time without adding voiceover time), and let the
+    // final-length pin below hold the assembled video's last frame up to that
+    // exact length — the interior slot residual is absorbed once, on the silent
+    // outro, instead of inflating the whole grid. Sourced (celebrity) renders
+    // keep the legacy slot-sum target: their footage path is already length-
+    // pinned and this reconciliation is specific to the synthetic drift.
+    const slotSumSeconds =
       introDurationActual
       + mergedDurations.reduce((a, b) => a + b, 0)
       - introAudioOverlap;
+    let totalVideoDurationSeconds = slotSumSeconds;
+    if (isSyntheticRender && voiceoverLocal) {
+      try {
+        const voProbe = await probeFile(voiceoverLocal);
+        const voDur = voProbe.durationSeconds;
+        if (voDur > 0) {
+          // Pitch blocks play their OWN audio and pause the narration, so they
+          // add timeline length without adding voiceover length — count their
+          // rendered slot durations into the target. (Same set the forced-audio
+          // splice below keys on: a pitch_video block with a video_url. The
+          // mid-timeline forced-footage case is gated off, so pitch is the only
+          // own-audio block today; kept explicit so it tracks isOwnAudioBlock.)
+          let ownAudioSeconds = 0;
+          for (let i = 0; i < renderable.length; i++) {
+            const it = renderable[i];
+            if (it?.type === "pitch_video" && it.video_url && slotDurations[i] > 0) {
+              ownAudioSeconds += slotDurations[i];
+            }
+          }
+          const reconciled = voDur + introDurationActual - introAudioOverlap + ownAudioSeconds;
+          await logJob({ projectId, jobId: mediaJobId }, "render.total_duration.reconciled", {
+            slotSumSeconds: Math.round(slotSumSeconds * 1000) / 1000,
+            voiceoverSeconds: Math.round(voDur * 1000) / 1000,
+            introSeconds: Math.round(introDurationActual * 1000) / 1000,
+            ownAudioSeconds: Math.round(ownAudioSeconds * 1000) / 1000,
+            reconciledSeconds: Math.round(reconciled * 1000) / 1000,
+            slotResidualMs: Math.round((slotSumSeconds - reconciled) * 1000),
+            note: "targeting true voiceover length; interior slot residual absorbed by final-length pin",
+          });
+          totalVideoDurationSeconds = reconciled;
+        }
+      } catch (e) {
+        // Probe failure → keep the slot-sum target (legacy behavior). Best
+        // effort: a drift-corrected target is an improvement, not a hard
+        // dependency of a shippable render.
+        await logJob({ projectId, jobId: mediaJobId }, "render.total_duration.reconcile_failed", { err: (e as Error).message });
+      }
+    }
     let outroFadeStartSeconds = 0;
     if (lastSegDur > OUTRO_FADE_SECONDS) {
       const fadedLast = path.join(tmp, "outro_fade.mp4");
@@ -2256,6 +2513,72 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       lastConcatHeartbeat = now;
       void touchMediaJob(mediaJobId);
     };
+    // DIAGNOSTIC (avatar lip-sync hunt, 2026-07-17). Probe every clip in CONCAT
+    // ORDER and log the true cumulative video position of each avatar.
+    //
+    // This is the ground truth nothing has ever measured. Every "correct" finding
+    // so far came from the PLAN (timeline_items.duration and its running sum) or
+    // from post-hoc probes of the finished mp4 — never from the actual list of
+    // files being concatenated. Video position in the final file is the running sum
+    // of these probed durations; audio position is the master voiceover, laid down
+    // continuously and independently. Those agree only if every clip is exactly the
+    // length the plan assumed, and render.timeline.audit already reports 233/250
+    // blocks off by up to ±37ms. If an avatar's true concat position differs from
+    // its voiceover window, that difference IS the lip-sync error, and this log
+    // states it directly instead of leaving it to be reconstructed.
+    //
+    // `normalized[]` may carry prepended intro/title cards that are not timeline
+    // blocks, so positions are reported by concat index with the offset spelled out
+    // rather than assumed to line up with `renderable[]`.
+    try {
+      const extraLead = normalized.length - renderable.length;
+      let cum = 0;
+      const avatarPositions: Array<Record<string, unknown>> = [];
+      let probeFailures = 0;
+      for (let n = 0; n < normalized.length; n++) {
+        let dur = 0;
+        try {
+          const p = await probeFile(normalized[n]);
+          dur = p.durationSeconds > 0 ? p.durationSeconds : 0;
+        } catch { probeFailures++; }
+        const blockIdx = n - extraLead; // index into renderable[], negative = intro/card
+        const it = blockIdx >= 0 ? renderable[blockIdx] : null;
+        if (it?.type === "avatar") {
+          const seg = it.synthetic_segment_id
+            ? (await sb.from("synthetic_segments").select("start_time, end_time")
+                .eq("id", it.synthetic_segment_id as string).maybeSingle()).data
+            : null;
+          const voStart = seg?.start_time != null ? Number(seg.start_time) : null;
+          avatarPositions.push({
+            concatIndex: n,
+            blockIndex: blockIdx,
+            videoStartSeconds: Math.round(cum * 1000) / 1000,
+            voStartSeconds: voStart,
+            // THE number: where the avatar's video begins vs where its words begin.
+            // Negative = video early (lips lead); positive = video late (lips lag).
+            videoMinusVoMs: voStart != null ? Math.round((cum - voStart) * 1000) : null,
+            clipSeconds: Math.round(dur * 1000) / 1000,
+            plannedSeconds: Math.round((plannedDurations[blockIdx] ?? 0) * 1000) / 1000,
+            heygenPath: /_api_/.test(String(it.video_url ?? "")) ? "api_fallback" : "browser",
+          });
+        }
+        cum += dur;
+      }
+      await logJob({ projectId, jobId: mediaJobId }, "render.concat.timeline", {
+        concatInputs: normalized.length,
+        renderableBlocks: renderable.length,
+        introOrCardLead: extraLead,
+        probeFailures,
+        totalVideoSeconds: Math.round(cum * 1000) / 1000,
+        voiceoverSeconds: Math.round((totalVideoDurationSeconds ?? 0) * 1000) / 1000,
+        avatars: avatarPositions,
+        note: "videoMinusVoMs is the lip-sync error at each avatar: negative = lips lead, positive = lips lag",
+      });
+    } catch (e) {
+      await logJob({ projectId, jobId: mediaJobId }, "render.concat.timeline.failed",
+        { err: (e as Error).message });
+    }
+
     const concatStageStart = Date.now();
     await concatNormalizedClips({
       onProgress: concatHeartbeat,

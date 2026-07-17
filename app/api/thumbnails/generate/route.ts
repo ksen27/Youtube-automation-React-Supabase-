@@ -1,17 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
-import { uploadBuffer } from "@/lib/storage";
 import { resolveReferenceUrl } from "@/lib/thumbnails/youtube";
 import {
-  generateThumbnailFromReferences,
   buildChannelReferenceUrls,
   pickStyleImage,
   isPikzelsConfigured,
   promptContainsUrl,
-  pikzelsErrorMessage,
 } from "@/lib/thumbnails/pikzels";
-import { resolvePersonaForFace } from "@/lib/thumbnails/persona";
+import { renderThumbnailRow } from "@/lib/thumbnails/render";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -122,49 +119,19 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: insErr?.message ?? "failed to create row" }, { status: 500 });
   }
 
-  // Identity lock: when the user uploaded a face (subject), build/reuse a
-  // Pikzels persona from it so the EXACT face is preserved instead of Pikzels
-  // regenerating a new person (the "avatar face was ignored" bug). The first
-  // subject is the face we lock onto. Returns null (silent fallback to the
-  // plain uploaded-face-as-base path) when personas are disabled or the build
-  // doesn't finish in the poll budget.
-  let personaId: string | null = null;
-  if (subjectUrls.length > 0) {
-    personaId = await resolvePersonaForFace(sb, subjectUrls[0], title);
+  // Render synchronously via the shared renderer (persona face-lock, Pikzels,
+  // R2 re-host, terminal status write all live there — the batch route reuses
+  // the same unit). The row already holds channel/title/prompt/subjects, so the
+  // renderer rebuilds its own references; it never throws.
+  const result = await renderThumbnailRow(sb, row.id);
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error ?? "generation failed" }, { status: 502 });
   }
 
-  try {
-    const result = await generateThumbnailFromReferences({ prompt, referenceUrls, personaId });
-
-    // Re-host the CDN output to R2 — the Pikzels URL expires in ~24h.
-    const imgRes = await fetch(result.outputUrl);
-    if (!imgRes.ok) throw new Error(`failed to download generated image (${imgRes.status})`);
-    const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-    const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-    const buf = Buffer.from(await imgRes.arrayBuffer());
-    const key = `thumbnails/output/${row.id}.${ext}`;
-    const up = await uploadBuffer(buf, key, contentType);
-
-    const { data: updated, error: updErr } = await sb
-      .from("thumbnails")
-      .update({
-        status: "completed",
-        output_url: up.publicUrl,
-        request_id: result.requestId,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", row.id)
-      .select("id, channel_id, title, prompt, subject_urls, reference_urls, output_url, status, error, created_at")
-      .single();
-    if (updErr) throw new Error(updErr.message);
-
-    return NextResponse.json({ thumbnail: updated }, { status: 200 });
-  } catch (err) {
-    const message = pikzelsErrorMessage(err);
-    await sb
-      .from("thumbnails")
-      .update({ status: "failed", error: message, updated_at: new Date().toISOString() })
-      .eq("id", row.id);
-    return NextResponse.json({ error: message }, { status: 502 });
-  }
+  const { data: updated } = await sb
+    .from("thumbnails")
+    .select("id, channel_id, title, prompt, subject_urls, reference_urls, output_url, status, error, created_at")
+    .eq("id", row.id)
+    .single();
+  return NextResponse.json({ thumbnail: updated }, { status: 200 });
 }
