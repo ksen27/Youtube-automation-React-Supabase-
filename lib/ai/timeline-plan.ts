@@ -499,22 +499,35 @@ export function buildBlockSequenceFromHints(
   // to the cadence estimator per-hint when a hint's words can't be aligned
   // (rare — Gemini paraphrasing far enough that the words don't match).
   wordTimings?: PlannerWordTiming[] | null,
-  // Seconds reserved for the intro block, which the matcher prepends to
-  // items[] AFTER the planner returns. Without this, the planner targets
-  // the full voiceoverSeconds and the prepended intro pushes the total
-  // past voiceover, but more importantly: the planner's blocks already
-  // cover voiceover[0..N], the intro is shown DURING voiceover[0..6s],
-  // and the matcher relies on the visible total = voiceover. So we shrink
-  // the planner's target by the intro's reserved time. Defaults to 0 for
-  // callers that don't have an intro (legacy / tests).
+  // DEPRECATED / no longer subtracted — kept for call-site API stability.
+  //
+  // This once encoded an "intro overlays the first ~6s of narration" model:
+  // the planner shrank its target by the intro's length so that
+  // intro + blocks == voiceover. But the renderer plays the intro as ADDITIVE
+  // pre-roll — it runs BEFORE the planned timeline with its own source audio
+  // (renderProcessor: "The intro plays BEFORE the planned timeline"), and the
+  // transcript-driven builder (the primary path) builds blocks covering the
+  // FULL voiceover. Subtracting the intro here made the legacy path target
+  // (voiceover − intro) while the transcript path targeted the full voiceover,
+  // so the two builders produced different timeline lengths for the same
+  // project. The render-route duration check compares against the full
+  // voiceover, so the legacy path's shorter timeline failed by exactly the
+  // intro length (e.g. 2326s vs 2332s, off by 6s > ±3s tolerance, 2026-07-20).
+  //
+  // Both builders now target the full voiceover; the intro is additive. This
+  // parameter is intentionally ignored (see targetSeconds below).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; intro is now additive pre-roll, not subtracted.
   introReservedSeconds: number = 0,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for API stability; sentence-aligned builder is deterministic.
   _rand: RandomFn = Math.random,
 ): PlannedBlockWithHint[] {
   if (hints.length === 0 || voiceoverSeconds <= 0) return [];
-  // Target sum the planner aims for. Subtract the intro slot so the
-  // matcher's prepended intro + planner blocks add up to voiceoverSeconds.
-  const targetSeconds = Math.max(0, voiceoverSeconds - Math.max(0, introReservedSeconds));
+  // Target sum the planner aims for = the FULL voiceover. The intro is
+  // additive pre-roll (played before the timeline with its own audio), NOT
+  // carved out of the narration, so the planned blocks must cover the entire
+  // voiceover. (introReservedSeconds is deliberately not subtracted — see the
+  // parameter doc above.)
+  const targetSeconds = voiceoverSeconds;
 
   // Derive the speaker's real cadence from the transcript when available.
   // Falls back to the 2.5 wps constant for legacy callers that don't have

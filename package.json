@@ -16,6 +16,7 @@
     "heygen:api-test": "tsx scripts/heygen-api-test.ts",
     "heygen:stop": "tsx scripts/heygen-stop.ts",
     "heygen:debug-gen": "tsx scripts/heygen-debug-gen.ts",
+    "heygen:debug-look-cleanup": "tsx scripts/heygen-debug-look-cleanup.ts",
     "heygen:debug-audio": "tsx scripts/heygen-debug-audio.ts",
     "test:synthetic": "tsx scripts/test-synthetic.ts",
     "db:migrate": "echo 'Run the SQL files in supabase/migrations/ via the Supabase SQL editor or `supabase db push`.'",

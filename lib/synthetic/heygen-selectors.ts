@@ -886,6 +886,45 @@ export function avatarShotsChooseLookButton(scope: Page | Locator): Locator {
     .or(scope.getByText(/^choose look$/i));
 }
 
+// Readiness tell for an avatar's looks-DETAIL page (Avatars → click a tile):
+// the "<N> looks" count and/or the "Upload look" action card (verified from
+// live screenshots 2026-07-18). This page — NOT the Switch-look modal — is
+// where looks can be deleted.
+export function avatarLooksDetailReady(page: Page): Locator {
+  return page
+    .getByText(/\d+\s*looks?\b/i)
+    .or(page.getByText(/upload look/i));
+}
+
+// The more-options ("...") control revealed on HOVERING a look tile on the
+// avatar's looks-DETAIL page — the entry point to deleting a look. Three icon
+// buttons mount top-right on hover ("..." more / select / ♡, verified from live
+// screenshots 2026-07-18); they are icon-only so a name-based selector may miss
+// — the cleanup flow falls back to trying each tile button and accepting
+// whichever reveals a Delete item.
+export function avatarShotsLookTileMoreButton(tile: Locator): Locator {
+  return tile
+    .getByRole("button", { name: /more|options|menu/i })
+    .or(tile.locator('[aria-haspopup="menu"]'))
+    .or(tile.locator('button:has(svg):not(:has-text("Choose look"))'));
+}
+
+// The "Delete" item in the menu opened by a look tile's more-options control.
+export function avatarShotsLookDeleteMenuItem(page: Page): Locator {
+  return page
+    .getByRole("menuitem", { name: /delete|remove/i })
+    .or(page.getByText(/^delete$/i));
+}
+
+// The confirm button in the delete-look confirmation dialog (if HeyGen shows
+// one). Scoped to the dialog first so a stray "Delete" elsewhere is never hit.
+export function avatarShotsLookDeleteConfirm(page: Page): Locator {
+  return page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^(delete|confirm|remove|yes)/i })
+    .or(page.getByRole("button", { name: /^delete$/i }));
+}
+
 // The orientation pill on the Avatar-Shots toolbar. Verified against the LIVE
 // HTML 2026-07: it's a div with aria-haspopup="menu" containing an svg sprite —
 // `#portrait-phone` when portrait, `#landscape-phone` when landscape — plus a
@@ -972,11 +1011,113 @@ export function avatarShotsGenerateButton(page: Page): Locator {
     .or(page.getByRole("button", { name: /generate/i }));
 }
 
-// NOTE: the saved avatar used by Avatar III is created MANUALLY by the user in
-// HeyGen at project setup, under a name they enter into the app at intake
-// (projects.heygen_avatar_name). The app never creates/names avatars itself — it
-// only SEARCHES for that name (avatarTileByName above) — so no New-Avatar / name
-// modal selectors are needed here.
+// ---------------------------------------------------------------------------
+// CREATE-AVATAR flow (per-project named avatar — the wrong-face fix, 2026-07-20)
+//
+// Verified live on bonniekim182: from the Avatar-Shots composer, Switch look
+// opens the CURRENT avatar's looks detail ("My Avatars > <name>"); clicking the
+// "My Avatars" breadcrumb opens the full "Choose Avatar" modal (tabs Recently
+// Used / My Avatars / Public Avatars, a Search box, and a "Create Avatar"
+// dropdown → Clone a real person / Upload photo / Design with AI). Upload photo
+// → native chooser → "Processing avatar…" (~7-10s; the S3 PUT reads the staged
+// file DEFERRED — see [[heygen-create-avatar-unlink-bug]], the file must stay on
+// disk) → "Name your avatar" dialog → name + Create.
+//
+// EMPTY-SHELF accounts show "Create Your First Avatar" instead of the grid, with
+// "Upload photo" revealed on hovering the "Create a virtual character" card.
+// ---------------------------------------------------------------------------
+
+// The "My Avatars" breadcrumb in the Switch-look detail header — clicks UP into
+// the full Choose Avatar modal.
+export function lookModalMyAvatarsCrumb(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /^my avatars$/i })
+    .or(page.getByRole("link", { name: /^my avatars$/i }))
+    .or(page.getByText(/^my avatars$/i));
+}
+
+// The "Choose Avatar" modal (header text). Presence == open.
+export function chooseAvatarModal(page: Page): Locator {
+  return page.getByText(/^choose avatar$/i);
+}
+
+// The Search box inside the Choose Avatar modal (filters the avatar grid by name).
+export function chooseAvatarSearch(page: Page): Locator {
+  return page.getByPlaceholder(/search/i).or(page.getByRole("searchbox"));
+}
+
+// The "Create Avatar" dropdown button (top-right of the Choose Avatar modal).
+// NOT present on the standalone /avatar/avatars grid (that page has "New Avatar").
+export function createAvatarButton(page: Page): Locator {
+  return page
+    .getByRole("button", { name: /create avatar/i })
+    .or(page.getByText(/^create avatar$/i));
+}
+
+// "Upload photo" item in the Create-Avatar dropdown (verified items: "Clone a
+// real person", "Upload photo", "Design with AI").
+export function createAvatarUploadPhotoItem(page: Page): Locator {
+  return page
+    .getByRole("menuitem", { name: /upload photo/i })
+    .or(page.getByText(/^upload photo$/i));
+}
+
+// EMPTY-SHELF variant: the "Create a virtual character" card on the "Create Your
+// First Avatar" screen; hovering it reveals its own Upload photo button.
+export function createVirtualCharacterCard(page: Page): Locator {
+  return page.getByText(/create a virtual character/i);
+}
+
+// The "Processing avatar..." modal shown while HeyGen builds the avatar from the
+// uploaded photo (appear → disappear ≈ upload+build done).
+export function processingAvatarModal(page: Page): Locator {
+  return page.getByText(/processing avatar/i);
+}
+
+// The "Name your avatar" dialog, its name input, and its Create confirm.
+export function nameAvatarDialog(page: Page): Locator {
+  return page.getByText(/name your avatar/i);
+}
+export function avatarNameInput(page: Page): Locator {
+  return page.getByPlaceholder(/add a name/i).or(page.getByRole("textbox"));
+}
+export function avatarNameCreateButton(page: Page): Locator {
+  return page.getByRole("button", { name: /^create$/i });
+}
+
+// An avatar tile in the Choose Avatar grid, by its EXACT name label (each card
+// shows the avatar name under the thumbnail). Same card-shape fallbacks as
+// avatarTileByName; exact match so "va-abc" never also matches "va-abc2".
+export function chooseAvatarTileByName(page: Page, name: string): Locator {
+  const exact = new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+  return page
+    .locator('[class*="card" i], [data-pacific-component], [role="button"], a, div')
+    .filter({ has: page.getByText(exact) })
+    .last(); // innermost matching container (broad selectors nest)
+}
+
+// The "..." more button on an avatar tile (Avatars grid). The tile's hover icons
+// mount in DOM order "..." (more) → ▷ (create video) → ♡ (favorite) — see
+// createVideoWithAvatarButton's CRITICAL note — so the FIRST icon button is the
+// more-menu trigger.
+export function avatarTileMoreButton(tile: Locator): Locator {
+  return tile.locator(':is(button,[role="button"]):has(svg)').first();
+}
+
+// "Delete" item in an avatar tile's "..." more-menu (Edit / Share / Delete /
+// Copy Avatar Identity ID — verified from the live tile menu 2026-07-20), and
+// the red confirm button in the delete dialog that follows.
+export function avatarDeleteMenuItem(page: Page): Locator {
+  return page
+    .getByRole("menuitem", { name: /^delete$/i })
+    .or(page.getByText(/^delete$/i));
+}
+export function avatarDeleteConfirmButton(page: Page): Locator {
+  return page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^delete$/i })
+    .or(page.getByRole("button", { name: /^delete$/i }).last());
+}
 
 // ---------------------------------------------------------------------------
 // LOGIN selectors — connect script ONLY (headed, human-driven)

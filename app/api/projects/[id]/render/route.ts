@@ -70,10 +70,23 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
   const sb = getServerSupabase();
 
   // Pull project for voiceover duration (drives the validation tolerance).
-  // intro_duration_seconds is the prefix segment the renderer plays with the
-  // celebrity's source audio before the voiceover starts; the duration-bearing
-  // timeline rows are planned to cover (voiceover − intro), so we subtract
-  // the intro here for the same reason DURATION_BEARING_TYPES excludes it.
+  //
+  // The intro is ADDITIVE pre-roll: the renderer plays it (with the
+  // celebrity's own source audio) BEFORE the planned timeline, then plays the
+  // full planned timeline under the voiceover (renderProcessor: "The intro
+  // plays BEFORE the planned timeline"). The matcher builds the duration-
+  // bearing rows from Deepgram word timings that span the ENTIRE voiceover
+  // (vo_start 0 → last word ≈ voiceover_duration_seconds), so the picture
+  // timeline is meant to equal the FULL voiceover, not (voiceover − intro).
+  //
+  // A previous version subtracted intro_duration_seconds here, describing the
+  // rows as covering "voiceover − intro". That never matched what the matcher
+  // actually produces, so every project with an intro clip failed this gate by
+  // exactly the intro length (e.g. timeline 2432.0s vs "voiceover" 2426.0s,
+  // off by 6.0s — the intro — > ±3s tolerance). Intros are 5-6s, so the check
+  // tripped on essentially every intro'd project once matching succeeded
+  // (2026-07-20, King Charles project 319484c9). Compare against the full
+  // voiceover; the intro row itself is already excluded via DURATION_BEARING_TYPES.
   const { data: project, error: projErr } = await sb
     .from("projects")
     .select("engine, transcript, voiceover_duration_seconds, intro_duration_seconds")
@@ -83,12 +96,10 @@ export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: strin
     return NextResponse.json({ error: "project not found" }, { status: 404 });
   }
   const isSynthetic = ((project.engine as string | null) ?? "sourced") === "synthetic";
-  const rawVoiceoverSeconds =
+  const voiceoverSeconds =
     Number(project.voiceover_duration_seconds) ||
     estimateDurationSeconds(project.transcript ?? "") ||
     0;
-  const introSeconds = Math.max(0, Number(project.intro_duration_seconds) || 0);
-  const voiceoverSeconds = Math.max(0, rawVoiceoverSeconds - introSeconds);
 
   // Require approved timeline with at least some clips. We also pull
   // metadata so forced doc clips (metadata.forced_clip.youtube_url) are

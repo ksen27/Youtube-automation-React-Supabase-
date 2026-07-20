@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { type Page, type BrowserContext } from "playwright";
+import { createHash } from "node:crypto";
+import { type Page, type BrowserContext, type Locator } from "playwright";
 import { getEnv } from "@/lib/env";
 import { probeFile } from "@/lib/media/probe";
 import { uploadBuffer } from "@/lib/storage";
@@ -68,6 +69,7 @@ import {
   avatarShotsNavEntry,
   avatarsSearchBox,
   avatarsLoadError,
+  avatarTileByName,
   firstAvatarTile,
   createVideoWithAvatarButton,
   createNewShotsMenuItem,
@@ -85,6 +87,10 @@ import {
   avatarShotsPhotoAvatarTileImage,
   avatarShotsTileClickTarget,
   avatarShotsChooseLookButton,
+  avatarShotsLookTileMoreButton,
+  avatarShotsLookDeleteMenuItem,
+  avatarShotsLookDeleteConfirm,
+  avatarLooksDetailReady,
   avatarShotsOrientationTrigger,
   avatarShotsOrientationOption,
   avatarShotsOrientationConfirmed,
@@ -92,6 +98,21 @@ import {
   avatarShotsAudioInput,
   avatarShotsAudioAttached,
   avatarShotsGenerateButton,
+  // Per-project named avatar (Create-Avatar) flow — the wrong-face fix.
+  lookModalMyAvatarsCrumb,
+  chooseAvatarModal,
+  chooseAvatarSearch,
+  createAvatarButton,
+  createAvatarUploadPhotoItem,
+  createVirtualCharacterCard,
+  processingAvatarModal,
+  nameAvatarDialog,
+  avatarNameInput,
+  avatarNameCreateButton,
+  chooseAvatarTileByName,
+  avatarTileMoreButton,
+  avatarDeleteMenuItem,
+  avatarDeleteConfirmButton,
 } from "@/lib/synthetic/heygen-selectors";
 
 // HeyGen avatar generation via Playwright browser automation (NOT the HeyGen
@@ -173,6 +194,10 @@ export interface GenerateAvatarResult {
   videoUrl: string; // R2 public URL of the downloaded avatar mp4
   accountId: string; // which account produced it
   seconds: number; // estimated output length (billing)
+  // Avatar III only: the post-selection face-verify outcome (see verifySelectedLook).
+  // Persisted to job metadata by the processor for durable ground truth on the
+  // wrong-avatar-face bug. Absent on the Avatar IV path (no look upload there).
+  faceCheck?: FaceCheck;
 }
 
 // Capture + upload a step screenshot for audit. Best-effort: never throws.
@@ -882,6 +907,131 @@ async function uploadAvatarShotsAudio(
     });
 }
 
+// Normalize an <img> src for look-tile identity comparison: origin + pathname,
+// dropping the query string. HeyGen serves look thumbnails via SIGNED urls whose
+// query params refresh between reads/sessions — a raw string compare makes an
+// UNCHANGED tile look "new" (and a re-read of our own tile look foreign).
+export function lookSrcKey(s: string): string {
+  try {
+    const u = new URL(s);
+    return u.origin + u.pathname;
+  } catch {
+    return s;
+  }
+}
+
+// The STABLE, surface-independent identity of a look photo: HeyGen embeds a
+// `/talking_photo/<group>/<hash>` segment in every rendition of a look's
+// thumbnail (the `tr:…` transform prefix and query differ between the modal,
+// the composer preview, and the detail page, so a full-URL compare fails across
+// surfaces — but this path segment is identical everywhere). Returns "" when the
+// src has no talking_photo segment (e.g. the seed avatar's default preview).
+//
+// Used to record which look each Avatar III render committed (the clicked tile's
+// key), persisted to job metadata for durable diagnosis of the wrong-avatar-face
+// bug — see FaceCheck. Independent of the "Validating photo" text (which never
+// appears on some accounts, or is skipped when HeyGen DEDUPES a repeat photo to an
+// existing asset — the exact case that dropped us onto the unsound new-src fallback
+// and rendered another project's face).
+export function lookAssetKey(s: string): string {
+  const m = /talking_photo\/([^/?#]+)\/([^/?#.]+)/.exec(s);
+  return m ? `talking_photo/${m[1]}/${m[2]}` : "";
+}
+
+// Durable record of which avatar a render committed, persisted to job metadata so
+// the wrong-avatar-face bug can be diagnosed from the DB (not ephemeral worker
+// logs). `avatarName` is the render's per-project NAMED avatar (projectAvatarName);
+// `ok:false` means the pre-Generate verify POSITIVELY saw a different avatar
+// committed (the caller throws — never render a stranger's face). Inconclusive
+// verifies stay ok:true with a reason: selection is by exact-name search, which is
+// already strong, and we never hard-fail a good render on an unreadable modal.
+export interface FaceCheck {
+  ok: boolean;
+  reason?: string;
+  avatarName?: string;
+}
+
+// The unique, deterministic name of THIS project's avatar for THIS source image:
+// `va-<projectId8>-<imageSha6>`. Keying on the image hash (not just the project)
+// makes split_2 automatic — its portrait-cropped bytes hash differently from the
+// full-frame photo, so the two aspect variants get their own avatars — and any
+// future multi-avatar-per-project feature inherits the same behavior. The `va-`
+// prefix marks OUR machine-made avatars so cleanup can tell them from the
+// account's human-made seed avatars (which must never be deleted — the composer
+// is entered through them). Deterministic ⇒ every clip of the same project+image
+// finds and REUSES the avatar created by the first clip on that account.
+export function projectAvatarName(projectId: string, imageBytes: Buffer): string {
+  const proj = projectId.replace(/-/g, "").slice(0, 8).toLowerCase();
+  const img = createHash("sha1").update(imageBytes).digest("hex").slice(0, 6);
+  return `va-${proj}-${img}`;
+}
+
+
+// Collect the srcs of ALL look tiles in the open Switch-look grid — including
+// tiles currently VIRTUALIZED out of view — by scrolling the grid container
+// end-to-end and accumulating at each step. The grid renders only ~9 tiles at a
+// time, so a single snapshot misses off-screen tiles; that incomplete baseline
+// is exactly what let a PRE-EXISTING tile (another project's uploaded face) that
+// scrolled/lazy-loaded in later pass as "new" and get selected as the look —
+// the wrong-avatar-face bug (2026-07-18). Returns NORMALIZED keys (see
+// lookSrcKey; the same normalization is inlined below because this runs in page
+// context). Restores the scroll position when done. Best-effort: an unscrollable
+// or missing grid returns whatever is visible.
+// TSX/ESBUILD CONSTRAINT (verified live 2026-07-18): the worker AND scripts run
+// via tsx, whose esbuild transform wraps NAMED function declarations (including
+// `const f = () => {}`) in a `__name()` helper — which does NOT exist inside the
+// browser page, so any evaluate/evaluateAll callback that declares an inner named
+// helper throws "ReferenceError: __name is not defined" at runtime. Every
+// page-context callback below therefore INLINES its logic (the src-normalization
+// block is deliberately duplicated instead of factored into a helper).
+export async function sweepLookTileSrcs(p: Page): Promise<string[]> {
+  return p.evaluate(async () => {
+    const cardSel = '[data-pacific-component="PrivatePhotoAvatarCard"]';
+    const seen = new Set<string>();
+    for (const img of Array.from(document.querySelectorAll(`${cardSel} img`))) {
+      const im = img as HTMLImageElement;
+      const s = im.currentSrc || im.src || "";
+      if (!s) continue;
+      let k = s;
+      try {
+        const u = new URL(s, location.href);
+        k = u.origin + u.pathname;
+      } catch {}
+      seen.add(k);
+    }
+    const first = document.querySelector(cardSel);
+    if (!first) return [...seen];
+    // Walk up to the scrollable ancestor that virtualizes the grid.
+    let scroller: HTMLElement | null = first.parentElement;
+    while (scroller && scroller !== document.body) {
+      if (scroller.scrollHeight > scroller.clientHeight + 10) break;
+      scroller = scroller.parentElement;
+    }
+    if (!scroller || scroller === document.body) return [...seen];
+    const orig = scroller.scrollTop;
+    const step = Math.max(200, scroller.clientHeight - 80);
+    for (let y = 0, guard = 0; guard < 40; y += step, guard++) {
+      scroller.scrollTop = y;
+      await new Promise((r) => setTimeout(r, 180)); // let virtualized rows mount
+      for (const img of Array.from(document.querySelectorAll(`${cardSel} img`))) {
+        const im = img as HTMLImageElement;
+        const s = im.currentSrc || im.src || "";
+        if (!s) continue;
+        let k = s;
+        try {
+          const u = new URL(s, location.href);
+          k = u.origin + u.pathname;
+        } catch {}
+        seen.add(k);
+      }
+      if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4) break;
+    }
+    scroller.scrollTop = orig;
+    await new Promise((r) => setTimeout(r, 120));
+    return [...seen];
+  });
+}
+
 // Drive the Avatar III render through the "Create new shots" / Avatar-Shots flow
 // and CLICK Generate. Returns once the render is kicked off; the SHARED
 // retrieval in attemptOnAccount (Projects poll + download) then collects the
@@ -891,12 +1041,15 @@ async function uploadAvatarShotsAudio(
 //   2) On Avatar Shots: pick model "Avatar III", set orientation, upload audio.
 //   3) Click "Generate for 1 credit".
 // Throws a classified HeygenError on any missing control.
+// Returns the uploaded look's img src (normalizable via lookSrcKey) so the
+// caller can DELETE exactly that look after the render — see
+// cleanupUploadedLook. "" = the look src could not be captured.
 async function driveAvatarIIIComposer(
   page: Page,
   input: GenerateAvatarInput,
   audioPath: string,
   imageBytes: Buffer,
-): Promise<void> {
+): Promise<{ avatarName: string; faceCheck: FaceCheck }> {
   const e = env();
   const p = page;
   const wantPortrait = input.aspectRatio === "portrait";
@@ -1085,27 +1238,30 @@ async function driveAvatarIIIComposer(
   // that re-checks BOTH and re-applies whichever got clobbered — model first, look
   // last (look is what renders, so it must be the last write to survive).
 
-  // Stage the project photo once (reused if the look must be re-applied).
+  // Stage the project photo once. CRITICAL: this file must stay ON DISK until any
+  // Create-Avatar upload has observably completed — that flow's browser-side S3
+  // PUT reads the file DEFERRED (seconds after setFiles), and unlinking early is
+  // exactly what caused the infinite "Processing avatar…" hang + "Failed to
+  // upload file" toast (root-caused live 2026-07-20, see
+  // [[heygen-create-avatar-unlink-bug]]). It is unlinked only after the
+  // model/avatar sequence below has fully committed.
   const lookDir = path.join(e.TMP_DIR, "heygen-uploads");
   await fs.mkdir(lookDir, { recursive: true });
   const lookPath = path.join(lookDir, `${input.segmentId}_look.jpg`);
   await fs.writeFile(lookPath, imageBytes);
 
-  // Set to the uploaded look's img src once applyLook identifies it — so we can
-  // DELETE exactly that look after the render (keeps the seed avatar's grid small,
-  // which is what makes tile selection reliable). "" = nothing to delete.
-  let uploadedLookSrc = "";
+  // This render's PER-PROJECT NAMED AVATAR. Deterministic on (project, image), so
+  // the first clip on an account CREATES it and every later clip of the same
+  // project on that account finds and REUSES it by exact-name search — no shared
+  // shelf, no "which tile is new" inference, no wrong face to pick.
+  const avatarName = projectAvatarName(input.projectId, imageBytes);
 
-  // The composer preview <img> src identifies WHICH face is currently selected.
-  // After a successful look upload it points at our uploaded photo; if the model
-  // switch reverts the look, this src changes back to the seed avatar's. We
-  // capture it post-upload and re-verify it before Generate.
-  const lookPreviewSrc = async (): Promise<string> =>
-    avatarShotsLookPreview(p)
-      .first()
-      .getAttribute("src")
-      .then((s) => s ?? "")
-      .catch(() => "");
+  // Result of the post-selection avatar-name verify (see applyProjectAvatar).
+  // Threaded out to the caller so the processor persists it to job metadata for
+  // durable ground truth (the worker's own logs are ephemeral). Defaults to a
+  // "not run" state so a code path that never reaches the verify still returns a
+  // well-formed value.
+  let faceCheck: FaceCheck = { ok: true, reason: "not_run", avatarName };
 
   // Select the Avatar III model, verifying the pill reads "Avatar III". Idempotent
   // — returns immediately if already set.
@@ -1127,245 +1283,299 @@ async function driveAvatarIIIComposer(
     return false;
   };
 
-  // Upload the project photo as the look and select it. Returns the committed
-  // preview src on success (so the caller can pin/verify it), or throws.
-  const applyLook = async (): Promise<string> => {
+  // ---------------------------------------------------------------------------
+  // applyProjectAvatar — select this render's PER-PROJECT NAMED AVATAR, creating
+  // it on this account if it doesn't exist yet. Replaces the shared-shelf
+  // applyLook (upload a look, then INFER which tile is ours), whose tile
+  // inference mis-fired on accounts where the "Validating photo" pin never shows
+  // and HeyGen dedupes repeat photos — selecting ANOTHER PROJECT'S face (the
+  // wrong-avatar-face bug, recurred 2026-07-19/20). Here identity is the exact
+  // avatar NAME (projectAvatarName — unique per project+image), so there is
+  // nothing to infer: find-by-name, else create-by-name, then verify-by-name.
+  //
+  // Flow (verified live on bonniekim182, 2026-07-20): composer → Switch look →
+  // looks detail ("My Avatars > <current>") → "My Avatars" crumb → "Choose
+  // Avatar" modal (search box + "Create Avatar" dropdown) → search our name →
+  //   * found: click the tile → its looks detail → commit its look (modal-closed
+  //     is the commit signal, same as the old flow), or
+  //   * missing: Create Avatar → Upload photo → "Processing avatar…" (~7-10s;
+  //     the staged file MUST stay on disk — the browser's S3 PUT reads it
+  //     DEFERRED, and an early unlink is exactly what caused the infinite
+  //     "Processing" hang + "Failed to upload file", see
+  //     [[heygen-create-avatar-unlink-bug]]) → "Name your avatar" → our unique
+  //     name → Create (HeyGen typically auto-selects the new avatar), then
+  //     select it explicitly if the modal is still open.
+  // VERIFY: reopen Switch look — its detail header names the CURRENTLY-committed
+  // avatar ("My Avatars > <name>"); assert OUR unique name is shown. A POSITIVE
+  // mismatch throws (rotate account; never render a stranger); an unreadable
+  // modal stays ok (selection was by exact name — already strong).
+  // ---------------------------------------------------------------------------
+
+  // Open the Choose Avatar modal from the composer. Returns false if it never
+  // appeared (caller retries once, then throws ui_changed).
+  const openChooseAvatar = async (): Promise<boolean> => {
     await avatarShotsLookPreview(p).first().hover().catch(() => {});
     await clickFirstVisible(avatarShotsSwitchLookButton(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch look").catch(() => {});
-    await waitFirstVisible(avatarShotsLookModal(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch-look modal");
+    await waitFirstVisible(avatarShotsLookModal(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch-look modal").catch(() => {});
+    await p.waitForTimeout(800);
+    await lookModalMyAvatarsCrumb(p).first().click({ timeout: 10_000, force: true }).catch(() => {});
+    return chooseAvatarModal(p)
+      .first()
+      .waitFor({ state: "visible", timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false);
+  };
 
-    // SNAPSHOT existing look-tile srcs BEFORE upload. The seed avatar has many
-    // identically-captioned "Photo Avatar" looks and the fresh upload does NOT land
-    // at a predictable position (positional selection picked a PREVIOUS look — the
-    // bug). The ONE img src that appears AFTER the upload that wasn't here before is
-    // unambiguously OURS — used both to SELECT the right tile and (later) to delete
-    // exactly that look. Read currentSrc||src to be robust to lazy/srcset loading.
-    const readTileSrcs = async (): Promise<string[]> =>
-      (await avatarShotsLookTileImages(p)
-        .evaluateAll((imgs) =>
-          imgs.map((im) => (im as HTMLImageElement).currentSrc || (im as HTMLImageElement).src || "")
-        )
-        .catch(() => [] as string[])).filter(Boolean);
-    const srcsBefore = new Set(await readTileSrcs());
+  // Search the Choose Avatar grid for our exact name, POLLING up to `pollMs` —
+  // a FRESHLY-CREATED avatar takes a while to become searchable (it processes /
+  // validates before appearing in the grid), so a single read right after Create
+  // reports "missing" and, unguarded, that mis-read caused a CREATE LOOP
+  // (duplicate avatars — observed live by the user 2026-07-20). Returns the tile
+  // locator, or null when the deadline passes without it.
+  const searchOurTile = async (pollMs: number): Promise<Locator | null> => {
+    const deadline = Date.now() + pollMs;
+    do {
+      await chooseAvatarSearch(p).first().fill(avatarName).catch(() => {});
+      await p.waitForTimeout(1500);
+      const tile = chooseAvatarTileByName(p, avatarName);
+      if (await isVisible(tile, 3000)) return tile;
+      await p.waitForTimeout(2000);
+    } while (Date.now() < deadline);
+    return null;
+  };
 
-    // Click Upload inside the modal, catching the native chooser.
+  // Create our named avatar via Create Avatar → Upload photo → name → Create.
+  const createOurAvatar = async (): Promise<void> => {
+    // Clear the search filter so the Create button / grid are in their normal state.
+    await chooseAvatarSearch(p).first().fill("").catch(() => {});
+    await p.waitForTimeout(500);
+    // Entry A (populated grid): the "Create Avatar" dropdown. Entry B (empty
+    // shelf, "Create Your First Avatar" screen): hover the "Create a virtual
+    // character" card to reveal its Upload photo button.
+    if (await isVisible(createAvatarButton(p), 3000)) {
+      await createAvatarButton(p).first().click({ timeout: 8000, force: true }).catch(() => {});
+      await p.waitForTimeout(800);
+    } else {
+      await createVirtualCharacterCard(p).first().hover().catch(() => {});
+      await p.waitForTimeout(600);
+    }
     try {
       const [chooser] = await Promise.all([
-        p.waitForEvent("filechooser", { timeout: e.HEYGEN_SETUP_TIMEOUT_MS }),
-        clickFirstVisible(avatarShotsLookUploadButton(p), e.HEYGEN_SETUP_TIMEOUT_MS, "Switch-look Upload"),
+        p.waitForEvent("filechooser", { timeout: 15_000 }),
+        clickFirstVisible(createAvatarUploadPhotoItem(p), 10_000, "Create-Avatar Upload photo"),
       ]);
       await chooser.setFiles(lookPath);
     } catch (err) {
       const input2 = p.locator('input[type="file"]');
       if ((await input2.count()) > 0) await input2.first().setInputFiles(lookPath);
-      else throw new HeygenError("ui_changed", "heygen: Switch-look Upload chooser did not open", err);
+      else throw new HeygenError("ui_changed", "heygen: Create-Avatar Upload photo chooser did not open", err);
     }
-    await shot(p, input.projectId, input.segmentId, "avatar3_look_uploading");
+    // NOTE: lookPath deliberately NOT unlinked here — the S3 PUT reads it in a
+    // few seconds. It is unlinked after the model/look sequence completes.
+    await shot(p, input.projectId, input.segmentId, "avatar3_create_uploading");
 
-    // ENFORCE THE REAL UPLOAD SEQUENCE (verified from the live UI 2026-07):
-    //   1) green toast "Image uploaded successfully"  (upload received), THEN
-    //   2) the NEW tile shows in-tile "Validating photo / This will take a few
-    //      seconds." over a blurred preview — the tile is NOT selectable yet, THEN
-    //   3) that text clears and the tile becomes the real selectable look.
-    // We must NOT touch any tile until step 3. So: wait for the success toast
-    // (best-effort), then wait for "Validating photo" to APPEAR and then DISAPPEAR.
-    // WAIT FOR VALIDATION — but do NOT burn fixed timeouts on toast/validating-text
-    // selectors that may not match this build (that made the step take ~50s of dead
-    // waiting). The AUTHORITATIVE, self-timing signal is the STABLE NEW SRC: the
-    // uploaded tile's final thumbnail src appears and holds only once validation
-    // completes. So we poll for it directly on a SHORT (1s) interval and stop the
-    // instant it's ready — fast when validation is fast, still correct when slow.
-    // A best-effort peek at the validating text is logged for diagnostics only; it
-    // never gates timing.
-    // HARD GATE ON VALIDATION — the ROOT of "selects a previous image before
-    // validating": the srcsBefore baseline only captured the ~9 VIRTUALIZED tiles
-    // rendered at snapshot time, so a pre-existing tile scrolled/rendered later
-    // looked "new" and got clicked mid-validation. The reliable, unambiguous signal
-    // is the in-tile "Validating photo" text — it appears ONLY on OUR uploaded tile.
-    // So: (1) wait for it to APPEAR (our upload is validating), capturing the CARD
-    // it lives in as OUR tile; (2) wait for it to DISAPPEAR (validation done). We do
-    // NOT touch any tile until it's gone.
-    //
-    // OUR tile = the PrivatePhotoAvatarCard that contains the "Validating photo"
-    // text. We pin it while the text is showing, then reuse that exact card after
-    // validation clears (its position is stable — it stays where it validated).
-    const validatingText = avatarShotsLookValidating(p).first();
-    const appeared = await validatingText
+    // "Processing avatar…" appears (~1s) then clears when the build finishes
+    // (~7-10s healthy). Missing-appear is tolerated (fast builds); the hard gate
+    // is the Name dialog.
+    const procSeen = await processingAvatarModal(p)
+      .first()
       .waitFor({ state: "visible", timeout: 30_000 })
       .then(() => true)
       .catch(() => false);
+    if (procSeen) {
+      await processingAvatarModal(p)
+        .first()
+        .waitFor({ state: "hidden", timeout: 240_000 })
+        .catch(() => {});
+    }
+    const named = await nameAvatarDialog(p)
+      .first()
+      .waitFor({ state: "visible", timeout: 60_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!named) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_create_no_name_dialog");
+      throw new HeygenError(
+        "ui_changed",
+        "heygen: Create-Avatar upload did not reach the 'Name your avatar' dialog " +
+          "(photo upload/build likely failed)",
+      );
+    }
+    await avatarNameInput(p).first().fill(avatarName).catch(() => {});
+    await avatarNameCreateButton(p).first().click({ timeout: 8000, force: true }).catch(() => {});
+    await nameAvatarDialog(p)
+      .first()
+      .waitFor({ state: "hidden", timeout: 60_000 })
+      .catch(() => {});
+    await p.waitForTimeout(1500);
     console.log(
       JSON.stringify({
         ts: new Date().toISOString(),
-        msg: appeared
-          ? "synthetic.heygen.avatar3_validating_seen"
-          : "synthetic.heygen.avatar3_validating_missing",
+        msg: "synthetic.heygen.avatar3_project_avatar_created",
         projectId: input.projectId,
         segmentId: input.segmentId,
+        avatarName,
       }),
     );
+  };
 
-    // Identify OUR tile. While the "Validating photo" text is showing it uniquely
-    // marks our tile — but the tile's img during validation is a BLURRED PLACEHOLDER
-    // whose src differs from the final thumbnail. So we do NOT pin the src now;
-    // instead we snapshot the FULL set of tile srcs at validation START, WAIT for
-    // validation to finish, then the new fully-loaded src that appears is our final
-    // thumbnail. Combined with the hard validation gate, this can't fire early.
-    let ourImgSrc = "";
-    if (appeared) {
-      // Baseline srcs the moment validation is confirmed in-flight (grid is settled
-      // to its current virtualized set; our tile currently shows the placeholder).
-      const srcsAtValidateStart = await avatarShotsLookTileImages(p)
-        .evaluateAll((imgs) =>
-          imgs.map((im) => (im as HTMLImageElement).currentSrc || (im as HTMLImageElement).src || "")
-        )
-        .catch(() => [] as string[]);
-      // HARD GATE: wait for the validating text to fully disappear.
-      await validatingText
-        .waitFor({ state: "hidden", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
-        .catch(() => {});
-      if (await isVisible(avatarShotsLookValidating(p), 1000)) {
-        await avatarShotsLookValidating(p)
-          .first()
-          .waitFor({ state: "hidden", timeout: e.HEYGEN_SETUP_TIMEOUT_MS })
-          .catch(() => {});
-      }
-      await p.waitForTimeout(500);
-      // After validation, the final thumbnail replaces the placeholder → its src is
-      // the one NOT present during validation. Poll briefly for that fully-loaded
-      // new src.
-      const deadline = Date.now() + 30_000;
-      while (!ourImgSrc && Date.now() < deadline) {
-        ourImgSrc = await avatarShotsLookTileImages(p)
-          .evaluateAll(
-            (imgs, before) => {
-              for (const el of imgs) {
-                const im = el as HTMLImageElement;
-                const s = im.currentSrc || im.src || "";
-                if (s && !before.includes(s) && im.complete && im.naturalWidth > 0) return s;
-              }
-              return "";
-            },
-            srcsAtValidateStart,
-          )
-          .catch(() => "");
-        if (!ourImgSrc) await p.waitForTimeout(400);
-      }
-    } else {
-      // Validating text never seen (very fast, or text differs on this build). Fall
-      // back to the new-src diff, but ONLY accept a fully-loaded src that stays
-      // stable across two 700ms reads — reduces the chance of grabbing a scrolled-in
-      // pre-existing tile.
-      let candidate = "";
-      const deadline = Date.now() + 30_000;
-      while (!ourImgSrc && Date.now() < deadline) {
-        const fresh = await avatarShotsLookTileImages(p)
-          .evaluateAll(
-            (imgs, before) => {
-              for (const el of imgs) {
-                const im = el as HTMLImageElement;
-                const s = im.currentSrc || im.src || "";
-                if (s && !before.includes(s) && im.complete && im.naturalWidth > 0) return s;
-              }
-              return "";
-            },
-            [...srcsBefore],
-          )
-          .catch(() => "");
-        if (fresh && fresh === candidate) ourImgSrc = fresh;
-        else {
-          candidate = fresh;
-          await p.waitForTimeout(700);
-        }
-      }
-    }
-
-    if (!ourImgSrc) {
-      await captureDiagnostics(p, input.jobId, "avatar_iii_look_newsrc_missing");
-      throw new HeygenError(
-        "ui_changed",
-        "heygen: could not identify the uploaded look tile after validation — " +
-          "would risk selecting the wrong face",
-      );
-    }
-    // Settle so the post-validation grid is stable, then resolve OUR tile by the
-    // pinned src (the tile that was validating now carries this final thumbnail).
-    await p.waitForTimeout(500);
-    const newSrc = ourImgSrc;
-    const uploadedImg = p.locator(`img[src="${newSrc.replace(/"/g, '\\"')}"]`).first();
-    const topTile = p
-      .locator('[data-pacific-component="PrivatePhotoAvatarCard"]')
-      .filter({ has: p.locator(`img[src="${newSrc.replace(/"/g, '\\"')}"]`) })
-      .first();
-    // Remember our src so the caller can delete exactly this look after the render.
-    uploadedLookSrc = newSrc;
-
-    const clickLook = async (): Promise<void> => {
-      // The commit action is the tile's own "Choose look" BUTTON (verified from the
-      // live DOM: every card has one). Clicking the tile card just highlights it and
-      // does NOT close the modal — which is why the old card-click loop retried
-      // forever ("modal never closed"). The button lives in a group-hover overlay,
-      // so we HOVER our tile to reveal it, then FORCE-click it (the overlay is
-      // pointer-events-none until hover; force bypasses the actionability check).
-      await uploadedImg.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-      await topTile.hover().catch(() => {});
+  // Commit a found tile: click it (opens its looks detail inside the modal), then
+  // commit its look. Modal-closed is the commit signal (HeyGen closes the "My
+  // Avatars" modal ONLY when a look is applied — same signal as the old flow; a
+  // composer-preview compare gives false negatives, see the old applyLook notes).
+  const selectTile = async (tile: Locator): Promise<boolean> => {
+    await tile.click({ timeout: 8000, force: true }).catch(() => {});
+    await p.waitForTimeout(1200);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const lookTile = avatarShotsPhotoAvatarTiles(p).first();
+      await lookTile.hover().catch(() => {});
       await p.waitForTimeout(150);
-      // Primary: this tile's "Choose look" button.
-      await avatarShotsChooseLookButton(topTile)
-        .first()
-        .click({ timeout: 4000, force: true })
-        .catch(() => {});
-      // Fallbacks if the modal is still open: the card, then the image.
+      await avatarShotsChooseLookButton(lookTile).first().click({ timeout: 4000, force: true }).catch(() => {});
       if (await isVisible(avatarShotsLookModal(p), 500)) {
-        await avatarShotsTileClickTarget(topTile).first().click({ timeout: 3000, force: true }).catch(() => {});
+        await avatarShotsTileClickTarget(lookTile).first().click({ timeout: 3000, force: true }).catch(() => {});
       }
-      if (await isVisible(avatarShotsLookModal(p), 500)) {
-        await uploadedImg.click({ timeout: 3000, force: true }).catch(() => {});
-      }
-    };
-
-    // Click the tile, then confirm success by the MODAL CLOSING. HeyGen closes the
-    // "My Avatars" Switch-look modal ONLY when a look is applied, so a closed modal
-    // IS the commit signal. We deliberately do NOT compare the composer preview src
-    // here: that check was giving FALSE NEGATIVES (the look WAS applied, but the
-    // broad preview selector read a stale/unchanged src), which made the loop think
-    // it failed and RE-CLICK / re-open the modal endlessly until it threw — the
-    // "selects again many times then stalls" bug. Modal-closed is the reliable,
-    // low-false-negative signal.
-    let lookApplied = false;
-    for (let attempt = 0; attempt < 3 && !lookApplied; attempt++) {
-      await clickLook();
-      lookApplied = await avatarShotsLookModal(p)
+      const closed = await avatarShotsLookModal(p)
         .first()
         .waitFor({ state: "hidden", timeout: 8000 })
         .then(() => true)
         .catch(() => false);
-      if (lookApplied) break;
-      // Modal still open — the click didn't commit. Only in this case do we retry
-      // (the modal is already open, so no need to re-open it).
+      if (closed) return true;
       await p.waitForTimeout(600);
     }
-    if (!lookApplied) {
-      await captureDiagnostics(p, input.jobId, "avatar_iii_look_not_applied");
-      throw new HeygenError(
-        "ui_changed",
-        "heygen: uploaded project photo did not commit as the selected look " +
-          "(Switch-look modal never closed after selecting) — would render the wrong face",
-      );
-    }
-    await p.waitForTimeout(600); // settle so the composer preview repaints
-    return lookPreviewSrc();
+    return false;
   };
 
-  // ORDER: LOOK FIRST, MODEL LAST. Verified on the current build (2026-07):
-  // selecting the uploaded LOOK resets the model back to the default (Avatar IV),
-  // but selecting the MODEL does NOT change the look. So the convergent order is to
-  // apply the look FIRST, then select Avatar III LAST — the model is the final
-  // write and nothing after it disturbs it, and the look survives because
-  // model-select doesn't touch it. (The old model-first order left the pill on
-  // Avatar IV because applyLook reset it; a guard that alternated could never win
-  // since look-select always re-reset the model.)
-  await applyLook();
+  // VERIFY which avatar is committed: reopen Switch look and read the detail
+  // header ("My Avatars > <currentName>"). Returns "verified" | "mismatch" |
+  // "inconclusive" (modal unreadable). Always closes the modal again.
+  const verifyCommitted = async (): Promise<"verified" | "mismatch" | "inconclusive"> => {
+    await avatarShotsLookPreview(p).first().hover().catch(() => {});
+    await clickFirstVisible(avatarShotsSwitchLookButton(p), 15_000, "Switch look (verify)").catch(() => {});
+    const opened = await avatarShotsLookModal(p)
+      .first()
+      .waitFor({ state: "visible", timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    let verdict: "verified" | "mismatch" | "inconclusive" = "inconclusive";
+    if (opened) {
+      const exact = new RegExp(`^${avatarName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      const nameShown = await p
+        .getByText(exact)
+        .first()
+        .waitFor({ state: "visible", timeout: 4000 })
+        .then(() => true)
+        .catch(() => false);
+      verdict = nameShown ? "verified" : "mismatch";
+    }
+    await p.keyboard.press("Escape").catch(() => {});
+    await avatarShotsLookModal(p)
+      .first()
+      .waitFor({ state: "hidden", timeout: 5000 })
+      .catch(() => {});
+    await p.waitForTimeout(500);
+    return verdict;
+  };
+
+  const applyProjectAvatar = async (): Promise<void> => {
+    let lastVerdict: "verified" | "mismatch" | "inconclusive" = "inconclusive";
+    // CREATE AT MOST ONCE per call. A freshly-created avatar is not immediately
+    // searchable AND is auto-selected by HeyGen only AFTER SOME TIME — treating
+    // either lag as "avatar missing" made the retry loop CREATE AGAIN, endlessly
+    // (duplicate avatars, observed live by the user 2026-07-20). After creating,
+    // we only ever WAIT (poll search / poll verify), never re-create.
+    let created = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (!(await openChooseAvatar())) {
+        if (attempt < 2) continue;
+        await captureDiagnostics(p, input.jobId, "avatar_iii_choose_avatar_not_open");
+        throw new HeygenError("ui_changed", "heygen: the Choose Avatar modal never opened");
+      }
+      // Post-create the grid needs time to index the new avatar — poll longer.
+      let tile = await searchOurTile(created ? 90_000 : 12_000);
+      const found = !!tile;
+      if (!tile && !created) {
+        await createOurAvatar();
+        created = true;
+        // HeyGen usually auto-selects the fresh avatar (after a beat) and closes
+        // the modals on its own. If a modal is still open, select explicitly —
+        // polling the search generously while the new avatar becomes visible.
+        const modalStillOpen =
+          (await isVisible(chooseAvatarModal(p), 2000)) || (await isVisible(avatarShotsLookModal(p), 1000));
+        if (modalStillOpen) tile = await searchOurTile(90_000);
+      }
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.avatar3_project_avatar",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          avatarName,
+          found,
+          created,
+          attempt,
+        }),
+      );
+      if (tile) {
+        if (!(await selectTile(tile))) {
+          await captureDiagnostics(p, input.jobId, "avatar_iii_named_select_not_applied");
+          if (attempt < 2) continue;
+          throw new HeygenError(
+            "ui_changed",
+            "heygen: the project's named avatar did not commit (modal never closed)",
+          );
+        }
+      } else {
+        // Post-create with all modals closed: HeyGen auto-selected. Close any
+        // stray overlay and fall through to the verify, which is the arbiter.
+        await p.keyboard.press("Escape").catch(() => {});
+        await p.waitForTimeout(500);
+      }
+      // VERIFY — patiently right after a create: the auto-select lands "after
+      // some time", so an immediate single read can see the OLD avatar still
+      // committed and false-flag a mismatch. Re-read a few times before judging.
+      const verifyReads = created ? 3 : 2;
+      for (let read = 0; read < verifyReads; read++) {
+        lastVerdict = await verifyCommitted();
+        if (lastVerdict !== "mismatch") break;
+        await p.waitForTimeout(8000); // give the auto-select/commit time to land
+      }
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.avatar3_face_verify",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          avatarName,
+          verdict: lastVerdict,
+          attempt,
+        }),
+      );
+      if (lastVerdict !== "mismatch") break; // verified or inconclusive → done
+      // mismatch → loop again for an explicit re-selection (never a re-create)
+    }
+    if (lastVerdict === "mismatch") {
+      faceCheck = { ok: false, reason: "mismatch", avatarName };
+      await captureDiagnostics(p, input.jobId, "avatar_iii_face_mismatch");
+      throw new HeygenError(
+        "ui_changed",
+        `heygen: committed avatar is not this project's named avatar (${avatarName}) — ` +
+          "would render the wrong face",
+      );
+    }
+    faceCheck = {
+      ok: true,
+      reason: lastVerdict === "verified" ? "verified" : "verify_inconclusive",
+      avatarName,
+    };
+  };
+
+  // ORDER: AVATAR FIRST, MODEL LAST. Verified on the current build (2026-07):
+  // committing a look/avatar resets the model back to the default (Avatar IV),
+  // but selecting the MODEL does NOT change the avatar. So the convergent order is
+  // to apply the project avatar FIRST, then select Avatar III LAST — the model is
+  // the final write and nothing after it disturbs it, and the avatar survives
+  // because model-select doesn't touch it.
+  await applyProjectAvatar();
   await shot(p, input.projectId, input.segmentId, "avatar3_look_selected");
 
   if (!(await selectModelIII())) {
@@ -1492,6 +1702,297 @@ async function driveAvatarIIIComposer(
     // is uncertain, so proceed to the shared Projects retrieval (bounded) rather
     // than orphaning a paid render.
     await captureDiagnostics(p, input.jobId, "avatar_iii_generate_no_start");
+  }
+  return { avatarName, faceCheck };
+}
+
+// Delete OTHER projects' machine-made avatars (va-* — see projectAvatarName) from
+// this account, AFTER the render has been retrieved and stored. Named avatars
+// accumulate one per (project, image) per account, and HeyGen caps instant-avatar
+// slots (v1/avatar_group/slot_info.get), so without pruning, avatar CREATION
+// eventually starts failing. Pruning is LAZY — done by the NEXT render on the
+// account rather than at project finalize (finalize has no browser session):
+// every va-* avatar that is NOT this render's own is deleted; our own is KEPT so
+// this project's later clips reuse it (a future project's cleanup removes it).
+// Human-made seed avatars (no va- prefix) are NEVER touched — the composer is
+// entered through them.
+//
+// WHERE DELETE LIVES (tile menu verified live 2026-07-20): Avatars grid → hover
+// tile → "..." more-menu (Edit / Share / Delete / Copy Avatar Identity ID) →
+// Delete → confirm dialog → Delete.
+//
+// BEST-EFFORT BY DESIGN: the render is already safe in R2 when this runs, so a
+// cleanup failure must NEVER fail the job — every step swallows and the outcome
+// is logged (synthetic.heygen.avatar3_va_cleanup), with diagnostics captured when
+// a delete misses. Deletions per run are capped to bound job time.
+export async function cleanupProjectAvatars(
+  p: Page,
+  input: GenerateAvatarInput,
+  keepAvatarName: string,
+): Promise<void> {
+  const e = env();
+  const deleted: string[] = [];
+  const failed: string[] = [];
+  try {
+    // Navigate to the Avatars grid — same production pattern as the composer's
+    // tile-fallback entry (direct URL, sidebar nav fallback, search-box readiness).
+    await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatars`, { waitUntil: "commit" }).catch(() => {});
+    if (!(await isVisible(avatarsSearchBox(p), 8000))) {
+      await clickFirstVisible(avatarsNavEntry(p), 15_000, "Avatars nav (va-cleanup)").catch(() => {});
+    }
+    const gridReady = await avatarsSearchBox(p)
+      .first()
+      .waitFor({ state: "visible", timeout: 30_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!gridReady) {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.avatar3_va_cleanup",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+          note: "avatars grid not ready — skipped",
+        }),
+      );
+      return;
+    }
+    await p.waitForTimeout(1500);
+    // Enumerate machine-made avatar names on the grid. Tile text concatenates
+    // name + "N looks", so extract by our exact va-<8hex>-<6hex> shape — a strict
+    // match also guarantees a human-named avatar can never be caught by accident.
+    const names: string[] = await p
+      .locator('[class*="card" i], [data-testid*="avatar" i], [role="button"]')
+      .evaluateAll((cards) => {
+        const out: string[] = [];
+        for (const card of cards) {
+          const m = /(va-[0-9a-f]{8}-[0-9a-f]{6})\b/i.exec(card.textContent || "");
+          if (m) out.push(m[1].toLowerCase());
+        }
+        return Array.from(new Set(out));
+      })
+      .catch(() => [] as string[]);
+    const targets = names.filter((n) => n !== keepAvatarName.toLowerCase()).slice(0, 4);
+    for (const name of targets) {
+      try {
+        const tile = avatarTileByName(p, name).first();
+        if (!(await isVisible(tile, 3000))) {
+          failed.push(name);
+          continue;
+        }
+        await tile.hover().catch(() => {});
+        await p.waitForTimeout(400);
+        await avatarTileMoreButton(tile).click({ timeout: 4000, force: true }).catch(() => {});
+        const menuOpen = await avatarMoreMenuOpen(p)
+          .first()
+          .waitFor({ state: "visible", timeout: 4000 })
+          .then(() => true)
+          .catch(() => false);
+        if (!menuOpen) {
+          await p.keyboard.press("Escape").catch(() => {});
+          failed.push(name);
+          continue;
+        }
+        await avatarDeleteMenuItem(p).first().click({ timeout: 4000, force: true }).catch(() => {});
+        await p.waitForTimeout(600);
+        await avatarDeleteConfirmButton(p).first().click({ timeout: 5000, force: true }).catch(() => {});
+        // Deleted when the tile disappears from the grid.
+        const gone = await tile
+          .waitFor({ state: "hidden", timeout: 8000 })
+          .then(() => true)
+          .catch(() => false);
+        (gone ? deleted : failed).push(name);
+        await p.waitForTimeout(600);
+      } catch {
+        failed.push(name);
+      }
+    }
+    if (failed.length > 0) {
+      await captureDiagnostics(p, input.jobId, "avatar_iii_va_cleanup_missed").catch(() => {});
+    }
+  } catch {
+    // best-effort — never fail the job over cleanup
+  }
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      msg: "synthetic.heygen.avatar3_va_cleanup",
+      projectId: input.projectId,
+      segmentId: input.segmentId,
+      keep: keepAvatarName,
+      deleted,
+      failed,
+    }),
+  );
+}
+
+// Delete the look a render uploaded, AFTER the render has been retrieved and
+// stored. The look grid is SHARED per account across every project: without
+// cleanup each render leaves its project's face behind, the grid grows unbounded
+// (a live account showed 470 looks, 2026-07-18), and tile selection has to pick
+// "ours" out of a pile of other projects' faces — the wrong-avatar-face bug.
+// Keeping the grid small makes selection trivially reliable.
+//
+// WHERE DELETE LIVES (verified from live UI screenshots 2026-07-18): the
+// Avatar-Shots "Switch look" modal has NO delete control (hover shows only
+// "Choose look" — probed live). Looks are deleted from the avatar's looks-DETAIL
+// page: Avatars → click the FIRST avatar tile (the seed the composer uploads
+// into) → its looks grid → hover a tile → three icon buttons mount top-right
+// ("..." more / select / ♡) → "..." → Delete → "Delete Look? This action cannot
+// be revoked." dialog → red Delete. New uploads land FIRST in that grid.
+//
+// BEST-EFFORT BY DESIGN: the render is already safe in R2 when this runs, so a
+// cleanup failure must NEVER fail the job — every step swallows and the outcome
+// is logged (synthetic.heygen.avatar3_look_cleanup), with diagnostics captured
+// when a step misses. Deletion is IRREVERSIBLE → we act only on a tile whose img
+// carries the uploaded look's stable talking_photo asset path (the tr:…
+// transform prefix and query differ between surfaces, so a full-url compare
+// can't work across pages).
+// Exported for scripts/heygen-debug-look-cleanup.ts (headed test of the delete
+// flow without burning a render).
+export async function cleanupUploadedLook(
+  p: Page,
+  input: GenerateAvatarInput,
+  lookSrc: string,
+): Promise<void> {
+  if (!lookSrc) return;
+  const e = env();
+  // Stable identity: every rendition of the look's thumbnail embeds the same
+  // /talking_photo/<avatar_id>/<image_hash> path segment.
+  const idMatch = /talking_photo\/([^/?#]+)\/([^/?#.]+)/.exec(lookSrc);
+  const identity = idMatch ? `talking_photo/${idMatch[1]}/${idMatch[2]}` : "";
+  const outcome = (ok: boolean, note: string) =>
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "synthetic.heygen.avatar3_look_cleanup",
+        projectId: input.projectId,
+        segmentId: input.segmentId,
+        ok,
+        note,
+      }),
+    );
+  if (!identity) {
+    outcome(false, "no_identity_in_src");
+    return;
+  }
+  try {
+    // 1) Open the Avatars page.
+    await p.goto(`${e.HEYGEN_BASE_URL}/avatar/avatars`, { waitUntil: "commit" }).catch(() => {});
+    if (!(await isVisible(avatarsSearchBox(p), 10_000))) {
+      await clickFirstVisible(avatarsNavEntry(p), 15_000, "Avatars nav (cleanup)").catch(() => {});
+    }
+    // 2) Open the FIRST avatar's looks-detail page (the seed avatar the composer
+    // entered from — uploads always attach to it). On the new UI a plain tile
+    // click opens the detail page; old-UI accounts where it doesn't just skip
+    // cleanup this round (best-effort).
+    const avatarTile = firstAvatarTile(p).first();
+    await avatarTile.waitFor({ state: "visible", timeout: 20_000 });
+    await avatarTile.click({ timeout: 8000 });
+    await waitFirstVisible(avatarLooksDetailReady(p), 20_000, "avatar looks-detail page");
+    await p.waitForTimeout(800); // let the grid render
+
+    // 3) Stamp OUR look's card by identity. Our upload is the NEWEST look and
+    // lands FIRST in the grid, so no scroll sweep is needed — if it's not in the
+    // initially rendered set, something is off and we bail rather than guess.
+    // (Identity match logic INLINED — no inner named helpers in page callbacks;
+    // tsx's __name wrapper doesn't exist in the page, see sweepLookTileSrcs.)
+    const matches = await p.evaluate((ident) => {
+      for (const el of Array.from(document.querySelectorAll("[data-va-cleanup]")))
+        el.removeAttribute("data-va-cleanup");
+      let count = 0;
+      const cardSel = '[data-pacific-component="PrivatePhotoAvatarCard"]';
+      for (const img of Array.from(document.querySelectorAll("img"))) {
+        const im = img as HTMLImageElement;
+        const s = im.currentSrc || im.src || "";
+        if (!s || s.indexOf(ident) === -1) continue;
+        const card =
+          im.closest(cardSel) ??
+          im.closest('[class*="card" i]');
+        if (card && !card.hasAttribute("data-va-cleanup")) {
+          card.setAttribute("data-va-cleanup", "1");
+          count++;
+        }
+      }
+      return count;
+    }, identity);
+    if (matches < 1) {
+      await captureDiagnostics(p, input.jobId, "avatar3_look_cleanup_no_match").catch(() => {});
+      outcome(false, `match_count_${matches}`);
+      return;
+    }
+    // >1 match means the page HEADER/preview also shows our look (it's the
+    // currently-selected one), or the same photo was uploaded twice. The header
+    // sits BEFORE the grid in DOM order, so take the LAST stamped card — a grid
+    // tile either way (and duplicates carry identical bytes, so any grid match
+    // is a correct delete target).
+    const tile = p.locator('[data-va-cleanup="1"]').last();
+    await tile.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await tile.hover().catch(() => {});
+    await p.waitForTimeout(500); // let the hover-mounted icon buttons render
+
+    // 4) Open the tile's "..." more-menu. The three hover buttons are icon-only,
+    // so a name-based selector may miss: try the aria-haspopup trigger first,
+    // then each button in turn, accepting whichever reveals a Delete item.
+    // Escape/goBack out of any wrong click (one icon navigates to the composer).
+    let deleteItemVisible = false;
+    await clickFirstVisible(avatarShotsLookTileMoreButton(tile), 4000, "look tile more-menu").catch(
+      () => {},
+    );
+    deleteItemVisible = await isVisible(avatarShotsLookDeleteMenuItem(p), 2000);
+    if (!deleteItemVisible) {
+      const btns = tile.locator('button, [role="button"]');
+      const n = Math.min(await btns.count().catch(() => 0), 5);
+      for (let i = 0; i < n && !deleteItemVisible; i++) {
+        await tile.hover().catch(() => {});
+        await p.waitForTimeout(300);
+        const b = btns.nth(i);
+        const bHtml = (await b.evaluate((el) => el.outerHTML).catch(() => "")) ?? "";
+        if (/choose look|create/i.test(bHtml)) continue; // never commit/navigate on purpose
+        await b.click({ timeout: 2500, force: true }).catch(() => {});
+        deleteItemVisible = await isVisible(avatarShotsLookDeleteMenuItem(p), 2000);
+        if (!deleteItemVisible) {
+          await p.keyboard.press("Escape").catch(() => {});
+          // A wrong icon may have navigated away (e.g. a create-video shortcut).
+          if (!(await isVisible(avatarLooksDetailReady(p), 1500))) {
+            await p.goBack().catch(() => {});
+            await waitFirstVisible(avatarLooksDetailReady(p), 10_000, "looks-detail (back)").catch(
+              () => {},
+            );
+            await tile.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          }
+        }
+      }
+    }
+    if (!deleteItemVisible) {
+      await captureDiagnostics(p, input.jobId, "avatar3_look_cleanup_no_menu").catch(() => {});
+      outcome(false, "no_delete_menu");
+      await p.keyboard.press("Escape").catch(() => {});
+      return;
+    }
+
+    // 5) Delete → confirm ("Delete Look? This action cannot be revoked." →
+    // red Delete button).
+    await clickFirstVisible(avatarShotsLookDeleteMenuItem(p), 5000, "look Delete item");
+    await clickFirstVisible(avatarShotsLookDeleteConfirm(p), 8000, "look Delete confirm").catch(
+      () => {},
+    );
+    // Verify: the stamped tile should leave the DOM.
+    const gone = await p
+      .waitForFunction(() => !document.querySelector('[data-va-cleanup="1"]'), undefined, {
+        timeout: 12_000,
+      })
+      .then(() => true)
+      .catch(() => false);
+    if (!gone) {
+      await captureDiagnostics(p, input.jobId, "avatar3_look_cleanup_not_deleted").catch(() => {});
+    }
+    outcome(gone, gone ? "deleted" : "delete_unconfirmed");
+    await p.keyboard.press("Escape").catch(() => {});
+  } catch (err) {
+    await captureDiagnostics(p, input.jobId, "avatar3_look_cleanup_failed").catch(() => {});
+    outcome(false, (err as Error).message?.slice(0, 200) ?? "unknown");
+    await p.keyboard.press("Escape").catch(() => {});
   }
 }
 
@@ -1657,10 +2158,15 @@ export async function attemptOnAccount(
       // Wall-clock just before Generate fires inside the composer, minus skew —
       // the freshness floor for pinning OUR render in the shared Projects list.
       const genClickTs = Math.floor(Date.now() / 1000) - 10;
-      await driveAvatarIIIComposer(p, input, input.audioFilePath, imageBytes);
+      const { avatarName, faceCheck } = await driveAvatarIIIComposer(
+        p,
+        input,
+        input.audioFilePath,
+        imageBytes,
+      );
       // Steps 8–9 (Projects poll + download) are shared; jump straight to them.
       // Always audio-driven on this path (audioFilePath asserted above).
-      return await finishRenderRetrieval(
+      const result = await finishRenderRetrieval(
         p,
         context,
         account,
@@ -1671,6 +2177,14 @@ export async function attemptOnAccount(
         true,
         t0,
       );
+      result.faceCheck = faceCheck; // durable ground truth → job metadata (processor)
+      // POST-RENDER HYGIENE: delete OTHER projects' machine-made (va-*) avatars
+      // from this account so they don't accumulate into HeyGen's avatar-slot
+      // limit. Our OWN named avatar is kept — later clips of this project reuse
+      // it; a future project's cleanup removes it. Best-effort: the render is
+      // already safe in R2, so cleanup never fails the job.
+      await cleanupProjectAvatars(p, input, avatarName);
+      return result;
     }
 
     // 2) Re-navigate to the avatar "Quick create" workspace for a CLEAN composer

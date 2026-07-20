@@ -372,7 +372,11 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
     await setMediaJob(mediaJobId, {
       status: "completed",
       progress: 100,
-      metadata: { accountId: result.accountId, seconds: result.seconds },
+      // faceCheck (Avatar III) records which look key this render committed, so the
+      // wrong-avatar-face bug is diagnosable from the DB (not ephemeral worker logs):
+      // compare the committed key against the project's real avatar to tell
+      // selection-side contamination from retrieval-side. null on the Avatar IV path.
+      metadata: { accountId: result.accountId, seconds: result.seconds, faceCheck: result.faceCheck ?? null },
     });
   } catch (err) {
     // POOL CONTENTION (client 2026-07-07): every account is busy rendering another

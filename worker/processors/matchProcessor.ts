@@ -6854,11 +6854,28 @@ async function loadBlockHintsFromAnalyze(
       });
     }
   }
-  // Sanity check: if the total hint count is wildly out of range with the
-  // voiceover length we'd produce a degenerate timeline. The legacy planner
-  // targets ~voiceoverSeconds / 5s blocks; if Gemini produced fewer than
-  // half that, the hints are probably truncated — fall back to legacy.
-  const minReasonable = Math.max(2, Math.floor(voiceoverSeconds / 10));
+  // Sanity check: reject only a GROSSLY truncated hint stream (Gemini
+  // returned a handful of blocks for a long script), because that would
+  // force a degenerate timeline. We must NOT reject a merely coarse plan.
+  //
+  // These hints feed the transcript-driven builder, which is SENTENCE-driven:
+  // it emits one block per sentence and looks each hint up as enrichment, so
+  // the block-per-sentence coverage is what matters, not a fixed seconds/block
+  // assumption. On long-form narration a legitimate analyze plan averages
+  // ~10-15s of speech per block (one sentence each), i.e. ~voiceoverSeconds/12
+  // hints. The previous threshold (voiceoverSeconds / 10 — "half of one block
+  // per 5s") wrongly classified those complete plans as truncated: a real
+  // 39-min King Charles script produced 184 valid blocks but needed 233 to
+  // pass, so ALL 184 hints were discarded and the match fell back to the
+  // legacy quota planner. That planner has no per-sentence vo_start telescoping
+  // and its reclaim/proportional-fit passes could not reconcile the picture
+  // timeline to the voiceover, so the final duration gate threw
+  // "match produced a timeline 135s off the voiceover" (2026-07-19).
+  //
+  // A block roughly every 30s or coarser is the real truncation signal (e.g.
+  // 5 blocks for a 40-min video); anything denser is a usable plan. Guard the
+  // absolute floor at 2 so a very short project still needs a couple of blocks.
+  const minReasonable = Math.max(2, Math.floor(voiceoverSeconds / 30));
   if (hints.length < minReasonable) return [];
   return hints;
 }
