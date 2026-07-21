@@ -1,7 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createHash } from "node:crypto";
 import { type Page, type BrowserContext, type Locator } from "playwright";
 import { getEnv } from "@/lib/env";
 import { probeFile } from "@/lib/media/probe";
@@ -31,6 +30,7 @@ import {
 } from "@/lib/synthetic/heygen-session";
 import { inspectPage } from "@/lib/synthetic/heygen-health";
 import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
+import { projectAvatarName } from "@/lib/synthetic/avatar-name";
 import {
   HeygenError,
   PoolBusyError,
@@ -951,20 +951,11 @@ export interface FaceCheck {
   avatarName?: string;
 }
 
-// The unique, deterministic name of THIS project's avatar for THIS source image:
-// `va-<projectId8>-<imageSha6>`. Keying on the image hash (not just the project)
-// makes split_2 automatic — its portrait-cropped bytes hash differently from the
-// full-frame photo, so the two aspect variants get their own avatars — and any
-// future multi-avatar-per-project feature inherits the same behavior. The `va-`
-// prefix marks OUR machine-made avatars so cleanup can tell them from the
-// account's human-made seed avatars (which must never be deleted — the composer
-// is entered through them). Deterministic ⇒ every clip of the same project+image
-// finds and REUSES the avatar created by the first clip on that account.
-export function projectAvatarName(projectId: string, imageBytes: Buffer): string {
-  const proj = projectId.replace(/-/g, "").slice(0, 8).toLowerCase();
-  const img = createHash("sha1").update(imageBytes).digest("hex").slice(0, 6);
-  return `va-${proj}-${img}`;
-}
+// projectAvatarName (`va-<projectId8>-<imageSha6>`) moved to avatar-name.ts so
+// the API fallback can derive the same name without a circular import — it
+// looks avatars up by this exact name to reuse the ones this browser flow
+// creates. Re-exported here for existing callers.
+export { projectAvatarName };
 
 
 // Collect the srcs of ALL look tiles in the open Switch-look grid — including
@@ -2631,9 +2622,10 @@ export async function attemptOnAccount(
 
 // Attempt the OFFICIAL HeyGen API path for this clip. Shared by the two triggers
 // that route here: the EARLY speed switch (mid-rotation, if enabled) and the
-// pool-exhausted last resort. Renders via the talking-photo (Avatar IV) path —
-// avatar_iii inputs are DOWNGRADED to Avatar IV here (see below) rather than
-// hard-failing. Returns the result on success, or null when the API path is not
+// pool-exhausted last resort. Renders AVATAR III via a saved photo-avatar look
+// (found/created by va- name — see heygen-api.ts; client 2026-07-20: Avatar IV
+// is too expensive). Returns the result on success, or null when the API path
+// is not
 // applicable (flag/key off, or no sliced audio) OR the API render itself failed —
 // the caller then continues the browser rotation / throws the original error.
 // Never throws: an API failure must not mask the underlying browser error.
@@ -2645,30 +2637,14 @@ async function tryApiFallback(
   // Scope guard: requires the flag/key AND the sliced audio (never HeyGen TTS —
   // wrong audio is unusable). Otherwise the API path is unavailable → return null.
   //
-  // AVATAR III -> AVATAR IV DOWNGRADE (client 2026-07-06): the API can't render the
-  // avatar_iii engine without a PRE-TRAINED photo-avatar look id (we upload a fresh
-  // photo per render, so we don't have one). But the client would rather have the
-  // clip rendered via the API's talking-photo path (Avatar IV — fresh photo + our
-  // 69labs audio, correct lip-sync) than HARD-FAIL the segment. generateAvatarViaApi
-  // already drives the talking-photo (`type:"image"`) path regardless of avatarModel,
-  // so an avatar_iii input simply renders as Avatar IV here — exactly the intended
-  // downgrade. We log it so the substitution is visible in cost/audit.
+  // ENGINE: renders as Avatar III via the saved photo-avatar route (the one-shot
+  // type:"image" path is not used — it has no engine choice and bills Avatar IV;
+  // probed live 2026-07-21, see heygen-api.ts).
   if (
     !heygenApiFallbackEnabled() ||
     (!input.audioUrl && !input.audioFilePath)
   ) {
     return null;
-  }
-  if (input.avatarModel === "avatar_iii") {
-    console.log(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        msg: "heygen.api_fallback.avatar_iii_downgrade",
-        projectId: input.projectId,
-        segmentId: input.segmentId,
-        note: "avatar_iii could not render in the browser pool — rendering via API as Avatar IV (talking-photo) instead of hard-failing",
-      }),
-    );
   }
   try {
     console.log(
@@ -2862,7 +2838,7 @@ export async function generateAvatar(
   //   * LAST RESORT — the browser pool exhausted with no early trigger; produce a
   //     clip that would otherwise HARD-FAIL.
   // Both bill API credits (pricier than the browser renders), so tryApiFallback is
-  // a no-op unless enabled + configured, avatar_iv, and audio-driven. On an API
+  // a no-op unless enabled + configured and audio-driven. On an API
   // failure it returns null and we fall through to the original error below.
   const apiReason =
     earlySwitchReason ??

@@ -29,6 +29,10 @@ export const QUEUE_NAMES = {
   imageGeneration:  "video-automation-image-generation",
   imageToVideo:     "video-automation-image-to-video",
   avatar:           "video-automation-avatar",
+  // AI-generated sales-pitch video (migration 0026). Its own queue so a pitch
+  // build (which drives a browser + a HeyGen render) runs alongside the main
+  // asset fan-out on the avatar worker without contending for the avatar slot.
+  pitchGen:         "video-automation-pitch-gen",
 } as const;
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 
@@ -65,6 +69,11 @@ export interface ImageToVideoJobData     { projectId: string; mediaJobId: string
 // handlePoolBusy. forceApi tells generateAvatar to skip the browser pool and
 // render via the HeyGen API once the wait threshold is crossed.
 export interface AvatarJobData           { projectId: string; mediaJobId: string; segmentId: string; imageOnly?: boolean; forceApi?: boolean; poolWaitCycles?: number; poolWaitStartMs?: number; }
+// AI-generated sales-pitch video (standalone Sales Pitch tool, migration 0029).
+// Keyed by a pitch_videos row id (NOT a project). Small payload: the processor
+// re-reads all inputs off the pitch_videos row, so a retry never depends on
+// stale data pickled here.
+export interface PitchGenJobData         { pitchVideoId: string; }
 
 // Idle BullMQ workers sit on a long blocking BRPOP. Two distinct teardown
 // causes, depending on how a process reaches Redis:
@@ -209,4 +218,9 @@ export async function enqueueImageToVideo(data: ImageToVideoJobData) {
 }
 export async function enqueueAvatar(data: AvatarJobData) {
   return getQueue<AvatarJobData>(QUEUE_NAMES.avatar).add("avatar", data, { jobId: data.mediaJobId });
+}
+export async function enqueuePitchGen(data: PitchGenJobData) {
+  // jobId = the pitch_videos row id (the standalone tool has no media_job): it
+  // dedupes double-enqueues and maps a BullMQ job straight back to its row.
+  return getQueue<PitchGenJobData>(QUEUE_NAMES.pitchGen).add("pitch_gen", data, { jobId: data.pitchVideoId });
 }

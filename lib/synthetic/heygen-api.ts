@@ -4,6 +4,7 @@ import { uploadBuffer } from "@/lib/storage";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { HeygenError } from "@/lib/synthetic/heygen-errors";
+import { projectAvatarName } from "@/lib/synthetic/avatar-name";
 import type { GenerateAvatarInput, GenerateAvatarResult } from "@/lib/synthetic/heygen";
 
 // OFFICIAL HeyGen API fallback for avatar generation.
@@ -15,18 +16,32 @@ import type { GenerateAvatarInput, GenerateAvatarResult } from "@/lib/synthetic/
 // never runs on the happy path; it exists so a clip that would otherwise HARD-FAIL
 // still gets produced. Gated by HEYGEN_API_FALLBACK + HEYGEN_API_KEY (see env.ts).
 //
-// Flow (HeyGen API v3, verified 2026-07):
-//   1. POST /v3/assets (multipart)  -> upload the project PHOTO      -> asset_id
-//   2. POST /v3/assets (multipart)  -> upload the sliced 69labs AUDIO -> asset_id
-//   3. POST /v3/videos              -> talking-photo video driven by the audio
-//                                      asset, at the block's aspect ratio -> video_id
+// Flow (HeyGen API v3, probed LIVE against api.heygen.com 2026-07-21):
+//   1. Resolve a SAVED photo-avatar look for this project+image:
+//      a. derive the deterministic name `va-<proj8>-<sha6>` (projectAvatarName —
+//         the SAME name the browser flow gives the avatars it creates, so a
+//         browser-created avatar is found and reused here, no new training), and
+//      b. search GET /v3/avatars (private groups) for that name; on a hit take
+//         its look id (GET /v3/avatars/looks?group_id=…); for photo avatars the
+//         look id equals the group id;
+//      c. on a miss, POST /v3/assets the photo -> POST /v3/avatars
+//         {type:"photo", name, file:{asset_id}} -> poll the look until its
+//         training completes.
+//   2. Audio: prefer the R2 public URL (audio_url); else POST /v3/assets the
+//      sliced 69labs audio -> audio_asset_id.
+//   3. POST /v3/videos {type:"avatar", avatar_id: <look id>,
+//      engine:{type:"avatar_iii"}, audio, aspect_ratio, resolution} -> video_id.
 //   4. GET  /v3/videos/{video_id}   -> poll until "completed" -> download video_url
 //   5. upload the mp4 to R2 and return its public URL (same shape the browser path
 //      returns, so callers are agnostic to which path produced the clip).
 //
-// SCOPE: talking-photo (Avatar IV equivalent) only — covers full-frame avatars and
-// split_2 left-halves. Avatar III's "Create new shots" flow has a different API
-// surface; generateAvatar() does NOT route avatar_iii here (it logs and skips).
+// ENGINE = AVATAR III (client 2026-07-20: Avatar IV is too expensive — ~20
+// credits/min vs Avatar III's ~3). The engine field exists ONLY on type:"avatar"
+// (a saved avatar_id) — type:"image" (fresh uploaded photo) rejects it with a
+// 400 and always renders Avatar IV, which is why this module goes through a
+// saved photo avatar rather than the one-shot image path. There is NO silent
+// Avatar IV fallback: if the look can't be resolved or doesn't support
+// avatar_iii, the clip fails loudly instead of billing 6-7x.
 // REQUIRES the sliced audio: like the browser path, we never speak HeyGen's own
 // TTS (wrong audio is unusable), so a missing audio slice means no API fallback.
 
@@ -104,10 +119,118 @@ async function uploadAsset(
   return assetId;
 }
 
-// Kick off a talking-photo render driven by the uploaded audio asset. Returns the
-// video_id to poll.
-async function createTalkingPhotoVideo(
-  photoAssetId: string,
+// Authed GET returning parsed JSON (list/detail endpoints).
+async function apiGetJson(op: string, path: string): Promise<Record<string, unknown>> {
+  const e = getEnv();
+  const res = await withHttpRetry(op, () =>
+    fetchOrThrow(`${e.HEYGEN_API_BASE_URL}${path}`, {
+      method: "GET",
+      headers: { [AUTH_HEADER]: apiKeyOrThrow() },
+      timeoutMs: 30_000,
+    }),
+  );
+  return (await res.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+interface AvatarGroupRow {
+  id?: string;
+  group_id?: string;
+  name?: string;
+}
+interface AvatarLookRow {
+  id?: string;
+  status?: string;
+  supported_api_engines?: string[];
+}
+
+// Find this project+image's photo-avatar look by its deterministic va- name.
+// Returns the look id (the avatar_id for POST /v3/videos) or null when no group
+// with that name exists in the API account. Pages through ALL private groups —
+// the account accumulates one group per project+image, so the target can sit on
+// any page.
+async function findLookIdByName(name: string): Promise<string | null> {
+  let token: string | undefined;
+  for (let page = 0; page < 40; page++) {
+    const q = new URLSearchParams({ ownership: "private", limit: "50" });
+    if (token) q.set("token", token);
+    const json = await apiGetJson("heygen-api.list_avatar_groups", `/v3/avatars?${q}`);
+    const groups = (json.data ?? []) as AvatarGroupRow[];
+    const hit = groups.find((g) => g?.name === name);
+    if (hit) {
+      const groupId = hit.id ?? hit.group_id;
+      const looksJson = await apiGetJson(
+        "heygen-api.list_avatar_looks",
+        `/v3/avatars/looks?group_id=${encodeURIComponent(String(groupId))}&limit=50`,
+      );
+      const looks = (looksJson.data ?? []) as AvatarLookRow[];
+      // Photo-avatar groups hold one look whose id equals the group id; prefer a
+      // completed one anyway in case a group ever grows extra looks.
+      const look = looks.find((l) => l?.status === "completed") ?? looks[0];
+      return look?.id ?? null;
+    }
+    if (!json.has_more || !json.next_token) return null;
+    token = String(json.next_token);
+  }
+  return null;
+}
+
+// Create a photo avatar from the uploaded photo asset and wait for its training
+// to complete. Training is asynchronous on HeyGen's side (usually well under a
+// minute for a photo avatar) — poll the look until status "completed", bounded
+// so a stuck training fails the clip in bounded time.
+async function createPhotoAvatarLook(name: string, photoAssetId: string): Promise<string> {
+  const e = getEnv();
+  const res = await withHttpRetry("heygen-api.create_avatar", () =>
+    fetchOrThrow(`${e.HEYGEN_API_BASE_URL}/v3/avatars`, {
+      method: "POST",
+      headers: { [AUTH_HEADER]: apiKeyOrThrow(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "photo",
+        name,
+        file: { type: "asset_id", asset_id: photoAssetId },
+      }),
+      timeoutMs: 60_000,
+    }),
+  );
+  const json = (await res.json().catch(() => ({}))) as {
+    data?: {
+      avatar_item?: { id?: string };
+      avatar_group?: { id?: string };
+      look_id?: string;
+      id?: string;
+    };
+  };
+  // Docs: "Returns an avatar_item (the look) and an avatar_group". Tolerate a
+  // few placements; for photo avatars look id == group id anyway.
+  const lookId =
+    json.data?.avatar_item?.id ?? json.data?.look_id ?? json.data?.id ?? json.data?.avatar_group?.id;
+  if (!lookId) {
+    throw new HeygenError("unknown", "heygen-api: create avatar returned no look/group id");
+  }
+
+  const deadline = Date.now() + e.HEYGEN_API_AVATAR_TRAIN_TIMEOUT_SECONDS * 1000;
+  while (Date.now() < deadline) {
+    const detail = await apiGetJson(
+      "heygen-api.get_avatar_look",
+      `/v3/avatars/looks/${encodeURIComponent(lookId)}`,
+    );
+    const status = String((detail.data as AvatarLookRow | undefined)?.status ?? "").toLowerCase();
+    if (status === "completed" || status === "ready") return lookId;
+    if (status === "failed" || status === "error") {
+      throw new HeygenError("unknown", `heygen-api: photo avatar training failed (${name})`);
+    }
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+  throw new HeygenError(
+    "unknown",
+    "heygen-api: photo avatar training did not complete within the training budget",
+  );
+}
+
+// Kick off an AVATAR III render of the saved photo-avatar look, driven by the
+// uploaded audio. Returns the video_id to poll.
+async function createAvatarIiiVideo(
+  lookId: string,
   // The voiceover, supplied EITHER as a public URL (preferred — no upload) OR as
   // an uploaded asset id. Exactly one is set. Both map to the top-level audio
   // field HeyGen expects (audio_url / audio_asset_id), which is mutually exclusive
@@ -119,13 +242,16 @@ async function createTalkingPhotoVideo(
   const e = getEnv();
   const url = `${e.HEYGEN_API_BASE_URL}/v3/videos`;
   const body = {
-    type: "image", // talking-photo from an uploaded image asset
+    type: "avatar",
     title: title.slice(0, 120),
-    image: { type: "asset_id", asset_id: photoAssetId },
+    avatar_id: lookId,
     // Drive lip-sync with OUR audio (the sliced 69labs voiceover).
     ...("url" in audio ? { audio_url: audio.url } : { audio_asset_id: audio.assetId }),
     aspect_ratio: aspectRatio === "portrait" ? "9:16" : "16:9",
     resolution: e.HEYGEN_API_RESOLUTION,
+    // The whole point of the saved-avatar route: without this HeyGen defaults to
+    // Avatar IV (~6-7x the credits). Only valid on type:"avatar".
+    engine: { type: "avatar_iii" },
   };
   const res = await withHttpRetry("heygen-api.create_video", () =>
     fetchOrThrow(url, {
@@ -193,10 +319,12 @@ async function awaitRenderedUrl(videoId: string): Promise<{ url: string; seconds
 }
 
 /**
- * Generate an avatar clip via the OFFICIAL HeyGen API (fallback path). Uploads the
- * project photo + the sliced 69labs audio as assets, creates a talking-photo video
- * driven by that audio at the block's aspect ratio, polls to completion, downloads
- * the mp4, and re-hosts it to R2. Returns the SAME GenerateAvatarResult shape the
+ * Generate an avatar clip via the OFFICIAL HeyGen API (fallback path). Resolves
+ * this project+image's saved photo-avatar look (reusing a browser-created one by
+ * its va- name, else creating + training one from the photo), then renders it
+ * with the AVATAR III engine driven by the sliced 69labs audio at the block's
+ * aspect ratio, polls to completion, downloads the mp4, and re-hosts it to R2.
+ * Returns the SAME GenerateAvatarResult shape the
  * browser path returns so callers are agnostic. accountId is reported as
  * "heygen-api" for auditing (it is not a pool account).
  *
@@ -227,8 +355,16 @@ export async function generateAvatarViaApi(
     extra: { note: "browser pool exhausted — attempting API fallback" },
   });
 
-  // 1) Upload the PHOTO asset (always needed — it's passed as bytes).
-  const photoAssetId = await uploadAsset(imageBytes, `${input.segmentId}_photo.jpg`, "image/jpeg");
+  // 1) Resolve the saved photo-avatar look (find-by-name, else create+train).
+  // The name matches what the browser flow creates for this project+image, so a
+  // browser-created avatar is reused directly — no upload, no training wait.
+  const avatarName = projectAvatarName(input.projectId, imageBytes);
+  let lookId = await findLookIdByName(avatarName);
+  const createdAvatar = !lookId;
+  if (!lookId) {
+    const photoAssetId = await uploadAsset(imageBytes, `${input.segmentId}_photo.jpg`, "image/jpeg");
+    lookId = await createPhotoAvatarLook(avatarName, photoAssetId);
+  }
 
   // 2) AUDIO: prefer the R2 public URL (no upload) when we have it; otherwise
   // upload the local slice as an asset. Both paths drive lip-sync identically.
@@ -243,10 +379,10 @@ export async function generateAvatarViaApi(
     audioInput = { assetId: audioAssetId };
   }
 
-  // 3) Create the talking-photo video driven by the audio.
+  // 3) Create the Avatar III render of the saved look, driven by the audio.
   const aspect = input.aspectRatio ?? "landscape";
-  const videoId = await createTalkingPhotoVideo(
-    photoAssetId,
+  const videoId = await createAvatarIiiVideo(
+    lookId,
     audioInput,
     aspect,
     `synthetic ${input.projectId} ${input.segmentId}`,
@@ -279,7 +415,15 @@ export async function generateAvatarViaApi(
     phase: "response",
     durationMs: Date.now() - t0,
     cost: { provider: "heygen_api", seconds: billedSeconds },
-    extra: { videoId, aspect, resolution: getEnv().HEYGEN_API_RESOLUTION },
+    extra: {
+      videoId,
+      aspect,
+      resolution: getEnv().HEYGEN_API_RESOLUTION,
+      engine: "avatar_iii",
+      avatarName,
+      lookId,
+      createdAvatar, // false = reused an existing (usually browser-created) avatar
+    },
   });
 
   return { videoUrl: up.publicUrl, accountId: "heygen-api", seconds: billedSeconds };

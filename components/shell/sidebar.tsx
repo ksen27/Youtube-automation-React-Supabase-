@@ -3,16 +3,21 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
-import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot, Image as ImageIcon } from "lucide-react";
+import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot, Image as ImageIcon, Megaphone } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// Three top-level products live in this one app:
+// Top-level products in this one app:
 //   Celebrity Videos — the sourced engine (edit real YouTube footage) at /dashboard
 //   AI Avatar        — the synthetic engine (AI-generated avatar videos) at /avatar
+//   Sales Pitch      — standalone tool: generate a sales-pitch video (avatar +
+//                      website scroll-recording) at /sales-pitch, then upload it
+//                      to an AI Avatar project. Kept SEPARATE from AI Avatar so
+//                      the two aren't confused (client 2026-07-21).
 //   Thumbnails       — YouTube thumbnail generation (Pikzels) at /thumbnails
 const NAV = [
   { href: "/dashboard", label: "Celebrity Videos", icon: FolderClosed },
   { href: "/avatar", label: "AI Avatar", icon: Bot },
+  { href: "/sales-pitch", label: "Sales Pitch", icon: Megaphone },
   { href: "/thumbnails", label: "Thumbnails", icon: ImageIcon },
   { href: "/settings", label: "Settings", icon: Settings },
 ];

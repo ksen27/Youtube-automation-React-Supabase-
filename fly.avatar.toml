@@ -109,6 +109,16 @@ primary_region = 'lhr'
   # each attempt. A crashed worker's account auto-frees after this. Default in
   # lib/env.ts is 900; set here only to override.
   # HEYGEN_ACCOUNT_LEASE_SECONDS = "900"
+  # Clip/image mix (client 2026-07-20 via Joey: "30-70 for the first 15 minutes,
+  # then all images for the last 10-15 minutes" — ai_clip cost reduction).
+  # Zone 1 (0-15 min): 1 clip / 2 images repeating ≈ 33:67, the closest evenly
+  # spaced run pattern to 30:70. Zone 2 (after 15 min): fraction 0 = every
+  # visual is a still. split_2/avatar blocks are untouched by this pass.
+  # Previous values: 180 / 2 / 2 / 0.25 (50:50 first 3 min, then 1-in-4 clips).
+  SYNTHETIC_CLIP_HEAVY_SECONDS = "900"
+  SYNTHETIC_INTRO_CLIP_RUN = "1"
+  SYNTHETIC_INTRO_IMAGE_RUN = "2"
+  SYNTHETIC_POST_INTRO_CLIP_FRACTION = "0"
   # Local scratch for downloads/screenshots (ephemeral is fine for HeyGen
   # automation artifacts).
   TMP_DIR = "/tmp/work"

@@ -17,7 +17,8 @@ export interface SyntheticProject {
   transcript: string | null;
   script_doc_url: string | null;
   avatar_mark_ranges: Array<{ start: number; end: number; model?: "avatar_iv" | "avatar_iii" }> | null;
-  // Sales-pitch video inserted near the 3:00 mark (migration 0025).
+  // Sales-pitch video inserted near the 3:00 mark (migration 0025). The user
+  // UPLOADS this here (generated separately by the standalone Sales Pitch tool).
   pitch_video_url: string | null;
   pitch_video_duration_seconds: number | null;
   pitch_video_insert_seconds: number;

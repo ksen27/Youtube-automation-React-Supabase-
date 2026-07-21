@@ -24,6 +24,7 @@ import { processSyntheticPlannerJob } from "./processors/synthetic/plannerProces
 import { processImageGenJob }         from "./processors/synthetic/imageGenProcessor";
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
+import { processPitchGenJob }         from "./processors/synthetic/pitchGenProcessor";
 import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
@@ -274,6 +275,10 @@ if (runSynthetic) {
   workers.push(startWorker(QUEUE_NAMES.imageGeneration,  processImageGenJob,         env.IMAGE_GEN_CONCURRENCY));
   workers.push(startWorker(QUEUE_NAMES.imageToVideo,     processImageToVideoJob,     env.IMAGE_TO_VIDEO_CONCURRENCY));
   workers.push(startWorker(QUEUE_NAMES.avatar,           processAvatarJob,           env.AVATAR_CONCURRENCY));
+  // AI-generated sales-pitch video (migration 0026). Concurrency 1: a pitch build
+  // drives a browser recording + a HeyGen render, so one at a time per machine
+  // keeps it from contending with the avatar pool for browser/CPU resources.
+  workers.push(startWorker(QUEUE_NAMES.pitchGen,         processPitchGenJob,         1));
   // Synthetic renders run HERE (on the avatar worker) rather than on the sourced
   // render slot, so an avatar render and a celebrity render proceed in parallel.
   // Concurrency 1: a render is a heavy multi-core FFmpeg job — one at a time per
@@ -304,7 +309,7 @@ const SWEEP_STALE_MS = 45 * 60_000; // 45 min
 const SOURCED_TYPES = ["search", "download", "clip", "match", "render", "script_clip", "analyze"];
 // "render" is in BOTH lists: the media_jobs type is "render" regardless of which
 // queue ran it, so the synthetic worker must sweep its own stalled renders too.
-const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar", "render"];
+const SYNTHETIC_TYPES = ["tts", "plan_synthetic", "image_gen", "image_to_video", "avatar", "pitch_gen", "render"];
 const sweepTypes =
   role === "sourced" ? SOURCED_TYPES : role === "synthetic" ? SYNTHETIC_TYPES : undefined;
 const sweepTimer = setInterval(() => {

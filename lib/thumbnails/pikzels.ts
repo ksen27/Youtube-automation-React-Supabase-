@@ -118,6 +118,14 @@ export function pikzelsErrorMessage(err: unknown): string {
       return `Pikzels is temporarily unavailable (HTTP ${err.status}). Please try generating again in a moment.`;
     }
     const snippet = (err.body ?? err.message).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    // A 422 GENERATION_REJECTED is Pikzels' content-moderation refusal — its raw
+    // message ("We couldn't process this request.") gives the user nothing to
+    // act on. Explain the real cause: prompts that put a NAMED real person in an
+    // explicit distressing/violent state (e.g. "crying", "shouting") are blocked.
+    // The fix is to soften the wording, not to retry the same prompt.
+    if (err.status === 422 || /generation_rejected/i.test(snippet)) {
+      return "Pikzels rejected this prompt (content moderation). This usually happens when the prompt shows a named real person in an explicit distressing or violent state (e.g. \"crying\", \"shouting\", \"terrified\"). Edit the prompt to use restrained wording — describe the drama through lighting, colour, and a serious/tense expression instead — then generate again.";
+    }
     return `Pikzels rejected the request (HTTP ${err.status}): ${snippet}`;
   }
   return err instanceof Error ? err.message : "generation failed";

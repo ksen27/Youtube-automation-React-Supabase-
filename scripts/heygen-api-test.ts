@@ -69,7 +69,7 @@ function usage(msg?: string): never {
     audioFilePath: isUrl ? undefined : audioArg,
     audioUrl: isUrl ? audioArg : undefined,
     aspectRatio: aspectArg as "landscape" | "portrait",
-    avatarModel: "avatar_iv" as const,
+    avatarModel: "avatar_iii" as const,
     heygenAvatarName: null,
   };
 

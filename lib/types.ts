@@ -257,7 +257,8 @@ export type MediaJobType =
   | "plan_synthetic"  // Gemini planner -> synthetic_segments[]
   | "avatar"          // HeyGen avatar video (Playwright automation)
   | "image_gen"       // 69labs nano-banana image (Flux fallback)
-  | "image_to_video"; // nano-banana image -> fal.ai Veo Fast (Kling fallback)
+  | "image_to_video"  // nano-banana image -> fal.ai Veo Fast (Kling fallback)
+  | "pitch_gen";      // AI-generated sales-pitch video (avatar half + website scroll-recording; migration 0026)
 export type MediaJobStatus = "queued" | "running" | "completed" | "failed";
 
 export interface MediaJob {

@@ -2407,6 +2407,134 @@ export async function degradeVideoLowFi(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal, undefined, opts.onProgress);
 }
 
+// AI-GENERATED SALES PITCH (migration 0026). Normalize ONE source video (the
+// HeyGen avatar clip, or the website scroll-recording .webm) into a canvas-sized
+// H.264 mp4 for the pitch concat. Unlike normalizeClip (which is -an, for the
+// silent render timeline), this KEEPS or SYNTHESIZES an audio track so the two
+// pitch parts can be concatenated with their own audio intact:
+//   • keepAudio=true  → copy the source's audio, re-encoded to AAC (the avatar
+//                       clip carries the pitch TTS narration).
+//   • keepAudio=false → attach a SILENT AAC track (the website scroll has no
+//                       audio, but the concat needs every part to have a matching
+//                       stream layout or it drops audio partway through).
+// scale-to-fit + pad keeps the real aspect ratio (a portrait avatar or an
+// oversized website capture is letterboxed, never stretched). The output codec
+// is a plain, widely-compatible H.264/AAC mp4 — this file is a standalone pitch
+// video (it becomes pitch_video_url), NOT a segment in the -c:v copy render
+// concat, so it does not need to match segmentVcodecArgs.
+export async function buildPitchClip(opts: {
+  inputPath: string;
+  outputPath: string;
+  keepAudio: boolean;
+  width?: number;
+  height?: number;
+  fps?: number;
+  // Trim this many seconds off the FRONT of the input (input-side -ss seek).
+  // Used for the website recording, whose front holds static top-of-page dead-
+  // air (page load + settle) before the scroll begins — the recorder reports the
+  // scroll-start offset so we open the clip on the motion, not the dead-air.
+  startSeconds?: number;
+  // Pin the output to EXACTLY this many seconds. The client rule is that the
+  // pitch always shows the website for a fixed window (default 10s) at the end,
+  // so the website clip must be exactly that long: if the (trimmed) recording is
+  // longer it's cut to length; if it's a touch shorter its last frame is held
+  // (tpad=clone) up to the target. Ignored when unset (natural length).
+  durationSeconds?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  const seek = opts.startSeconds && opts.startSeconds > 0 ? ["-ss", opts.startSeconds.toFixed(3)] : [];
+  const pinDur = opts.durationSeconds && opts.durationSeconds > 0 ? opts.durationSeconds : null;
+  // When pinning an exact duration, hold the last frame (tpad clone) so a
+  // slightly-short recording fills the full window, then the output-side -t caps
+  // it. When not pinning, no tpad and no -t.
+  const vfBase = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`;
+  const vf = pinDur ? `${vfBase},tpad=stop_mode=clone:stop_duration=${pinDur.toFixed(3)}` : vfBase;
+  const durArgs = pinDur ? ["-t", pinDur.toFixed(3)] : [];
+  const args: string[] = ["-y", "-threads", String(env.FFMPEG_THREADS)];
+  if (opts.keepAudio) {
+    // Input 0 supplies both video and its own audio. -ss before -i seeks the input.
+    args.push(...seek, "-i", opts.inputPath, "-vf", vf, "-c:a", "aac", "-b:a", "160k");
+  } else {
+    // Input 0 = video only (seeked); input 1 = a synthesized silent stereo track.
+    // With a pinned duration, -t caps both streams; otherwise -shortest keys the
+    // (infinite) silent track off the video length.
+    args.push(
+      ...seek, "-i", opts.inputPath,
+      "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+      "-vf", vf,
+      "-c:a", "aac", "-b:a", "160k",
+      ...(pinDur ? [] : ["-shortest"]),
+    );
+  }
+  args.push(
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "21",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    ...durArgs,
+    "-movflags", "+faststart",
+    opts.outputPath,
+  );
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
+// AI-GENERATED SALES PITCH (migration 0026). Concatenate the pitch parts (avatar
+// clip, then website scroll-recording) into ONE mp4, PRESERVING each part's own
+// audio. Uses the concat FILTER (not the demuxer) with a re-encode so parts that
+// differ slightly in codec params still join cleanly, and every part contributes
+// both its video AND audio to the output. All inputs must already be canvas-sized
+// with an audio track (produced by buildPitchClip), which the filter assumes.
+export async function concatPitchParts(opts: {
+  inputPaths: string[];
+  outputPath: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const env = getEnv();
+  const n = opts.inputPaths.length;
+  if (n === 0) throw new Error("concatPitchParts: no inputs");
+  const w = opts.width ?? 1280;
+  const h = opts.height ?? 720;
+  const fps = opts.fps ?? 30;
+  await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
+
+  const args: string[] = ["-y", "-threads", String(env.FFMPEG_THREADS)];
+  for (const p of opts.inputPaths) args.push("-i", p);
+  // Re-assert a common size/fps/sar per input so a mismatched part can't break
+  // the concat filter, then concat with v=1:a=1 so both streams flow through.
+  let filter = "";
+  for (let i = 0; i < n; i++) {
+    filter +=
+      `[${i}:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
+      `pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1[v${i}];` +
+      `[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}];`;
+  }
+  for (let i = 0; i < n; i++) filter += `[v${i}][a${i}]`;
+  filter += `concat=n=${n}:v=1:a=1[v][a]`;
+  args.push(
+    "-filter_complex", filter,
+    "-map", "[v]", "-map", "[a]",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "21",
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
+    "-c:a", "aac", "-b:a", "160k",
+    "-movflags", "+faststart",
+    opts.outputPath,
+  );
+  await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
+}
+
 function runFFmpeg(
   bin: string,
   args: string[],

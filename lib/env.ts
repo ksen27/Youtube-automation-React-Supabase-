@@ -912,6 +912,17 @@ const ServerEnvSchema = z.object({
   // canvas (1280×720) and keeps API credit cost down; bump to 1080p if the client
   // wants it and their plan allows.
   HEYGEN_API_RESOLUTION: z.enum(["720p", "1080p"]).default("720p"),
+  // NOTE on the render ENGINE (client 2026-07-20: Avatar IV too expensive, wants
+  // Avatar III everywhere): probed live 2026-07-21 — POST /v3/videos with
+  // type:"image" (one-shot uploaded photo) REJECTS an `engine` field and always
+  // renders Avatar IV; engine selection exists ONLY on type:"avatar" (a saved
+  // avatar_id). The API fallback therefore resolves/creates a saved photo-avatar
+  // (named va-<proj8>-<sha6>, shared with the browser flow) and renders it with
+  // engine avatar_iii — see heygen-api.ts.
+  // Ceiling (seconds) on waiting for a newly created photo avatar's TRAINING to
+  // complete before the render can start. Only hit when no browser-created
+  // avatar exists to reuse; photo-avatar training is usually well under a minute.
+  HEYGEN_API_AVATAR_TRAIN_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
   // Hard ceiling (seconds) on the API render poll loop, so a stuck HeyGen-side
   // render fails in bounded time instead of hanging the avatar job.
   HEYGEN_API_RENDER_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(900),

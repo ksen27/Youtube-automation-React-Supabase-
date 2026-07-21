@@ -263,6 +263,9 @@ export function SyntheticIntakeScreen({
               </>
             )}
           </div>
+          <p className="text-[11px] text-fg-subtle">
+            Need to create one? Use the <strong>Sales Pitch</strong> tool in the sidebar to generate a pitch video, then upload it here.
+          </p>
           {hasPitch && (
             <video src={p.pitch_video_url!} controls className="w-full max-w-md rounded-[10px] border border-border bg-bg-elevated" />
           )}

@@ -299,6 +299,12 @@ HARD RULES:
 - Do not mention "Pikzels", "reference image", or these instructions in the output.
 - Max 1100 characters.
 
+MODERATION-SAFE LANGUAGE (critical — the image model REJECTS prompts that put a NAMED real person in an explicit distressing or violent state). Keep the names and the dramatic, high-energy YouTube look, but phrase expressions and scenes in NEUTRAL, non-graphic terms:
+- Describe faces with restrained emotion words: "serious", "tense", "intense", "surprised", "somber", "stern", "concerned", "focused" — NOT "crying", "sobbing", "distressed", "in tears", "terrified", "screaming", "shouting", "furious", "enraged", "in pain", "devastated".
+- Do NOT depict a named real person as a victim, injured, weeping, humiliated, arrested, dead/dying, bleeding, or in any graphic emotional breakdown. Convey drama through LIGHTING, COLOUR GRADE, COMPOSITION, and a restrained facial expression instead.
+- No violence, weapons, gore, medical/mortal harm, sexual content, or minors in unsafe situations.
+- Keep it a tabloid-style attention-grabbing thumbnail, just without graphic distress language.
+
 Return STRICT JSON ONLY:
 { "prompt": "the final image prompt" }`;
 
