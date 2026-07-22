@@ -43,7 +43,8 @@ export function NewPitchForm() {
   }
 
   const canSubmit =
-    website.trim().length > 0 && !!avatarUrl && script.trim().length > 0 && !submitting && !uploading;
+    website.trim().length > 0 && !!avatarUrl && script.trim().length > 0 &&
+    voiceId.trim().length > 0 && !submitting && !uploading;
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -126,9 +127,9 @@ export function NewPitchForm() {
 
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-1.5">
-          <Label htmlFor="pv-voice">69labs voice ID <span className="text-fg-subtle">(optional)</span></Label>
-          <Input id="pv-voice" value={voiceId} onChange={(e) => setVoiceId(e.target.value)} placeholder="match your video's voice" />
-          <p className="text-[11px] text-fg-subtle">Leave blank for the default voice.</p>
+          <Label htmlFor="pv-voice">69labs voice ID</Label>
+          <Input id="pv-voice" value={voiceId} onChange={(e) => setVoiceId(e.target.value)} placeholder="e.g. ngiiW8FFLIdMew1cqwSB" />
+          <p className="text-[11px] text-fg-subtle">Required — the pitch is narrated in this voice. Use the same voice as your video.</p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="pv-avatar-name">HeyGen avatar name <span className="text-fg-subtle">(optional)</span></Label>
@@ -142,6 +143,7 @@ export function NewPitchForm() {
           {submitting ? "Starting…" : "Generate pitch"}
         </Button>
         {!avatarUrl && <span className="text-xs text-fg-subtle">Upload an avatar image</span>}
+        {avatarUrl && voiceId.trim().length === 0 && <span className="text-xs text-fg-subtle">Enter a 69labs voice ID</span>}
         {error && <span className="text-xs text-danger">{error}</span>}
       </div>
     </form>

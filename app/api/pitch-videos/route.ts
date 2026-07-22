@@ -19,7 +19,9 @@ const CreateSchema = z.object({
   websiteUrl: z.string().trim().min(1).max(2000),
   avatarImageUrl: z.string().trim().url().max(2000),
   script: z.string().trim().min(1).max(5000),
-  ttsVoiceId: z.string().trim().max(200).optional(),
+  // Required: the pitch voiceover is generated in this 69labs voice (the avatar
+  // is then lip-synced to it), so the caller must always supply a voice.
+  ttsVoiceId: z.string().trim().min(1).max(200),
   avatarName: z.string().trim().max(200).optional(),
 });
 

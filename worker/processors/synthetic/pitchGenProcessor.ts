@@ -6,6 +6,7 @@ import type { PitchGenJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadFile, ensureTmp, safeUnlink, publicUrlForKey } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
+import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
 import { generateVoice } from "@/lib/synthetic/sixtynine-labs";
 import { recordWebsiteScroll } from "@/lib/synthetic/website-recorder";
 import { logProviderCall } from "@/lib/synthetic/cost";
@@ -110,27 +111,50 @@ export async function processPitchGenJob(
     );
     const imageBytes = Buffer.from(await imgRes.arrayBuffer());
 
-    // generateAvatar takes image+audio directly and returns an mp4 URL; it never
-    // reads a DB row, so the id args are just for its logging + R2 asset keys.
-    const avatarResult = await generateAvatar(
-      {
-        projectId: pitchVideoId,
-        segmentId: `pitch-${ts}`,
-        jobId: pitchVideoId,
-        avatarImageUrl,
-        script,
-        audioFilePath: audioPath,
-        audioUrl: audioUrl ?? undefined,
-        audioDurationSeconds: audioSeconds || undefined,
-        aspectRatio: "landscape",
-        avatarModel: "avatar_iii",
-        heygenAvatarName: row.avatar_name ?? null,
-      },
-      imageBytes,
-    );
-    await logJob(logScope, "pitch.avatar_rendered", {
-      accountId: avatarResult.accountId, seconds: avatarResult.seconds,
-    });
+    // Avatar generation input. It's AUDIO-DRIVEN: the clip lip-syncs to the pitch
+    // TTS we generated above (audioFilePath/audioUrl), NOT HeyGen's own TTS — so
+    // the avatar speaks the pitch script in the chosen 69labs voice. generateAvatar*
+    // never reads a DB row; the id args are just for logging + R2 asset keys.
+    const avatarInput = {
+      projectId: pitchVideoId,
+      segmentId: `pitch-${ts}`,
+      jobId: pitchVideoId,
+      avatarImageUrl,
+      script,
+      audioFilePath: audioPath,
+      audioUrl: audioUrl ?? undefined,
+      audioDurationSeconds: audioSeconds || undefined,
+      aspectRatio: "landscape" as const,
+      avatarModel: "avatar_iii" as const,
+      heygenAvatarName: row.avatar_name ?? null,
+    };
+
+    // API-FIRST (client 2026-07-21): render the pitch avatar via the HeyGen API
+    // directly (audio-driven Avatar III). The API path avoids the browser pool +
+    // Cloudflare/session fragility that fails on this worker; it's the same
+    // audio-driven render, just through the official API. Fall back to the browser
+    // pool only if the API is unavailable/errors, so a pitch still renders.
+    let avatarResult;
+    if (heygenApiFallbackEnabled()) {
+      try {
+        avatarResult = await generateAvatarViaApi(avatarInput, imageBytes);
+        await logJob(logScope, "pitch.avatar_rendered", { via: "api", seconds: avatarResult.seconds });
+      } catch (apiErr) {
+        await logJob(logScope, "pitch.avatar_api_failed_fallback_browser", {
+          err: (apiErr as Error).message?.slice(0, 200),
+        });
+        avatarResult = await generateAvatar(avatarInput, imageBytes);
+        await logJob(logScope, "pitch.avatar_rendered", {
+          via: "browser", accountId: avatarResult.accountId, seconds: avatarResult.seconds,
+        });
+      }
+    } else {
+      // API not configured (no HEYGEN_API_KEY / HEYGEN_API_FALLBACK) — browser pool.
+      avatarResult = await generateAvatar(avatarInput, imageBytes);
+      await logJob(logScope, "pitch.avatar_rendered", {
+        via: "browser", accountId: avatarResult.accountId, seconds: avatarResult.seconds,
+      });
+    }
 
     // Download the avatar mp4 + normalize to canvas (KEEP its audio = narration).
     const avatarRaw = path.join(tmp, `avatar_raw_${ts}.mp4`);

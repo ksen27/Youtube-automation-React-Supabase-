@@ -37,17 +37,19 @@ const ServerEnvSchema = z.object({
   // CX is the Programmable Search Engine ID from programmablesearchengine.google.com.
   GOOGLE_SEARCH_API_KEY: z.string().optional(),
   GOOGLE_SEARCH_CX: z.string().optional(),
-  // Use the "-latest" alias so a Google model retirement can't 404 us: the pinned
-  // gemini-2.5-flash / gemini-2.0-flash were retired (generateContent returns 404
-  // "no longer available") even though ListModels still shows them. -latest always
-  // resolves to the current stable flash model.
-  GEMINI_MODEL: z.string().default("gemini-flash-latest"),
-  // Secondary model the planner falls back to when GEMINI_MODEL keeps throwing
-  // retryable 503/429 "high demand" errors after its full retry budget. A demand
-  // spike on one Gemini model usually does NOT hit a different model, so re-running
-  // the call on the lite alias turns a Google outage into a slightly slower success.
-  // Set empty to disable the fallback.
-  GEMINI_FALLBACK_MODEL: z.string().default("gemini-flash-lite-latest"),
+  // Pinned to a model verified to accept thinkingConfig.thinkingBudget: 0. The
+  // previous "-latest" alias repointed (2026-07) to a Gemini-3-generation model
+  // that 400s "invalid argument" on thinkingBudget: 0 — and a 400 is
+  // non-retryable, so every planner/scoreClips call hard-failed without ever
+  // reaching the fallback. If Google retires this pin (404 "no longer
+  // available" — happened before to gemini-2.0-flash), withGeminiModelFallback
+  // treats the retirement as fallback-eligible and moves to the alias below.
+  GEMINI_MODEL: z.string().default("gemini-2.5-flash"),
+  // Secondary model for primary-model outages (503/429 after the full retry
+  // budget) and retirements (404). The -latest alias always resolves to a live
+  // model; when that model rejects thinkingConfig, getModel retries the call
+  // once with the thinkingConfig stripped. Set empty to disable the fallback.
+  GEMINI_FALLBACK_MODEL: z.string().default("gemini-flash-latest"),
   DEEPGRAM_API_KEY: z.string().optional(),
   DEEPGRAM_MODEL: z.string().default("nova-3"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
@@ -496,6 +498,15 @@ const ServerEnvSchema = z.object({
   // a UK residential proxy will NOT lift the block. Empty + no pool = direct
   // egress (works only from a supported region, e.g. local dev in the US).
   GEMINI_IMAGE_PROXY: z.string().optional(),
+  // HARD monthly cap on Gemini-fallback image generations (client cost guard,
+  // 2026-07-22: a Gemini billing spike while the 69labs pool was out of credits
+  // — the client asked for a ~300-image ceiling with a warning). Counted in
+  // Redis per calendar month across the whole cluster; only SUCCESSFUL
+  // generations consume budget. At the cap the Gemini fallback refuses (the
+  // caller then tries fal.ai / surfaces the 69labs error), and a loud
+  // "gemini.image.budget" log fires from 80% onward. 0 disables the Gemini
+  // fallback outright; raise the value (and redeploy) to lift the cap.
+  GEMINI_IMAGE_MONTHLY_CAP: z.coerce.number().int().nonnegative().default(300),
   // HeyGen avatar automation (Playwright — NOT the API, per spec).
   HEYGEN_BASE_URL: z.string().url().default("https://app.heygen.com"),
   // 64-hex-char (32-byte) AES-256-GCM key encrypting heygen_accounts secrets
@@ -766,20 +777,20 @@ const ServerEnvSchema = z.object({
   // illustrative still) is chosen freely by Gemini and routinely overruns — one
   // 115-block plan came back with 50 split_2 (~43%). This caps split_2 at this
   // FRACTION of total blocks; the excess (lowest-priority first) is demoted to a
-  // plain 'image'. Client 2026-07-07: split_2 should sit at ~10-15% of the video,
-  // so this CEILING is 0.15 and SYNTHETIC_SPLIT2_MIN_FRACTION below is the 0.10
-  // floor — together they hold split_2 in the 10-15% band.
+  // plain 'image'. Client 2026-07-07 asked for ~10-15%; client 2026-07-22 asked
+  // to REDUCE split_2 again, so the band is now 5-8%: this CEILING is 0.08 and
+  // SYNTHETIC_SPLIT2_MIN_FRACTION below is the 0.05 floor.
   // Set to 0 to demote EVERY split_2 to image (no presenter-beside-image layout);
   // set to 1 to disable the cap (back to Gemini's unrestricted choice).
-  SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.15),
-  // FLOOR of the 10-15% band (client 2026-07-07). The cap KEEPS this fraction of
+  SYNTHETIC_SPLIT2_MAX_FRACTION: z.coerce.number().min(0).max(1).default(0.08),
+  // FLOOR of the 5-8% band (client 2026-07-22). The cap KEEPS this fraction of
   // total blocks as split_2 rather than demoting below it, so a plan with plenty
   // of split_2 lands at ~10-15%, not scraped down to a token few. NOTE: the capper
   // only DEMOTES excess split_2; it never PROMOTES images, so this is a
   // "don't-demote-below" guarantee — if Gemini chose fewer than 10%, the plan keeps
   // whatever it chose (we don't force the layout onto unsuitable content). 0
   // disables the fractional floor (fall back to the fixed MIN_KEEP count).
-  SYNTHETIC_SPLIT2_MIN_FRACTION: z.coerce.number().min(0).max(1).default(0.10),
+  SYNTHETIC_SPLIT2_MIN_FRACTION: z.coerce.number().min(0).max(1).default(0.05),
   // Minimum split_2 blocks to KEEP when Gemini chose at least one (client:
   // "why is split_2 not appeared?"). The cap above trims excess split_2; this
   // floor guarantees a few survive the later passes so the layout still shows
@@ -793,7 +804,9 @@ const ServerEnvSchema = z.object({
   // A split_2 is kept only when at least this many non-split_2 blocks sit
   // between it and the previously kept one; the ones in between are demoted to
   // plain 'image'. 0 disables spacing (count cap only); 1 = never back-to-back.
-  SYNTHETIC_SPLIT2_MIN_GAP: z.coerce.number().int().nonnegative().default(3),
+  // Raised 3 → 5 with the 2026-07-22 band reduction so the fewer kept split_2
+  // also spread further apart instead of pairing up in one section.
+  SYNTHETIC_SPLIT2_MIN_GAP: z.coerce.number().int().nonnegative().default(5),
   // Maximum DURATION for a single split_2 block (client 2026-07-03: a 38s
   // split_2 — Gemini lumped 5 sentences into one block and, unlike image /
   // ai_clip, nothing carves a split_2, so the same still held beside the

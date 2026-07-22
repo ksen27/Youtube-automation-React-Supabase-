@@ -10,7 +10,39 @@ function getModel(modelId?: string) {
   const env = getEnv();
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
   const genai = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-  return genai.getGenerativeModel({ model: modelId ?? env.GEMINI_MODEL });
+  const resolvedId = modelId ?? env.GEMINI_MODEL;
+  const model = genai.getGenerativeModel({ model: resolvedId });
+  // Gemini-3-generation models (what the "-latest" aliases resolve to since
+  // 2026-07) reject thinkingConfig.thinkingBudget: 0 with a blanket
+  // 400 INVALID_ARGUMENT — thinking can no longer be disabled that way.
+  // Callers set thinkingBudget: 0 to stop gemini-2.5-flash burning its output
+  // budget on hidden reasoning; on a model that refuses the knob the right
+  // move is to drop it and accept the model's default, not hard-fail the job
+  // (a 400 is non-retryable, so it would skip the model fallback entirely).
+  // Intercept generateContent: when a request carrying a thinkingConfig 400s,
+  // retry once with the thinkingConfig stripped.
+  const orig = model.generateContent.bind(model);
+  model.generateContent = (async (req: Parameters<typeof orig>[0]) => {
+    try {
+      return await orig(req);
+    } catch (e) {
+      const msg = (e as Error)?.message ?? "";
+      const cfg =
+        typeof req === "object" && req !== null && "generationConfig" in req
+          ? (req.generationConfig as Record<string, unknown> | undefined)
+          : undefined;
+      if (!cfg?.thinkingConfig || !msg.includes("400") || !/invalid argument/i.test(msg)) {
+        throw e;
+      }
+      const { thinkingConfig: _drop, ...cleaned } = cfg;
+      console.warn(JSON.stringify({
+        msg: "gemini.thinking_config_stripped",
+        model: resolvedId,
+      }));
+      return await orig({ ...(req as object), generationConfig: cleaned } as unknown as typeof req);
+    }
+  }) as typeof model.generateContent;
+  return model;
 }
 
 // Exported accessor so other modules (e.g. the synthetic planner) can reuse the
@@ -43,6 +75,16 @@ export function isRetryableGeminiError(err: unknown): boolean {
     // model. Callers signal it by throwing an error tagged GEMINI_TRUNCATED.
     /GEMINI_TRUNCATED/.test(msg)
   );
+}
+
+// Google retires models with a 404 "no longer available" from generateContent
+// while ListModels still shows them (bit us for gemini-2.0-flash and
+// gemini-2.5-flash-lite). Not an outage — retrying the same model is pointless
+// — but it IS a reason to try the fallback alias, which always resolves to a
+// live model. Checked by withGeminiModelFallback alongside the outage check.
+export function isModelRetiredError(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? String(err);
+  return msg.includes("404") && /no longer available/i.test(msg);
 }
 
 // Parse the server-mandated retry delay from a 429 quota error. Gemini's
@@ -130,8 +172,15 @@ export async function withGeminiModelFallback<T>(
     return { result, model: primary };
   } catch (e) {
     const fallback = env.GEMINI_FALLBACK_MODEL?.trim();
-    // Only fall back for a genuine outage, and only if a DIFFERENT model is set.
-    if (!fallback || fallback === primary || !isRetryableGeminiError(e)) throw e;
+    // Only fall back for a genuine outage OR a retired primary model, and only
+    // if a DIFFERENT model is set.
+    if (
+      !fallback ||
+      fallback === primary ||
+      !(isRetryableGeminiError(e) || isModelRetiredError(e))
+    ) {
+      throw e;
+    }
     console.warn(JSON.stringify({
       msg: "gemini.fallback",
       op: label,

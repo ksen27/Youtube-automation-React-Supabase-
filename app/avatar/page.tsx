@@ -1,6 +1,7 @@
 import Link from "next/link";
-import { Bot } from "lucide-react";
+import { Bot, AlertTriangle } from "lucide-react";
 import { getServerSupabase, isSupabaseConfigured } from "@/lib/supabase/server";
+import { getGeminiImageBudgetStatus } from "@/lib/synthetic/gemini-image";
 import {
   Card,
   CardContent,
@@ -74,10 +75,43 @@ function badgeVariantFor(s: string): "default" | "secondary" | "success" | "warn
 }
 
 export default async function AvatarDashboardPage() {
-  const projects = await loadProjects();
+  const [projects, geminiBudget] = await Promise.all([
+    loadProjects(),
+    getGeminiImageBudgetStatus(),
+  ]);
 
   return (
     <div className="px-6 lg:px-8 py-8 max-w-7xl mx-auto space-y-10">
+      {/* Gemini image fallback budget — the paid safety net behind 69labs.
+          Amber from 80% of the monthly cap, red at the cap (fallback refusing,
+          so image failures surface instead of billing Google). Hidden below
+          the warning threshold and when Redis is unreachable. */}
+      {geminiBudget && (geminiBudget.warning || geminiBudget.exhausted) && (
+        <div
+          className={`flex items-start gap-3 rounded-[14px] border p-4 text-sm ${
+            geminiBudget.exhausted
+              ? "border-danger/50 bg-danger/10 text-danger"
+              : "border-amber-500/40 bg-amber-500/10 text-amber-300"
+          }`}
+        >
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <div>
+            <p className="font-medium">
+              {geminiBudget.exhausted
+                ? `Gemini image budget exhausted (${geminiBudget.used}/${geminiBudget.cap} this month)`
+                : `Gemini image budget warning: ${geminiBudget.used}/${geminiBudget.cap} images used this month`}
+            </p>
+            <p className="mt-0.5 opacity-80">
+              These are paid Gemini generations used only when the 69labs image pool fails
+              (usually out of credits).{" "}
+              {geminiBudget.exhausted
+                ? "New fallback generations are now blocked — top up 69labs credits, or raise GEMINI_IMAGE_MONTHLY_CAP if the extra Gemini spend is intended."
+                : "Check the 69labs account credits — heavy fallback use means the primary pool is failing."}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Hero */}
       <section className="relative overflow-hidden rounded-[18px] border border-border bg-bg-elevated p-8">
         <div

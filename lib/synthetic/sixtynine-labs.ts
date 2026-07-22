@@ -414,32 +414,48 @@ async function generateNanoBananaImage(
   //     with backoff instead of failing the whole segment, and
   //   - use a 2s base cadence (up from 1s) to stay under the rate budget.
   const deadline = Date.now() + c.imagePollTimeoutMs;
-  const pollIntervalMs = 2000;
+  // 5s cadence (was 2s). The status endpoint's rate limit is PER API KEY and
+  // separate from the generation tier: on the single mega account (2026-07-22)
+  // the whole cluster's polls land on one key, so demand must be a fraction of
+  // what the 3-key pool sustained. Images take ~40s+ on this tier — a 5s tick
+  // adds negligible latency while cutting poll demand by 60%.
+  const pollIntervalMs = 5000;
   while (Date.now() < deadline) {
     // CRITICAL: a 429 on the STATUS endpoint must NOT fail a job that is still
-    // generating. The status GET is rate-limited by request rate (separate from
-    // the generation-concurrency cap), and with several jobs polling at once —
-    // each also paying the backup-key failover round-trip — the combined poll
-    // rate trips 429 {"code":"TOO_MANY_REQUESTS"}. The default 3-attempt retry
-    // budget (~5s) gave up while the image was fine, BullMQ resubmitted a NEW
-    // 69labs job, and the abandoned one kept holding a slot → the phantom
-    // "concurrent limit reached (7)". So give the poll a budget that rides out
-    // 429 for most of the poll window (8 attempts ≈ 1+3+9+27...s of backoff)
-    // instead of failing a healthy generation on a transient rate-limit.
-    // GLOBAL poll-rate gate (Redis token bucket). The status endpoint is rate-
-    // limited by REQUEST RATE separately from generation; with many jobs polling
-    // at once the combined rate tripped 429 "TOO_MANY_REQUESTS". Take a cluster-
-    // wide token before each poll so total polls/sec stay under budget no matter
-    // how many jobs are in flight. Blocks briefly when the bucket is empty.
+    // generating — and must not STALL the lane either. The old strategy (8
+    // withHttpRetry attempts, exponential backoff to ~12 min) parked every
+    // in-flight job in escalating sleeps during a sustained 429 window, which
+    // read as "generation stopped" (2026-07-22 mega-cutover storm). Strategy
+    // now: the retry budget handles transient 5xx/network blips only (3
+    // attempts), and a 429 that survives it is treated as a MISSED TICK — wait
+    // one cadence and poll again, bounded by the overall deadline. A healthy
+    // generation is never failed or back-off-parked because the poll window is
+    // momentarily full.
     const env = getEnv();
-    await acquirePollToken("image.status", env.SIXTYNINE_POLL_RATE_PER_SEC, env.SIXTYNINE_POLL_BURST);
-    const statusRes = await withHttpRetry("69labs.image.status", () =>
-      fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
-        headers: authOnly,
-        timeoutMs: 30_000,
-      }),
-      { attempts: 8, baseMs: 1000 },
-    );
+    // The token is taken INSIDE the retried closure so every attempt — retries
+    // included — pays the global rate gate. With it outside (the same storm),
+    // a 429'd poll's retries hit the endpoint UNTHROTTLED and kept the 429s
+    // alive long after the bucket had drained.
+    let statusRes: Awaited<ReturnType<typeof fetchOrThrow>>;
+    try {
+      statusRes = await withHttpRetry("69labs.image.status", async () => {
+        await acquirePollToken("image.status", env.SIXTYNINE_POLL_RATE_PER_SEC, env.SIXTYNINE_POLL_BURST);
+        return fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
+          headers: authOnly,
+          timeoutMs: 30_000,
+        });
+      },
+        { attempts: 3, baseMs: 1000 },
+      );
+    } catch (e) {
+      if (/-> 429/.test((e as Error).message ?? "")) {
+        await new Promise((r) =>
+          setTimeout(r, Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5))),
+        );
+        continue;
+      }
+      throw e;
+    }
     const st = (await statusRes.json()) as ImageStatusResponse;
     if (st.status === "COMPLETED") break;
     if (st.status === "FAILED" || st.status === "CANCELLED") {

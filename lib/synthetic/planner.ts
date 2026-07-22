@@ -2225,17 +2225,18 @@ export async function buildSyntheticTimeline(input: {
   {
     const maxFraction = getEnv().SYNTHETIC_SPLIT2_MAX_FRACTION;
     const minGap = getEnv().SYNTHETIC_SPLIT2_MIN_GAP;
-    // 10-15% BAND (client 2026-07-07). maxFraction (0.15) is the ceiling; the floor
-    // is the LARGER of the fixed MIN_KEEP count and MIN_FRACTION (0.10) of total
-    // blocks — so a plan with plenty of split_2 settles at ~10-15% instead of being
-    // scraped to a token few, while a short video still keeps a couple when 10%
-    // rounds below the fixed count. This only holds split_2 Gemini already chose
-    // (the capper demotes excess, never promotes), so it's a don't-demote-below
-    // floor, not a forced minimum. PRECEDENCE: the MIN_GAP spacing rule still wins
-    // over the floor — a heavily CLUSTERED section can land below 10% because
-    // spreading a clump matters more to the client than hitting the exact band
-    // (they explicitly rejected consecutive split_2). In a normally-spread video
-    // the band binds and split_2 settles at ~10-15%.
+    // FRACTION BAND (5-8% since 2026-07-22; was 10-15% per 2026-07-07 — the
+    // client asked to reduce split_2 again). maxFraction is the ceiling; the
+    // floor is the LARGER of the fixed MIN_KEEP count and MIN_FRACTION of total
+    // blocks — so a plan with plenty of split_2 settles inside the band instead
+    // of being scraped to a token few, while a short video still keeps a couple
+    // when the fraction rounds below the fixed count. This only holds split_2
+    // Gemini already chose (the capper demotes excess, never promotes), so it's
+    // a don't-demote-below floor, not a forced minimum. PRECEDENCE: the MIN_GAP
+    // spacing rule still wins over the floor — a heavily CLUSTERED section can
+    // land below the floor because spreading a clump matters more to the client
+    // than hitting the exact band (they explicitly rejected consecutive
+    // split_2). In a normally-spread video the band binds.
     const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
     const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
     const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
@@ -2496,16 +2497,17 @@ export async function buildSyntheticTimeline(input: {
   }
 
   // split_2 FLOOR. Gemini sometimes returns FAR fewer split_2 than the client's
-  // 10-15% band wants — on a 300-part video it routinely picks just 2-6, so the
+  // band wants — on a 300-part video it routinely picks just 2-6, so the
   // layout barely appears (client: "the split count is only 2 or 10 although
   // there are 250 parts"). Promote evenly-spaced post-intro 'image' blocks up to
   // the SAME band floor the cap pass uses — max(MIN_KEEP, ceil(total *
-  // MIN_FRACTION)) — so a long video reaches ~10% split_2 instead of the fixed
-  // count of 2. Runs AFTER the visual balance so the balance pass can't flip a
-  // promotion back to image. The cap pass (which only DEMOTES) enforces the
-  // upper 15% edge; this promoter enforces the lower 10% edge. Both must use the
-  // fractional floor or the band only binds from one side (the bug that let long
-  // videos sit at <2% split_2).
+  // MIN_FRACTION)) — so a long video reaches the band floor instead of the
+  // fixed count of 2. Runs AFTER the visual balance so the balance pass can't
+  // flip a promotion back to image. The cap pass (which only DEMOTES) enforces
+  // the band's upper edge (MAX_FRACTION); this promoter enforces the lower edge
+  // (MIN_FRACTION, 5% since 2026-07-22). Both must use the fractional floor or
+  // the band only binds from one side (the bug that let long videos sit at <2%
+  // split_2).
   {
     const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
     const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
