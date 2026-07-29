@@ -431,10 +431,28 @@ export async function ensurePitchTimelineItem(projectId: string): Promise<void> 
   });
 }
 
+// Marker merged into a segment's metadata when its asset came from the reusable
+// asset library (migration 0030) instead of a fresh provider generation. The
+// review screen reads segment.metadata.reused to show a "Reused" badge, so the
+// user (and client) can see which assets were fetched vs generated.
+export interface ReusedMarker {
+  // 'exact' = normalized-prompt hash hit; 'semantic' = embedding NN hit.
+  via: "exact" | "semantic";
+  // cosine similarity (1 for exact hits).
+  similarity: number;
+  // the generated_assets row the asset was reused from.
+  assetId: string;
+}
+
 // Convenience: set a segment terminal state + (optionally) its media_job.
+//
+// `reused`, when passed, is MERGED into the segment's metadata (preserving the
+// existing keys like mediaJobId) so the review screen can badge the asset as
+// reused-from-library. A read-modify-write, only performed when reused is set.
 export async function finishSegment(
   segmentId: string,
   patch: Partial<Pick<SyntheticSegment, "status" | "image_url" | "video_url" | "right_image_url" | "provider" | "error">>,
+  reused?: ReusedMarker,
 ): Promise<void> {
   const sb = getServerSupabase();
 
@@ -449,6 +467,20 @@ export async function finishSegment(
     patch.right_image_url !== undefined;
 
   const finalPatch: Record<string, unknown> = { ...patch };
+
+  // Merge the reused marker into the segment's EXISTING metadata (which holds
+  // mediaJobId from dispatchSegments) so the review screen can badge it without
+  // clobbering the correlation id. Read-modify-write only when reused is set.
+  if (reused) {
+    const { data: curMeta } = await sb
+      .from("synthetic_segments")
+      .select("metadata")
+      .eq("id", segmentId)
+      .single();
+    const existing = (curMeta?.metadata as Record<string, unknown> | null) ?? {};
+    finalPatch.metadata = { ...existing, reused };
+  }
+
   if (setsAsset) {
     const { data: cur } = await sb
       .from("synthetic_segments")

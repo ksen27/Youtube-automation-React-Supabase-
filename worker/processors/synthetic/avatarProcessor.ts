@@ -130,7 +130,7 @@ async function generateSplitRightImage(
       similarity: Number(reuse.similarity.toFixed(4)),
       assetId: reuse.id,
     });
-    await finishSegment(segmentId, { right_image_url: reuse.assetUrl });
+    await finishSegment(segmentId, { right_image_url: reuse.assetUrl }, { via: reuse.via, similarity: reuse.similarity, assetId: reuse.id });
     return;
   }
   await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });

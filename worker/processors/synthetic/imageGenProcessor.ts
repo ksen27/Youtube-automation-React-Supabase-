@@ -94,7 +94,7 @@ export async function processImageGenJob(
       provider: reuse.provider ?? "library_reuse",
       error: null,
       ...(isSplitBlock ? { right_image_url: reuse.assetUrl } : { image_url: reuse.assetUrl }),
-    });
+    }, { via: reuse.via, similarity: reuse.similarity, assetId: reuse.id });
     await setMediaJob(mediaJobId, {
       status: "completed",
       progress: 100,

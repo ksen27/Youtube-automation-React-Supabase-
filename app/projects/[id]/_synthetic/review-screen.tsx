@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2, Images, History, RotateCcw } from "lucide-react";
+import { RefreshCw, Trash2, Save, Film, Sparkles, Volume2, Loader2, Play, Maximize2, Images, History, RotateCcw, Recycle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -487,6 +487,9 @@ function SegmentRow({
   const history = segment.asset_history ?? [];
 
   const thumb = thumbUrl(segment);
+  // Reused-from-library marker (worker sets segment.metadata.reused on a library
+  // hit). Drives the "Reused" badge below. Narrowed from the loose metadata bag.
+  const reused = segment.metadata?.reused;
   // A stuck segment is 'generating' in the DB but its render is dead — surface it
   // like a failure (destructive badge, "stuck" label, Retry) rather than a live
   // spinner. isSpinning is the genuine in-flight case (generating, not stuck).
@@ -610,6 +613,18 @@ function SegmentRow({
             <span className="text-xs tabular-nums text-fg-subtle">#{segment.position + 1}</span>
             <Badge variant="outline">{segment.block_type}</Badge>
             <Badge variant={statusVariant as "success" | "destructive" | "info" | "secondary"}>{isStuck ? "stuck" : segment.status}</Badge>
+            {/* Reused-from-library badge (migration 0030): this asset was fetched
+                from a prior generation instead of being generated fresh — a cost
+                saving. Shows the match type + similarity so the reuse is auditable. */}
+            {reused && (
+              <Badge
+                variant="success"
+                className="gap-1"
+                title={`Fetched from the asset library (${reused.via} match, ${(reused.similarity * 100).toFixed(1)}% similar) instead of generating — no provider cost.`}
+              >
+                <Recycle className="h-3 w-3" /> Reused
+              </Badge>
+            )}
             <span className="text-[11px] text-fg-subtle tabular-nums">{segment.duration.toFixed(1)}s</span>
             {segment.provider && <span className="text-[11px] text-fg-subtle">via {segment.provider}</span>}
           </div>

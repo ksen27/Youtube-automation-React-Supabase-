@@ -55,10 +55,20 @@ export interface SyntheticSegmentRow {
   right_image_url: string | null;
   provider: string | null;
   error: string | null;
-  metadata: Record<string, unknown>;
+  // metadata.reused (set by the worker when the asset came from the reusable
+  // asset library, migration 0030) drives the "Reused" badge; see ReusedMarker.
+  metadata: Record<string, unknown> & { reused?: ReusedMarker };
   // Prior asset versions (newest last), preserved on each regenerate so the
   // review screen can preview + restore them. Empty for never-regenerated rows.
   asset_history?: AssetVersion[] | null;
+}
+
+// Present on segment.metadata.reused when the asset was fetched from the
+// cross-project library instead of freshly generated (a cost saving).
+export interface ReusedMarker {
+  via: "exact" | "semantic";
+  similarity: number;
+  assetId: string;
 }
 
 export interface AssetVersion {

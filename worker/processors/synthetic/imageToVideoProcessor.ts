@@ -82,7 +82,7 @@ export async function processImageToVideoJob(
         ...(clipReuse.sourceImageUrl && !seg.image_url ? { image_url: clipReuse.sourceImageUrl } : {}),
         provider: clipReuse.provider ?? "library_reuse",
         error: null,
-      });
+      }, { via: clipReuse.via, similarity: clipReuse.similarity, assetId: clipReuse.id });
       await setMediaJob(mediaJobId, {
         status: "completed",
         progress: 100,
