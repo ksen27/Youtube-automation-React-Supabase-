@@ -89,7 +89,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // Keep the current asset urls in place — finishSegment archives them into
   // asset_history before writing the new one, and the old asset stays visible
   // until the new one lands. Only flip status + clear error.
-  await resetSegmentForRegen([segmentId], "generating");
+  // A full (non-imageOnly) regen of an image-bearing block must drop the cached
+  // still (clearStill) so the processor generates a FRESH one from the (possibly
+  // just-edited) prompt. Otherwise a still that a provider content-filtered (e.g.
+  // LTX image-to-video) is re-sent UNCHANGED on every Retry — the image, not the
+  // prompt, is what gets filtered — so it could never clear. clearStill archives
+  // the old asset first, so Restore still recovers it. Avatar (HeyGen render) and
+  // split_2 imageOnly (keeps the avatar video) intentionally keep their asset.
+  const clearStill = !imageOnly && (blockType === "image" || blockType === "ai_clip");
+  await resetSegmentForRegen([segmentId], "generating", { clearStill });
   // Drop any timeline_item materialized from a prior run so finalize re-creates it.
   await sb.from("timeline_items").delete().eq("project_id", id).contains("metadata", { synthetic_segment_id: segmentId });
 

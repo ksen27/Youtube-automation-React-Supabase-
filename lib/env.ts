@@ -758,18 +758,22 @@ const ServerEnvSchema = z.object({
   // stays inside LTX's animatable range. avatar blocks are exempt. Set to 0 to
   // disable the merge entirely (back to one-visual-per-sentence pacing).
   SYNTHETIC_BLOCK_MIN_HOLD: z.coerce.number().nonnegative().default(5),
-  // Clip-heavy intro (client requirement 2026-06). The reference channel opens
-  // with mostly MOVING footage and shifts to still images later to save credits.
-  // Any 'image' block whose spoken window STARTS before this many seconds is
-  // promoted to 'ai_clip' so the first stretch of the video is animated. After
-  // this cutoff blocks keep whatever type Gemini chose (stills dominate, cheaper).
-  // 0 disables the promotion entirely.
-  SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(180),
-  // Intro clip/image run pattern (client 2026-07-03: the all-clip intro was too
-  // expensive — "ai clip - ai clip - image - image" for the first 3 min, after
-  // that leave as is). Within the clip-heavy window above, visual blocks follow
-  // a repeating pattern of CLIP_RUN ai_clips then IMAGE_RUN images. IMAGE_RUN 0
-  // restores the old all-clip intro.
+  // Mixed clip/image window (client 2026-07-22 via Joey: "30% clips - 70%
+  // images for the first 15 mins, and then the rest all images — no more LTX
+  // after 15 minutes", LTX cost reduction). Visual blocks whose spoken window
+  // STARTS before this many seconds get the intro clip:image mix below; after
+  // the cutoff only SYNTHETIC_POST_INTRO_CLIP_FRACTION (0 = all stills) stay
+  // clips. 0 disables the window entirely (whole video uses the post fraction).
+  SYNTHETIC_CLIP_HEAVY_SECONDS: z.coerce.number().nonnegative().default(900),
+  // Fraction of visual blocks INSIDE the clip-heavy window that are ai_clip,
+  // spaced evenly (client 2026-07-22: 30% clips / 70% images). Takes precedence
+  // over the run pattern below when > 0; set to 0 to fall back to the
+  // CLIP_RUN/IMAGE_RUN pattern.
+  SYNTHETIC_INTRO_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.3),
+  // LEGACY intro clip/image run pattern (client 2026-07-03: "ai clip - ai clip
+  // - image - image"), used only when SYNTHETIC_INTRO_CLIP_FRACTION is 0.
+  // Within the clip-heavy window, visual blocks follow a repeating pattern of
+  // CLIP_RUN ai_clips then IMAGE_RUN images. IMAGE_RUN 0 = all-clip intro.
   SYNTHETIC_INTRO_CLIP_RUN: z.coerce.number().int().positive().default(2),
   SYNTHETIC_INTRO_IMAGE_RUN: z.coerce.number().int().nonnegative().default(2),
   // split_2 cap (client feedback 2026-06: "too many split_2 parts, I don't want
@@ -817,14 +821,11 @@ const ServerEnvSchema = z.object({
   // 'image' (there is no sentence boundary to carve on). 0 disables the cap.
   SYNTHETIC_SPLIT2_MAX_SECONDS: z.coerce.number().nonnegative().default(12),
   // Target fraction of POST-clip-heavy-cutoff visual blocks that stay ai_clip,
-  // the rest demoted to image (client: "after 3 mins, image and ai_clip should
-  // appear naturally" — NOT all-clip). The short-visual merge biases every
-  // merge to ai_clip, which snowballed one plan to 100 clips / 15 images; this
-  // final pass re-balances the post-cutoff stretch to a natural mix by spacing
-  // clips evenly. 0.25 ≈ ~1 in 4 stays a clip after the intro, the rest stills
-  // (client 2026-06-30: "after 3 mins, reduce the ai_clip count"). 1 = keep all
-  // clips (disable), 0 = all stills after the cutoff, 0.5 = even split.
-  SYNTHETIC_POST_INTRO_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.25),
+  // the rest demoted to image, spaced evenly. Default 0 (client 2026-07-22:
+  // "then the rest all images — no more LTX after 15 minutes", LTX cost
+  // reduction; previously 0.25 ≈ 1 in 4 after a 3-min intro). 1 = keep all
+  // clips (disable), 0.5 = even split.
+  SYNTHETIC_POST_INTRO_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0),
   // Low-fi "vlogging" degrade (client requirement 2026-06). The reference channel
   // looks REAL precisely because its footage is slightly LOW QUALITY — grainy,
   // soft, compressed, like a real phone vlog. Our generations come out too clean
@@ -921,6 +922,19 @@ const ServerEnvSchema = z.object({
   HEYGEN_API_KEY: z.string().optional(),
   HEYGEN_API_FALLBACK: z.coerce.boolean().default(false),
   HEYGEN_API_BASE_URL: z.string().url().default("https://api.heygen.com"),
+  // RETRIEVAL SOURCE (V1→V3 migration). When false (default) the post-Generate
+  // render retrieval polls HeyGen's INTERNAL web-app API
+  // (api2.heygen.com/v1/project/items, cookie-authed via the browser context) —
+  // the legacy path. That constant /v1/ traffic is what trips HeyGen's "still on
+  // V1/V2 APIs" deprecation notice even though our public REST client is already
+  // v3. When true, retrieval instead polls the PUBLIC v3 endpoint
+  // GET {HEYGEN_API_BASE_URL}/v3/videos?title=<segmentId> (x-api-key authed) — a
+  // live probe (scripts/heygen-v3-title-probe.ts) confirmed the title filter runs
+  // server-side and returns exactly our segment's render, so retrieval no longer
+  // needs the browser cookie NOR a 4000-row scan. REQUIRES HEYGEN_API_KEY. Kept
+  // behind a flag so v3 retrieval can be canaried on the Fly avatar worker before
+  // the v1 path is removed. See lib/synthetic/heygen.ts fetchProjectItems.
+  HEYGEN_RETRIEVAL_V3: z.coerce.boolean().default(false),
   // Rendered resolution for the API fallback. 720p matches the synthetic render
   // canvas (1280×720) and keeps API credit cost down; bump to 1080p if the client
   // wants it and their plan allows.
@@ -968,6 +982,47 @@ const ServerEnvSchema = z.object({
   // endpoint responds synchronously (~<30s per Pikzels), so this is a
   // fetch-abort backstop, not a poll loop.
   PIKZELS_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
+
+  // =======================================================================
+  // REUSABLE ASSET LIBRARY (migration 0030). A cross-project index of every
+  // generated still / ai_clip keyed by its clean semantic prompt, so a NEW
+  // segment whose prompt closely matches something we already generated can
+  // REUSE that asset instead of paying a provider (69labs image, LTX clip)
+  // to make it again. The client's explicit cost-reduction ask: "store
+  // everything we've generated so the AI can fetch older generations."
+  // =======================================================================
+  // Master toggle. Off = the image / ai_clip processors behave exactly as
+  // before (always generate fresh; nothing is indexed). On = check the library
+  // before generating and index every fresh asset after generating. Default
+  // false so a deploy without the migration applied (or before backfill) is a
+  // pure no-op.
+  ASSET_LIBRARY_ENABLED: z.coerce.boolean().default(false),
+  // Cosine-SIMILARITY threshold [0..1] a library candidate must clear to be
+  // reused (1 = identical embedding). Deliberately strict — a loose match
+  // reuses visibly wrong footage, which reads worse than a fresh generation.
+  // 0.92 ≈ "same scene, differently worded". Raise toward 0.96 to reuse only
+  // near-identical prompts; lower cautiously to widen reuse. The exact-hash
+  // fast-path (normalized prompt equality) short-circuits this for verbatim
+  // repeats (e.g. the planner's recurring base_prompt) at similarity 1.0.
+  ASSET_LIBRARY_REUSE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.92),
+  // Gemini text-embedding model for prompt vectors. gemini-embedding-001 emits
+  // vectors up to 3072-dim; we request 768 (outputDimensionality) to match the
+  // migration's vector(768) column. The older text-embedding-004 alias is
+  // RETIRED on the current v1beta API (404 "not found for embedContent"), so it
+  // is NOT a valid value here. Reuses GEMINI_API_KEY. Bump only in lockstep
+  // with ASSET_LIBRARY_EMBED_DIMS + the migration's column width.
+  ASSET_LIBRARY_EMBED_MODEL: z.string().default("gemini-embedding-001"),
+  // Dimensionality of the embedding vectors. MUST equal the migration's
+  // vector(N) column width AND a size the embed model can output. 768 is
+  // text-embedding-004's native size. Changing this requires a new migration
+  // that re-creates the column + index at the new width (and a re-backfill).
+  ASSET_LIBRARY_EMBED_DIMS: z.coerce.number().int().positive().default(768),
+  // How many nearest neighbours the match query returns before variety
+  // filtering picks one. A small pool (default 8) is enough for the
+  // least-recently-used rotation to avoid always returning the single closest
+  // match (which would recycle the same asset into every video). Raise to
+  // widen rotation, lower to cut query cost.
+  ASSET_LIBRARY_MATCH_LIMIT: z.coerce.number().int().positive().default(8),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

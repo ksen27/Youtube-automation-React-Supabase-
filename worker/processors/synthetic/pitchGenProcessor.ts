@@ -26,8 +26,9 @@ import type { JobAttemptInfo } from "@/worker/index";
 //
 // The generated pitch = an AVATAR talking-head (HeyGen, driven by the script's
 // own 69labs TTS) followed by a FIXED-length screen-recording that scrolls the
-// real website. Same generation engine as before; only the storage/trigger moved
-// from a project row to the standalone pitch_videos table.
+// real website, with the narration playing continuously over BOTH parts. Same
+// generation engine as before; only the storage/trigger moved from a project row
+// to the standalone pitch_videos table.
 //
 // PROGRESS/STATUS lives on the pitch_videos row (status: generating|ready|failed),
 // NOT media_jobs — media_jobs.project_id is a NOT NULL FK to projects and this
@@ -42,9 +43,16 @@ import type { JobAttemptInfo } from "@/worker/index";
 const PITCH_AVATAR_MAX_SECONDS = 90;
 
 // Client rule: the pitch always shows the website scroll for a FIXED window at the
-// END (avatar speaks the script first, then the website plays this long).
-//   pitch = [avatar half: script length] + [website half: PITCH_WEBSITE_SECONDS]
+// END, and (client 2026-07-22) the narration keeps playing OVER it — the website
+// is never silent. The single TTS narration is the master audio track for the
+// whole video; the avatar is on screen until the last PITCH_WEBSITE_SECONDS of
+// narration, then the website scroll plays that tail:
+//   pitch = [avatar: narration - website window] + [website: PITCH_WEBSITE_SECONDS]
 const PITCH_WEBSITE_SECONDS = 10;
+
+// Never let the website window swallow the avatar entirely on a short script —
+// the avatar stays on screen at least this long (the website window shrinks).
+const PITCH_AVATAR_MIN_SECONDS = 5;
 
 export async function processPitchGenJob(
   data: PitchGenJobData,
@@ -156,7 +164,20 @@ export async function processPitchGenJob(
       });
     }
 
-    // Download the avatar mp4 + normalize to canvas (KEEP its audio = narration).
+    // The narration runs over the WHOLE pitch (avatar + website), so the website
+    // window overlaps the END of the narration instead of extending past it. On a
+    // short script the window shrinks so the avatar keeps a minimum on-screen run.
+    // If the audio probe failed (audioSeconds 0) fall back to no overlap: full
+    // avatar, then the website with the narration already finished (apad silence).
+    const websiteOverlapSeconds = Math.min(
+      PITCH_WEBSITE_SECONDS,
+      Math.max(0, audioSeconds - PITCH_AVATAR_MIN_SECONDS),
+    );
+    const avatarShowSeconds = audioSeconds > 0 ? audioSeconds - websiteOverlapSeconds : 0;
+
+    // Download the avatar mp4 + normalize to canvas. Its own audio is dropped —
+    // the original 69labs narration mp3 is muxed as the master track at concat,
+    // so cutting the avatar video early never cuts the voiceover.
     const avatarRaw = path.join(tmp, `avatar_raw_${ts}.mp4`);
     const avatarClip = path.join(tmp, `avatar_${ts}.mp4`);
     staged.push(avatarRaw, avatarClip);
@@ -165,11 +186,12 @@ export async function processPitchGenJob(
     );
     await fs.writeFile(avatarRaw, Buffer.from(await avRes.arrayBuffer()));
     await buildPitchClip({
-      inputPath: avatarRaw, outputPath: avatarClip, keepAudio: true,
+      inputPath: avatarRaw, outputPath: avatarClip, keepAudio: false,
+      durationSeconds: avatarShowSeconds > 0 ? avatarShowSeconds : undefined,
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS,
     });
 
-    // --- 3) Record the WEBSITE scroll (real UI, silent, fixed window) ---
+    // --- 3) Record the WEBSITE scroll (real UI, narration continues over it) ---
     const webRaw = path.join(tmp, `website_raw_${ts}.webm`);
     const webClip = path.join(tmp, `website_${ts}.mp4`);
     staged.push(webRaw, webClip);
@@ -178,7 +200,8 @@ export async function processPitchGenJob(
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT,
       targetScrollSeconds: PITCH_WEBSITE_SECONDS,
     });
-    // Silent track for concat continuity; trim front dead-air; PIN to the window.
+    // Trim front dead-air; PIN to the window. The recording itself is silent —
+    // the narration master track covers it at concat.
     await buildPitchClip({
       inputPath: webRaw, outputPath: webClip, keepAudio: false,
       startSeconds: webRec.scrollStartSeconds,
@@ -186,12 +209,27 @@ export async function processPitchGenJob(
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS,
     });
 
-    // --- 4) Concat avatar → website into the final pitch mp4 ---
+    // --- 4) Concat avatar → website; narration voiceover runs across BOTH ---
     const finalPath = path.join(tmp, `pitch_final_${ts}.mp4`);
     staged.push(finalPath);
+    // The output length is the two pinned parts back-to-back. Pass it so the
+    // concat ENDS deterministically (explicit -t + bounded silence-pad) instead
+    // of relying on -shortest, which hangs on the worker's ffmpeg 5.1 and burns
+    // the 240s watchdog. avatarShowSeconds can be 0 (audio probe failed) — in
+    // that case the avatar clip ran at natural length, which we don't know here,
+    // so leave the total unset and fall back to -shortest.
+    const totalDurationSeconds =
+      avatarShowSeconds > 0 ? avatarShowSeconds + PITCH_WEBSITE_SECONDS : undefined;
     await concatPitchParts({
       inputPaths: [avatarClip, webClip], outputPath: finalPath,
+      masterAudioPath: audioPath,
+      totalDurationSeconds,
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS,
+    });
+    await logJob(logScope, "pitch.voiceover_layout", {
+      audioSeconds: Math.round(audioSeconds * 100) / 100,
+      avatarShowSeconds: Math.round(avatarShowSeconds * 100) / 100,
+      websiteOverlapSeconds: Math.round(websiteOverlapSeconds * 100) / 100,
     });
 
     let finalSeconds = 0;

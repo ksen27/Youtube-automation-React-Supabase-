@@ -470,8 +470,16 @@ async function commitVoice(page: Page): Promise<void> {
 // (verified 2026-06-19): it returns avatar videos newest-first, each with a
 // stable `video_id`, a `status` ("completed" when done), and a directly
 // downloadable signed `video_url`. Far more robust than the DOM.
+//
+// LEGACY V1 (cookie-authed, api2 internal host). Still used when HEYGEN_RETRIEVAL_V3
+// is off. This is the last /v1/ call in the codebase — the one that trips HeyGen's
+// "still on V1/V2 APIs" deprecation notice — so it is on its way out; see
+// fetchProjectItems + the HEYGEN_RETRIEVAL_V3 flag in env.ts.
 const HEYGEN_ITEMS_API =
   "https://api2.heygen.com/v1/project/items?limit=20&filter_groups=avatar_video&sort_key=created_ts&sort_order=desc";
+
+// PUBLIC v3 auth header (same as heygen-api.ts). x-api-key, not a cookie.
+const HEYGEN_V3_AUTH_HEADER = "x-api-key";
 
 interface HeygenProjectItem {
   video_id: string;
@@ -481,18 +489,41 @@ interface HeygenProjectItem {
   // created_ts but NO video_id and a null/processing status, and is promoted to a
   // real video_id ~10s+ later (longer under load). We treat a fresh placeholder as
   // proof OUR render started — see awaitNewItemId / everSawOurs. Verified against
-  // the live /v1/project/items API 2026-07-10.
+  // the live /v1/project/items API 2026-07-10. NOTE (v3): the public /v3/videos
+  // list did not surface any pre-completion rows in probing, so on the v3 path the
+  // placeholder branch simply never fires — the title-filtered poll below is the
+  // signal that our render exists instead (see fetchProjectItems).
   created_ts?: number;
   video_url?: string;
   video_download_url?: string;
   error_message?: string;
-  // HeyGen reports the render's shape directly on the item (verified 2026-07):
+  // The render's TITLE. Browser + API renders are both titled
+  // "synthetic <projectId> <segmentId>" (see heygen-api.ts createAvatarIiiVideo).
+  // On the v3 path this is the pinning lever: GET /v3/videos?title=<segmentId>
+  // filters server-side to just our segment's render(s) — probe-confirmed.
+  title?: string;
+  // HeyGen V1 reports the render's shape directly on the item (verified 2026-07):
   //   aspect_ratio: "16:9" | "9:16" | ...   orientation: "landscape" | "portrait"
   // Both Avatar IV and Avatar III (Avatar-Shots) renders appear in the SAME
   // avatar_video list, so orientation is the cleanest signal to skip a wrong-
   // aspect render BEFORE downloading it (the file probe remains the final gate).
+  // NOTE (v3): GET /v3/videos does NOT return these fields (probe-confirmed), so on
+  // the v3 path the early aspect gate no-ops and the file probe is the sole aspect
+  // authority — which it already was.
   aspect_ratio?: string;
   orientation?: string;
+}
+
+// A single row from GET /v3/videos (public REST). Mapped into HeygenProjectItem by
+// fetchProjectItems so every downstream gate is source-agnostic.
+interface HeygenV3VideoRow {
+  id?: string;
+  status?: string;
+  title?: string | null;
+  created_at?: number | null;
+  duration?: number | null;
+  video_url?: string | null;
+  error?: { message?: string } | string | null;
 }
 
 // HeyGen's created_ts is Unix SECONDS, but be defensive: normalize a value that
@@ -505,9 +536,68 @@ function createdSeconds(it: HeygenProjectItem): number | null {
   return v > 1e12 ? Math.floor(v / 1000) : v;
 }
 
-// Fetch the avatar-video list via the authed browser context (cookies apply).
-async function fetchProjectItems(context: BrowserContext): Promise<HeygenProjectItem[]> {
-  const resp = await context.request.get(HEYGEN_ITEMS_API, { timeout: env().HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
+// Fetch the avatar-video list. Two sources behind the HEYGEN_RETRIEVAL_V3 flag:
+//   • v3 (public REST, x-api-key): GET /v3/videos, optionally filtered to a single
+//     segment by `titleFilter` (server-side substring match — probe-confirmed). No
+//     browser cookie needed; `context` is ignored on this path. v3 returns no sort,
+//     so we sort the mapped rows newest-first in memory to preserve the ordering
+//     the downstream gates assume (candidates[0] == newest).
+//   • v1 (legacy, cookie-authed internal api2 host): the original call, unchanged.
+// Both return the SAME HeygenProjectItem shape, so every caller/gate is agnostic.
+async function fetchProjectItems(
+  context: BrowserContext,
+  titleFilter?: string,
+): Promise<HeygenProjectItem[]> {
+  const e = env();
+  if (e.HEYGEN_RETRIEVAL_V3) {
+    const key = e.HEYGEN_API_KEY;
+    if (!key) {
+      // Misconfiguration guard: v3 retrieval is on but no key. Return empty so the
+      // caller keeps polling / falls back rather than throwing on every tick; the
+      // startup log (attemptOnAccount) surfaces the missing key loudly.
+      return [];
+    }
+    const q = new URLSearchParams({ limit: "100" });
+    if (titleFilter) q.set("title", titleFilter);
+    const url = `${e.HEYGEN_API_BASE_URL}/v3/videos?${q}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: { [HEYGEN_V3_AUTH_HEADER]: key },
+      signal: AbortSignal.timeout(e.HEYGEN_NAV_TIMEOUT_MS),
+    }).catch(() => null);
+    if (!resp || !resp.ok) return [];
+    const json = (await resp.json().catch(() => null)) as { data?: HeygenV3VideoRow[] } | null;
+    const rows = json?.data ?? [];
+    const mapped: HeygenProjectItem[] = rows
+      .filter((r): r is HeygenV3VideoRow & { id: string } => typeof r.id === "string" && r.id.length > 0)
+      .map((r) => {
+        const errMsg =
+          typeof r.error === "string" ? r.error : r.error?.message ? r.error.message : undefined;
+        return {
+          video_id: r.id,
+          status: String(r.status ?? ""),
+          duration: typeof r.duration === "number" ? r.duration : undefined,
+          created_ts: typeof r.created_at === "number" ? r.created_at : undefined,
+          video_url: r.video_url ?? undefined,
+          // v3 has no separate download URL; video_url is the signed CDN link.
+          video_download_url: undefined,
+          error_message: errMsg,
+          title: r.title ?? undefined,
+          // v3 does not report shape — leave aspect fields undefined so the early
+          // aspect gate no-ops and the file probe stays authoritative.
+          aspect_ratio: undefined,
+          orientation: undefined,
+        };
+      });
+    // v3 gives no sort param; replicate v1's created_ts DESC so "newest-first"
+    // assumptions (candidates[0]) hold.
+    mapped.sort((a, b) => (b.created_ts ?? 0) - (a.created_ts ?? 0));
+    return mapped;
+  }
+
+  // Legacy v1 path (cookie-authed). titleFilter is ignored — the v1 endpoint has no
+  // title filter; downstream baseline/created_ts/pin gates do the scoping.
+  const resp = await context.request.get(HEYGEN_ITEMS_API, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
   if (!resp || !resp.ok()) return [];
   const json = (await resp.json().catch(() => null)) as { data?: { items?: HeygenProjectItem[] } } | null;
   return json?.data?.items ?? [];
@@ -516,8 +606,13 @@ async function fetchProjectItems(context: BrowserContext): Promise<HeygenProject
 // The FULL set of video_ids present before we generate. Used to pin retrieval to
 // the EXACT render we just made: after clicking Generate, the one id that is NOT
 // in this set is unambiguously ours — no inference from "newest" or duration.
-async function baselineItemIds(context: BrowserContext): Promise<Set<string>> {
-  const items = await fetchProjectItems(context);
+// `titleFilter` (the segmentId) scopes the v3 query to just our segment; on v1 it
+// is ignored (the whole avatar list is the baseline, as before).
+async function baselineItemIds(
+  context: BrowserContext,
+  titleFilter?: string,
+): Promise<Set<string>> {
+  const items = await fetchProjectItems(context, titleFilter);
   return new Set(items.map((it) => it.video_id).filter(Boolean));
 }
 
@@ -539,10 +634,13 @@ async function awaitNewItemId(
   // authoritative guard against pinning a sibling project's render from the shared
   // account list. 0 disables the time guard (legacy behavior).
   minCreatedTs = 0,
+  // The segmentId — scopes the v3 query server-side to just our segment's render(s)
+  // so the poll sees ~1 row instead of the whole account. Ignored on v1.
+  titleFilter?: string,
 ): Promise<string> {
   const deadline = Date.now() + appearMs;
   while (Date.now() < deadline) {
-    const items = await fetchProjectItems(context);
+    const items = await fetchProjectItems(context, titleFilter);
     // Newest-first list: the first id that is NOT in the baseline AND was created
     // at/after our Generate click is the freshest new render that is genuinely
     // ours. (A single avatar Generate creates exactly one new item.) The
@@ -617,6 +715,9 @@ async function retrieveRenderedVideo(
   // non-baseline scan) this rejects any candidate created BEFORE we clicked —
   // i.e. a sibling project's render in the shared list. 0 disables the guard.
   minCreatedTs = 0,
+  // The segmentId — on the v3 path, scopes the project-list poll server-side to
+  // just our segment's render(s). Ignored on v1.
+  titleFilter?: string,
 ): Promise<Buffer> {
   const e = env();
   const deadline = Date.now() + e.HEYGEN_RENDER_TIMEOUT_MS;
@@ -649,9 +750,21 @@ async function retrieveRenderedVideo(
   const downloadAndProbe = async (
     url: string,
   ): Promise<{ buf: Buffer; seconds: number; aspect: "landscape" | "portrait" | null } | null> => {
-    const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
-    if (!resp || !resp.ok()) return null;
-    const buf = Buffer.from(await resp.body());
+    // v3's video_url is a signed CDN link — no cookie needed, so use a plain fetch
+    // (keeps retrieval independent of the browser context). v1 downloads through the
+    // authed browser context as before.
+    let buf: Buffer;
+    if (e.HEYGEN_RETRIEVAL_V3) {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(e.HEYGEN_NAV_TIMEOUT_MS) }).catch(
+        () => null,
+      );
+      if (!resp || !resp.ok) return null;
+      buf = Buffer.from(await resp.arrayBuffer());
+    } else {
+      const resp = await context.request.get(url, { timeout: e.HEYGEN_NAV_TIMEOUT_MS }).catch(() => null);
+      if (!resp || !resp.ok()) return null;
+      buf = Buffer.from(await resp.body());
+    }
     if (buf.length < 1024) return null;
     if (!probeGateOn) return { buf, seconds: 0, aspect: null }; // legacy path: no probe gate
     const tmpPath = path.join(os.tmpdir(), `heygen_probe_${Date.now()}_${Math.round(buf.length)}.mp4`);
@@ -671,7 +784,7 @@ async function retrieveRenderedVideo(
   let lastShortSeconds = 0;
   let lastWrongLengthSeconds = 0;
   while (Date.now() < deadline) {
-    const items = await fetchProjectItems(context);
+    const items = await fetchProjectItems(context, titleFilter);
     // Candidates. When we captured the exact id of OUR render at generate time,
     // poll ONLY that item — no other render in the shared list can be mistaken
     // for ours. Otherwise fall back to "every item that isn't the pre-generate
@@ -2028,6 +2141,7 @@ async function finishRenderRetrieval(
     3000,
     (ms) => p.waitForTimeout(ms),
     genClickTs,
+    input.segmentId,
   ).catch(() => "");
   console.log(
     JSON.stringify({
@@ -2052,6 +2166,7 @@ async function finishRenderRetrieval(
     expectedAspect,
     pinnedVideoId,
     genClickTs,
+    input.segmentId,
   );
   await shot(p, input.projectId, input.segmentId, "done");
 
@@ -2129,7 +2244,19 @@ export async function attemptOnAccount(
     //     new id that appears — our render's exact identity, no inference.
     // Best-effort: an empty/"" snapshot just degrades to the gated newest-non-
     // baseline retrieval; it never hard-fails.
-    const baselineIds = await baselineItemIds(context).catch(() => new Set<string>());
+    // V3 retrieval requires an API key. If the flag is on but the key is missing,
+    // fetchProjectItems returns empty on every poll and retrieval would false-fail;
+    // surface it loudly here (once per attempt) rather than silently degrading.
+    if (e.HEYGEN_RETRIEVAL_V3 && !e.HEYGEN_API_KEY) {
+      console.error(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "synthetic.heygen.retrieval_v3_missing_key",
+          note: "HEYGEN_RETRIEVAL_V3 is on but HEYGEN_API_KEY is unset — v3 retrieval cannot work",
+        }),
+      );
+    }
+    const baselineIds = await baselineItemIds(context, input.segmentId).catch(() => new Set<string>());
     const baselineId = [...baselineIds][0] ?? "";
 
     // AVATAR III (orange marks): drive the "Create new shots" / Avatar-Shots

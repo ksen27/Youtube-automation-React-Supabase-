@@ -2486,14 +2486,34 @@ export async function buildPitchClip(opts: {
 }
 
 // AI-GENERATED SALES PITCH (migration 0026). Concatenate the pitch parts (avatar
-// clip, then website scroll-recording) into ONE mp4, PRESERVING each part's own
-// audio. Uses the concat FILTER (not the demuxer) with a re-encode so parts that
-// differ slightly in codec params still join cleanly, and every part contributes
-// both its video AND audio to the output. All inputs must already be canvas-sized
-// with an audio track (produced by buildPitchClip), which the filter assumes.
+// clip, then website scroll-recording) into ONE mp4. Uses the concat FILTER (not
+// the demuxer) with a re-encode so parts that differ slightly in codec params
+// still join cleanly. All inputs must already be canvas-sized with an audio track
+// (produced by buildPitchClip), which the filter assumes.
+//
+// Audio comes in two modes:
+//   • default              → each part contributes its OWN audio (concat v=1:a=1).
+//   • masterAudioPath set  → the parts' audio is IGNORED and this single track
+//                            (the pitch TTS narration) plays continuously across
+//                            the whole video, so the voiceover keeps going over
+//                            the website scroll instead of cutting to silence.
+//                            The track is silence-padded (apad) and keyed off the
+//                            video length, so a narration slightly shorter than
+//                            the video never truncates the final frames.
 export async function concatPitchParts(opts: {
   inputPaths: string[];
   outputPath: string;
+  masterAudioPath?: string;
+  // Known TOTAL output length (seconds) = sum of the part durations. Only used
+  // with masterAudioPath: it bounds the narration's silence-pad and caps the
+  // encode with an explicit `-t`, so the pass ENDS deterministically instead of
+  // relying on `-shortest`. On the worker's ffmpeg 5.1 (Debian 12), `-shortest`
+  // does NOT reliably stop a video-only concat fed by an `apad`-padded (infinite)
+  // audio track — ffmpeg keeps encoding silence past the video and the job dies
+  // at the FFMPEG_TIMEOUT_SECONDS watchdog (240s). Passing this is what makes the
+  // pitch concat terminate. When unset we fall back to `-shortest` (fine for the
+  // per-part-audio branch, whose streams are all finite).
+  totalDurationSeconds?: number;
   width?: number;
   height?: number;
   fps?: number;
@@ -2505,24 +2525,49 @@ export async function concatPitchParts(opts: {
   const w = opts.width ?? 1280;
   const h = opts.height ?? 720;
   const fps = opts.fps ?? 30;
+  const totalDur =
+    opts.totalDurationSeconds && opts.totalDurationSeconds > 0 ? opts.totalDurationSeconds : null;
   await fs.mkdir(path.dirname(opts.outputPath), { recursive: true });
 
   const args: string[] = ["-y", "-threads", String(env.FFMPEG_THREADS)];
   for (const p of opts.inputPaths) args.push("-i", p);
+  if (opts.masterAudioPath) args.push("-i", opts.masterAudioPath);
   // Re-assert a common size/fps/sar per input so a mismatched part can't break
-  // the concat filter, then concat with v=1:a=1 so both streams flow through.
+  // the concat filter.
   let filter = "";
   for (let i = 0; i < n; i++) {
     filter +=
       `[${i}:v]scale=${w}:${h}:force_original_aspect_ratio=decrease,` +
-      `pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1[v${i}];` +
-      `[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}];`;
+      `pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1[v${i}];`;
   }
-  for (let i = 0; i < n; i++) filter += `[v${i}][a${i}]`;
-  filter += `concat=n=${n}:v=1:a=1[v][a]`;
+  if (opts.masterAudioPath) {
+    // Video-only concat; the narration (last input) is the sole audio track.
+    // Pad it with silence so a narration slightly SHORTER than the video never
+    // truncates the final frames — but bound the pad to the exact output length
+    // (`apad=whole_dur`) so the audio stream is FINITE, and cap the encode with
+    // `-t` below. Both bounds are absent-safe: with no totalDur we pad
+    // unbounded + `-shortest` (see totalDurationSeconds note re: ffmpeg 5.1).
+    const apad = totalDur ? `apad=whole_dur=${totalDur.toFixed(3)}` : "apad";
+    for (let i = 0; i < n; i++) filter += `[v${i}]`;
+    filter += `concat=n=${n}:v=1:a=0[v];`;
+    filter += `[${n}:a]aresample=44100,asetpts=PTS-STARTPTS,${apad}[a]`;
+  } else {
+    for (let i = 0; i < n; i++) {
+      filter += `[${i}:a]aresample=44100,asetpts=PTS-STARTPTS[a${i}];`;
+    }
+    for (let i = 0; i < n; i++) filter += `[v${i}][a${i}]`;
+    filter += `concat=n=${n}:v=1:a=1[v][a]`;
+  }
   args.push(
     "-filter_complex", filter,
     "-map", "[v]", "-map", "[a]",
+    // Deterministic stop: an explicit -t when we know the length, else -shortest
+    // (only reached on the finite per-part-audio branch or when no length given).
+    ...(opts.masterAudioPath
+      ? totalDur
+        ? ["-t", totalDur.toFixed(3)]
+        : ["-shortest"]
+      : []),
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-crf", "21",

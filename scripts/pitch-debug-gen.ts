@@ -118,7 +118,15 @@ async function main() {
   const avatarClip = path.join(tmp, "avatar.mp4");
   const avRes = await fetchOrThrow(avatarResult.videoUrl, { timeoutMs: 120_000 });
   await fs.writeFile(avatarRaw, Buffer.from(await avRes.arrayBuffer()));
-  await buildPitchClip({ inputPath: avatarRaw, outputPath: avatarClip, keepAudio: true, width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS });
+  // Mirrors the processor: avatar audio is dropped; the narration mp3 becomes
+  // the master track at concat so the voiceover continues over the website.
+  const websiteOverlapSeconds = Math.min(10, Math.max(0, audioSeconds - 5));
+  const avatarShowSeconds = audioSeconds > 0 ? audioSeconds - websiteOverlapSeconds : 0;
+  await buildPitchClip({
+    inputPath: avatarRaw, outputPath: avatarClip, keepAudio: false,
+    durationSeconds: avatarShowSeconds > 0 ? avatarShowSeconds : undefined,
+    width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS,
+  });
 
   // --- 3) Record the website scroll ---
   console.log("[3/5] Recording website scroll…");
@@ -130,7 +138,7 @@ async function main() {
 
   // --- 4) Concat avatar -> website ---
   console.log("[4/5] Concatenating avatar → website…");
-  await concatPitchParts({ inputPaths: [avatarClip, webClip], outputPath: outPath, width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS });
+  await concatPitchParts({ inputPaths: [avatarClip, webClip], outputPath: outPath, masterAudioPath: audioPath, width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS });
 
   // --- 5) Report ---
   const fin = await probeFile(outPath);

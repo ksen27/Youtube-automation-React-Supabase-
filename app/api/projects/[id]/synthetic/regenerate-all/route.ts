@@ -128,11 +128,29 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ ok: true, enqueued: 0, note: "nothing to regenerate" }, { status: 200 });
   }
 
-  // Keep current asset urls — finishSegment archives them into asset_history
-  // before writing the new ones, and the old assets stay visible until the new
-  // ones land. Reset to 'pending' so dispatchSegments re-enqueues them.
+  // Reset to 'pending' so dispatchSegments re-enqueues them. For image/ai_clip
+  // blocks a full regen must DROP the cached still (clearStill) so a fresh one is
+  // generated from the current prompt — otherwise a provider-content-filtered
+  // still (e.g. LTX image-to-video) is re-sent unchanged on every retry and never
+  // clears. clearStill archives the old asset first (Restore still works). We do
+  // NOT clear for avatar/split_2 (their asset is a HeyGen render we keep), nor for
+  // the "images" scope (imageOnly dispatch keeps split_2's avatar video). Other
+  // block types keep their asset visible until the new one lands.
   try {
-    await resetSegmentForRegen(ids, "pending");
+    if (scope === "images") {
+      await resetSegmentForRegen(ids, "pending");
+    } else {
+      const { data: typed } = await sb
+        .from("synthetic_segments")
+        .select("id, block_type")
+        .in("id", ids);
+      const clearIds = (typed ?? [])
+        .filter((s) => s.block_type === "image" || s.block_type === "ai_clip")
+        .map((s) => s.id);
+      const keepIds = ids.filter((i) => !clearIds.includes(i));
+      await resetSegmentForRegen(clearIds, "pending", { clearStill: true });
+      await resetSegmentForRegen(keepIds, "pending");
+    }
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message }, { status: 500 });
   }

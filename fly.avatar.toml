@@ -31,6 +31,20 @@
 app = 'video-automation-avatar-worker'
 primary_region = 'lhr'
 
+# Graceful-shutdown window. On deploy / `secrets set`, Fly sends SIGTERM and the
+# worker's shutdown() handler drains via worker.close() — it stops taking new
+# jobs and WAITS for the in-flight avatar render to finish before exiting. Fly's
+# DEFAULT kill_timeout is only 5s, which SIGKILLed that drain mid-render and left
+# the job frozen at status='running' forever (a zombie the 45-min stall sweep
+# then has to clean up) — this happened 2026-07-23 deploying during a render.
+# NOTE: Fly HARD-CAPS kill_timeout at 5 minutes (300s) — 600s is rejected at
+# deploy with "invalid stop_config.timeout, cannot exceed 5 minutes". 300s is the
+# max, and still covers one avatar render's worst case (HeyGen ~1-2 min). If a
+# render can genuinely exceed 5 min, prefer deploying when no avatar is live (the
+# standing guidance) rather than relying on the drain window. Rolling deploys
+# restart one machine at a time, so at most one machine drains at once.
+kill_timeout = "300s"
+
 [env]
   # Serve ONLY the synthetic queues (tts/planner/image/video/avatar).
   WORKER_ROLE = "synthetic"
@@ -109,15 +123,15 @@ primary_region = 'lhr'
   # each attempt. A crashed worker's account auto-frees after this. Default in
   # lib/env.ts is 900; set here only to override.
   # HEYGEN_ACCOUNT_LEASE_SECONDS = "900"
-  # Clip/image mix (client 2026-07-20 via Joey: "30-70 for the first 15 minutes,
-  # then all images for the last 10-15 minutes" — ai_clip cost reduction).
-  # Zone 1 (0-15 min): 1 clip / 2 images repeating ≈ 33:67, the closest evenly
-  # spaced run pattern to 30:70. Zone 2 (after 15 min): fraction 0 = every
-  # visual is a still. split_2/avatar blocks are untouched by this pass.
-  # Previous values: 180 / 2 / 2 / 0.25 (50:50 first 3 min, then 1-in-4 clips).
+  # Clip/image mix (client 2026-07-22 via Joey: "30% clips - 70% images for the
+  # first 15 mins, and then the rest all images — no more LTX after 15 minutes",
+  # LTX cost reduction). Zone 1 (0-15 min): exactly 30% ai_clips, evenly spaced
+  # (fraction stride replaced the old 1/2 run pattern ≈ 33:67). Zone 2 (after
+  # 15 min): fraction 0 = every visual is a still. split_2/avatar blocks are
+  # untouched by this pass. These now match the lib/env.ts defaults; kept
+  # explicit here so a defaults change can't silently alter the client's mix.
   SYNTHETIC_CLIP_HEAVY_SECONDS = "900"
-  SYNTHETIC_INTRO_CLIP_RUN = "1"
-  SYNTHETIC_INTRO_IMAGE_RUN = "2"
+  SYNTHETIC_INTRO_CLIP_FRACTION = "0.3"
   SYNTHETIC_POST_INTRO_CLIP_FRACTION = "0"
   # Local scratch for downloads/screenshots (ephemeral is fine for HeyGen
   # automation artifacts).

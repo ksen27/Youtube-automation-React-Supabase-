@@ -8,6 +8,7 @@ import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure, ltxModel, ltxPoolSize } from "@/lib/synthetic/ltx";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
+import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
 
@@ -60,6 +61,38 @@ export async function processImageToVideoJob(
   ).trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
+  // ASSET LIBRARY (migration 0030): a matching PRIOR clip skips BOTH paid
+  // steps (69labs still + LTX render). Clips are keyed on the scene prompt
+  // (imagePrompt) — the animation prompt is a near-constant subtle push-in and
+  // carries no scene identity. Urls already used in this project are excluded
+  // (no repeats within one video); disabled/error falls through to generate.
+  if (imagePrompt) {
+    const clipReuse = await findReusableAsset({ prompt: imagePrompt, assetType: "clip", projectId });
+    if (clipReuse) {
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.reused", {
+        via: clipReuse.via,
+        similarity: Number(clipReuse.similarity.toFixed(4)),
+        assetId: clipReuse.id,
+      });
+      await finishSegment(segmentId, {
+        status: "ready",
+        video_url: clipReuse.assetUrl,
+        // Carry the reused clip's source still too (when known) so a later
+        // image-only regenerate / degrade path has a matching frame.
+        ...(clipReuse.sourceImageUrl && !seg.image_url ? { image_url: clipReuse.sourceImageUrl } : {}),
+        provider: clipReuse.provider ?? "library_reuse",
+        error: null,
+      });
+      await setMediaJob(mediaJobId, {
+        status: "completed",
+        progress: 100,
+        metadata: { reusedFromLibrary: true, libraryAssetId: clipReuse.id },
+      });
+      await maybeFinalizeSynthetic(projectId);
+      return;
+    }
+  }
+
   // --- step 1: ensure a source still exists (reuse on retry) ---
   let imageUrl = seg.image_url as string | null;
   if (!imageUrl) {
@@ -84,6 +117,17 @@ export async function processImageToVideoJob(
     imageUrl = up.publicUrl;
     // Persist the still immediately so a later video failure can degrade to it.
     await finishSegment(segmentId, { image_url: imageUrl, provider: img.provider });
+    // Index the fresh still as a reusable IMAGE too — it's the same
+    // nano-banana output the image_gen lane produces. Best-effort no-op when
+    // the library is disabled.
+    await indexGeneratedAsset({
+      prompt: imagePrompt,
+      assetType: "image",
+      assetUrl: imageUrl,
+      provider: img.provider,
+      projectId,
+      segmentId,
+    });
     await setMediaJob(mediaJobId, { progress: 45 });
   }
 
@@ -113,6 +157,20 @@ export async function processImageToVideoJob(
 
     const up = await uploadBuffer(clip.video, r2Keys.segmentVideo(projectId, segmentId, Date.now()), "video/mp4");
     await finishSegment(segmentId, { status: "ready", video_url: up.publicUrl, provider: clip.provider, error: null });
+    // Index the fresh clip into the cross-project asset library (keyed on the
+    // scene prompt, with its source still recorded). Best-effort; no-op when
+    // ASSET_LIBRARY_ENABLED is off.
+    if (imagePrompt) {
+      await indexGeneratedAsset({
+        prompt: imagePrompt,
+        assetType: "clip",
+        assetUrl: up.publicUrl,
+        sourceImageUrl: imageUrl,
+        provider: clip.provider,
+        projectId,
+        segmentId,
+      });
+    }
     await setMediaJob(mediaJobId, { status: "completed", progress: 100, metadata: { provider: clip.provider } });
   } catch (err) {
     // A billing/quota failure (LTX out of funds) can NEVER succeed on retry, and

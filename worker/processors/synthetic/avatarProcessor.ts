@@ -10,6 +10,7 @@ import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
+import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { cutAudio, cropImageToPortrait } from "@/lib/media/ffmpeg";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import { classOf, userFacingMessage, isPoolBusyError } from "@/lib/synthetic/heygen-errors";
@@ -119,6 +120,19 @@ async function generateSplitRightImage(
   const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
   const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
   if (!prompt) throw new Error(`avatar: split_2 segment ${segmentId} has no usable image prompt`);
+  // ASSET LIBRARY (migration 0030): reuse a matching prior still for the right
+  // half instead of generating (urls already used in this project excluded).
+  // Disabled/miss/error falls through to the normal 69labs call.
+  const reuse = await findReusableAsset({ prompt, assetType: "image", projectId });
+  if (reuse) {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.avatar.right_image_reused", {
+      via: reuse.via,
+      similarity: Number(reuse.similarity.toFixed(4)),
+      assetId: reuse.id,
+    });
+    await finishSegment(segmentId, { right_image_url: reuse.assetUrl });
+    return;
+  }
   await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
   const img = await generateImage(prompt);
   await logProviderCall({
@@ -133,6 +147,16 @@ async function generateSplitRightImage(
     deg.degraded ? deg.contentType : img.contentType,
   );
   await finishSegment(segmentId, { right_image_url: up.publicUrl });
+  // Index the fresh right-half still into the cross-project asset library
+  // (best-effort; no-op when ASSET_LIBRARY_ENABLED is off).
+  await indexGeneratedAsset({
+    prompt,
+    assetType: "image",
+    assetUrl: up.publicUrl,
+    provider: img.provider,
+    projectId,
+    segmentId,
+  });
 }
 
 export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttemptInfo): Promise<void> {

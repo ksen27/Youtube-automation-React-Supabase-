@@ -6,6 +6,7 @@ import { generateImage } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
+import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
 
@@ -70,6 +71,39 @@ export async function processImageGenJob(
   const prompt = (seg.image_prompt?.trim() || basePrompt).trim();
   if (!prompt) throw new Error(`image_gen: segment ${segmentId} has no usable image prompt`);
 
+  const isSplitBlock = seg.block_type === "split_2";
+
+  // ASSET LIBRARY (migration 0030): before paying for a fresh still, look for
+  // a close-enough prior generation (exact-hash or semantic match, gated by
+  // ASSET_LIBRARY_REUSE_THRESHOLD; urls already used in THIS project are
+  // excluded so one video never repeats an asset). On a hit we reuse its
+  // permanent R2 url outright — no provider call, no upload. Disabled (or any
+  // library error) falls straight through to the normal generate path.
+  const reuse = await findReusableAsset({ prompt, assetType: "image", projectId });
+  if (reuse) {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.reused", {
+      via: reuse.via,
+      similarity: Number(reuse.similarity.toFixed(4)),
+      assetId: reuse.id,
+    });
+    await finishSegment(segmentId, {
+      status: "ready",
+      // Keep the ORIGINAL provider label (nano_banana etc.) so cost estimates
+      // stay by-provider-correct; the reuse itself is visible in the log line
+      // above and in generated_assets.reuse_count.
+      provider: reuse.provider ?? "library_reuse",
+      error: null,
+      ...(isSplitBlock ? { right_image_url: reuse.assetUrl } : { image_url: reuse.assetUrl }),
+    });
+    await setMediaJob(mediaJobId, {
+      status: "completed",
+      progress: 100,
+      metadata: { reusedFromLibrary: true, libraryAssetId: reuse.id, sixtynineJobId: null, sixtynineKeyIdx: null },
+    });
+    await maybeFinalizeSynthetic(projectId);
+    return;
+  }
+
   try {
     const t0 = Date.now();
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
@@ -84,12 +118,11 @@ export async function processImageGenJob(
     // the still reads as real phone footage instead of a clean AI render.
     const deg = await degradeImageLowFi(out.image);
 
-    const isSplit = seg.block_type === "split_2";
     // Versioned key (timestamp) so a regenerate writes a NEW file and the prior
     // version survives in R2 for the review screen's history. finishSegment
     // archives the previous URL into asset_history.
     const version = Date.now();
-    const key = isSplit
+    const key = isSplitBlock
       ? r2Keys.segmentRightImage(projectId, segmentId, version)
       : r2Keys.segmentImage(projectId, segmentId, version);
     const up = await uploadBuffer(deg.image, key, deg.degraded ? deg.contentType : out.contentType);
@@ -98,7 +131,19 @@ export async function processImageGenJob(
       status: "ready",
       provider: out.provider,
       error: null, // clear any prior-attempt / stall-sweep error on success
-      ...(isSplit ? { right_image_url: up.publicUrl } : { image_url: up.publicUrl }),
+      ...(isSplitBlock ? { right_image_url: up.publicUrl } : { image_url: up.publicUrl }),
+    });
+    // Index the fresh still into the cross-project asset library so future
+    // videos with a matching prompt can reuse it. Best-effort — never fails
+    // the segment (indexGeneratedAsset catches its own errors), and a no-op
+    // when ASSET_LIBRARY_ENABLED is off.
+    await indexGeneratedAsset({
+      prompt,
+      assetType: "image",
+      assetUrl: up.publicUrl,
+      provider: out.provider,
+      projectId,
+      segmentId,
     });
     // Clear the resume pointer on success so a later regenerate of this segment
     // starts a fresh generation instead of re-polling this now-consumed job.

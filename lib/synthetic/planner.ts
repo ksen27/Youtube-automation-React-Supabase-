@@ -1308,40 +1308,50 @@ export function splitMergedVisuals(
 // avatar / split_2 are NEVER touched (different render paths). A block flipped
 // to image loses its animationPrompt (a still has no motion); a block flipped to
 // ai_clip gets a null animationPrompt and the worker's default gentle push-in.
+//
+// Pre-cutoff mix (client 2026-07-22: "30% clips - 70% images for the first 15
+// mins"): when `introClipFraction` > 0 the window uses the SAME even-spacing
+// stride as the post-cutoff zone at that fraction, so the ratio is exact and
+// clips never clump. When 0, the legacy clipRun/imageRun repeating pattern
+// applies instead.
 export function balanceVisualTypesByPosition(
   segs: PlannedSegment[],
   clipHeavyCutoffSeconds: number,
   postClipFraction: number,
   introClipRun: number = 2,
   introImageRun: number = 2,
+  introClipFraction: number = 0,
 ): { segments: PlannedSegment[]; toClip: number; toImage: number } {
   let toClip = 0;
   let toImage = 0;
   // Index among PRE-cutoff visual blocks, used to walk the clip/image run
-  // pattern (e.g. 2/2 -> clip clip image image clip clip …).
+  // pattern (e.g. 2/2 -> clip clip image image clip clip …) or the fraction
+  // stride.
   let preIdx = 0;
   // Index among POST-cutoff visual blocks, used to space clips evenly. We keep a
   // clip when floor(i * frac) increments — a classic even-distribution stride.
   let postIdx = 0;
   const clipRun = Math.max(1, Math.floor(introClipRun));
   const imageRun = Math.max(0, Math.floor(introImageRun));
+  // Even-spacing decision: keep a clip when the running quota ticks up.
+  const strideClip = (i: number, frac: number) =>
+    frac >= 1 ? true : frac <= 0 ? false : Math.floor((i + 1) * frac) > Math.floor(i * frac);
   const out = segs.map((seg) => {
     if (seg.blockType !== "image" && seg.blockType !== "ai_clip") return seg;
     const beforeCutoff = clipHeavyCutoffSeconds > 0 && seg.startTime < clipHeavyCutoffSeconds;
     let want: SyntheticBlockType;
     if (beforeCutoff) {
-      want = imageRun <= 0 || preIdx % (clipRun + imageRun) < clipRun ? "ai_clip" : "image";
-      preIdx++;
+      const i = preIdx++;
+      if (introClipFraction > 0) {
+        // Phase-shifted stride so the WINDOW OPENS on a clip (moving footage
+        // first, per the reference channel), then e.g. 0.3 -> clip img img img
+        // clip … — still exactly the fraction over the window.
+        want = i === 0 || strideClip(i - 1, introClipFraction) ? "ai_clip" : "image";
+      } else {
+        want = imageRun <= 0 || i % (clipRun + imageRun) < clipRun ? "ai_clip" : "image";
+      }
     } else {
-      // Even-spacing decision: keep a clip when the running quota ticks up.
-      const i = postIdx++;
-      const shouldBeClip =
-        postClipFraction >= 1
-          ? true
-          : postClipFraction <= 0
-            ? false
-            : Math.floor((i + 1) * postClipFraction) > Math.floor(i * postClipFraction);
-      want = shouldBeClip ? "ai_clip" : "image";
+      want = strideClip(postIdx++, postClipFraction) ? "ai_clip" : "image";
     }
     if (want === seg.blockType) return seg;
     if (want === "ai_clip") { toClip++; return { ...seg, blockType: "ai_clip" as SyntheticBlockType }; }
@@ -2466,24 +2476,26 @@ export async function buildSyntheticTimeline(input: {
   }
 
   // FINAL image/ai_clip balance by position. Runs LAST so the short-visual
-  // merge's clip-bias can't undo it: before the clip-heavy cutoff visuals follow
-  // the intro run pattern (default 2 clips / 2 images — client cost fix
-  // 2026-07-03); after it, only a fraction stay clips (evenly spaced) and the
-  // rest become stills — a natural mix instead of the all-clip snowball. split_2
-  // and avatar are untouched.
+  // merge's clip-bias can't undo it: before the clip-heavy cutoff visuals hold
+  // SYNTHETIC_INTRO_CLIP_FRACTION as evenly-spaced clips (client 2026-07-22:
+  // 30% clips / 70% images for the first 15 min — LTX cost cut); after it, only
+  // postFraction stay clips (default 0 = all stills, "no more LTX after 15
+  // minutes"). split_2 and avatar are untouched.
   {
     const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
     const postFraction = getEnv().SYNTHETIC_POST_INTRO_CLIP_FRACTION;
     const introClipRun = getEnv().SYNTHETIC_INTRO_CLIP_RUN;
     const introImageRun = getEnv().SYNTHETIC_INTRO_IMAGE_RUN;
+    const introFraction = getEnv().SYNTHETIC_INTRO_CLIP_FRACTION;
     const { segments, toClip, toImage } = balanceVisualTypesByPosition(
-      planned, cutoff, postFraction, introClipRun, introImageRun,
+      planned, cutoff, postFraction, introClipRun, introImageRun, introFraction,
     );
     if (toClip > 0 || toImage > 0) {
       planned = segments;
       await logJob({ projectId, jobId }, "synthetic.plan.visual_balance", {
         clipHeavyCutoffSeconds: cutoff,
         postIntroClipFraction: postFraction,
+        introClipFraction: introFraction,
         introClipRun,
         introImageRun,
         flippedToClip: toClip,
@@ -2630,16 +2642,20 @@ export async function buildSyntheticTimeline(input: {
   // via HeyGen Avatar III, which lip-syncs to an audio slice cut from the master
   // voiceover across [startTime, endTime]. If that window is degenerate
   // (endTime <= startTime + a hair), the slice is empty and Avatar III has NO
-  // script fallback — the avatar job fails hard across every account (observed:
-  // a split_2 with start_time == end_time == 178.08). Such a block can't be a
-  // talking head, so demote it to a still IMAGE (needs no audio); the block's
-  // illustrative prompt already describes a frame. A bare avatar has no prompt to
-  // fall back to, so we log it — it should never occur (avatars come from
-  // non-empty marked runs), but we surface it rather than emit a doomed block.
+  // script fallback — the avatar job fails hard (observed: a split_2 with
+  // start_time == end_time == 178.08). Such a block can't be a talking head:
+  //   - split_2: demote to a still IMAGE (needs no audio); the block's
+  //     illustrative prompt already describes a frame.
+  //   - full avatar: it has no visual prompt to fall back to, so DROP it and
+  //     absorb its (≤0.2s) window + script into a neighboring block — prefer an
+  //     avatar neighbor so the words still play over a talking head. Only when
+  //     the plan has no neighbor at all is the block kept and logged.
   {
     const AVATAR_MIN_WINDOW = 0.2; // seconds; below this the audio slice is unusable
     let demotedZeroWindow = 0;
-    for (const p of planned) {
+    const drop = new Set<number>();
+    for (let i = 0; i < planned.length; i++) {
+      const p = planned[i];
       const window = p.endTime - p.startTime;
       if (window > AVATAR_MIN_WINDOW) continue;
       if (p.blockType === "split_2") {
@@ -2648,11 +2664,46 @@ export async function buildSyntheticTimeline(input: {
         p.avatarModel = null;
         demotedZeroWindow++;
       } else if (p.blockType === "avatar") {
-        await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window", {
+        // Nearest surviving neighbors (an earlier degenerate block may already
+        // be marked for dropping).
+        let prevIdx = i - 1;
+        while (prevIdx >= 0 && drop.has(prevIdx)) prevIdx--;
+        const prev = prevIdx >= 0 ? planned[prevIdx] : null;
+        const next = i + 1 < planned.length ? planned[i + 1] : null;
+        const into =
+          (prev?.blockType === "avatar" ? prev : null) ??
+          (next?.blockType === "avatar" ? next : null) ??
+          prev ?? next;
+        if (!into) {
+          // Single-block plan — nothing to absorb into; keep and surface it.
+          await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window", {
+            position: p.position, startTime: p.startTime, endTime: p.endTime,
+            script: (p.script ?? "").slice(0, 80),
+          });
+          continue;
+        }
+        // Extend the absorber's spoken window over the dropped block's window so
+        // the timeline stays continuous, and carry the script so the review
+        // screen still shows those words under the block that now covers them.
+        if (into === prev) {
+          into.endTime = Math.max(into.endTime, p.endTime);
+          into.script = [into.script, p.script].filter((s) => s?.trim()).join(" ");
+        } else {
+          into.startTime = Math.min(into.startTime, p.startTime);
+          into.script = [p.script, into.script].filter((s) => s?.trim()).join(" ");
+        }
+        into.duration = into.endTime - into.startTime;
+        drop.add(i);
+        await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window_absorbed", {
           position: p.position, startTime: p.startTime, endTime: p.endTime,
+          intoPosition: into.position, intoBlockType: into.blockType,
           script: (p.script ?? "").slice(0, 80),
         });
       }
+    }
+    if (drop.size > 0) {
+      planned = planned.filter((_, i) => !drop.has(i));
+      planned.forEach((p, i) => { p.position = i; });
     }
     if (demotedZeroWindow > 0) {
       await logJob({ projectId, jobId }, "synthetic.plan.zero_window_split2_demoted", {

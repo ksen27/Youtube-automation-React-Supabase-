@@ -543,9 +543,61 @@ export async function withSegmentHeartbeat<T>(
 export async function resetSegmentForRegen(
   segmentIds: string[],
   status: "pending" | "generating",
+  // When true, ARCHIVE the current still into asset_history and then null
+  // image_url/video_url so the processor generates a FRESH still from the
+  // (possibly just-edited) prompt. Needed for image/ai_clip regen: a still that
+  // a downstream provider content-filtered (e.g. LTX image-to-video) is otherwise
+  // reused unchanged on every Retry — the image, not the prompt, is what gets
+  // filtered — so it could never clear. We archive here (rather than letting
+  // finishSegment do it) because nulling now would leave finishSegment nothing to
+  // preserve; Restore still recovers the prior version. Default false keeps the
+  // asset in place (UI stays populated during regen; finishSegment archives it).
+  opts?: { clearStill?: boolean },
 ): Promise<void> {
   if (segmentIds.length === 0) return;
   const sb = getServerSupabase();
+
+  if (opts?.clearStill) {
+    // Archive each segment's current asset trio before clearing. Per-segment
+    // because asset_history is an append and every row's history differs.
+    const { data: rows } = await sb
+      .from("synthetic_segments")
+      .select("id, image_url, video_url, right_image_url, provider, asset_history")
+      .in("id", segmentIds);
+    for (const cur of rows ?? []) {
+      const hasAsset = cur.image_url || cur.video_url;
+      const history = Array.isArray(cur.asset_history) ? cur.asset_history : [];
+      const nextHistory = hasAsset
+        ? [
+            ...history,
+            {
+              image_url: (cur.image_url as string | null) ?? null,
+              video_url: (cur.video_url as string | null) ?? null,
+              right_image_url: (cur.right_image_url as string | null) ?? null,
+              provider: (cur.provider as string | null) ?? null,
+              created_at: new Date().toISOString(),
+            },
+          ]
+        : history;
+      const patch: Record<string, unknown> = {
+        status,
+        error: null,
+        image_url: null,
+        video_url: null,
+        asset_history: nextHistory,
+      };
+      let { error } = await sb.from("synthetic_segments").update(patch).eq("id", cur.id);
+      // Back-compat: asset_history column may not be migrated yet (see finishSegment).
+      if (error && /asset_history/.test(error.message)) {
+        const { asset_history: _omit, ...withoutHistory } = patch;
+        void _omit;
+        ({ error } = await sb.from("synthetic_segments").update(withoutHistory).eq("id", cur.id));
+      }
+      if (error) throw new Error(`resetSegmentForRegen: ${error.message}`);
+    }
+    return;
+  }
+
   const { error } = await sb
     .from("synthetic_segments")
     .update({ status, error: null })
