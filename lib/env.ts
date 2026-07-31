@@ -1055,6 +1055,13 @@ const ServerEnvSchema = z.object({
   // match (which would recycle the same asset into every video). Raise to
   // widen rotation, lower to cut query cost.
   ASSET_LIBRARY_MATCH_LIMIT: z.coerce.number().int().positive().default(8),
+  // Per-project reuse ceiling, as a fraction of the project's segment count.
+  // Client requirement: at most half of a video may be assets pulled from the
+  // library — beyond that the video stops reading as freshly produced. Once
+  // floor(total_segments * this) segments carry a reused marker, lookups return
+  // null and every remaining segment generates fresh. Set to 1 to lift the cap,
+  // 0 to disable reuse entirely without touching ASSET_LIBRARY_ENABLED.
+  ASSET_LIBRARY_MAX_REUSE_FRACTION: z.coerce.number().min(0).max(1).default(0.5),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

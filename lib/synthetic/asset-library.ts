@@ -25,7 +25,10 @@ import { isProductPrompt } from "@/lib/synthetic/constants";
 //   - among qualifying matches we pick the LEAST recently reused (nulls
 //     first), so footage rotates across videos instead of the single closest
 //     match recycling everywhere;
-//   - product/brand stills only match other product stills (is_product).
+//   - product/brand stills only match other product stills (is_product);
+//   - at most ASSET_LIBRARY_MAX_REUSE_FRACTION (default 50%) of a project's
+//     segments may be served from the library; past that every remaining
+//     segment generates fresh.
 //
 // Failure policy: the library is an optimization, never a dependency. Every
 // public function catches its own errors (including "migration not applied
@@ -58,17 +61,26 @@ export function promptHash(prompt: string): string {
   return createHash("sha256").update(normalizePrompt(prompt)).digest("hex");
 }
 
-// Every asset url already present on the project's segments (live columns AND
-// asset_history) — the per-video no-repeat exclusion list. Read fresh per
-// lookup: segments complete concurrently and a stale list would let two
-// concurrent segments reuse the same asset into one video.
-async function projectUsedUrls(projectId: string): Promise<string[]> {
+// One read of the project's segments serving both per-video guards:
+//   - usedUrls: every asset url already present on the project (live columns
+//     AND asset_history) — the no-repeat exclusion list, so one video never
+//     shows the same asset twice;
+//   - total / reusedCount: the reuse budget (see reuseBudgetLeft) — segments
+//     whose metadata carries the `reused` marker written by finishSegment.
+// Read fresh per lookup: segments complete concurrently and a stale snapshot
+// would let two concurrent segments reuse the same asset, or overshoot the cap.
+async function projectReuseState(projectId: string): Promise<{
+  usedUrls: string[];
+  total: number;
+  reusedCount: number;
+}> {
   const sb = getServerSupabase();
   const { data } = await sb
     .from("synthetic_segments")
-    .select("image_url, video_url, right_image_url, asset_history")
+    .select("image_url, video_url, right_image_url, asset_history, metadata")
     .eq("project_id", projectId);
   const urls = new Set<string>();
+  let reusedCount = 0;
   for (const row of data ?? []) {
     for (const u of [row.image_url, row.video_url, row.right_image_url]) {
       if (u) urls.add(u as string);
@@ -81,8 +93,23 @@ async function projectUsedUrls(projectId: string): Promise<string[]> {
         }
       }
     }
+    // A segment counts ONCE however many of its assets came from the library —
+    // the marker is a single metadata key, and the cap is expressed in items.
+    if ((row.metadata as Record<string, unknown> | null)?.reused) reusedCount += 1;
   }
-  return [...urls];
+  return { usedUrls: [...urls], total: (data ?? []).length, reusedCount };
+}
+
+/**
+ * How many more segments of this project may be served from the library.
+ * Budget = floor(total_segments * ASSET_LIBRARY_MAX_REUSE_FRACTION), default
+ * 50%. Best-effort under concurrency: several in-flight segments can each see
+ * the same pre-write count, so the realized share can overshoot by roughly the
+ * number of concurrently running segments before settling at the cap.
+ */
+function reuseBudgetLeft(state: { total: number; reusedCount: number }, fraction: number): number {
+  const allowed = Math.floor(state.total * fraction);
+  return allowed - state.reusedCount;
 }
 
 // Least-recently-reused pick: nulls (never reused) first, then oldest
@@ -102,7 +129,8 @@ function pickLeastRecentlyReused<T extends { reuse_count: number; last_reused_at
 
 /**
  * Look up a reusable prior generation for `prompt`. Returns null when the
- * library is disabled, nothing clears the threshold, everything qualifying is
+ * library is disabled, the project has spent its reuse budget (see
+ * reuseBudgetLeft), nothing clears the threshold, everything qualifying is
  * already used in this project, or any error occurs. On a hit, bumps the row's
  * rotation bookkeeping (reuse_count / last_reused_at) before returning.
  */
@@ -119,7 +147,23 @@ export async function findReusableAsset(opts: {
   try {
     const sb = getServerSupabase();
     const isProduct = isProductPrompt(prompt);
-    const exclude = await projectUsedUrls(opts.projectId);
+    const state = await projectReuseState(opts.projectId);
+
+    // Per-project reuse ceiling — checked BEFORE any query/embedding so an
+    // exhausted budget costs nothing. Generation proceeds fresh, as if the
+    // library had no match.
+    const budget = reuseBudgetLeft(state, env.ASSET_LIBRARY_MAX_REUSE_FRACTION);
+    if (budget <= 0) {
+      console.log(JSON.stringify({
+        msg: "asset_library.reuse_cap_reached",
+        projectId: opts.projectId,
+        total: state.total,
+        reused: state.reusedCount,
+        fraction: env.ASSET_LIBRARY_MAX_REUSE_FRACTION,
+      }));
+      return null;
+    }
+    const exclude = state.usedUrls;
 
     // Tier 1: exact normalized-prompt hash.
     const { data: exact, error: exactErr } = await sb
