@@ -6,6 +6,11 @@ import { logJob } from "@/lib/jobs/db";
 import type { WordTiming } from "@/lib/ai/deepgram";
 import { alignSentencesToWords } from "@/lib/ai/sentence-alignment";
 import type { Sentence } from "@/lib/ai/sentences";
+import {
+  buildTimedSentences,
+  repairCoverage,
+  type TimedSentence,
+} from "@/lib/synthetic/sentence-windows";
 import type { SyntheticBlockType } from "@/lib/types";
 import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
 
@@ -65,6 +70,30 @@ const GeminiSegmentSchema = z.object({
   shotType2: optString(),
   animationPrompt: optString(),
 });
+// Align-first block. Identical creative fields to GeminiSegmentSchema, except
+// the narration is referenced by SENTENCE INDEX instead of being echoed back as
+// text. That single change is what removes the text search — and with it the
+// desync that let a plan finish ~725s behind its own audio.
+//
+// z.coerce.number() because Gemini intermittently quotes integers ("12").
+const SentenceBlockSchema = z.object({
+  startSentence: z.coerce.number().int().nonnegative(),
+  endSentence: z.coerce.number().int().nonnegative(),
+  blockType: z.enum(["avatar", "image", "ai_clip", "split_2"]),
+  imagePrompt: optString(),
+  shotType: optString(),
+  imagePrompt2: optString(),
+  shotType2: optString(),
+  animationPrompt: optString(),
+});
+// NOTE the array key is `segments`, matching the legacy schema, so
+// salvageTruncatedTimeline (which recovers complete objects from a response
+// truncated at MAX_TOKENS) works for this path unchanged.
+const SentenceResponseSchema = z.object({
+  basePrompt: optString(),
+  segments: z.array(SentenceBlockSchema),
+});
+
 const GeminiResponseSchema = z.object({
   // A global "style bible" for the whole video: the recurring subjects, setting,
   // era, and mood that every block shares. Composed in FRONT of each block's
@@ -94,6 +123,13 @@ export interface PlannedSegment {
   // Shot type for the SECOND visual (paired with imagePrompt2).
   shotType2?: string | null;
   animationPrompt: string | null;
+  // Exact char range in the transcript this block covers. Set by the
+  // align-first path from the sentence offsets it groups. Undefined on the
+  // legacy path, which has no reliable offsets (Gemini's script text is a
+  // paraphrase) and must fall back to a normalized text search — see the
+  // avatar-marking pass, the second fuzzy matcher this replaces.
+  charStart?: number;
+  charEnd?: number;
   // Which HeyGen model an avatar-bearing block renders with. Set by avatar
   // marking from the doc-highlight color (red -> avatar_iv, orange ->
   // avatar_iii). Null on every non-avatar block; null on an avatar block means
@@ -313,7 +349,7 @@ function productBrandRule(topic: VideoTopic): string {
   );
 }
 
-function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): string {
+function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
   // Niche anchor. When we could derive the video's topic from the title +
   // transcript, we tell Gemini the world up front so EVERY scene stays on-theme
   // — the fix for off-topic visuals (a car video that rendered houses & lawns
@@ -364,14 +400,95 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
     "when the line is specifically about gardening or being outdoors.",
     "",
   );
+  return topicBlock;
+}
+
+// What the planner is asked to produce. The two modes differ ONLY in how the
+// script is presented and how a block declares the narration it covers:
+//
+//   text      — legacy. Gemini re-emits the narration as each block's `script`,
+//               and the caller then searches the word stream for that text to
+//               discover when the block is spoken.
+//   sentences — align-first. The transcript's sentences are already timed and
+//               numbered; a block declares a contiguous INDEX RANGE and never
+//               reproduces the narration at all, so nothing has to be searched
+//               for afterwards.
+//
+// Every creative instruction below is shared, so the two paths can't drift
+// into producing different-looking videos.
+type PlannerPayload =
+  | { mode: "text"; transcript: string }
+  | { mode: "sentences"; numbered: string; from: number; to: number };
+
+function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): string {
+  const topicBlock = buildTopicBlock(topic);
+
+  const segmentationIntro =
+    payload.mode === "text"
+      ? [
+          "You are a video director planning the visual track for an AI-generated",
+          "narrated video. Segment the transcript below into an ordered list of",
+          "visual blocks that play in sync with the narration. Cover the ENTIRE",
+          "transcript with no gaps and no overlaps — each block's `script` must be a",
+          "contiguous slice of the transcript, and concatenating all blocks' script",
+          "in order must reproduce the transcript.",
+        ]
+      : [
+          "You are a video director planning the visual track for an AI-generated",
+          "narrated video. The narration has ALREADY been split into numbered",
+          "sentences (listed at the end) and each sentence's spoken timing is",
+          "already known. Your job is to GROUP those sentences into an ordered list",
+          "of visual blocks.",
+          "",
+          "Each block covers a CONTIGUOUS run of sentence indices, declared as",
+          "`startSentence` and `endSentence` (both inclusive; use the same number",
+          `for both when a block is one sentence). Cover EVERY index from ${payload.from}`,
+          `to ${payload.to} exactly once: the first block starts at ${payload.from}, each`,
+          "block starts at the previous block's endSentence + 1, and the last block",
+          `ends at ${payload.to}. No gaps, no overlaps, ascending order.`,
+          "",
+          "Do NOT reproduce the narration text anywhere in your answer — the",
+          "sentence numbers are the only reference you need, and the system already",
+          "has the words.",
+        ];
+
+  const sizing =
+    payload.mode === "text"
+      ? [
+          "Block sizing — ONE SENTENCE = ONE BLOCK. Each block's `script` MUST be a",
+          "WHOLE sentence (or a few short, tightly-related sentences). NEVER break a",
+          "single sentence across two blocks, and NEVER end a block mid-sentence /",
+          "mid-clause — a block always ends at a sentence boundary (. ? !). A long",
+          "sentence stays ONE block even if it runs 10-15 seconds; the system covers a",
+          "long sentence with multiple visuals automatically, so you do NOT need to",
+          "shorten it. Keeping the whole sentence in one block lets you describe a",
+          "visual for the COMPLETE thought instead of a fragment.",
+        ]
+      : [
+          "Block sizing — ONE SENTENCE = ONE BLOCK by default. Group two or three",
+          "consecutive sentences into one block ONLY when they are short and describe",
+          "the SAME visual moment. A long sentence stays its own block even if it runs",
+          "10-15 seconds; the system covers a long block with multiple visuals",
+          "automatically, so you never need to shorten one. Never group sentences that",
+          "would need different pictures.",
+        ];
+
+  const responseShape =
+    payload.mode === "text"
+      ? 'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}'
+      : 'Respond ONLY with JSON: {"basePrompt","segments":[{"startSentence","endSentence","blockType","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}';
+
+  const tail =
+    payload.mode === "text"
+      ? ["TRANSCRIPT:", payload.transcript.trim()]
+      : [
+          `NUMBERED SENTENCES (${payload.from} to ${payload.to}):`,
+          payload.numbered,
+        ];
+
   return [
     ...topicBlock,
-    "You are a video director planning the visual track for an AI-generated",
-    "narrated video. Segment the transcript below into an ordered list of",
-    "visual blocks that play in sync with the narration. Cover the ENTIRE",
-    "transcript with no gaps and no overlaps — each block's `script` must be a",
-    "contiguous slice of the transcript, and concatenating all blocks' script",
-    "in order must reproduce the transcript.",
+    ...segmentationIntro,
     "",
     "For each block choose exactly one blockType:",
     "  - avatar : emotional, personal, or first-person statements (a person",
@@ -389,14 +506,7 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
     "             make it the majority of blocks); a varied mix of all four types",
     "             is the goal.",
     "",
-    "Block sizing — ONE SENTENCE = ONE BLOCK. Each block's `script` MUST be a",
-    "WHOLE sentence (or a few short, tightly-related sentences). NEVER break a",
-    "single sentence across two blocks, and NEVER end a block mid-sentence /",
-    "mid-clause — a block always ends at a sentence boundary (. ? !). A long",
-    "sentence stays ONE block even if it runs 10-15 seconds; the system covers a",
-    "long sentence with multiple visuals automatically, so you do NOT need to",
-    "shorten it. Keeping the whole sentence in one block lets you describe a",
-    "visual for the COMPLETE thought instead of a fragment.",
+    ...sizing,
     "",
     "FIRST, read the WHOLE transcript and write a single `basePrompt`: the",
     "video's recurring visual world — the SETTING / location type, the era, and",
@@ -481,11 +591,30 @@ function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): strin
     "'extremely slow, very slight push-in, scene completely static, no shake, no",
     "motion blur'). avatar blocks need no prompts.",
     "",
-    'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}',
+    responseShape,
     "",
-    "TRANSCRIPT:",
-    transcript.trim(),
+    ...tail,
   ].join("\n");
+}
+
+function buildPrompt(transcript: string, topic: VideoTopic = EMPTY_TOPIC): string {
+  return composePlannerPrompt(topic, { mode: "text", transcript });
+}
+
+// Render the sentence list Gemini groups. Indices are GLOBAL (they index the
+// whole transcript's sentence list, not the chunk), so a block's range needs
+// no offsetting after the fact and a chunk boundary can't shift a range.
+function buildSentencePrompt(
+  sentences: TimedSentence[],
+  from: number,
+  to: number,
+  topic: VideoTopic = EMPTY_TOPIC,
+): string {
+  const numbered = sentences
+    .slice(from, to + 1)
+    .map((s) => `[${s.index}] ${s.text}`)
+    .join("\n");
+  return composePlannerPrompt(topic, { mode: "sentences", numbered, from, to });
 }
 
 // Build the prompt for a SINGLE-segment image-prompt regeneration. Mirrors the
@@ -1906,8 +2035,8 @@ async function deriveVideoTopic(input: {
             responseMimeType: "application/json",
             temperature: 0.2,
             maxOutputTokens: 512,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             thinkingConfig: { thinkingBudget: 0 },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
           } as any,
         }),
       // Short PRIMARY ladder so a broad primary outage (whole model 503ing)
@@ -2018,6 +2147,136 @@ async function planTranscriptChunk(
   return { basePrompt: safe.data.basePrompt.trim(), segments: safe.data.segments };
 }
 
+type SentenceBlock = z.infer<typeof SentenceBlockSchema>;
+
+// Align-first counterpart of planTranscriptChunk: same model config, same
+// truncation salvage, but the response is index ranges over already-timed
+// sentences. The returned ranges are NOT trusted as a partition — the caller
+// repairs them (repairCoverage) before they can influence anything.
+async function planSentenceChunk(
+  ctx: { projectId: string; jobId?: string },
+  sentences: TimedSentence[],
+  from: number,
+  to: number,
+  chunkLabel: string,
+  topic: VideoTopic = EMPTY_TOPIC,
+): Promise<{ basePrompt: string; blocks: SentenceBlock[] }> {
+  const { result: res, model: usedModel } = await withGeminiModelFallback(
+    "buildSyntheticTimeline",
+    (model) =>
+      model.generateContent({
+        contents: [
+          { role: "user", parts: [{ text: buildSentencePrompt(sentences, from, to, topic) }] },
+        ],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.3,
+          maxOutputTokens: 32768,
+          thinkingConfig: { thinkingBudget: 0 },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+      }),
+    { attempts: 2, baseMs: 1500 },
+    { attempts: 5, baseMs: 1500 },
+  );
+  if (usedModel !== getEnv().GEMINI_MODEL) {
+    await logJob(ctx, "synthetic.plan.model_fallback", { model: usedModel, chunk: chunkLabel });
+  }
+  const txt = res.response.text();
+  const finishReason = res.response.candidates?.[0]?.finishReason;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(txt);
+  } catch {
+    const salvaged = salvageTruncatedTimeline(txt);
+    if (salvaged) {
+      await logJob(ctx, "synthetic.plan.salvaged_truncated", {
+        chunk: chunkLabel,
+        finishReason,
+        responseChars: txt.length,
+        path: "align_first",
+      });
+      parsed = salvaged;
+    } else {
+      throw new Error(
+        `buildSyntheticTimeline: Gemini response unparseable (finishReason=${finishReason}, chars=${txt.length}, chunk=${chunkLabel}): ${txt.slice(0, 200)}`,
+      );
+    }
+  }
+  const safe = SentenceResponseSchema.safeParse(parsed);
+  if (!safe.success || safe.data.segments.length === 0) {
+    throw new Error(
+      `buildSyntheticTimeline: schema/empty (finishReason=${finishReason}, chunk=${chunkLabel}): ${JSON.stringify(safe.success ? "empty" : safe.error.flatten()).slice(0, 300)}`,
+    );
+  }
+  return { basePrompt: safe.data.basePrompt.trim(), blocks: safe.data.segments };
+}
+
+// Turn repaired sentence ranges into PlannedSegments. Every field that used to
+// be guessed is now read off the sentence list:
+//   startTime / endTime — the first and last sentence's spoken window
+//   script              — the exact transcript slice those sentences span
+//   charStart / charEnd — their real offsets, for exact doc-mark intersection
+//
+// Because the sentence windows are continuous and span exactly the voiceover
+// (see buildTimedSentences), the blocks are too — so the timeline sums to the
+// voiceover by construction, with no floor and no residual.
+function segmentsFromSentenceBlocks(
+  blocks: SentenceBlock[],
+  sentences: TimedSentence[],
+  transcript: string,
+): PlannedSegment[] {
+  const out: PlannedSegment[] = [];
+  for (const b of blocks) {
+    const first = sentences[b.startSentence];
+    const last = sentences[b.endSentence];
+    if (!first || !last) continue;
+    const isVisual = b.blockType !== "avatar";
+    const script = transcript.slice(first.charStart, last.charEnd).trim();
+    out.push({
+      position: out.length,
+      blockType: b.blockType,
+      startTime: first.voStart,
+      endTime: last.voEnd,
+      duration: Math.max(0, last.voEnd - first.voStart),
+      script,
+      charStart: first.charStart,
+      charEnd: last.charEnd,
+      imagePrompt: isVisual ? (b.imagePrompt?.trim() || null) : null,
+      shotType: isVisual ? (b.shotType?.trim() || null) : null,
+      imagePrompt2: isVisual ? (b.imagePrompt2?.trim() || null) : null,
+      shotType2: isVisual ? (b.shotType2?.trim() || null) : null,
+      animationPrompt: b.blockType === "ai_clip" ? (b.animationPrompt?.trim() || null) : null,
+    });
+  }
+  return out;
+}
+
+// Split the sentence list into index ranges small enough that one Gemini call
+// can answer without overrunning its output budget. Mirrors
+// chunkTranscriptBySentence's char budget, but boundaries are sentence indices
+// so a chunk can never end mid-sentence.
+function chunkSentenceRanges(
+  sentences: TimedSentence[],
+  maxChars: number,
+): Array<{ from: number; to: number }> {
+  const ranges: Array<{ from: number; to: number }> = [];
+  let from = 0;
+  let chars = 0;
+  for (let i = 0; i < sentences.length; i++) {
+    const len = sentences[i].text.length + 1;
+    if (chars > 0 && chars + len > maxChars) {
+      ranges.push({ from, to: i - 1 });
+      from = i;
+      chars = 0;
+    }
+    chars += len;
+  }
+  if (from < sentences.length) ranges.push({ from, to: sentences.length - 1 });
+  return ranges;
+}
+
 /**
  * Run the Gemini planner and persist the result as synthetic_segments rows.
  * Returns the planned segments. Idempotent on retry: existing segments for the
@@ -2061,35 +2320,158 @@ export async function buildSyntheticTimeline(input: {
   // spikes; planTranscriptChunk waits those out (6 attempts) and falls back to
   // GEMINI_FALLBACK_MODEL before giving up, per chunk.
   const maxChars = getEnv().SYNTHETIC_PLANNER_MAX_CHARS_PER_CALL;
-  const chunks = chunkTranscriptBySentence(transcript, maxChars);
-  if (chunks.length > 1) {
-    await logJob({ projectId, jobId }, "synthetic.plan.chunked", {
-      chunks: chunks.length,
-      transcriptChars: transcript.trim().length,
-      maxCharsPerCall: maxChars,
-    });
-  }
 
   // basePrompt is a whole-video style bible; the first chunk reads enough of the
   // script to set it for everyone, so we adopt the first chunk's and ignore the
   // rest (they'd only describe their own slice).
   let basePrompt = "";
-  const rawSegments: RawSegment[] = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const { basePrompt: bp, segments } = await planTranscriptChunk(
-      { projectId, jobId },
-      chunks[i],
-      `${i + 1}/${chunks.length}`,
-      topic,
-    );
-    if (i === 0) basePrompt = bp;
-    rawSegments.push(...segments);
-  }
-  if (rawSegments.length === 0) {
-    throw new Error("buildSyntheticTimeline: planner produced no segments");
-  }
+  let planned: PlannedSegment[];
 
-  let planned = alignSegments(rawSegments, words, voiceoverDuration);
+  const alignFirst = getEnv().SYNTHETIC_PLAN_ALIGN_FIRST;
+  if (alignFirst) {
+    // ---- ALIGN-FIRST PATH -------------------------------------------------
+    // Time the transcript's own sentences, THEN ask Gemini only to group them.
+    // Nothing downstream searches the audio for Gemini's text, so the desync
+    // that stranded a whole plan behind its voiceover cannot occur.
+    const timed = buildTimedSentences({ transcript, words, voiceoverDuration });
+    if (timed.sentences.length === 0) {
+      throw new Error("buildSyntheticTimeline: transcript produced no sentences");
+    }
+    await logJob({ projectId, jobId }, "synthetic.plan.sentences_timed", {
+      sentences: timed.sentences.length,
+      anchored: timed.anchored,
+      interpolated: timed.interpolated,
+      anchoredFraction: Math.round(timed.anchoredFraction * 1000) / 1000,
+      hasWordTimings: !!words?.length,
+      voiceoverDuration,
+    });
+
+    // Alarm the old path never had. A collapsed anchor fraction means the word
+    // timings and the transcript disagree (wrong voiceover, bad Deepgram run,
+    // edited script) — every window past the collapse would be interpolated
+    // guesswork. Fail here instead of shipping it to the review screen. Only
+    // meaningful when we HAVE timings; without them everything is interpolated
+    // by definition and the proportional fit is the intended degraded mode.
+    const minAnchor = getEnv().SYNTHETIC_PLAN_MIN_ANCHOR_FRACTION;
+    if (words?.length && timed.anchoredFraction < minAnchor) {
+      throw new Error(
+        `buildSyntheticTimeline: only ${(timed.anchoredFraction * 100).toFixed(0)}% of ` +
+          `${timed.sentences.length} sentences anchored to the voiceover (need ` +
+          `${(minAnchor * 100).toFixed(0)}%) — the transcript and the voiceover audio ` +
+          `do not match. Re-generate the voiceover or re-import the script.`,
+      );
+    }
+
+    const ranges = chunkSentenceRanges(timed.sentences, maxChars);
+    if (ranges.length > 1) {
+      await logJob({ projectId, jobId }, "synthetic.plan.chunked", {
+        chunks: ranges.length,
+        sentences: timed.sentences.length,
+        maxCharsPerCall: maxChars,
+        path: "align_first",
+      });
+    }
+
+    const allBlocks: SentenceBlock[] = [];
+    let repairedTotal = 0;
+    let droppedTotal = 0;
+    for (let i = 0; i < ranges.length; i++) {
+      const { from, to } = ranges[i];
+      const { basePrompt: bp, blocks } = await planSentenceChunk(
+        { projectId, jobId },
+        timed.sentences,
+        from,
+        to,
+        `${i + 1}/${ranges.length}`,
+        topic,
+      );
+      if (i === 0) basePrompt = bp;
+      // Gemini's grouping is a suggestion; the partition is not. Repair each
+      // chunk against its OWN range so a chunk can never bleed into another.
+      const fixed = repairCoverage(blocks, from, to);
+      repairedTotal += fixed.repaired;
+      droppedTotal += fixed.dropped;
+      allBlocks.push(...fixed.blocks);
+    }
+    if (allBlocks.length === 0) {
+      throw new Error("buildSyntheticTimeline: planner produced no segments");
+    }
+    if (repairedTotal > 0 || droppedTotal > 0) {
+      await logJob({ projectId, jobId }, "synthetic.plan.coverage_repaired", {
+        blocks: allBlocks.length,
+        rangesRepaired: repairedTotal,
+        blocksDropped: droppedTotal,
+      });
+    }
+    planned = segmentsFromSentenceBlocks(allBlocks, timed.sentences, transcript);
+
+    // DOMINANCE CHECK — must run HERE, on the raw grouping, not after the
+    // later passes. repairCoverage guarantees every sentence is covered, so a
+    // Gemini response that stops early doesn't lose the tail: it hands the
+    // whole remainder to the last block. That block is then perfectly valid
+    // arithmetic and splitByDuration will happily carve it into dozens of
+    // ~6s slots that all repeat the same script — which is precisely how 12
+    // minutes of one sentence reached the review screen. Once carved, nothing
+    // downstream can tell those slots apart from legitimate ones, so this is
+    // the last moment the anomaly is visible.
+    //
+    // Calibrated on the 32-min Jubilees script: a healthy grouping's longest
+    // raw block is 27.9s against a 6.3s median, so 8x-the-median (floor 45s)
+    // leaves ~1.8x headroom while still firing when Gemini stops even 10
+    // sentences short. Avatar coalescing and the carve passes all run LATER,
+    // so nothing legitimately long exists yet at this point.
+    {
+      const durations = planned.map((s) => s.duration).sort((a, b) => a - b);
+      const median = durations[Math.floor(durations.length / 2)] ?? 0;
+      const longest = durations[durations.length - 1] ?? 0;
+      const ceiling = Math.max(45, median * 8);
+      if (longest > ceiling) {
+        const worst = planned.find((s) => s.duration === longest);
+        throw new Error(
+          `buildSyntheticTimeline: one block covers ${longest.toFixed(1)}s ` +
+            `(median ${median.toFixed(1)}s, ceiling ${ceiling.toFixed(1)}s) — the planner ` +
+            `did not group the whole script. Block at ${worst?.startTime.toFixed(1)}s: ` +
+            `"${(worst?.script ?? "").slice(0, 80)}"`,
+        );
+      }
+    }
+
+    await logJob({ projectId, jobId }, "synthetic.plan.align_first", {
+      blocks: planned.length,
+      timelineSeconds:
+        planned.length > 0 ? planned[planned.length - 1].endTime - planned[0].startTime : 0,
+      voiceoverDuration,
+    });
+  } else {
+    // ---- LEGACY PATH (SYNTHETIC_PLAN_ALIGN_FIRST=0) -----------------------
+    // Kept for rollback only. Its timing comes from searching the word stream
+    // for Gemini's paraphrased block text; see alignSegments for why that
+    // fails silently.
+    const chunks = chunkTranscriptBySentence(transcript, maxChars);
+    if (chunks.length > 1) {
+      await logJob({ projectId, jobId }, "synthetic.plan.chunked", {
+        chunks: chunks.length,
+        transcriptChars: transcript.trim().length,
+        maxCharsPerCall: maxChars,
+        path: "legacy",
+      });
+    }
+    const rawSegments: RawSegment[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const { basePrompt: bp, segments } = await planTranscriptChunk(
+        { projectId, jobId },
+        chunks[i],
+        `${i + 1}/${chunks.length}`,
+        topic,
+      );
+      if (i === 0) basePrompt = bp;
+      rawSegments.push(...segments);
+    }
+    if (rawSegments.length === 0) {
+      throw new Error("buildSyntheticTimeline: planner produced no segments");
+    }
+    planned = alignSegments(rawSegments, words, voiceoverDuration);
+  }
 
   // Diagnostic: Gemini's RAW block-type choice, BEFORE any avatar-marking,
   // capping, promotion, or merging. This is the ground truth for "did Gemini
@@ -2155,7 +2537,24 @@ export async function buildSyntheticTimeline(input: {
     let unplaced = 0;
     let split = 0;
     const result: PlannedSegment[] = [];
+    let exact = 0;
     for (const seg of planned) {
+      // Align-first blocks carry their real transcript offsets (they were built
+      // FROM sentence offsets), so marking is an index intersection — no search,
+      // no drift, no misses. This is the second fuzzy matcher the align-first
+      // change removes; the normalized-indexOf path below is the legacy
+      // fallback for blocks with no offsets.
+      if (seg.charStart !== undefined && seg.charEnd !== undefined) {
+        exact++;
+        const pieces = splitByMarks(seg, seg.charStart, seg.charEnd, avatarRanges, basePrompt);
+        if (pieces.length > 1) split++;
+        for (const p of pieces) {
+          if (p.blockType === "avatar") forced++;
+          result.push(p);
+        }
+        placed++;
+        continue;
+      }
       const needle = normNeedle(seg.script);
       if (!needle) {
         result.push(applyMark(seg, false, basePrompt));
@@ -2198,6 +2597,8 @@ export async function buildSyntheticTimeline(input: {
       transcriptChars: transcript.length,
       markedChars: avatarRanges.reduce((a, r) => a + (r.end - r.start), 0),
       segmentsPlaced: placed,
+      // Placed by exact char offsets (align-first) rather than text search.
+      segmentsPlacedExact: exact,
       segmentsUnplaced: unplaced,
       segmentsSplit: split,
       segmentsTotal: planned.length,
@@ -2658,45 +3059,59 @@ export async function buildSyntheticTimeline(input: {
       const p = planned[i];
       const window = p.endTime - p.startTime;
       if (window > AVATAR_MIN_WINDOW) continue;
-      if (p.blockType === "split_2") {
-        p.blockType = "image";
-        p.animationPrompt = null;
-        p.avatarModel = null;
-        demotedZeroWindow++;
-      } else if (p.blockType === "avatar") {
-        // Nearest surviving neighbors (an earlier degenerate block may already
-        // be marked for dropping).
-        let prevIdx = i - 1;
-        while (prevIdx >= 0 && drop.has(prevIdx)) prevIdx--;
-        const prev = prevIdx >= 0 ? planned[prevIdx] : null;
-        const next = i + 1 < planned.length ? planned[i + 1] : null;
-        const into =
-          (prev?.blockType === "avatar" ? prev : null) ??
-          (next?.blockType === "avatar" ? next : null) ??
-          prev ?? next;
-        if (!into) {
-          // Single-block plan — nothing to absorb into; keep and surface it.
-          await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window", {
-            position: p.position, startTime: p.startTime, endTime: p.endTime,
-            script: (p.script ?? "").slice(0, 80),
-          });
-          continue;
-        }
+
+      // ABSORB FIRST, for EVERY block type (widened 2026-07-31). Previously only
+      // 'avatar' was absorbed and a degenerate image/ai_clip was left in place —
+      // where the legacy path's Math.max(0.5, …) floor then gave it 0.5s of
+      // duration it did not occupy. Eleven such blocks put a project 5.5s over
+      // its voiceover and the render route refused it. A block with no spoken
+      // window has nothing to show and nothing to say: fold it into a neighbour.
+      let prevIdx = i - 1;
+      while (prevIdx >= 0 && drop.has(prevIdx)) prevIdx--;
+      const prev = prevIdx >= 0 ? planned[prevIdx] : null;
+      const next = i + 1 < planned.length ? planned[i + 1] : null;
+      // Prefer a same-type neighbour so a talking head's words stay over a
+      // talking head; otherwise either neighbour will do.
+      const into =
+        (prev?.blockType === p.blockType ? prev : null) ??
+        (next?.blockType === p.blockType ? next : null) ??
+        prev ?? next;
+
+      if (into) {
         // Extend the absorber's spoken window over the dropped block's window so
         // the timeline stays continuous, and carry the script so the review
         // screen still shows those words under the block that now covers them.
         if (into === prev) {
           into.endTime = Math.max(into.endTime, p.endTime);
           into.script = [into.script, p.script].filter((s) => s?.trim()).join(" ");
+          if (p.charEnd !== undefined) into.charEnd = p.charEnd;
         } else {
           into.startTime = Math.min(into.startTime, p.startTime);
           into.script = [p.script, into.script].filter((s) => s?.trim()).join(" ");
+          if (p.charStart !== undefined) into.charStart = p.charStart;
         }
         into.duration = into.endTime - into.startTime;
         drop.add(i);
-        await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window_absorbed", {
-          position: p.position, startTime: p.startTime, endTime: p.endTime,
+        await logJob({ projectId, jobId }, "synthetic.plan.zero_window_absorbed", {
+          position: p.position, blockType: p.blockType,
+          startTime: p.startTime, endTime: p.endTime,
           intoPosition: into.position, intoBlockType: into.blockType,
+          script: (p.script ?? "").slice(0, 80),
+        });
+        continue;
+      }
+
+      // No neighbour at all (single-block plan). An avatar-bearing block still
+      // can't render — Avatar III lip-syncs to an audio slice and has no script
+      // fallback — so demote split_2 to a still and surface a lone avatar.
+      if (p.blockType === "split_2") {
+        p.blockType = "image";
+        p.animationPrompt = null;
+        p.avatarModel = null;
+        demotedZeroWindow++;
+      } else if (p.blockType === "avatar") {
+        await logJob({ projectId, jobId }, "synthetic.plan.avatar_zero_window", {
+          position: p.position, startTime: p.startTime, endTime: p.endTime,
           script: (p.script ?? "").slice(0, 80),
         });
       }
@@ -2710,6 +3125,55 @@ export async function buildSyntheticTimeline(input: {
         count: demotedZeroWindow, minWindowSeconds: AVATAR_MIN_WINDOW,
       });
     }
+  }
+
+  // ---- FINAL PLAN VALIDATION -------------------------------------------
+  // The last line of defence, and the alarm that was missing when a plan
+  // reached the review screen ~725s behind its own audio with one sentence
+  // fanned across the final 12 minutes. Both checks are on the PLAN, before
+  // a single image is paid for.
+  {
+    const timelineDuration = planned.reduce((s, p) => s + (Number(p.duration) || 0), 0);
+    // 1) Total must match the voiceover. The render route enforces ±3s; we use
+    //    a tighter bound here so a plan can never be persisted that the render
+    //    route would later refuse — the operator sees the real cause instead of
+    //    a duration-arithmetic complaint after every asset has been generated.
+    const PLAN_DURATION_TOLERANCE = 1.5;
+    if (voiceoverDuration > 0 && Math.abs(timelineDuration - voiceoverDuration) > PLAN_DURATION_TOLERANCE) {
+      throw new Error(
+        `buildSyntheticTimeline: planned timeline ${timelineDuration.toFixed(1)}s does not ` +
+          `match voiceover ${voiceoverDuration.toFixed(1)}s ` +
+          `(delta ${(timelineDuration - voiceoverDuration).toFixed(1)}s, ${planned.length} blocks)`,
+      );
+    }
+    // 2) No block may survive the carve passes at an impossible length. By
+    //    this point splitByDuration has carved visuals to
+    //    SYNTHETIC_BLOCK_SPLIT_THRESHOLD, split_2 is capped by
+    //    SYNTHETIC_SPLIT2_MAX_SECONDS, and an avatar part is capped at
+    //    AVATAR_PART_MAX_SECONDS — so anything far past a minute means a pass
+    //    was skipped or a block escaped one.
+    //
+    //    This is a backstop, NOT the coverage guard: a block that swallowed
+    //    the script has already been carved into many short slots by now and
+    //    would sail through. That check lives at assembly time in the
+    //    align-first branch above, before any carving happens.
+    const durations = planned.map((p) => Number(p.duration) || 0).sort((a, b) => a - b);
+    const longest = durations[durations.length - 1] ?? 0;
+    const median = durations[Math.floor(durations.length / 2)] ?? 0;
+    const ceiling = Math.max(90, median * 15);
+    if (longest > ceiling) {
+      throw new Error(
+        `buildSyntheticTimeline: a single block spans ${longest.toFixed(1)}s after all ` +
+          `pacing passes (median ${median.toFixed(1)}s, ceiling ${ceiling.toFixed(1)}s, ` +
+          `${planned.length} blocks)`,
+      );
+    }
+    await logJob({ projectId, jobId }, "synthetic.plan.validated", {
+      blocks: planned.length,
+      timelineDuration: Math.round(timelineDuration * 100) / 100,
+      voiceoverDuration,
+      longestBlockSeconds: Math.round(longest * 100) / 100,
+    });
   }
 
   // Persist. Clear any prior plan first so retries don't accumulate.

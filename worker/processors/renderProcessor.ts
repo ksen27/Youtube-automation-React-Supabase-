@@ -1625,11 +1625,40 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     const { data: project } = await sb.from("projects")
       .select("voiceover_url, title, intro_clip_id, intro_duration_seconds, intro_source_youtube_url, intro_source_start_seconds, bg_music_url, bg_music_gain, sfx_urls, sfx_gain")
       .eq("id", projectId).single();
+    // The voiceover IS the master audio track — the whole video's sound. Unlike
+    // bg music / SFX (best-effort polish below), a MISSING voiceover means a
+    // completely silent render, which the duration-only post-validation happily
+    // passes (a silent video has the exact right length). That shipped ≥5
+    // "completed" videos with no voice (client report 2026-07-30). So a
+    // voiceover download failure must NOT be swallowed: downloadHttp already
+    // retries transient CDN failures, and if it still throws we HARD-FAIL the
+    // render (the catch at the bottom marks it failed + retryable) rather than
+    // silently producing a voiceless video. A project that legitimately has no
+    // voiceover_url (voiceoverLocal stays undefined) is a different, valid case
+    // — an audio guard after concat catches an unexpectedly-silent render there.
     let voiceoverLocal: string | undefined;
     if (project?.voiceover_url) {
       voiceoverLocal = path.join(tmp, "voiceover.audio");
-      try { await downloadHttp(project.voiceover_url, voiceoverLocal); }
-      catch { voiceoverLocal = undefined; }
+      try {
+        await downloadHttp(project.voiceover_url, voiceoverLocal);
+        // Guard against a "successful" download of an empty/corrupt file that
+        // would produce a silent track — probe it and require real audio.
+        const voProbe = await probeFile(voiceoverLocal);
+        if (!voProbe.hasAudio || !(voProbe.durationSeconds > 0)) {
+          throw new Error(
+            `voiceover downloaded but has no audio stream (hasAudio=${voProbe.hasAudio}, dur=${voProbe.durationSeconds})`,
+          );
+        }
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId }, "render.voiceover.download_failed", {
+          url: project.voiceover_url,
+          err: (e as Error).message?.slice(0, 300),
+        });
+        throw new Error(
+          `render aborted: could not fetch the master voiceover (${(e as Error).message}). ` +
+            `Rendering without it would ship a silent video; retrying instead.`,
+        );
+      }
     }
     // Background music is best-effort — a download failure should not
     // block the render. The user gets a video without the bed and the
@@ -3066,6 +3095,36 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
     } catch (e) {
       await logJob({ projectId, jobId: mediaJobId },
         "render.post_validation.failed", { err: (e as Error).message });
+    }
+
+    // 4d) SILENT-RENDER SAFEGUARD (client report 2026-07-30: ≥5 "completed"
+    // videos with no voice). The duration-only validation above passes a silent
+    // video — a voiceless MP4 is the exact right LENGTH — which is how voiceless
+    // renders shipped as completed. `voiceoverLocal` is set only when the project
+    // had a voiceover_url that downloaded AND probed as real audio, so its
+    // presence means "narration was expected". Probe the FINAL mp4 for an audio
+    // stream; if we expected narration but the file came back with no audio,
+    // abort BEFORE upload so the render fails + retries instead of publishing a
+    // voiceless video. Deliberately OUTSIDE the post_validation try/catch above
+    // (that catch swallows) so the throw reaches the render's outer catch. Cheap
+    // whole-file probe; last line of defense past every upstream best-effort catch.
+    if (voiceoverLocal) {
+      let finalHasAudio: boolean | null = null;
+      try {
+        const audioProbe = await probeFile(finalLocal);
+        finalHasAudio = audioProbe.hasAudio;
+      } catch (e) {
+        await logJob({ projectId, jobId: mediaJobId }, "render.silent_check.probe_failed",
+          { err: (e as Error).message });
+      }
+      if (finalHasAudio === false) {
+        await logJob({ projectId, jobId: mediaJobId }, "render.silent_output.detected", {
+          note: "expected narration but final MP4 has no audio stream — failing render so it retries",
+        });
+        throw new Error(
+          "render produced a SILENT video (no audio stream) despite an expected voiceover — aborting so it retries instead of shipping voiceless.",
+        );
+      }
     }
 
     // 5) Upload final. Pushing a multi-hundred-MB mp4 to R2 can take a while on

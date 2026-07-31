@@ -166,6 +166,43 @@ const MAX_INTER_SENTENCE_GAP = 30;
 // the standard for English voiceover narration.
 const FALLBACK_WPS = 2.5;
 
+// Opt-in behaviour changes. EVERY field defaults to the historical
+// behaviour, so the celebrity matcher (matchProcessor) is byte-identical
+// unless it opts in. Added 2026-07-31 after the synthetic planner hit a
+// permanent desync: the two recovery rules below deadlock each other.
+//
+//   A missed head leaves `wordCursor` parked (so a one-off Deepgram glitch
+//   can't cascade) while `lastEndSeconds` still advances by cadence. Each
+//   miss therefore leaves the cursor further behind the audio. Once the
+//   accumulated lag exceeds MAX_INTER_SENTENCE_GAP, the desync guard starts
+//   rejecting CORRECT matches as "too far ahead" — and each rejection is
+//   itself a miss that doesn't advance the cursor. Neither rule can recover
+//   on its own. Measured on a 32-minute voiceover: alignment died at
+//   sentence 53 of 127 and every one of the remaining 73 was synthesized,
+//   ending ~725s behind the real audio.
+// Measured note: "advance the cursor on a miss" was tried here as a third
+// option and REJECTED — on verbatim transcript sentences it cut anchors from
+// 255/373 to 81/373. A miss usually means the sentence IS at the cursor and
+// Deepgram simply spelled a token differently; skipping ahead by its length
+// steps over the real match, and the search is forward-only, so it never
+// comes back. Parking the cursor is correct. The lock-in it was meant to fix
+// is addressed at the source instead — the planner no longer searches for
+// paraphrased text at all (lib/synthetic/sentence-windows.ts).
+export interface AlignOptions {
+  // After this many consecutive desync rejections, treat the next head hit
+  // as a genuine RESYNC: accept it and re-anchor `lastEndSeconds` to it
+  // rather than rejecting it again. A single stray match is still rejected
+  // (that's what the guard is for); a sustained disagreement means our
+  // synthesized clock is the thing that's wrong. 0/undefined = never resync
+  // (historical behaviour).
+  resyncAfterMisses?: number;
+  // Words-per-second for cadence fallback. Callers that know the real rate
+  // (words.length / voiceover_duration) should pass it — the 2.5 constant
+  // is 9% fast for a 2.29 wps narrator, and that error compounds across
+  // every synthesized sentence.
+  fallbackWps?: number;
+}
+
 // Align an ordered Sentence[] against the Deepgram word stream. Returns
 // an AlignedSentence[] of the same length and order — every input
 // sentence appears in the output, never dropped.
@@ -199,8 +236,15 @@ const FALLBACK_WPS = 2.5;
 export function alignSentencesToWords(
   sentences: Sentence[],
   timings: WordTiming[],
+  opts: AlignOptions = {},
 ): AlignedSentence[] {
   if (sentences.length === 0) return [];
+
+  // Caller-supplied cadence wins over the 2.5 constant when it looks sane.
+  const fallbackWps =
+    opts.fallbackWps && Number.isFinite(opts.fallbackWps) && opts.fallbackWps > 0
+      ? opts.fallbackWps
+      : FALLBACK_WPS;
 
   // No word timings — degrade gracefully. Every sentence falls back to a
   // cadence estimate, anchored to the cumulative start. The matcher can
@@ -210,7 +254,7 @@ export function alignSentencesToWords(
     let cursor = 0;
     for (const s of sentences) {
       const tokens = tokenize(s.text).length;
-      const dur = tokens > 0 ? tokens / FALLBACK_WPS : 0.5;
+      const dur = tokens > 0 ? tokens / fallbackWps : 0.5;
       out.push({
         ...s,
         vo_start: cursor,
@@ -225,6 +269,8 @@ export function alignSentencesToWords(
   const result: AlignedSentence[] = [];
   let wordCursor = 0;
   let lastEndSeconds = 0;
+  // Consecutive desync rejections, for opts.resyncAfterMisses.
+  let consecutiveMisses = 0;
 
   // Pre-canonicalize Deepgram tokens ONCE. Index-aligned with `timings` so
   // we still read .start/.end by the same index. findRun walks this canonical
@@ -257,11 +303,12 @@ export function alignSentencesToWords(
       // No head match in the search window. Synthesize: this sentence's
       // window picks up where the previous one ended, sized by cadence.
       // The aligned=false flag lets the matcher surface this in logs.
-      const estimatedDur = tokens.length / FALLBACK_WPS;
+      const estimatedDur = tokens.length / fallbackWps;
       const vo_start = lastEndSeconds;
       const vo_end = vo_start + estimatedDur;
       result.push({ ...s, vo_start, vo_end, aligned: false });
       lastEndSeconds = vo_end;
+      consecutiveMisses++;
       // Cursor doesn't advance — the next sentence searches from the
       // same position, so a one-sentence Deepgram glitch doesn't
       // cascade-desync the rest of the alignment.
@@ -272,15 +319,24 @@ export function alignSentencesToWords(
 
     // Sanity check: head landed too far past previous end. Treat as
     // a desync and synthesize instead.
-    if (
-      lastEndSeconds > 0 &&
-      candidateStart - lastEndSeconds > MAX_INTER_SENTENCE_GAP
-    ) {
-      const estimatedDur = tokens.length / FALLBACK_WPS;
+    //
+    // …UNLESS we've already rejected `resyncAfterMisses` in a row. A single
+    // stray match landing far ahead is what this guard is for; a SUSTAINED
+    // disagreement means our synthesized clock has drifted and the word
+    // stream is the trustworthy side. Without this escape the guard locks
+    // permanently: every rejection pushes lastEndSeconds further from the
+    // truth, which makes the next correct match look even more suspicious.
+    const farAhead =
+      lastEndSeconds > 0 && candidateStart - lastEndSeconds > MAX_INTER_SENTENCE_GAP;
+    const mayResync =
+      !!opts.resyncAfterMisses && consecutiveMisses >= opts.resyncAfterMisses;
+    if (farAhead && !mayResync) {
+      const estimatedDur = tokens.length / fallbackWps;
       const vo_start = lastEndSeconds;
       const vo_end = vo_start + estimatedDur;
       result.push({ ...s, vo_start, vo_end, aligned: false });
       lastEndSeconds = vo_end;
+      consecutiveMisses++;
       // Don't advance the cursor — the suspicious head match shouldn't
       // dictate where subsequent sentences search from.
       continue;
@@ -295,6 +351,7 @@ export function alignSentencesToWords(
       result.push({ ...s, vo_start, vo_end, aligned: true });
       lastEndSeconds = vo_end;
       wordCursor = lastIdx + 1;
+      consecutiveMisses = 0;
       continue;
     }
 
@@ -309,7 +366,7 @@ export function alignSentencesToWords(
       // Defensive: if the tail somehow ended before the head started
       // (Deepgram word ordering glitch), fall back to head-only.
       if (vo_end <= vo_start) {
-        const estimatedDur = tokens.length / FALLBACK_WPS;
+        const estimatedDur = tokens.length / fallbackWps;
         result.push({
           ...s,
           vo_start,
@@ -323,6 +380,7 @@ export function alignSentencesToWords(
       result.push({ ...s, vo_start, vo_end, aligned: true });
       lastEndSeconds = vo_end;
       wordCursor = lastIdx + 1;
+      consecutiveMisses = 0;
       continue;
     }
 
@@ -335,15 +393,18 @@ export function alignSentencesToWords(
     if (cadenceLookahead >= 2) {
       const cadenceSpan =
         timings[headIdx + cadenceLookahead - 1].end - timings[headIdx].start;
-      const localWps = cadenceSpan > 0 ? cadenceLookahead / cadenceSpan : FALLBACK_WPS;
+      const localWps = cadenceSpan > 0 ? cadenceLookahead / cadenceSpan : fallbackWps;
       estimatedDur = tokens.length / localWps;
     } else {
-      estimatedDur = tokens.length / FALLBACK_WPS;
+      estimatedDur = tokens.length / fallbackWps;
     }
     const vo_start = candidateStart;
     const vo_end = vo_start + estimatedDur;
     result.push({ ...s, vo_start, vo_end, aligned: false });
     lastEndSeconds = vo_end;
+    // The head DID match, so the cursor is back on the real audio position —
+    // this is not a desync, only an unknown sentence end.
+    consecutiveMisses = 0;
     // Advance the cursor past the head — we don't know where the
     // sentence actually ended, but we know it starts somewhere after
     // the head. Conservative cursor advance prevents the next
