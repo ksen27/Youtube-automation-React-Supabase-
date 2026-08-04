@@ -12,6 +12,8 @@ import { recordWebsiteScroll } from "@/lib/synthetic/website-recorder";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { SYNTHETIC_WIDTH, SYNTHETIC_HEIGHT, SYNTHETIC_FPS } from "@/lib/synthetic/constants";
 import { buildPitchClip, concatPitchParts } from "@/lib/media/ffmpeg";
+import { generateQRCard, qrOverlayOffset, normalizeQRUrl } from "@/lib/media/qr";
+import { getEnv } from "@/lib/env";
 import { probeFile } from "@/lib/media/probe";
 import { userFacingMessage } from "@/lib/synthetic/heygen-errors";
 import type { JobAttemptInfo } from "@/worker/index";
@@ -200,6 +202,16 @@ export async function processPitchGenJob(
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT,
       targetScrollSeconds: PITCH_WEBSITE_SECONDS,
     });
+
+    // QR card for the scroll window (client 2026-08-03) — a viewer watching the
+    // website scroll can scan it and open that same site on their phone. It is
+    // composited into the pass below, NOT as a separate post-render overlay:
+    // this clip is already being re-encoded (webm -> mp4, trimmed + pinned), so
+    // the QR costs no extra pass. Deliberately scoped to the website window only
+    // — the avatar half carries no QR.
+    const qr = await buildPitchQROverlay(websiteUrl, tmp, ts, logScope);
+    if (qr) staged.push(qr.path);
+
     // Trim front dead-air; PIN to the window. The recording itself is silent —
     // the narration master track covers it at concat.
     await buildPitchClip({
@@ -207,6 +219,9 @@ export async function processPitchGenJob(
       startSeconds: webRec.scrollStartSeconds,
       durationSeconds: PITCH_WEBSITE_SECONDS,
       width: SYNTHETIC_WIDTH, height: SYNTHETIC_HEIGHT, fps: SYNTHETIC_FPS,
+      overlayImagePath: qr?.path,
+      overlayX: qr?.x,
+      overlayY: qr?.y,
     });
 
     // --- 4) Concat avatar → website; narration voiceover runs across BOTH ---
@@ -264,6 +279,57 @@ export async function processPitchGenJob(
     throw err; // let BullMQ retry
   } finally {
     for (const p of staged) await safeUnlink(p);
+  }
+}
+
+// Build the QR card PNG for the website-scroll window and work out where it
+// sits in the frame. Returns null when the overlay is disabled, the URL can't be
+// encoded, or rendering fails.
+//
+// NEVER throws. The QR is cosmetic; a pitch that renders without it is a far
+// better outcome than a failed job that has already burned a HeyGen render and a
+// 69labs TTS call.
+async function buildPitchQROverlay(
+  websiteUrl: string,
+  tmp: string,
+  ts: string,
+  logScope: { jobId: string },
+): Promise<{ path: string; x: number; y: number } | null> {
+  const env = getEnv();
+  if (!env.PITCH_QR_ENABLED) return null;
+
+  const url = normalizeQRUrl(websiteUrl);
+  if (!url) {
+    await logJob(logScope, "pitch.qr_skipped", { reason: "unusable_url" });
+    return null;
+  }
+
+  try {
+    // Sized off frame WIDTH so the card keeps its proportions if the canvas
+    // changes (e.g. the client's 4K request).
+    const sizePx = Math.round(SYNTHETIC_WIDTH * env.PITCH_QR_SIZE_FRACTION);
+    const marginPx = Math.round(SYNTHETIC_WIDTH * env.PITCH_QR_MARGIN_FRACTION);
+    const paddingPx = Math.round(sizePx * env.PITCH_QR_PADDING_FRACTION);
+
+    const png = await generateQRCard({ url, sizePx, paddingPx });
+    const qrPath = path.join(tmp, `qr_${ts}.png`);
+    await fs.writeFile(qrPath, png);
+
+    const { x, y } = qrOverlayOffset({
+      position: env.PITCH_QR_POSITION,
+      width: SYNTHETIC_WIDTH,
+      height: SYNTHETIC_HEIGHT,
+      sizePx,
+      marginPx,
+    });
+
+    await logJob(logScope, "pitch.qr_overlay", {
+      url, sizePx, marginPx, position: env.PITCH_QR_POSITION, x, y,
+    });
+    return { path: qrPath, x, y };
+  } catch (err) {
+    await logJob(logScope, "pitch.qr_failed", { err: (err as Error).message?.slice(0, 200) });
+    return null;
   }
 }
 

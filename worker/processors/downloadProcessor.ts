@@ -130,7 +130,12 @@ export async function processDownloadJob(
   const tmp = await ensureTmp(`source/${safeId}`);
   try {
     const result = await downloadYoutubeVideo({
-      url: youtubeUrl, outputDir: tmp, videoId: safeId, maxHeight: 720,
+      // 1080p, not 2160p: the export is 4K but the FOOTAGE need not be (client
+      // 2026-08-03). Raised from 720 anyway because the 3840x2160 canvas would
+      // upscale 720p footage 3x across most of a celebrity video's screen time,
+      // and yt-dlp costs bandwidth only — no per-unit price. Raise to 2160 if real
+      // 4K footage is ever wanted (few YouTube sources actually carry it).
+      url: youtubeUrl, outputDir: tmp, videoId: safeId, maxHeight: 1080,
       onLog: () => { /* keep stdout clean — high-volume */ },
     });
 

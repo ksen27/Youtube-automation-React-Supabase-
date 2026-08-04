@@ -228,11 +228,15 @@ const ServerEnvSchema = z.object({
   MAX_CLIP_CAP: z.coerce.number().int().positive().default(400),
   MAX_SOURCE_DURATION_SECONDS: z.coerce.number().int().positive().default(1500),
   YTDLP_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
-  // Bumped from 120s — on shared-CPU hosts (Fly shared-cpu-2x) several
-  // concurrent ffmpegs can starve each other and a single short clip cut
-  // ends up taking >2 min. The fix is `-threads` capping + lower
-  // CLIP_PIPELINE_CONCURRENCY, but we leave headroom for the slowest clip.
-  FFMPEG_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(240),
+  // 120s -> 240s -> 1200s. The 240s value was sized for the 720p/1080p canvas and
+  // became a live failure the day the render canvas moved to 4K (2026-08-03):
+  // every ffmpeg op carries 4x the pixels, and the FINAL AUDIO MUX — one pass over
+  // the whole ~27-minute concat — landed right on the edge. Measured the same
+  // night: 93s on one machine (passed) vs >240s on the other (killed the render
+  // with "ffmpeg timed out after 240s" after 3 attempts). It is a watchdog for a
+  // HUNG ffmpeg, not a performance budget, so it must sit far above the slowest
+  // legitimate pass; 1200s keeps that role without failing honest 4K work.
+  FFMPEG_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1200),
   // Scene-detect runs once per source before clip cuts and decodes (downscaled)
   // every frame. It should fail fast: a slow scene-detect means the clip job
   // has to wait that long before its first lane starts, even though the
@@ -417,6 +421,12 @@ const ServerEnvSchema = z.object({
   // require setting SIXTYNINE_LABS_IMAGE_MODEL to the Pro model name.
   // Verified valid values for nano-banana-2: "1k" | "2k" | "4k" (LOWERCASE —
   // the API 400s on "2K"). "" omits the field (provider default = 1k).
+  // "2k", not "4k": the export only has to BE 4K (client 2026-08-03), it does not
+  // need 4K source detail. But this was "1k" in production, which the 3840x2160
+  // canvas would upscale 4x on ~215 of ~277 blocks — visibly mushy for no saving,
+  // since 69labs bills per IMAGE, not per pixel. "2k" is the middle ground.
+  // Probed 2026-08-03: "4k" returns 5504×3072 (above the canvas) and each file is
+  // ~10MB, so 4k costs ~2GB of storage per project — the reason not to default to it.
   SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("2k"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
   // Max seconds to poll a TTS job to COMPLETED before giving up.
@@ -454,6 +464,14 @@ const ServerEnvSchema = z.object({
   LTX_API_KEYS: z.string().optional(),
   LTX_BASE_URL: z.string().url().default("https://api.ltx.video"),
   LTX_MODEL: z.string().default("ltx-2-3-fast"),
+  // DELIBERATELY 1080p even though the render canvas is 4K. Client 2026-08-03:
+  // "the clips and images generated doesn't matter if the footage is 4k, the
+  // export just has to be 4k" — YouTube keys off the EXPORT resolution, so the
+  // renderer upscaling a 1080p clip into the 3840x2160 frame satisfies the ask.
+  // Generating clips at 4K costs ~4x per second and ~6x storage (measured
+  // 2026-08-03: 6s clip = 5.9MB at 1080p vs 36MB at 4K) and buys nothing he asked
+  // for. Probed and CONFIRMED WORKING at "3840x2160" if real 4K clips are ever
+  // wanted — flip this one value, and scale PRICE_TABLE.ltx2 in cost.ts with it.
   LTX_RESOLUTION: z.string().default("1920x1080"),
   // LTX-2 source frame rate. Allowed values are 25 or 50 (NOT 24 — the API
   // rejects fps 24 for ltx-2-fast at 1080p). The render pipeline re-encodes
@@ -886,6 +904,31 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_DEGRADE_VIDEO_NOISE: z.coerce.number().nonnegative().default(18),
   SYNTHETIC_DEGRADE_VIDEO_CRF_DELTA: z.coerce.number().int().nonnegative().default(6),
 
+  // SALES-PITCH QR OVERLAY (client 2026-08-03). The pitch's final window scroll-
+  // records the client's real website; this pins a scannable QR card over THAT
+  // window (and only that window — never the avatar half) linking to the same
+  // site. Nothing new is asked of the user: the QR encodes the pitch's existing
+  // website_url.
+  //
+  // Size/margin are FRACTIONS OF FRAME WIDTH, not pixels, deliberately. The
+  // pitch canvas is SYNTHETIC_WIDTH/HEIGHT (1280x720 today) and the client has
+  // an open 4K request — hardcoded pixel offsets would land at the wrong scale
+  // the moment the canvas changes. The defaults resolve to ~179px inset 48px at
+  // 1280 wide, which is ~14% of frame width: big enough for a phone to lock on
+  // to from a screen, small enough not to cover the page being scrolled.
+  //
+  // Off by default so deploying this is a no-op until the client confirms the
+  // placement on a real pitch.
+  PITCH_QR_ENABLED: z.coerce.boolean().default(false),
+  PITCH_QR_SIZE_FRACTION: z.coerce.number().min(0.02).max(0.5).default(0.14),
+  PITCH_QR_MARGIN_FRACTION: z.coerce.number().min(0).max(0.4).default(0.0375),
+  PITCH_QR_POSITION: z
+    .enum(["top-right", "top-left", "bottom-right", "bottom-left"])
+    .default("top-right"),
+  // White padding between the card edge and the QR, as a fraction of card size.
+  // On top of the QR's own 4-module quiet zone. ~0.09 of a 179px card ≈ 16px.
+  PITCH_QR_PADDING_FRACTION: z.coerce.number().min(0).max(0.3).default(0.09),
+
   // Voiceover QC (client 2026-07: "sometimes the audio file is corrupted —
   // check if the audio has any low volume and if so, regenerate"). 69labs
   // occasionally renders a MIDDLE stretch of a long TTS job with the wrong
@@ -967,10 +1010,19 @@ const ServerEnvSchema = z.object({
   // behind a flag so v3 retrieval can be canaried on the Fly avatar worker before
   // the v1 path is removed. See lib/synthetic/heygen.ts fetchProjectItems.
   HEYGEN_RETRIEVAL_V3: z.coerce.boolean().default(false),
-  // Rendered resolution for the API fallback. 720p matches the synthetic render
-  // canvas (1280×720) and keeps API credit cost down; bump to 1080p if the client
-  // wants it and their plan allows.
-  HEYGEN_API_RESOLUTION: z.enum(["720p", "1080p"]).default("720p"),
+  // Rendered resolution for the API fallback.
+  //
+  // 4K IS NOT REACHABLE HERE. Probed live 2026-08-03 with a real photo-avatar
+  // look: POST /v3/videos resolution:"4k" returns 400
+  //   "Photo Avatar (engine 'avatar_iii' with a photo avatar) does not support
+  //    4K output."
+  // while the identical 1080p request rendered fine. It is an ENGINE limit, not a
+  // plan limit (the account is billing_type "wallet", subscription null). Since
+  // every avatar goes through Avatar III + a per-project photo avatar (see the
+  // va-<proj8>-<sha6> flow), 1080p is the hard ceiling for avatar blocks and the
+  // 3840×2160 canvas upscales them. "4k" stays in the enum because the API accepts
+  // it for OTHER engines (Avatar IV) — do not set it on this path.
+  HEYGEN_API_RESOLUTION: z.enum(["720p", "1080p", "4k"]).default("1080p"),
   // NOTE on the render ENGINE (client 2026-07-20: Avatar IV too expensive, wants
   // Avatar III everywhere): probed live 2026-07-21 — POST /v3/videos with
   // type:"image" (one-shot uploaded photo) REJECTS an `engine` field and always

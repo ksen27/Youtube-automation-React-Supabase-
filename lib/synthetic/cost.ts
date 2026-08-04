@@ -35,8 +35,9 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   // exhausted. FLUX schnell is cheap; tune if FAL_AI_IMAGE_MODEL changes.
   fal_flux_image:  { unit: "per_image",    usd: 0.01 },
   // LTX-2 bills per second of generated video. Rate tracks LTX_MODEL/resolution:
-  // ltx-2-fast @ 1080p = $0.04/sec (current). Was $0.08 (ltx-2-3-pro @ 1080p);
-  // bump this back if LTX_MODEL/LTX_RESOLUTION changes.
+  // ltx-2-3-fast @ 1080p = $0.04/sec (current). Was $0.08 (ltx-2-3-pro @ 1080p).
+  // If LTX_RESOLUTION is ever moved to 4K, raise this ~4x (LTX's published ratio
+  // is 10s: $0.60 at 1080p -> $2.40 at 4K).
   ltx2:            { unit: "per_second",   usd: 0.04 },
   fal_veo3_fast:   { unit: "per_second",   usd: 0.10 },
   fal_kling:       { unit: "per_second",   usd: 0.06 },

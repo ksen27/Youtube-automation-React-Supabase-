@@ -46,6 +46,18 @@ export async function POST(req: NextRequest) {
   let websiteUrl = parsed.data.websiteUrl;
   if (!/^https?:\/\//i.test(websiteUrl)) websiteUrl = `https://${websiteUrl}`;
 
+  // Reject a malformed URL HERE rather than letting the job fail later — the
+  // pitch burns a 69labs TTS call and a HeyGen render before it ever reaches the
+  // website recorder, so an unparseable address is expensive to discover late.
+  // It is also what the scroll-window QR encodes, so a bad URL means an
+  // unscannable code. http is allowed, not just https: the recorder handles it.
+  try {
+    const u = new URL(websiteUrl);
+    if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error("bad scheme");
+  } catch {
+    return NextResponse.json({ error: "invalid website URL" }, { status: 400 });
+  }
+
   const sb = getServerSupabase();
   const { data: row, error } = await sb
     .from("pitch_videos")

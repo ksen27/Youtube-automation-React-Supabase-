@@ -7,6 +7,14 @@ import { probeFile } from "@/lib/media/probe";
 // All FFmpeg invocations use spawn with an argument array — no shell strings.
 // This is critical when input filenames are derived from external IDs/URLs.
 
+// THE render canvas — client 2026-08-02: every export is 4K, both engines.
+// Anything that pre-normalizes a clip for the final concat (the render loop
+// itself, and scriptClipProcessor's doc clips) MUST use these exact dims: the
+// concat stream-copies (-c:v copy), so a segment at different dimensions fails
+// the demuxer instead of being silently rescaled.
+export const RENDER_WIDTH = 3840;
+export const RENDER_HEIGHT = 2160;
+
 // Shared H.264 codec flags for EVERY per-segment encode (still images, clips,
 // split-screens, xfades, mixed boundaries, black filler). ALL segments in one
 // render MUST share this identical block so the final concat can stay on the
@@ -15,10 +23,14 @@ import { probeFile } from "@/lib/media/probe";
 //
 // Quality is chosen PER RENDER by the project's engine (both engines render on
 // the same worker, so it can't be a per-worker env):
-//   • sourced (celebrity): HARD-PINNED to the original ultrafast/crf25 so
-//     celebrity output is byte-for-byte unchanged. Never reads env.
 //   • synthetic (AI avatar): SYNTHETIC_X264_PRESET / SYNTHETIC_X264_CRF
 //     (default veryfast/crf21) for sharper output.
+//   • sourced (celebrity): the SAME env knobs since the 4K cutover. It used to be
+//     hard-pinned to ultrafast/crf25 to keep celebrity output byte-for-byte
+//     identical, but the 4K canvas already changes every byte, so that guarantee
+//     was void — and ultrafast at 3840×2160 emits enormous files for visibly worse
+//     quality (ultrafast disables most rate-distortion work, which costs far more
+//     at 4x the pixels). Encode time per frame rises; the 8x render VMs absorb it.
 // renderProcessor resolves this ONCE per render and passes the result into every
 // segment encoder via the `vcodecArgs` option, so the whole video is uniform.
 // Encoders that aren't given vcodecArgs fall back to the sourced default, which
@@ -36,15 +48,19 @@ export function segmentVcodecArgsFor(engine: RenderEngine): string[] {
       "-pix_fmt", "yuv420p",
     ];
   }
-  // sourced (celebrity): unchanged from the original hardcoded values.
+  // sourced (celebrity): same knobs as synthetic since the 4K cutover (see above).
+  const env = getEnv();
   return [
     "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "25",
+    "-preset", env.SYNTHETIC_X264_PRESET,
+    "-crf", String(env.SYNTHETIC_X264_CRF),
     "-pix_fmt", "yuv420p",
   ];
 }
-const SOURCED_VCODEC_ARGS = segmentVcodecArgsFor("sourced");
+// Lazily resolved, NOT a module-load constant: the sourced branch now reads env,
+// and evaluating that at import time would throw wherever this module is imported
+// before the environment is loaded.
+const SOURCED_VCODEC_ARGS = () => segmentVcodecArgsFor("sourced");
 
 export interface CutClipOptions {
   inputPath: string;
@@ -405,7 +421,7 @@ export async function buildStillVideo(opts: {
     // image segments is dwarfed by the 30× speedup from skipping concat
     // re-encode, so we deliberately use the SAME shared codec block as every
     // other segment encoder (segmentVcodecArgs()).
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     // Exact frame-count cap for frame-snapped callers — see exactFrames doc.
     // The looped input supplies unlimited frames, so this is always reachable.
@@ -461,7 +477,7 @@ export async function buildBlackVideo(opts: {
     "-f", "lavfi",
     "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds.toFixed(3)}`,
     "-an",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -520,7 +536,7 @@ export async function padVideoToLength(opts: {
     "-i", opts.inputPath,
     "-an",
     "-vf", vf,
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     ...(typeof opts.targetFrames === "number" && opts.targetFrames > 0
       ? ["-frames:v", String(Math.round(opts.targetFrames))]
@@ -615,7 +631,7 @@ export async function buildSplitScreenVideo(opts: {
     "-an",
     "-filter_complex", filter,
     "-map", "[v]",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -834,7 +850,7 @@ export async function buildSplitScreenAvatarVideo(opts: {
     "-an",
     "-filter_complex", filter,
     "-map", "[v]",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     // Exact frame-count cap. The trim/fps chain quantizes on its own grid and
     // was measured emitting one frame fewer than the caller recorded (149 vs
@@ -1087,7 +1103,7 @@ export async function buildTitleCardVideo(opts: {
     "-i", `color=c=black:s=${w}x${h}:r=${fps}:d=${opts.durationSeconds}`,
     "-vf", vfChain,
     "-an",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-t", String(opts.durationSeconds),
     "-force_key_frames", "expr:eq(n,0)",
@@ -1667,7 +1683,7 @@ export async function normalizeClip(opts: NormalizeOptions): Promise<void> {
     "-i", opts.inputPath,
     ...(opts.keepAudio ? ["-c:a", "aac"] : ["-an"]),
     "-vf", vf,
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     // Trim the copy-cut's GOP overshoot back to the asked length. Placed
@@ -1751,7 +1767,7 @@ export async function xfadePair(opts: {
     "-filter_complex", filter,
     "-map", "[v]",
     "-an",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -1803,7 +1819,7 @@ export async function xfadeFadeBlack(opts: {
     "-filter_complex", filter,
     "-map", "[v]",
     "-an",
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -1856,7 +1872,7 @@ export async function applyEdgeFade(opts: {
     "-i", opts.inputPath,
     "-an",
     "-vf", vf,
-    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS),
+    ...(opts.vcodecArgs ?? SOURCED_VCODEC_ARGS()),
     "-r", String(fps),
     "-force_key_frames", "expr:eq(n,0)",
     "-movflags", "+faststart",
@@ -2422,6 +2438,25 @@ export async function degradeVideoLowFi(opts: {
 // is a plain, widely-compatible H.264/AAC mp4 — this file is a standalone pitch
 // video (it becomes pitch_video_url), NOT a segment in the -c:v copy render
 // concat, so it does not need to match segmentVcodecArgs.
+// Compose the pitch clip's normal video chain and then composite a STILL image
+// over it. `vf` is the same filter chain the no-overlay path passes to -vf.
+//
+// eof_action=repeat is what makes a single-frame PNG cover the whole clip: the
+// image input ends after one frame and overlay holds that frame for the rest of
+// the base stream. It also keeps `-shortest` safe — the image is consumed by the
+// filtergraph and never mapped to an output stream, so it can't truncate the
+// output to one frame the way a mapped short stream would.
+//
+// format=auto preserves the overlay's alpha during the blend (overlay's default
+// yuv420 would flatten the card's rounded corners); the encode still ends at
+// -pix_fmt yuv420p.
+function overlayFilter(vf: string, imageInputIndex: string, x: number, y: number): string {
+  return (
+    `[0:v]${vf}[base];` +
+    `[base][${imageInputIndex}:v]overlay=${Math.round(x)}:${Math.round(y)}:eof_action=repeat:format=auto[v]`
+  );
+}
+
 export async function buildPitchClip(opts: {
   inputPath: string;
   outputPath: string;
@@ -2440,6 +2475,13 @@ export async function buildPitchClip(opts: {
   // longer it's cut to length; if it's a touch shorter its last frame is held
   // (tpad=clone) up to the target. Ignored when unset (natural length).
   durationSeconds?: number;
+  // Optional still image composited over the WHOLE clip (sales-pitch QR card).
+  // Must already be at its final pixel size — it is overlaid verbatim, with no
+  // scale filter, so the module grid of a QR stays crisp. `overlayX/Y` are the
+  // image's top-left offset in the output frame.
+  overlayImagePath?: string;
+  overlayX?: number;
+  overlayY?: number;
   signal?: AbortSignal;
 }): Promise<void> {
   const env = getEnv();
@@ -2456,10 +2498,23 @@ export async function buildPitchClip(opts: {
   const vfBase = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:-1:-1:color=black,fps=${fps},setsar=1`;
   const vf = pinDur ? `${vfBase},tpad=stop_mode=clone:stop_duration=${pinDur.toFixed(3)}` : vfBase;
   const durArgs = pinDur ? ["-t", pinDur.toFixed(3)] : [];
+  const overlay = opts.overlayImagePath;
   const args: string[] = ["-y", "-threads", String(env.FFMPEG_THREADS)];
   if (opts.keepAudio) {
     // Input 0 supplies both video and its own audio. -ss before -i seeks the input.
-    args.push(...seek, "-i", opts.inputPath, "-vf", vf, "-c:a", "aac", "-b:a", "160k");
+    args.push(...seek, "-i", opts.inputPath);
+    if (overlay) args.push("-i", overlay);
+    if (overlay) {
+      // Overlay is input 1 here. Build the base chain in filter_complex (a -vf
+      // and a -filter_complex cannot both feed the same output stream).
+      args.push(
+        "-filter_complex", overlayFilter(vf, "1", opts.overlayX ?? 0, opts.overlayY ?? 0),
+        "-map", "[v]", "-map", "0:a",
+      );
+    } else {
+      args.push("-vf", vf);
+    }
+    args.push("-c:a", "aac", "-b:a", "160k");
   } else {
     // Input 0 = video only (seeked); input 1 = a synthesized silent stereo track.
     // With a pinned duration, -t caps both streams; otherwise -shortest keys the
@@ -2467,7 +2522,18 @@ export async function buildPitchClip(opts: {
     args.push(
       ...seek, "-i", opts.inputPath,
       "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-      "-vf", vf,
+    );
+    if (overlay) {
+      // Overlay is input 2 (after the video and the silent track).
+      args.push(
+        "-i", overlay,
+        "-filter_complex", overlayFilter(vf, "2", opts.overlayX ?? 0, opts.overlayY ?? 0),
+        "-map", "[v]", "-map", "1:a",
+      );
+    } else {
+      args.push("-vf", vf);
+    }
+    args.push(
       "-c:a", "aac", "-b:a", "160k",
       ...(pinDur ? [] : ["-shortest"]),
     );

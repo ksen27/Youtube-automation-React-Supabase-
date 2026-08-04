@@ -4,7 +4,7 @@ import type { ScriptClipJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
-import { cutAudio, cutClip, normalizeClip } from "@/lib/media/ffmpeg";
+import { cutAudio, cutClip, normalizeClip, RENDER_WIDTH, RENDER_HEIGHT } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
@@ -116,7 +116,7 @@ export async function processScriptClipJob(
     if (audioDl) audioTmp = audioDl.outputPath;
     await setMediaJob(mediaJobId, { progress: 55 });
 
-    // 4) Cut + normalize video to the canonical render shape (1280x720@30)
+    // 4) Cut + normalize video to the canonical render shape (3840x2160@30)
     // so the final concat can stream-copy it. The renderer's forced-clip
     // branch used to do this work on the hot path — moving it here means
     // a render with 5 doc clips doesn't pay for 5 yt-dlp downloads in
@@ -146,7 +146,7 @@ export async function processScriptClipJob(
     await normalizeClip({
       inputPath: trimmedTmp,
       outputPath: normalizedTmp,
-      width: 1280, height: 720, fps: 30,
+      width: RENDER_WIDTH, height: RENDER_HEIGHT, fps: 30,
       keepAudio: true,
       startOffsetSeconds: headTrim > 0 ? headTrim : undefined,
       pinDurationSeconds: duration,

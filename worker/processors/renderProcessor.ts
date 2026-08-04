@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, degradeVideoLowFi, segmentVcodecArgsFor, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, degradeVideoLowFi, segmentVcodecArgsFor, RENDER_WIDTH, RENDER_HEIGHT, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -98,16 +98,20 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       : "effects active (PERFORMANCE_MODE off or non-synthetic engine)",
   });
 
-  // Output resolution, also per-render by engine. Synthetic sources (HeyGen
-  // avatars + LTX ai_clips) are natively 1920x1080, so rendering at 720p
-  // downscaled them and lost ~44% of the pixels (the soft-picture complaint).
-  // Synthetic now renders at 1080p so those sources pass through at native res.
-  // Celebrity (sourced) STAYS 1280x720 — byte-for-byte unchanged — because its
-  // YouTube footage is often sub-1080p and upscaling it would only add encode
-  // cost with no real detail gain. Every segment in one render shares these
+  // Output resolution. Client 2026-08-02: ALL exports are 4K, both engines
+  // (celebrity/CelebForge included). Every segment in one render shares these
   // dims (required for the -c:v copy concat fast path).
-  const outW = isSyntheticRender ? 1920 : 1280;
-  const outH = isSyntheticRender ? 1080 : 720;
+  //
+  // How much of the frame is TRUE 4K varies by block type — worth knowing before
+  // reading a "4K looks soft" report as a bug:
+  //   still      69labs at "4k" returns 5504×3072 -> downscaled, genuinely 4K
+  //   ai_clip    LTX at 3840x2160 -> genuinely 4K
+  //   avatar     HeyGen Avatar III caps at 1080p (engine limit, see env.ts)
+  //              -> UPSCALED 2x. split_2 avatars fill only a 1920×2160 half-cell,
+  //              so they upscale 1.78x and hold up better than full-frame ones.
+  //   footage    YouTube source; only as good as the original upload.
+  const outW = RENDER_WIDTH;
+  const outH = RENDER_HEIGHT;
 
   // Pull approved timeline items (only ones with clips — placeholders are skipped
   // for MVP rendering; their script_text/overlay_text would be added in v2)

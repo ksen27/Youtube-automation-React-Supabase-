@@ -365,7 +365,7 @@ export async function processAvatarJob(data: AvatarJobData, attempt?: JobAttempt
           audioFilePath: audio?.path,
           audioUrl: audio?.url ?? undefined,
           audioDurationSeconds: audio?.durationSeconds,
-          // split_2 avatars fill a tall LEFT half-cell (640×720) at render, so
+          // split_2 avatars fill a tall LEFT half-cell (1920×2160 at 4K), so
           // generate them 9:16 portrait; full-frame avatars use 16:9 landscape.
           aspectRatio: seg.block_type === "split_2" ? "portrait" : "landscape",
           // Client 2026-07-09: EVERY avatar part renders with Avatar III, including
