@@ -193,6 +193,20 @@ async function fetchImageAsBase64(
   return p;
 }
 
+// An unfetchable REFERENCE photo is not a per-candidate hiccup: it errors
+// EVERY candidate for that person without a single Gemini call, and enough of
+// those trip the matcher's outage circuit breaker under a message that blames
+// Gemini. Log it once, loudly, with the URL — that line is what identifies the
+// real cause (2026-08-04: a 4.6MB original whose utm-suffixed URL skipped the
+// Wikimedia resize path and hit the 4MB fetch cap).
+function warnReferenceUnfetchable(personName: string, referenceUrl: string): void {
+  console.warn(JSON.stringify({
+    msg: "verify.reference_unfetchable",
+    person: personName,
+    url: referenceUrl.slice(0, 300),
+  }));
+}
+
 // Single Gemini call → tri-state verdict. Centralised so both verify
 // functions share retry, parsing, and error-to-"uncertain" handling.
 async function askGemini(
@@ -374,6 +388,7 @@ export async function verifyPersonImageClean(input: PersonVerifyInput): Promise<
     fetchImageAsBase64(input.candidateUrl),
   ]);
   if (!reference || !candidate) {
+    if (!reference) warnReferenceUnfetchable(input.personName, input.referenceUrl);
     return fail(reference ? "candidate fetch failed" : "reference fetch failed");
   }
   const model = getModel();
@@ -480,7 +495,10 @@ export async function verifyPersonImagesCleanBatch(
   if (input.candidateUrls.length === 0) return [];
 
   const reference = await fetchImageAsBase64(input.referenceUrl);
-  if (!reference) return input.candidateUrls.map(() => errResult("reference fetch failed"));
+  if (!reference) {
+    warnReferenceUnfetchable(input.personName, input.referenceUrl);
+    return input.candidateUrls.map(() => errResult("reference fetch failed"));
+  }
 
   const fetched = await Promise.all(input.candidateUrls.map((u) => fetchImageAsBase64(u)));
   // Candidates whose fetch failed get an errored result and are excluded

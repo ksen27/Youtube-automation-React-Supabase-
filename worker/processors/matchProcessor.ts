@@ -6474,15 +6474,48 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // is cheap. Thresholds: enough attempts to be meaningful (≥20) and a
   // majority errored — a brief spike that the parked-retry rounds absorbed
   // never trips this.
+  //
+  // SCOPE: only INFRA failures count. A "reference fetch failed" is NOT an
+  // outage — it is a single entity's broken Wikipedia reference URL, and it
+  // errors EVERY candidate for that entity without one Gemini call. Counting
+  // those here meant one bad reference row failed the whole job and all its
+  // BullMQ retries, since a retry re-reads the same broken URL and fails
+  // identically (2026-08-05: the "Princess of Wales" coat-of-arms reference
+  // produced 102 of 103 errors and aborted a job whose other entities had
+  // verified fine). Those entities correctly fall back to "no reference
+  // available" and their pools degrade on their own; the breaker exists for
+  // the case it was built for — Gemini itself being down.
   {
     const vs = getVerifyOutageStats();
-    if (vs.checked >= 20 && vs.errored / vs.checked > 0.5) {
+    const REFERENCE_FETCH_REASON = "reference fetch failed";
+    const referenceFailures = vs.reasons[REFERENCE_FETCH_REASON] ?? 0;
+    // Attempts that could not have been an outage signal are excluded from
+    // BOTH sides of the ratio, so the remaining sample is outage-only.
+    const checked = vs.checked - referenceFailures;
+    const errored = vs.errored - referenceFailures;
+    if (referenceFailures > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "match.reference_fetch_failures", {
+        count: referenceFailures,
+        note: "excluded from outage breaker — broken reference URL, not a Gemini outage",
+      });
+    }
+    if (checked >= 20 && errored / checked > 0.5) {
+      // Name the dominant failure reason in the operator-visible error: "gemini
+      // verification unavailable" was misleading when the real cause was an
+      // unfetchable reference photo and Gemini was never even called.
+      const top = Object.entries(vs.reasons)
+        .filter(([reason]) => reason !== REFERENCE_FETCH_REASON)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([reason, n]) => `${reason} ×${n}`)
+        .join(", ");
       await logJob({ projectId, jobId: mediaJobId }, "match.gemini_outage_abort", {
-        checked: vs.checked, errored: vs.errored,
+        checked, errored, reasons: vs.reasons, referenceFailuresExcluded: referenceFailures,
       });
       throw new Error(
-        `gemini verification unavailable: ${vs.errored}/${vs.checked} verify attempts errored — ` +
-        `failing the job so it retries instead of shipping unverified fallback images`,
+        `image verification unavailable: ${errored}/${checked} verify attempts errored` +
+        (top ? ` (${top})` : "") +
+        ` — failing the job so it retries instead of shipping unverified fallback images`,
       );
     }
   }

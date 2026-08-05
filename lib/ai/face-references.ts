@@ -106,6 +106,20 @@ export async function fetchEntityReference(
         () => ({ verdict: "uncertain" as const, reason: "check failed", confidence: 0 }),
       );
       if (verdict.verdict === "no") continue;
+      // An UNFETCHABLE reference is not a passing grade. verifyImageIsPerson
+      // returns "uncertain" when it could not even download the image, so a
+      // 404 rendition URL sailed through this guard and was stored — then
+      // failed identically at verification time for every candidate. If we
+      // cannot fetch it now, it will not be fetchable later: reject the
+      // candidate and try the next query instead of persisting a dead URL.
+      if (verdict.reason === "image fetch failed") {
+        console.warn(JSON.stringify({
+          msg: "face_references.reference_unfetchable_at_build",
+          entity: entity.name,
+          url: url.slice(0, 300),
+        }));
+        continue;
+      }
     }
     return { url, pageUrl: hit.pageUrl, pageTitle: hit.pageTitle };
   }
