@@ -79,9 +79,25 @@ export interface AssetVersion {
   created_at?: string;
 }
 
+// A row of render_jobs — the SAME table POST /render's "render already in
+// progress" guard queries. The review screen decides whether a render is live
+// from this and nothing else, so the button it shows can never contradict what
+// the route will do.
+export interface SyntheticRenderJob {
+  id: string;
+  status: string;
+  progress: number;
+  output_url: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SyntheticResp {
   project: SyntheticProject;
   media_jobs: SyntheticMediaJob[];
+  // Newest first.
+  render_jobs: SyntheticRenderJob[];
   segments: SyntheticSegmentRow[];
   summary: { total: number; ready: number; failed: number; generating: number };
 }

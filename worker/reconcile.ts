@@ -32,6 +32,7 @@
 
 import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
+import { getQueue, QUEUE_NAMES } from "@/lib/jobs/queue";
 import { maybeEnqueueMatch } from "./processors/_shared";
 import { dispatchSegments } from "./processors/synthetic/_shared";
 
@@ -253,6 +254,114 @@ export async function sweepOrphanedSegments(): Promise<number> {
     fixed++;
     await logJob({ jobId: job.id, projectId: seg.project_id },
       "reconcile.marked_failed", { source: "segment_orphan_sweep", segmentId: seg.id });
+  }
+  return fixed;
+}
+
+// Periodic safety net for a ZOMBIE RENDER — a render_jobs row frozen at
+// 'queued'/'running' whose BullMQ job will never advance it again.
+//
+// THE GAP THIS CLOSES: render_jobs is written ONLY by renderProcessor itself
+// (running at the top, completed/failed at the bottom). Nothing else in the
+// codebase ever touches it — not failJobRow, not sweepStalledJobs. So if the
+// processor dies before ANY of those writes land, the row stays 'queued'
+// forever. This actually happened (2026-08-04): a synthetic render's very first
+// write — setMediaJob(..., "running") — hit a Supabase 522 outage, so the job
+// threw at line 1 and even its own catch-block's "failed" write went to the
+// dead DB. Both the render_jobs and media_jobs rows were left at 'queued' with
+// updated_at never moving, while the BullMQ job exhausted its retries and
+// landed in the failed set.
+//
+// The damage is that POST /render refuses a NEW render while any render_jobs row
+// for the project is queued/running — so the project can never be rendered again
+// ("render already in progress" on every click), with no UI path out.
+// sweepStalledJobs can't reach it either: the media_job was 'queued', and that
+// sweep deliberately skips 'queued' rows.
+//
+// WHY WE ASK BULLMQ RATHER THAN SWEEP ON AGE: a render legitimately sits queued
+// for hours behind other renders (concurrency 1 per machine), so any age-based
+// rule would false-fail a render that is merely waiting its turn. The queue is
+// the authority on whether the job can still run: a job in the failed set, or
+// gone from Redis entirely, will never advance the row again. Anything still
+// waiting/active/delayed is left strictly alone.
+//
+// Both render queues are probed regardless of this worker's role — the lookup is
+// read-only, Redis is shared, and render_jobs carries no queue discriminator.
+const RENDER_ZOMBIE_GRACE_MS = 5 * 60_000; // don't inspect a just-created row
+
+// What the queue says about a render's BullMQ job. Returns null when the job is
+// still able to advance (waiting/active/delayed/…) — i.e. do not touch the row.
+async function deadRenderReason(mediaJobId: string): Promise<string | null> {
+  for (const name of [QUEUE_NAMES.render, QUEUE_NAMES.renderSynthetic] as const) {
+    const job = await getQueue(name).getJob(mediaJobId);
+    if (!job) continue;
+    const state = await job.getState();
+    if (state === "failed") {
+      return (job.failedReason || "render job failed").slice(0, 500);
+    }
+    if (state === "completed") {
+      // Finished but never recorded a result — its terminal DB write was lost.
+      // Nothing will retry it, so free the project to render again.
+      return "render finished without recording a result";
+    }
+    return null; // waiting / active / delayed / prioritized — still live
+  }
+  // In neither queue: never enqueued (the route died between the insert and the
+  // enqueue) or evicted from Redis. Either way no job will ever run it.
+  return "render job is not in any queue";
+}
+
+export async function sweepZombieRenderJobs(): Promise<number> {
+  const sb = getServerSupabase();
+  const cutoff = new Date(Date.now() - RENDER_ZOMBIE_GRACE_MS).toISOString();
+
+  const { data: rows, error } = await sb
+    .from("render_jobs")
+    .select("id, project_id")
+    .in("status", ["queued", "running"])
+    .lt("updated_at", cutoff);
+  if (error) {
+    await logJob({}, "reconcile.render_sweep.query_error", { err: error.message });
+    return 0;
+  }
+  if (!rows || rows.length === 0) return 0;
+
+  let fixed = 0;
+  for (const rj of rows) {
+    // The media_job the queue keys on: jobId === mediaJobId by design, and the
+    // render route stamps the render_job id into its metadata.
+    const { data: jobs } = await sb
+      .from("media_jobs")
+      .select("id")
+      .eq("project_id", rj.project_id)
+      .eq("type", "render")
+      .contains("metadata", { renderJobId: rj.id })
+      .limit(1);
+    const mediaJobId = jobs?.[0]?.id as string | undefined;
+
+    const reason = mediaJobId
+      ? await deadRenderReason(mediaJobId)
+      : "no media_job was ever created for this render";
+    if (!reason) continue; // job is still live — leave it alone
+
+    const { error: updErr } = await sb
+      .from("render_jobs")
+      .update({ status: "failed", error: reason })
+      .eq("id", rj.id)
+      // Re-check in the write so a render that started between our read and here
+      // (or one a retry just completed) is never clobbered.
+      .in("status", ["queued", "running"]);
+    if (updErr) {
+      await logJob({ projectId: rj.project_id }, "reconcile.render_sweep.error",
+        { err: updErr.message, renderJobId: rj.id });
+      continue;
+    }
+    // Keep the paired media_job consistent — it's the row the progress UI reads,
+    // and sweepStalledJobs won't touch it while it sits at 'queued'. Idempotent.
+    if (mediaJobId) await failJobRow(mediaJobId, reason);
+    fixed++;
+    await logJob({ jobId: mediaJobId, projectId: rj.project_id },
+      "reconcile.marked_failed", { source: "render_zombie_sweep", renderJobId: rj.id, reason });
   }
   return fixed;
 }

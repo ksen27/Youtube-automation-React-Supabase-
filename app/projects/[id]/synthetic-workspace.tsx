@@ -26,10 +26,20 @@ const EARLY_PROGRESS = new Set(["voiceover", "aligning", "planning"]);
 // separate progress view once the plan exists.
 const ASSET_GENERATING = new Set(["generating_images", "generating_clips", "generating_avatars"]);
 
+// A render is in flight per render_jobs — the same source of truth the review
+// screen and POST /render's 409 guard use. project.status can lag it (the
+// processor writes "rendering" only once it starts, so a queued render leaves
+// the project at ready_for_review), so the phase router must consult the table
+// too or "View render" would have nowhere to navigate.
+function hasLiveRender(resp: SyntheticResp | undefined): boolean {
+  return (resp?.render_jobs ?? []).some((j) => j.status === "queued" || j.status === "running");
+}
+
 function derivePhase(resp: SyntheticResp | undefined): SyntheticPhase {
   if (!resp?.project) return "intake";
   const s = resp.project.status;
   if (s === "created" || s === "draft") return "intake";
+  if (hasLiveRender(resp)) return "render";
   // The planner/review screen is "home" once a plan exists:
   //   plan_ready          -> review the plan, click Generate
   //   generating_*        -> assets generating; per-segment status shown inline
@@ -44,6 +54,7 @@ function syntheticBusy(resp: SyntheticResp | undefined): boolean {
   if (!resp?.project) return false;
   const s = resp.project.status;
   if (EARLY_PROGRESS.has(s) || ASSET_GENERATING.has(s) || s === "rendering") return true;
+  if (hasLiveRender(resp)) return true;
   return (resp.media_jobs ?? []).some((j) => j.status === "queued" || j.status === "running");
 }
 

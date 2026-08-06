@@ -36,30 +36,12 @@ async function loadProjects(): Promise<ProjectCardData[]> {
   if (error) return [];
   const rows = (data ?? []) as ProjectRow[];
 
-  // For completed projects, fetch the most recent render's output_url so we
-  // can show an inline preview on the card without needing to open it.
-  const completedIds = rows.filter((r) => r.status === "completed").map((r) => r.id);
-  const videoByProject = new Map<string, string>();
-  if (completedIds.length > 0) {
-    const { data: renders } = await sb
-      .from("render_jobs")
-      .select("project_id, output_url, created_at")
-      .in("project_id", completedIds)
-      .eq("status", "completed")
-      .not("output_url", "is", null)
-      .order("created_at", { ascending: false });
-    for (const r of renders ?? []) {
-      if (!videoByProject.has(r.project_id)) videoByProject.set(r.project_id, r.output_url);
-    }
-  }
-
   return rows.map((r) => ({
     id: r.id,
     title: r.title,
     status: r.status,
     created_at: r.created_at,
     badgeVariant: badgeVariantFor(r.status),
-    videoUrl: videoByProject.get(r.id) ?? null,
   }));
 }
 

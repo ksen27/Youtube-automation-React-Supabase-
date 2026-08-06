@@ -371,8 +371,24 @@ export async function buildStillVideo(opts: {
   // CRITICAL: fps FIRST on every branch. See comment block above for why.
   // The encoder flags below stay identical to normalizeClip() so the final
   // concat can still use -c:v copy.
-  const BLUR_SIGMA = 20;
-  const FG_SUPERSAMPLE = 4;
+  // Background blur is computed at a FIXED SMALL size, not at the render canvas.
+  // gblur cost scales with pixel count, and at 3840x2160 a sigma=20 blur was
+  // ~1.7s of CPU per second of output — spent producing a frame that is, by
+  // design, unrecognisable mush. Blurring at 960x540 with a proportionally
+  // smaller sigma (20 / 4 = 5, since sigma is in pixels) and then upscaling is
+  // visually equivalent: the upscale's own interpolation is far narrower than
+  // the blur kernel, so it adds no detail the sigma=20 pass would have removed.
+  // Derived from w/h (not fixed) so the blur canvas keeps the render canvas's
+  // aspect ratio — the crop below must match it or portrait sources would be
+  // framed differently in the fill than in the foreground.
+  const BLUR_DIV = 4;
+  const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+  const BLUR_W = even(w / BLUR_DIV);
+  const BLUR_H = even(h / BLUR_DIV);
+  const BLUR_SIGMA = 20 / BLUR_DIV; // sigma is in pixels, so it scales with the canvas
+  // Ken Burns headroom for zoompan — see SYNTHETIC_STILL_SUPERSAMPLE in env.ts
+  // for why this is 2 and not the 4 that the 720p-era code hard-coded.
+  const FG_SUPERSAMPLE = env.SYNTHETIC_STILL_SUPERSAMPLE;
   const ssW = w * FG_SUPERSAMPLE;
   const ssH = h * FG_SUPERSAMPLE;
   // Optional lower-third drawtext, built from the same recipe normalizeClip
@@ -391,8 +407,9 @@ export async function buildStillVideo(opts: {
     `[0:v]fps=${fps},split=2[bgsrc][fgsrc];` +
     // Background: scale to COVER the target frame, center-crop to exactly
     // w×h, then heavy gaussian blur. Static — the FG zoom carries motion.
-    `[bgsrc]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
-      `crop=${w}:${h},gblur=sigma=${BLUR_SIGMA},setsar=1[bg];` +
+    `[bgsrc]scale=${BLUR_W}:${BLUR_H}:force_original_aspect_ratio=increase,` +
+      `crop=${BLUR_W}:${BLUR_H},gblur=sigma=${BLUR_SIGMA},` +
+      `scale=${w}:${h},setsar=1[bg];` +
     // Foreground: scale-to-fit into a 4×-supersampled canvas with
     // transparent padding (so portrait/square gutters reveal the blurred
     // BG), then zoompan does the smooth slow zoom down to w×h. d=1 emits
@@ -2646,6 +2663,48 @@ export async function concatPitchParts(opts: {
   await runFFmpeg(env.FFMPEG_PATH, args, opts.signal);
 }
 
+// FFmpeg option POSITION is semantic, and getting it wrong silently uncaps the
+// encoder. `-threads` is a per-codec option: placed BEFORE `-i` it configures
+// the DECODER of the next input; only after the inputs (i.e. as an output
+// option) does it reach libx264. Every encoder in this file builds its args as
+// ["-y", "-threads", N, ...inputs..., ...output opts, outputPath] — so
+// FFMPEG_THREADS has been tuning the (trivial) decode and libx264 has been
+// running at its auto thread count all along. Verified against ffmpeg 8.1:
+// with `-threads 2` before `-i`, x264 reports `threads=12 lookahead_threads=4`
+// on an 8-core box; moved after the inputs it correctly reports `threads=2`.
+//
+// That defeats the whole "RENDER_PIPELINE_CONCURRENCY x FFMPEG_THREADS <= vCPU"
+// rule documented in lib/env.ts: 4 lanes each spawning ~12 x264 threads plus an
+// auto-sized filter graph oversubscribes an 8-vCPU box several times over.
+//
+// We normalise here, in the single spawn funnel, rather than at ~25 call sites,
+// so a future encoder can't silently reintroduce the bug:
+//   • a `-threads N` found before the first `-i` is MOVED to just before the
+//     output path (all builders in this file put the output last), and
+//   • `-filter_threads` / `-filter_complex_threads` are pinned to the same N as
+//     global options — those default to nproc per process, so N lanes would
+//     otherwise each spin up a full-width filter graph.
+// Args that already place `-threads` after the inputs, or don't set it at all,
+// are passed through untouched.
+function normalizeThreadArgs(args: string[]): string[] {
+  const tIdx = args.indexOf("-threads");
+  if (tIdx < 0 || tIdx + 1 >= args.length) return args;
+  const firstInput = args.indexOf("-i");
+  // Already an output option (or there are no inputs, e.g. -f lavfi builders
+  // that still list -i) — nothing to correct.
+  if (firstInput >= 0 && tIdx > firstInput) return args;
+  const n = args[tIdx + 1];
+  if (!/^\d+$/.test(n)) return args;
+  const rest = [...args.slice(0, tIdx), ...args.slice(tIdx + 2)];
+  // Filter threading is a GLOBAL option, so it stays at the front.
+  const head = rest[0] === "-y" ? 1 : 0;
+  rest.splice(head, 0, "-filter_threads", n, "-filter_complex_threads", n);
+  // Re-insert -threads as an OUTPUT option: immediately before the output path,
+  // which every builder in this file passes as the final argument.
+  rest.splice(rest.length - 1, 0, "-threads", n);
+  return rest;
+}
+
 function runFFmpeg(
   bin: string,
   args: string[],
@@ -2669,7 +2728,8 @@ function runFFmpeg(
   // on platforms where `nice` isn't reliably available (Windows dev).
   const useNice = env.NICE_LEVEL > 0 && process.platform === "linux";
   const finalBin = useNice ? "nice" : bin;
-  const finalArgs = useNice ? ["-n", String(env.NICE_LEVEL), bin, ...args] : args;
+  const threaded = normalizeThreadArgs(args);
+  const finalArgs = useNice ? ["-n", String(env.NICE_LEVEL), bin, ...threaded] : threaded;
   return new Promise((resolve, reject) => {
     const child = spawn(finalBin, finalArgs, { stdio: ["ignore", "pipe", "pipe"] });
     // Ring-buffer the last STDERR_KEEP bytes of ffmpeg's stderr. The previous

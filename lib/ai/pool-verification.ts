@@ -231,8 +231,15 @@ export interface VerifyOutageStats {
   checked: number;
   // How many of those were infra failures.
   errored: number;
+  // Tally of the errored results' reasons ("gemini error", "reference fetch
+  // failed", "parse error", …). Not every mass failure is Gemini being down:
+  // an unfetchable REFERENCE photo errors every candidate for that entity
+  // without a single Gemini call (2026-08-04, Elvis reference URL carrying
+  // utm params so the resize path was skipped and the 4.6MB original hit the
+  // fetch size cap). The abort message quotes this so the log says which.
+  reasons: Record<string, number>;
 }
-let outageStats: VerifyOutageStats = { checked: 0, errored: 0 };
+let outageStats: VerifyOutageStats = { checked: 0, errored: 0, reasons: {} };
 
 // Shared wall-clock budget for retry WAITING across the whole process/job.
 // Bounds how much extra time a sustained outage can add: once the budget is
@@ -241,18 +248,22 @@ let outageStats: VerifyOutageStats = { checked: 0, errored: 0 };
 let retryWaitBudgetMs = 180_000;
 
 export function resetVerifyOutageTracking(retryBudget = 180_000): void {
-  outageStats = { checked: 0, errored: 0 };
+  outageStats = { checked: 0, errored: 0, reasons: {} };
   retryWaitBudgetMs = retryBudget;
 }
 
 export function getVerifyOutageStats(): VerifyOutageStats {
-  return { ...outageStats };
+  return { ...outageStats, reasons: { ...outageStats.reasons } };
 }
 
 function recordOutcome(out: PoolVerifyResult): void {
   if (!out.geminiCalled && !out.errored) return; // fast-path / cache — not an attempt
   outageStats.checked++;
-  if (out.errored) outageStats.errored++;
+  if (out.errored) {
+    outageStats.errored++;
+    const key = (out.reason || "unknown").slice(0, 60);
+    outageStats.reasons[key] = (outageStats.reasons[key] ?? 0) + 1;
+  }
 }
 
 function sleep(ms: number): Promise<void> {

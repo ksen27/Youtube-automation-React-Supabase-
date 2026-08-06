@@ -142,18 +142,22 @@ export function SyntheticReviewScreen({
   // second one (409 "render already in progress"), so when the user steps back
   // here mid-render we offer navigation to the render step instead of a re-POST.
   //
-  // But project.status alone is unreliable: a render can be manually cancelled
-  // (e.g. stuck on the fly.io worker) — the render/media job goes terminal while
-  // projects.status is still "rendering". In that case there's no live render to
-  // "view", and re-POSTing /render succeeds (the route only 409s on a
-  // queued/running render_job). So we treat it as re-renderable unless a render
-  // job is ACTUALLY in flight. media_jobs carries the render job's live status.
-  const hasLiveRender = (resp.media_jobs ?? []).some(
-    (j) => j.type === "render" && (j.status === "queued" || j.status === "running"),
+  // This reads render_jobs — the EXACT table (and statuses) the route's 409
+  // guard queries — so the button we show can never contradict what the route
+  // will do. Deriving it from media_jobs + project.status instead is what
+  // produced the dead-end: a render whose processor died before its first DB
+  // write left a queued render_jobs row (permanent 409) while project.status sat
+  // at ready_for_review and the media_job at 'queued', so this screen offered a
+  // plain "Render video" button that could only ever fail. Zombie render_jobs
+  // rows are now cleared by sweepZombieRenderJobs (worker/reconcile.ts), which
+  // turns this back into a real "Render video" within a sweep interval.
+  const hasLiveRender = (resp.render_jobs ?? []).some(
+    (j) => j.status === "queued" || j.status === "running",
   );
-  const isRendering = resp.project.status === "rendering" && hasLiveRender;
-  // Stuck: status says rendering but the render job is dead/cancelled. Offer a
-  // real re-render instead of a dead-end "View render".
+  const isRendering = hasLiveRender;
+  // Stuck: status says rendering but the render job is dead/cancelled (e.g.
+  // manually cancelled on the fly.io worker). Nothing live to "view", and the
+  // route accepts a re-POST — so offer a real re-render.
   const isStuckRendering = resp.project.status === "rendering" && !hasLiveRender;
   const generatingCount = segs.filter((s) => s.status === "generating" || s.status === "pending").length;
   const failedCount = segs.filter((s) => s.status === "failed").length;

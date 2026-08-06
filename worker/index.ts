@@ -25,7 +25,7 @@ import { processImageGenJob }         from "./processors/synthetic/imageGenProce
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
 import { processPitchGenJob }         from "./processors/synthetic/pitchGenProcessor";
-import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments } from "./reconcile";
+import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments, sweepZombieRenderJobs } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
 import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
@@ -318,6 +318,18 @@ const sweepTimer = setInterval(() => {
       if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.done", projectsAffected: n }));
     })
     .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.sweep.error", err: (e as Error).message })));
+  // Clear ZOMBIE render_jobs rows — frozen at queued/running because the
+  // processor died before any of its own DB writes landed (a DB outage at the
+  // top of the job does exactly this). Nothing else reconciles that table, and
+  // while such a row exists POST /render answers every click with "render
+  // already in progress". Decided against the queue, not on age, so a render
+  // merely waiting its turn behind another is never touched. Runs on any role:
+  // both render queues are probed and the guarded writes are idempotent.
+  void sweepZombieRenderJobs()
+    .then((n) => {
+      if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.render_sweep.done", renderJobsFailed: n }));
+    })
+    .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.render_sweep.error", err: (e as Error).message })));
   // Reconcile synthetic segments orphaned at 'generating' by an ALREADY-failed
   // media_job — the case sweepStalledJobs can't reach (it only sweeps 'running'
   // jobs) and failJobRow can't reach (it early-returns on a terminal job). This

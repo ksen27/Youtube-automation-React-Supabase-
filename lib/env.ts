@@ -287,6 +287,23 @@ const ServerEnvSchema = z.object({
     .enum(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
     .default("veryfast"),
   SYNTHETIC_X264_CRF: z.coerce.number().int().min(0).max(51).default(21),
+  // Ken Burns supersample factor for still segments (buildStillVideo). zoompan
+  // samples from this upscaled canvas, so it needs enough headroom to cover the
+  // 1.12x max zoom without resampling its own output grid — but no more.
+  //
+  // This was 4 (hard-coded) when the render canvas was 1280x720, where 4x meant
+  // a 5120x2880 intermediate. At the 3840x2160 canvas that same factor builds a
+  // 15360x8640 (132 MP) yuva420p frame EVERY frame, lanczos-scaled, and zoompan
+  // has no slice threading so it walks that buffer single-threaded regardless of
+  // FFMPEG_THREADS. Measured on an 8-core box at 4 lanes: 4x costs 61s per 8s of
+  // 4K still video, 2x costs 26s (with the bg-blur + thread fixes) for SSIM 0.93
+  // against the 4x output on a worst-case noisy source — no visible difference on
+  // photographic stills. 2x is still ~78% more headroom than a 1.12x zoom uses.
+  //
+  // Kept as a knob so it can be raised back to 4 by env alone (no deploy) if the
+  // client ever reports softer motion. Do NOT set it to 1 — with zero headroom
+  // zoompan resamples its own output and slow zooms visibly soften (SSIM 0.84).
+  SYNTHETIC_STILL_SUPERSAMPLE: z.coerce.number().int().min(1).max(4).default(2),
   // Global full-video effect overlay. A single effect clip (e.g. floating
   // dust/particle specks on a pure-black background) is screen-blended over
   // EVERY frame of the finished video — across intro clips, the opening

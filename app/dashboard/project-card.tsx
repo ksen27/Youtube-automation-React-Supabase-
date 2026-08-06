@@ -24,22 +24,11 @@ export interface ProjectCardData {
   status: string;
   created_at: string;
   badgeVariant: BadgeVariant;
-  videoUrl: string | null;
 }
 
 export function ProjectCard({ project, deletable = false }: { project: ProjectCardData; deletable?: boolean }) {
-  const isCompleted = project.status === "completed" && !!project.videoUrl;
-
   return (
     <Card interactive className={cn("h-full overflow-hidden relative group")}>
-      {isCompleted && (
-        <video
-          src={project.videoUrl!}
-          controls
-          preload="metadata"
-          className="w-full aspect-video bg-black"
-        />
-      )}
       {deletable && <DeleteButton id={project.id} title={project.title} />}
       <Link href={`/projects/${project.id}`} className="block">
         <CardHeader>

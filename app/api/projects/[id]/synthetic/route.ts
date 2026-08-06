@@ -16,7 +16,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   }
   const sb = getServerSupabase();
 
-  const [projectRes, mediaRes, segmentsRes] = await Promise.all([
+  const [projectRes, mediaRes, segmentsRes, renderRes] = await Promise.all([
     sb.from("projects")
       .select("id, title, engine, status, voiceover_url, voiceover_duration_seconds, avatar_image_url, heygen_avatar_name, voiceover_source, tts_voice_id, transcript, script_doc_url, avatar_mark_ranges, pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
       .eq("id", id).single(),
@@ -26,6 +26,13 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     sb.from("synthetic_segments")
       .select("id, position, block_type, avatar_model, start_time, end_time, duration, script, image_prompt, animation_prompt, status, image_url, video_url, right_image_url, provider, error, metadata, asset_history")
       .eq("project_id", id).order("position", { ascending: true }),
+    // render_jobs is what POST /render's "already in progress" guard reads, so
+    // the review screen must decide from THIS table too — deriving "a render is
+    // live" from media_jobs/project.status instead let the two disagree and
+    // offered a Render button that could only ever 409.
+    sb.from("render_jobs")
+      .select("id, status, progress, output_url, error, created_at, updated_at")
+      .eq("project_id", id).order("created_at", { ascending: false }),
   ]);
 
   // Surface real DB errors instead of collapsing them into a blank 404. A
@@ -33,7 +40,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   // synthetic_segments) errors here — returning that message tells us exactly
   // what's wrong rather than a misleading "project not found".
   // PGRST116 = "no rows" from .single(), which is a genuine 404.
-  const firstError = projectRes.error ?? mediaRes.error ?? segmentsRes.error;
+  const firstError = projectRes.error ?? mediaRes.error ?? segmentsRes.error ?? renderRes.error;
   if (firstError && (firstError as { code?: string }).code !== "PGRST116") {
     return NextResponse.json(
       { error: "synthetic query failed", detail: firstError.message },
@@ -67,6 +74,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   return NextResponse.json({
     project,
     media_jobs: mediaJobs ?? [],
+    render_jobs: renderRes.data ?? [],
     segments: segs,
     summary: { total, ready, failed, generating },
   });
