@@ -32,6 +32,19 @@ RUN npx playwright install --with-deps chromium
 # plain `install chromium` (no --with-deps) suffices here.
 RUN npx patchright install chromium
 
+# Puppeteer's OWN Chromium, for the ebook worker (WORKER_ROLE=ebook): the PDF
+# exporter and the landing-page template capturer call puppeteer.launch() with
+# no executablePath, so they need the browser Puppeteer downloads for itself —
+# the Playwright/patchright builds above are not interchangeable with it.
+#
+# PUPPETEER_CACHE_DIR is pinned so the install location is deterministic and
+# matches what fly.ebook.toml sets at runtime; the default (~/.cache/puppeteer)
+# is HOME-dependent, and a mismatch surfaces only when an export first runs, as
+# "Could not find Chrome". One image serves all three worker roles, so this is
+# installed unconditionally — the video workers simply never launch it.
+ENV PUPPETEER_CACHE_DIR=/root/.cache/puppeteer
+RUN npx puppeteer browsers install chrome
+
 COPY . .
 
 # AOF (appendonly) keeps queue state durable across restarts; noeviction is
@@ -48,12 +61,27 @@ ENV NODE_ENV=production \
 # --bind 0.0.0.0 lets the Vercel app reach Redis over the public internet
 # (port exposed via fly.toml [[services]]). --requirepass enforces auth.
 # Password is read at runtime from REDIS_PASSWORD env (Fly secret).
+#
+# Redis is started ONLY on the celebrity worker, which is the app that hosts it
+# (fly.toml exposes port 6379 and mounts the AOF volume). The avatar and ebook
+# workers are pure CONSUMERS of that instance and must not run one: a local
+# Redis there is not just wasted memory, it is a hazard — if REDIS_URL were ever
+# misconfigured to localhost, the worker would connect to an empty local queue,
+# find no jobs, and look "healthy" while the real queue silently backed up.
+#
+# Gated on WORKER_ROLE rather than on REDIS_PASSWORD: the role is declared in
+# each app's [env] and is the thing that actually distinguishes them, whereas a
+# stray password secret on a consumer app would silently start a second Redis.
+# 'sourced' and 'all' both host it; 'synthetic' and 'ebook' never do. Defaults
+# to starting Redis when WORKER_ROLE is unset, which is the local/dev case.
 CMD mkdir -p /data \
- && redis-server --daemonize yes \
-      --dir /data \
-      --appendonly yes \
-      --maxmemory-policy noeviction \
-      --bind 0.0.0.0 \
-      --protected-mode no \
-      --requirepass "$REDIS_PASSWORD" \
+ && if [ "$WORKER_ROLE" = "sourced" ] || [ "$WORKER_ROLE" = "all" ] || [ -z "$WORKER_ROLE" ]; then \
+      redis-server --daemonize yes \
+        --dir /data \
+        --appendonly yes \
+        --maxmemory-policy noeviction \
+        --bind 0.0.0.0 \
+        --protected-mode no \
+        --requirepass "$REDIS_PASSWORD"; \
+    fi \
  && exec npx tsx worker/index.ts

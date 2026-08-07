@@ -252,7 +252,8 @@ function startWorker<T>(
 const role = env.WORKER_ROLE;
 const runSourced = role === "all" || role === "sourced";
 const runSynthetic = role === "all" || role === "synthetic";
-console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.role", role, runSourced, runSynthetic }));
+const runEbook = role === "all" || role === "ebook";
+console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.role", role, runSourced, runSynthetic, runEbook }));
 
 if (runSourced) {
   workers.push(startWorker(QUEUE_NAMES.search,     processSearchJob,     1));
@@ -284,6 +285,39 @@ if (runSynthetic) {
   // Concurrency 1: a render is a heavy multi-core FFmpeg job — one at a time per
   // machine (same as the sourced render slot). The processor is shared.
   workers.push(startWorker(QUEUE_NAMES.renderSynthetic,  processRenderJob,           1));
+}
+
+// --- ebook generator queues (migrations 0031/0032) ---
+// These do NOT go through startWorker(): the ported pipeline brings its own
+// worker factory, which wraps every stage in the idempotency ledger
+// (job_runs) + convergence-barrier contract its 18 stages rely on. Building
+// them here would mean reimplementing that. Their per-queue concurrency and
+// rate limits live in QUEUE_CONFIG (packages/ebook-infra/queue/queues.ts).
+//
+// buildEbookWorkers is imported LAZILY so a `sourced`/`synthetic` worker never
+// pays to construct the ebook container — which would demand ANTHROPIC_API_KEY
+// and YOUTUBE_API_KEY (both required in its env schema) and crash a machine
+// that has no business running books.
+if (runEbook) {
+  void (async () => {
+    try {
+      const { buildEbookWorkers } = await import("./processors/ebook");
+      const ebookWorkers = await buildEbookWorkers();
+      workers.push(...ebookWorkers);
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "worker.ebook.online",
+        queues: ebookWorkers.length,
+      }));
+    } catch (e) {
+      // A misconfigured ebook env must not take the video engines down with it.
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        msg: "worker.ebook.boot_failed",
+        err: (e as Error).message,
+      }));
+    }
+  })();
 }
 
 // Periodic stall sweeper — the safety net for the case where on("failed")

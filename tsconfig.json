@@ -19,7 +19,13 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "@ebook/core": ["./packages/ebook-core/index.ts"],
+      "@ebook/core/*": ["./packages/ebook-core/*"],
+      "@ebook/infra": ["./packages/ebook-infra/index.ts"],
+      "@ebook/infra/*": ["./packages/ebook-infra/*"],
+      "@ebook/config": ["./packages/ebook-config/index.ts"],
+      "@ebook/config/*": ["./packages/ebook-config/*"]
     }
   },
   "include": [

@@ -1,0 +1,117 @@
+# Fly config for the EBOOK worker — a THIRD app, alongside the celebrity worker
+# (fly.toml) and the AI-avatar worker (fly.avatar.toml). Deploy with:
+#   fly deploy -c fly.ebook.toml
+#
+# Why a third app: the ebook pipeline is 18 queues of mostly LLM-bound work, but
+# two of its stages are genuinely heavy — `whisper-transcribe` (yt-dlp audio
+# download + Whisper) and `export` (Puppeteer/Chromium rendering a ~100-page PDF).
+# Folding those onto the celebrity or avatar machine would put a book's PDF
+# render in direct contention with a video encode for CPU and RAM. It also keeps
+# the blast radius small: this app needs ANTHROPIC_API_KEY, and a missing/expired
+# one must never take a video worker down.
+#
+# It hosts NO Redis of its own — it connects to the celebrity worker's Redis,
+# which is where all three engines' queues live. Its queues are namespaced
+# `video-automation-ebook-*` (see redisQueueName() in
+# packages/ebook-infra/queue/queues.ts) so they can never collide with the video
+# queues sharing that instance.
+#
+# REQUIRED secrets (set once):
+#   fly secrets set -c fly.ebook.toml \
+#     REDIS_URL='redis://:<password>@video-automation-worker.fly.dev:6379' \
+#     NEXT_PUBLIC_SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
+#     ANTHROPIC_API_KEY=... YOUTUBE_API_KEY=... \
+#     SIXTYNINE_LABS_API_KEY=...
+# (REDIS_URL must point at the celebrity worker's public Redis — the shared queue.)
+#
+# OPTIONAL secrets:
+#   OPENAI_API_KEY      — cover art (gpt-image-1) AND the Whisper transcript
+#                         fallback. Without it, books have no cover image and any
+#                         video lacking captions is skipped rather than
+#                         transcribed.
+#   NETLIFY_AUTH_TOKEN  — publishing generated sales pages. Without it a page can
+#                         still be generated and previewed, just not published.
+#   NETLIFY_ACCOUNT_SLUG — only when the token has access to more than one team.
+#
+# BEFORE THE FIRST DEPLOY, the ebook schema must exist:
+#   1. Run supabase/migrations/0031_ebook_schema.sql, then 0032_..., in the
+#      Supabase SQL editor. They MUST run as two separate statement batches —
+#      0032 references enum values 0031 adds, and Postgres rejects that in one
+#      transaction ("unsafe use of new value of enum type").
+#   2. Supabase → Settings → API → Exposed schemas → add `ebook`.
+#      PostgREST returns PGRST106 on every query until this is done.
+
+app = 'video-automation-ebook-worker'
+primary_region = 'lhr'
+
+# Graceful-shutdown window. On deploy / `secrets set`, Fly sends SIGTERM and the
+# worker's shutdown() drains via worker.close(), letting in-flight jobs finish.
+# The longest single ebook job is a chapter generation (one Claude call, a few
+# minutes) or a PDF export; 300s covers both. Fly HARD-CAPS this at 5 minutes —
+# 600s is rejected at deploy ("cannot exceed 5 minutes"), which is why the avatar
+# worker also sits at 300s.
+#
+# A job killed mid-flight is NOT lost: every stage runs behind the idempotency
+# ledger (job_runs), so BullMQ's stalled-job recovery re-delivers it and the
+# guard makes the re-run a no-op if it had already completed.
+kill_timeout = "300s"
+
+[env]
+  # Serve ONLY the ebook queues. The video engines run on the other two apps.
+  WORKER_ROLE = "ebook"
+
+  # Full upstream concurrency. The default is 0.25 (~36 concurrent jobs), sized
+  # for an ebook worker SHARING a machine with the video engines; this app is
+  # dedicated, so it runs the table as tuned (~135). See queueRuntimeConfig() in
+  # packages/ebook-infra/queue/queues.ts.
+  #
+  # NOTE: that total is deliberately much higher than the vCPU count — nearly
+  # every one of those slots is blocked on a Claude HTTP call, not burning CPU.
+  # The real ceiling is the Anthropic tier limit, enforced per-queue by the
+  # BullMQ limiters in QUEUE_CONFIG, not by this number.
+  EBOOK_CONCURRENCY_SCALE = "1"
+
+  # Puppeteer's bundled Chromium, installed to this path in Dockerfile.worker.
+  # Without it puppeteer.launch() looks in ~/.cache/puppeteer, which does not
+  # exist in the image, and every PDF export fails with "Could not find Chrome".
+  PUPPETEER_CACHE_DIR = "/root/.cache/puppeteer"
+
+  # Local scratch for yt-dlp audio downloads (Whisper fallback) and export
+  # artifacts before they are uploaded. Ephemeral is correct here: nothing on
+  # this path needs to survive a restart — see the no-[[mounts]] note below.
+  TMP_DIR = "/tmp/work"
+
+[build]
+  dockerfile = 'Dockerfile.worker'
+
+# Sizing. The work splits in two:
+#   * LLM-bound (most of the 18 queues) — near-zero CPU, just many concurrent
+#     open sockets waiting on Claude. Wants RAM for the in-flight book state,
+#     not cores.
+#   * Chromium-bound (`export`) — a ~100-page PDF render is a real memory spike,
+#     and the avatar worker's history is instructive: 4gb SIGTERM-killed Chromium
+#     after roughly one render.
+# shared-cpu-4x / 8gb covers both without paying for the performance-8x the video
+# encoders need — there is no libx264 work on this machine. Raise memory first if
+# exports OOM; raise cores only if profiling actually shows CPU saturation.
+[[vm]]
+  size = 'shared-cpu-4x'
+  memory = '8gb'
+
+# NO [[mounts]]. Unlike the two video workers, nothing here needs a persistent
+# volume: the render-cache they protect is a video-render concept, exports are
+# uploaded to storage as they finish, and audio downloads are transient. Job
+# durability lives in Redis (on the celebrity worker's volume) plus the job_runs
+# ledger in Postgres, so an interrupted book resumes from its last completed
+# stage regardless of this machine's disk.
+
+# NO [[services]]. This worker exposes no port and hosts no Redis — it is a pure
+# BullMQ consumer of the celebrity worker's instance.
+#
+# Consequence for cost: with no inbound service, Fly cannot auto-WAKE this app
+# from a queued Redis job (auto_start fires on inbound HTTP, which this app has
+# none of). Same trade-off as the avatar worker. Books are submitted in bursts,
+# so if idle cost matters:
+#   fly scale count 1 -c fly.ebook.toml   # before submitting books
+#   fly scale count 0 -c fly.ebook.toml   # when the queue is drained
+# Leaving one shared-cpu-4x machine always-on is the simpler default.

@@ -681,12 +681,26 @@ const ServerEnvSchema = z.object({
 
   // Which queue group this worker process serves. Lets the celebrity
   // (sourced) and AI-avatar (synthetic) engines run on SEPARATE Fly machines:
-  //   'all'       (default) — both engines, single-worker setup (unchanged).
+  //   'all'       (default) — every engine, single-worker setup (unchanged).
   //   'sourced'   — only the celebrity queues (search/download/clip/match/render/scriptClip).
   //   'synthetic' — only the AI-avatar queues (tts/planner/image/video/avatar).
+  //   'ebook'     — only the ebook-generator queues (the 18 stages of the
+  //                 channel→book pipeline). Mostly LLM-bound and cheap on CPU,
+  //                 so it can share a machine — but `whisper-transcribe` and
+  //                 `export` (Puppeteer) are memory-hungry, which is why it can
+  //                 also be pinned to its own app.
   // The synthetic worker can be a separate Fly app with auto_stop (scales to
   // zero when idle) since avatar generation is bursty, not 24/7.
-  WORKER_ROLE: z.enum(["all", "sourced", "synthetic"]).default("all"),
+  WORKER_ROLE: z.enum(["all", "sourced", "synthetic", "ebook"]).default("all"),
+
+  // Scales EVERY ebook queue's concurrency (packages/ebook-infra/queue/queues.ts).
+  // The upstream table was tuned for dedicated pods and sums to ~135 concurrent
+  // jobs; the whole video pipeline runs at ~13, so an unscaled ebook worker
+  // sharing a machine would starve it. 0.25 → ~34, a reasonable co-tenant.
+  // Set to 1 on a dedicated ebook machine (WORKER_ROLE=ebook) for full throughput.
+  // Read directly from process.env in queues.ts (that package has its own env
+  // schema); declared here so it is documented alongside the other knobs.
+  EBOOK_CONCURRENCY_SCALE: z.coerce.number().positive().default(0.25),
 
   // Per-queue concurrency for the synthetic asset-generation queues. Mirrors
   // the spec: tts=2, planner=2, image=3, video=2, avatar=1. Avatar stays at 1
