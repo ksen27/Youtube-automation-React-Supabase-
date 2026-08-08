@@ -10,7 +10,7 @@ import type { TemplateArtifactStore } from '../ports/services/TemplateArtifactSt
 import type { Clock } from '../ports/Clock';
 
 /** Where a cloned template's assets live. Private; read with the service role. */
-const LANDING_BUCKET = 'landing-assets';
+const LANDING_BUCKET = 'ebook-landing-assets';
 
 /**
  * Deploys the current draft to Netlify.

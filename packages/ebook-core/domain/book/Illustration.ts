@@ -5,7 +5,7 @@ interface IllustrationProps {
   chapterId: string;
   /** 0-based slot within the chapter; the renderer spreads slots across paragraphs. */
   orderInChapter: number;
-  /** Path in the 'exports' bucket where the generated PNG lives. */
+  /** Path in the 'ebook-exports' bucket where the generated PNG lives. */
   storagePath: string;
   /** The (textless) prompt used to generate it — kept for debugging/regeneration. */
   prompt: string | null;

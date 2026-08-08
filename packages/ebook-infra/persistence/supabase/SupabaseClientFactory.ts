@@ -30,11 +30,60 @@ export type EbookSupabaseClient = SupabaseClient<any, typeof EBOOK_SCHEMA, any>;
  * see supabase/migrations/0031_ebook_schema.sql — but the service-role key is
  * still what server-side code uses.)
  */
+/**
+ * Gives failed requests a non-empty error message.
+ *
+ * A count query uses `head: true`, which PostgREST answers with a bodiless HEAD
+ * response — so on failure supabase-js has nothing to build an error from and
+ * hands the caller `{ message: '' }`. Every one of the ~24
+ * `throw new Error(error.message)` call sites in these repositories then throws
+ * a blank `Error:`, which is what a fresh deployment actually sees first.
+ *
+ * The case that matters is **PGRST106 "Invalid schema: ebook"** (HTTP 406),
+ * returned until `ebook` is added under Supabase → Settings → API → Exposed
+ * schemas — a required manual step after the migrations. Naming it here turns a
+ * blank stack trace into the actual instruction.
+ *
+ * Only touches responses that would otherwise be blank; anything PostgREST
+ * describes itself is passed through untouched.
+ */
+function diagnosticFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return fetch(input, init).then(async (res) => {
+    if (res.ok) return res;
+    const text = await res.clone().text().catch(() => '');
+    // A body that already names the failure needs no help.
+    if (text.trim()) return res;
+
+    // The two setup failures a fresh deployment hits, in the order it hits them.
+    // Both arrive bodiless on a HEAD (count) request, so without naming them
+    // here they reach the log as a blank `Error:`.
+    const reason =
+      res.status === 406
+        ? `PGRST106: the "${EBOOK_SCHEMA}" schema is not exposed by PostgREST. ` +
+          `Add it under Supabase → Data API → "Exposed schemas" ` +
+          `(and confirm migrations 0031/0032 have been applied).`
+        : res.status === 403
+          ? `42501: permission denied for schema "${EBOOK_SCHEMA}". The Data API ` +
+            `roles have no privileges on it — apply migration ` +
+            `0033_ebook_schema_grants.sql.`
+          : `HTTP ${res.status} ${res.statusText}`.trim();
+
+    return new Response(JSON.stringify({ message: reason, code: String(res.status) }), {
+      status: res.status,
+      statusText: res.statusText,
+      // Force JSON: the original HEAD reply advertises no content type, and
+      // supabase-js only parses an error body when it is told it is JSON.
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+}
+
 export class SupabaseClientFactory {
   static serviceRole(url: string, serviceRoleKey: string): EbookSupabaseClient {
     return createClient(url, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
       db: { schema: EBOOK_SCHEMA },
+      global: { fetch: diagnosticFetch },
     });
   }
 }

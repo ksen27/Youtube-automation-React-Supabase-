@@ -47,7 +47,7 @@ const LayoutSchema = z.object({
 });
 
 /** The bucket the cover art and exports already live in. */
-const EXPORTS_BUCKET = 'exports';
+const EXPORTS_BUCKET = 'ebook-exports';
 
 /**
  * Widths every inlined image is resized to before it becomes a data URI, in

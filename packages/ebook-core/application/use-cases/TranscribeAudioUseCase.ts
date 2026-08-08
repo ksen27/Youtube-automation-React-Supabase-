@@ -7,7 +7,7 @@ import type { ObjectStorage } from '../ports/services/ObjectStorage';
 import type { Hasher } from '../ports/Hasher';
 import type { WhisperJob } from '../dto/jobs.dto';
 
-const AUDIO_BUCKET = 'audio';
+const AUDIO_BUCKET = 'ebook-audio';
 
 /** Whisper fallback worker — transcribes downloaded audio, then cleans it up. */
 export class TranscribeAudioUseCase {

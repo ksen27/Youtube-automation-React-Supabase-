@@ -76,6 +76,13 @@ kill_timeout = "300s"
   # exist in the image, and every PDF export fails with "Could not find Chrome".
   PUPPETEER_CACHE_DIR = "/root/.cache/puppeteer"
 
+  # Deno, installed to this path in Dockerfile.worker. yt-dlp uses it to solve
+  # YouTube's player challenge; WITHOUT a JS runtime YouTube rejects every
+  # request as a bot ("Sign in to confirm you're not a bot") regardless of how
+  # clean the source IP is — residential proxies alone do NOT fix it. Passed
+  # explicitly as `--js-runtimes deno:<path>` rather than relying on PATH.
+  YT_DLP_DENO_PATH = "/usr/local/bin/deno"
+
   # Local scratch for yt-dlp audio downloads (Whisper fallback) and export
   # artifacts before they are uploaded. Ephemeral is correct here: nothing on
   # this path needs to survive a restart — see the no-[[mounts]] note below.

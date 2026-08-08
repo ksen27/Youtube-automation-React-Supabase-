@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import { Result, type SpeechToText, type RawTranscript, type ObjectStorage } from '@ebook/core';
 import { keepAliveAgent } from '../net/keepAliveAgent';
 
-const AUDIO_BUCKET = 'audio';
+const AUDIO_BUCKET = 'ebook-audio';
 
 /**
  * Whisper fallback. Downloads the audio object from storage and sends it to the

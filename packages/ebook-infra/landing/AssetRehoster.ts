@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { Result, type CapturedAsset, type ObjectStorage, type TemplateAsset } from '@ebook/core';
 
 /** The bucket cloned template artifacts live in. Private, like `exports`. */
-export const LANDING_BUCKET = 'landing-assets';
+export const LANDING_BUCKET = 'ebook-landing-assets';
 
 /** Extensions by content type, so a deployed file is served as what it is. */
 const EXTENSIONS: Record<string, string> = {

@@ -41,7 +41,7 @@ import type { IdGenerator } from '../ports/IdGenerator';
 import type { Clock } from '../ports/Clock';
 import type { Hasher } from '../ports/Hasher';
 
-const EXPORTS_BUCKET = 'exports';
+const EXPORTS_BUCKET = 'ebook-exports';
 
 /** Widths every generated page is verified at. */
 const VERIFY_WIDTHS = [1280, 768, 390];
@@ -407,7 +407,7 @@ export class GenerateClonedLandingPageUseCase {
     const pageAssets: LandingPageAsset[] = [];
     for (const asset of assets) {
       const path = `pages/${input.projectId.value}/${asset.sitePath.replace('assets/', '')}`;
-      const put = await this.storage.put('landing-assets', path, asset.bytes, asset.contentType);
+      const put = await this.storage.put('ebook-landing-assets', path, asset.bytes, asset.contentType);
       if (put.isOk()) {
         pageAssets.push({ sitePath: asset.sitePath, storagePath: path, contentType: asset.contentType });
       }
@@ -538,7 +538,7 @@ export class GenerateClonedLandingPageUseCase {
   private async loadBaseline(template: StoredLandingTemplate) {
     const shots = [];
     for (const entry of template.baselineShots) {
-      const bytes = await this.storage.getBytes('landing-assets', entry.storagePath);
+      const bytes = await this.storage.getBytes('ebook-landing-assets', entry.storagePath);
       if (bytes.isFail()) continue;
       shots.push({
         width: entry.width,

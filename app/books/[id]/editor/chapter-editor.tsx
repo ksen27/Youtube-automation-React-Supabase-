@@ -23,6 +23,67 @@ interface Chapter {
   content: string | null;
 }
 
+/**
+ * Minimal markdown → React for the reading view.
+ *
+ * Deliberately not a markdown library: chapters are model-generated prose whose
+ * only structure is headings, blank-line paragraphs, list items and **bold** —
+ * so a ~30-line renderer covers it, and nothing here interprets raw HTML, which
+ * keeps model output from injecting markup into the page.
+ */
+function renderMarkdown(src: string): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  const blocks = src.split(/\n{2,}/);
+  blocks.forEach((raw, bi) => {
+    const block = raw.trim();
+    if (!block) return;
+
+    const heading = /^(#{1,4})\s+(.*)$/.exec(block);
+    if (heading) {
+      const depth = heading[1]!.length;
+      const text = heading[2]!;
+      const cls =
+        depth <= 1 ? "text-xl font-semibold mt-6 mb-2"
+        : depth === 2 ? "text-lg font-semibold mt-6 mb-2"
+        : "text-base font-semibold mt-4 mb-1";
+      out.push(<p key={bi} className={`${cls} text-fg`}>{inline(text)}</p>);
+      return;
+    }
+
+    // A block whose every line is a bullet / numbered item.
+    const lines = block.split("\n");
+    if (lines.every((l) => /^\s*([-*]|\d+\.)\s+/.test(l))) {
+      out.push(
+        <ul key={bi} className="my-3 list-disc space-y-1 pl-5">
+          {lines.map((l, i) => (
+            <li key={i}>{inline(l.replace(/^\s*([-*]|\d+\.)\s+/, ""))}</li>
+          ))}
+        </ul>,
+      );
+      return;
+    }
+
+    out.push(<p key={bi} className="my-3">{inline(block.replace(/\n/g, " "))}</p>);
+  });
+  return out;
+}
+
+/** **bold** and *italic* within a line. */
+function inline(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  const re = /\*\*([^*]+)\*\*|\*([^*]+)\*/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    if (m[1]) parts.push(<strong key={m.index} className="font-semibold text-fg">{m[1]}</strong>);
+    else parts.push(<em key={m.index}>{m[2]}</em>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 export function ChapterEditor({ projectId }: { projectId: string }) {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -31,6 +92,7 @@ export function ChapterEditor({ projectId }: { projectId: string }) {
   const [editedKey, setEditedKey] = useState("");
   const [editedText, setEditedText] = useState("");
   const [instructions, setInstructions] = useState("");
+  const [mode, setMode] = useState<"read" | "edit">("read");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -178,6 +240,20 @@ export function ChapterEditor({ projectId }: { projectId: string }) {
                     <CardDescription className="truncate">{selected.topic}</CardDescription>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
+                    <div className="flex rounded-md border border-border p-0.5">
+                      {(["read", "edit"] as const).map((m) => (
+                        <button
+                          key={m}
+                          onClick={() => setMode(m)}
+                          className={cn(
+                            "rounded px-2.5 py-1 text-xs font-medium capitalize transition-colors",
+                            mode === m ? "bg-surface-hover text-fg" : "text-fg-muted hover:text-fg",
+                          )}
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
                     <Badge variant={selected.status === "DONE" ? "success" : "secondary"}>
                       v{selected.version}
                     </Badge>
@@ -188,17 +264,28 @@ export function ChapterEditor({ projectId }: { projectId: string }) {
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
-                <Textarea
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  rows={24}
-                  className="font-mono text-sm leading-relaxed"
-                  placeholder="This chapter has not been written yet."
-                />
+                {/* Read is the default: the common action on a finished book is
+                    reviewing it, and raw markdown in a monospace box is for
+                    editing, not reading. */}
+                {mode === "read" ? (
+                  <article className="prose-book max-w-none text-sm leading-7 text-fg">
+                    {renderMarkdown(draft)}
+                  </article>
+                ) : (
+                  <Textarea
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    rows={24}
+                    className="font-mono text-sm leading-relaxed"
+                    placeholder="This chapter has not been written yet."
+                  />
+                )}
                 <div className="flex flex-wrap items-center gap-2">
-                  <Button size="sm" variant="gradient" disabled={busy} onClick={save}>
-                    <Save className="h-4 w-4" /> Save
-                  </Button>
+                  {mode === "edit" && (
+                    <Button size="sm" variant="gradient" disabled={busy} onClick={save}>
+                      <Save className="h-4 w-4" /> Save
+                    </Button>
+                  )}
                   {msg && <span className="text-xs text-emerald-400">{msg}</span>}
                   {err && <span className="text-xs text-red-400">{err}</span>}
                 </div>

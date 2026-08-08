@@ -9,7 +9,7 @@ import {
   Download,
   FileText,
   Loader2,
-  PenLine,
+  BookOpen,
   RotateCcw,
 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -47,12 +47,21 @@ interface BookData {
   chapters: BookChapter[];
 }
 
+interface Artifact {
+  format: string;
+  pageCount: number | null;
+  bookVersion: number;
+  url: string | null;
+}
+
 export function BookDetail({ id, initialStatus, initialError }: Props) {
   const [status, setStatus] = useState(initialStatus);
   const [pending, setPending] = useState<Record<string, number>>({});
   const [err, setErr] = useState<string | null>(initialError);
   const [book, setBook] = useState<BookData | null>(null);
   const [busy, setBusy] = useState(false);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
 
   // Whether there was a pipeline to watch AT MOUNT. Captured from the initial
   // prop rather than from live state: the effect must decide once, and
@@ -74,6 +83,19 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
     }
   }, [id]);
 
+  // Existing PDF/DOCX artifacts, with signed download URLs (1h expiry).
+  const loadArtifacts = useCallback(async (isCancelled?: () => boolean) => {
+    try {
+      const res = await fetch(`/api/books/exports?projectId=${id}`, { cache: "no-store" });
+      if (!res.ok || isCancelled?.()) return;
+      const data = await res.json();
+      if (isCancelled?.()) return;
+      setArtifacts(data.artifacts ?? []);
+    } catch {
+      /* leave the previous list in place */
+    }
+  }, [id]);
+
   // Live pipeline progress, and the book itself once there is one to show.
   //
   // One effect covering both: the SSE stream ends itself on COMPLETED/FAILED, at
@@ -84,12 +106,14 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
     let cancelled = false;
     const isCancelled = () => cancelled;
 
-    // A finished book has no stream to open — just load it. Microtask rather
-    // than a direct call: a cache-warm fetch can resolve inside the effect and
-    // cascade a render (react-hooks/set-state-in-effect).
+    // A finished book has no stream to open — just load it and its exports.
+    // Microtask rather than a direct call: a cache-warm fetch can resolve inside
+    // the effect and cascade a render (react-hooks/set-state-in-effect).
     if (!watchPipeline) {
       queueMicrotask(() => {
-        if (!cancelled) void loadBook(isCancelled);
+        if (cancelled) return;
+        void loadBook(isCancelled);
+        void loadArtifacts(isCancelled);
       });
       return () => { cancelled = true; };
     }
@@ -105,6 +129,7 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
         if (data.status === "COMPLETED" || data.status === "FAILED") {
           es.close();
           void loadBook(isCancelled);
+          void loadArtifacts(isCancelled);
         }
       } catch {
         /* ignore malformed frame */
@@ -115,7 +140,7 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
       cancelled = true;
       es.close();
     };
-  }, [id, loadBook, watchPipeline]);
+  }, [id, loadBook, loadArtifacts, watchPipeline]);
 
   async function retry() {
     setBusy(true);
@@ -132,8 +157,17 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
     }
   }
 
+  /**
+   * Export is ASYNCHRONOUS: the POST only enqueues a job on the `export` queue,
+   * and the PDF appears seconds-to-minutes later. So the button has to poll for
+   * an artifact at >= the version the API says this run will produce — without
+   * that, a click looks like it did nothing, and a stale download URL from the
+   * PREVIOUS export would be served as if it were the new one.
+   */
   async function exportBook(format: "pdf" | "docx" | "both") {
     setBusy(true);
+    setErr(null);
+    setExportMsg("Rendering…");
     try {
       const res = await fetch("/api/books/exports", {
         method: "POST",
@@ -141,7 +175,29 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
         body: JSON.stringify({ projectId: id, format }),
       });
       const data = await res.json();
-      if (!res.ok) setErr(data.error ?? "Export failed");
+      if (!res.ok) {
+        setErr(data.error ?? "Export failed");
+        setExportMsg(null);
+        return;
+      }
+      const wantVersion: number = data.nextVersion ?? 0;
+      // Poll for up to ~5 min; a 100-page PDF render is not instant.
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 5000));
+        const list = await fetch(`/api/books/exports?projectId=${id}`, { cache: "no-store" })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null);
+        const fresh: Artifact[] = list?.artifacts ?? [];
+        if (fresh.some((a) => a.bookVersion >= wantVersion && a.url)) {
+          setArtifacts(fresh);
+          setExportMsg(null);
+          return;
+        }
+      }
+      setExportMsg("Still rendering — reload in a minute to get the download link.");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Export failed");
+      setExportMsg(null);
     } finally {
       setBusy(false);
     }
@@ -176,12 +232,9 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
         <div className="flex shrink-0 gap-2">
           {done && (
             <>
-              <Button variant="outline" size="sm" disabled={busy} onClick={() => exportBook("both")}>
-                <Download className="h-4 w-4" /> Export
-              </Button>
               <Button asChild size="sm" variant="gradient">
                 <Link href={`/books/${id}/editor`}>
-                  <PenLine className="h-4 w-4" /> Edit chapters
+                  <BookOpen className="h-4 w-4" /> Read &amp; edit
                 </Link>
               </Button>
             </>
@@ -199,6 +252,47 @@ export function BookDetail({ id, initialStatus, initialError }: Props) {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <span className="min-w-0 break-words">{err}</span>
         </div>
+      )}
+
+      {done && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Downloads</CardTitle>
+            <CardDescription>
+              {artifacts.length > 0
+                ? "Links are signed and expire after an hour — reload the page for fresh ones."
+                : "No export yet. Press Export to render the PDF and DOCX."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {artifacts.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {artifacts.map((a) => (
+                  <Button key={`${a.format}-${a.bookVersion}`} asChild variant="outline" size="sm" disabled={!a.url}>
+                    <a href={a.url ?? "#"} target="_blank" rel="noreferrer">
+                      <Download className="h-4 w-4" />
+                      {a.format.toUpperCase()}
+                      {a.pageCount ? ` · ${a.pageCount}p` : ""}
+                      <span className="text-fg-subtle"> v{a.bookVersion}</span>
+                    </a>
+                  </Button>
+                ))}
+              </div>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => exportBook("both")}>
+                <Download className="h-4 w-4" />
+                {artifacts.length > 0 ? "Re-export" : "Export"}
+              </Button>
+              {exportMsg && (
+                <span className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
+                  {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                  {exportMsg}
+                </span>
+              )}
+            </div>
+          </CardContent>
+        </Card>
       )}
 
       {isQueuedStatus(status) && (

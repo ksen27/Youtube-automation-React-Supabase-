@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     ca-certificates \
     curl \
+    unzip \
     redis-server \
     fonts-dejavu-core \
  && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
@@ -15,6 +16,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && chmod +x /usr/local/bin/yt-dlp \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
+
+# Deno — the JS runtime yt-dlp uses to solve YouTube's player challenge.
+#
+# NOT optional, despite yt-dlp only WARNING about it: without a JS runtime
+# YouTube rejects the request as a bot ("Sign in to confirm you're not a bot")
+# no matter how clean the source IP is, so residential proxies alone do not fix
+# it. yt-dlp has deprecated JS-less extraction; the warning is the cause, not
+# noise. Installed to a fixed path and pointed at explicitly via
+# YT_DLP_DENO_PATH (see fly.ebook.toml) rather than relying on PATH.
+#
+# Used by the ebook worker's Whisper audio fallback. Harmless on the video
+# workers, which share this image — yt-dlp there picks it up on PATH too, which
+# only makes their downloads more reliable.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y \
+ && /usr/local/bin/deno --version
 
 WORKDIR /app
 

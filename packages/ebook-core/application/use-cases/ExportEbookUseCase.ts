@@ -5,7 +5,7 @@ import type { ObjectStorage } from '../ports/services/ObjectStorage';
 import type { ExportArtifactRepository } from '../ports/repositories/ExportArtifactRepository';
 
 /** Storage bucket holding rendered ebook artifacts (private; served via signed URLs). */
-export const EXPORT_BUCKET = 'exports';
+export const EXPORT_BUCKET = 'ebook-exports';
 
 /** Renders the assembled document to the requested formats and stores artifacts. */
 export class ExportEbookUseCase {

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Result, type AudioDownloader, type ObjectStorage } from '@ebook/core';
 import { youtubeProxyList } from '../net/ProxyRotator';
 
-const AUDIO_BUCKET = 'audio';
+const AUDIO_BUCKET = 'ebook-audio';
 
 /**
  * Downloads a video's audio with yt-dlp, uploads it to storage, returns the ref.

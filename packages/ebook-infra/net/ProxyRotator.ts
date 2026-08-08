@@ -83,10 +83,21 @@ export class ProxyRotator {
  * The shared YouTube proxy pool from env: YT_DLP_PROXIES (pool) takes precedence
  * over YT_DLP_PROXY (single). Used by both the transcript scraper and the yt-dlp
  * audio path so one proxy list drives the whole YouTube-facing pipeline.
+ *
+ * PORT NOTE: this app spells the same setting **YTDLP_PROXIES** (no underscore
+ * after YT — see lib/env.ts), and that is where the residential pool the video
+ * engines rely on is actually configured. Upstream's spelling is checked first
+ * for compatibility, then this app's.
+ *
+ * Without this fallback the ebook worker ran with NO proxy while the video
+ * workers had one, so every YouTube request left from the Fly machine's
+ * datacenter IP and came back "Sign in to confirm you're not a bot" — on all
+ * ~20 videos of a book, at the transcript stage. Two env vars for one concept is
+ * exactly the kind of drift that produces a failure looking like a code bug.
  */
 export function youtubeProxyList(): string[] {
-  const pool = parseProxyList(process.env.YT_DLP_PROXIES);
-  return pool.length ? pool : parseProxyList(process.env.YT_DLP_PROXY);
+  const pool = parseProxyList(process.env.YT_DLP_PROXIES ?? process.env.YTDLP_PROXIES);
+  return pool.length ? pool : parseProxyList(process.env.YT_DLP_PROXY ?? process.env.YTDLP_PROXY);
 }
 
 /** Build a rotator from the shared YouTube proxy env. */
