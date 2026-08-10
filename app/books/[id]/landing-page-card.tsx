@@ -24,6 +24,7 @@ interface Settings {
   enabled: boolean;
   checkoutUrl: string;
   templateUrl: string;
+  templateId: string;
   priceCents: number | null;
   compareAtCents: number | null;
   currency: string;
@@ -51,6 +52,16 @@ interface Candidate {
   title: string;
   channelUrl: string;
   sameChannel: boolean;
+}
+
+/** A cloned reference site this book's page can be built from. */
+interface Template {
+  id: string;
+  sourceUrl: string;
+  name: string | null;
+  state: string;
+  failureReason: string | null;
+  stale: boolean;
 }
 
 /** One sibling row's editable state. */
@@ -117,15 +128,31 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // The reference site. TWO different mechanisms, deliberately kept apart in the
+  // UI because they produce very different pages:
+  //   templateId  → the CLONE engine: the page IS that site with our content
+  //                 swapped in. This is what "make it look like the sample"
+  //                 means, and it requires cloning the site first.
+  //   templateUrl → the BUILT-IN renderer reads that page for its section
+  //                 STRUCTURE and writes our own design from it.
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templateId, setTemplateId] = useState("");
+  const [templateUrl, setTemplateUrl] = useState("");
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [attest, setAttest] = useState(false);
+  const [cloning, setCloning] = useState(false);
+
   const load = useCallback(async (isCancelled?: () => boolean) => {
     try {
-      const [sRes, cRes] = await Promise.all([
+      const [sRes, cRes, tRes] = await Promise.all([
         fetch(`/api/books/projects/${projectId}/landing-page`, { cache: "no-store" }),
         fetch(`/api/books/projects/${projectId}/landing-page/candidates`, { cache: "no-store" }),
+        fetch(`/api/books/landing-templates`, { cache: "no-store" }),
       ]);
       if (!sRes.ok || isCancelled?.()) return;
       const data = await sRes.json();
       const cData = cRes.ok ? await cRes.json() : { candidates: [] };
+      const tData = tRes.ok ? await tRes.json() : { templates: [] };
       if (isCancelled?.()) return;
 
       const s: Settings = data.settings;
@@ -140,6 +167,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setBundlePrice(centsToInput(s.bundlePriceCents));
       setBundleUrl(s.bundleCheckoutUrl ?? "");
       setPhotoPath(s.authorPhotoPath ?? "");
+      setTemplateId(s.templateId ?? "");
+      setTemplateUrl(s.templateUrl ?? "");
+      setTemplates(tData.templates ?? []);
       setSiblings(
         Array.from({ length: SIBLING_SLOTS }, (_, i) => {
           const saved = s.siblings?.[i];
@@ -206,6 +236,46 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     }
   }
 
+  /**
+   * Clone a reference site so this book's page can be built from it.
+   *
+   * Queued, not inline: extraction drives a real browser, takes six full-height
+   * screenshots and sweeps the site's assets. The new template appears in the
+   * list as EXTRACTING and becomes selectable once it is READY.
+   *
+   * `attestOwnership` is required by the API and is not a formality — this makes
+   * a COMPLETE copy of someone's page, which is a different act from taking
+   * design inspiration, and not a call the system can make for the seller.
+   */
+  async function cloneTemplate() {
+    const url = cloneUrl.trim();
+    if (!url) return setErr("Paste the URL of the page to copy.");
+    if (!isHttpUrl(url)) return setErr("The template URL must be a full URL (https://…).");
+    if (!attest) return setErr("Confirm you have the right to copy that page.");
+    setCloning(true);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/books/landing-templates`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceUrl: url, attestOwnership: true, force: false }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setErr(data.error ?? "Could not start the copy");
+        return;
+      }
+      // Select it immediately: an already-extracted template is usable now, and
+      // a queued one becomes usable when it finishes.
+      if (data.templateId) setTemplateId(data.templateId);
+      setCloneUrl("");
+      setAttest(false);
+      await load();
+    } finally {
+      setCloning(false);
+    }
+  }
+
   async function removePhoto() {
     setUploading(true);
     setErr(null);
@@ -259,6 +329,8 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         body: JSON.stringify({
           checkoutUrl: checkoutUrl.trim(),
           ...(ownCents !== null ? { priceCents: ownCents } : {}),
+          landingTemplateId: templateId,
+          landingTemplateUrl: templateUrl.trim(),
           landingMode: mode,
           landingSiblings: chosen.map((s) => {
             const cents = parsePrice(s.price);
@@ -364,6 +436,101 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
             ))}
           </ul>
         )}
+
+        {/* ── reference site ─────────────────────────────────────────────── */}
+        <div className="space-y-3">
+          <Label>Design</Label>
+          <select
+            value={templateId}
+            onChange={(e) => setTemplateId(e.target.value)}
+            className="flex h-9 w-full rounded-md border border-border bg-surface px-3 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
+          >
+            <option value="">Built-in design (no copied template)</option>
+            {templates.map((t) => (
+              <option key={t.id} value={t.id} disabled={t.state !== "READY"}>
+                {t.name?.trim() || t.sourceUrl}
+                {t.state !== "READY" ? ` — ${t.state.toLowerCase()}…` : ""}
+                {t.stale ? " (rebuilds on use)" : ""}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-fg-subtle">
+            {templateId
+              ? "The page will BE this template, with your book's content swapped in."
+              : "The built-in design. Add a reference below to copy a site's look instead."}
+          </p>
+
+          {templates.some((t) => t.state === "EXTRACTING") && (
+            <p className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              A template is still being copied — it becomes selectable when it finishes.
+            </p>
+          )}
+
+          {templates.find((t) => t.id === templateId)?.failureReason && (
+            <p className="text-xs text-amber-300">
+              {templates.find((t) => t.id === templateId)?.failureReason}
+            </p>
+          )}
+
+          <div className="rounded-md border border-border p-3 space-y-2.5">
+            <Label htmlFor="cloneUrl" className="text-xs">
+              Copy a new reference site
+            </Label>
+            <div className="flex flex-wrap gap-2">
+              <Input
+                id="cloneUrl"
+                value={cloneUrl}
+                onChange={(e) => setCloneUrl(e.target.value)}
+                placeholder="https://the-page-to-copy.com"
+                className="min-w-[16rem] flex-1"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={cloning || busy}
+                onClick={cloneTemplate}
+              >
+                {cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />}
+                Copy site
+              </Button>
+            </div>
+            <label className="flex items-start gap-2 text-xs text-fg-muted">
+              <input
+                type="checkbox"
+                checked={attest}
+                onChange={(e) => setAttest(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 rounded border-border accent-[var(--color-brand-500)]"
+              />
+              {/* Required by the API, and deliberately not pre-ticked: this makes a
+                  complete copy of someone's page. */}
+              I have the right to copy this page&apos;s design.
+            </label>
+            <p className="text-xs text-fg-subtle">
+              Takes a minute or two — it opens the page in a browser and captures its
+              layout, styles and assets.
+            </p>
+          </div>
+
+          {!templateId && (
+            <div className="space-y-1.5">
+              <Label htmlFor="templateUrl" className="text-xs">
+                Or follow a page&apos;s structure only
+              </Label>
+              <Input
+                id="templateUrl"
+                value={templateUrl}
+                onChange={(e) => setTemplateUrl(e.target.value)}
+                placeholder="https://a-page-to-take-the-section-order-from.com"
+              />
+              <p className="text-xs text-fg-subtle">
+                The built-in design writes the same sections, in the same order, in our
+                own styling. Nothing is copied.
+              </p>
+            </div>
+          )}
+        </div>
 
         {/* ── page shape ─────────────────────────────────────────────────── */}
         <div className="space-y-2">
