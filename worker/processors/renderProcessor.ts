@@ -6,7 +6,7 @@ import type { RenderJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob, setProjectStatus, touchMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
-import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, degradeVideoLowFi, segmentVcodecArgsFor, RENDER_WIDTH, RENDER_HEIGHT, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
+import { concatAudioFiles, concatNormalizedClips, cutClip, cutAudio, normalizeClip, buildStillVideo, buildBlackVideo, padVideoToLength, buildTitleCardVideo, buildSplitScreenVideo, buildSplitScreenAvatarVideo, xfadePair, xfadeFadeBlack, applyEdgeFade, extractAudio, buildSilentAudio, overlayEffectVideo, degradeVideoLowFi, segmentVcodecArgsFor, renderCanvasFor, IMAGE_XFADE_PALETTE, type SfxCue } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { detectSceneTimestamps } from "@/lib/media/scenes";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
@@ -98,10 +98,10 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
       : "effects active (PERFORMANCE_MODE off or non-synthetic engine)",
   });
 
-  // Output resolution. Client 2026-08-02: ALL exports are 4K, both engines
-  // (celebrity/CelebForge included). Every segment in one render shares these
+  // Output resolution, PER ENGINE. Every segment in one render shares these
   // dims (required for the -c:v copy concat fast path).
   //
+  // synthetic (AI avatar) = 3840x2160. Client 2026-08-02 wants 4K here.
   // How much of the frame is TRUE 4K varies by block type — worth knowing before
   // reading a "4K looks soft" report as a bug:
   //   still      69labs at "4k" returns 5504×3072 -> downscaled, genuinely 4K
@@ -110,8 +110,16 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   //              -> UPSCALED 2x. split_2 avatars fill only a 1920×2160 half-cell,
   //              so they upscale 1.78x and hold up better than full-frame ones.
   //   footage    YouTube source; only as good as the original upload.
-  const outW = RENDER_WIDTH;
-  const outH = RENDER_HEIGHT;
+  //
+  // sourced (celebrity/CelebForge) = 1920x1080. Client 2026-08-08 reverted this
+  // engine off 4K: after the cutover celebrity renders ran to a ~59min median
+  // (render-time-audit.ts) because libx264 cost scales with pixel count. Going
+  // back to 1080p cuts the encoded area 4x. Celebrity footage is YouTube-sourced
+  // and was mostly being upscaled into the 4K frame anyway, so little real
+  // detail is lost.
+  const { width: outW, height: outH } = renderCanvasFor(
+    isSyntheticRender ? "synthetic" : "sourced"
+  );
 
   // Pull approved timeline items (only ones with clips — placeholders are skipped
   // for MVP rendering; their script_text/overlay_text would be added in v2)
@@ -488,6 +496,13 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
           // long (buildStillVideo's on-boundary input -t); superseded by the
           // exactFrames pin on buildStillVideo.
           pin: "frames_v3",
+          // Output canvas. The cache survives redeploys on /data, so entries
+          // encoded at 3840x2160 before the 2026-08-08 sourced-1080p revert are
+          // still on disk. Serving one into a 1080p render would copy a 4K
+          // segment into the timeline and break the -c:v copy concat (the
+          // demuxer requires identical dims across inputs). Keying on the canvas
+          // retires those entries automatically instead of needing a cache wipe.
+          canvas: `${outW}x${outH}`,
         },
       });
 
@@ -995,7 +1010,7 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
         // Forced clip from a script-doc title-card marker. Two paths:
         //   • Pre-downloaded (preferred): the script_clip worker has
         //     already pulled the YouTube source, cut the doc's window,
-        //     normalized to 1280x720@30, and uploaded the result to R2.
+        //     normalized to the project engine's canvas @30, and uploaded to R2.
         //     The marker row carries clip_storage_url. We just downloadHttp
         //     it and re-encode if a lower_third overlay needs baking in.
         //   • Fallback: the pre-download didn't run or failed. We do the
@@ -1094,9 +1109,31 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
               });
               await safeUnlink(trimmedPre);
             } else {
-              // No re-encode needed — the pre-download already matches the
-              // final shape. Just rename into the slot.
-              await fs.rename(localPre, out);
+              // No overlay/headroom work needed. The pre-download is USUALLY
+              // already the final shape — but only if it was normalized to the
+              // canvas THIS render is using. Clips downloaded before the
+              // 2026-08-08 sourced-1080p revert are 3840x2160, and renaming one
+              // into a 1080p timeline puts a 4K segment in the concat list,
+              // which fails the -c:v copy demuxer (it requires identical dims).
+              // Probe and re-normalize only on mismatch, so the common case
+              // stays a free rename.
+              let preMatches = true;
+              try {
+                const p = await probeFile(localPre);
+                preMatches = p.width === outW && p.height === outH;
+              } catch { preMatches = false; }
+              if (preMatches) {
+                await fs.rename(localPre, out);
+              } else {
+                await logJob({ projectId, jobId: mediaJobId },
+                  "render.forced_clip.pre.canvas_mismatch", { idx: i, docMarkerId, outW, outH });
+                await normalizeClip({
+                  vcodecArgs: vcodec,
+                  inputPath: localPre, outputPath: out,
+                  width: outW, height: outH, fps: 30,
+                  keepAudio: true,
+                });
+              }
             }
             slots[i] = out;
             let actualDur = renderDur;

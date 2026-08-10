@@ -4,7 +4,7 @@ import type { ScriptClipJobData } from "@/lib/jobs/queue";
 import { logJob, setMediaJob } from "@/lib/jobs/db";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { downloadYoutubeAudio, downloadYoutubeVideo } from "@/lib/media/ytdlp";
-import { cutAudio, cutClip, normalizeClip, RENDER_WIDTH, RENDER_HEIGHT } from "@/lib/media/ffmpeg";
+import { cutAudio, cutClip, normalizeClip, renderCanvasFor } from "@/lib/media/ffmpeg";
 import { probeFile } from "@/lib/media/probe";
 import { ensureTmp, safeUnlink, uploadFile } from "@/lib/storage";
 import { extractYoutubeVideoId } from "@/lib/youtube/url";
@@ -56,6 +56,21 @@ export async function processScriptClipJob(
   if (marker.project_id !== projectId) {
     throw new Error(`marker ${markerId} belongs to a different project`);
   }
+
+  // Pre-normalize to the canvas THIS project's engine renders on, so the render
+  // loop can rename the clip straight into its slot instead of re-encoding it
+  // (renderProcessor probes and re-normalizes on mismatch, but that costs a full
+  // libx264 pass per forced clip). Script-doc markers are a celebrity-intake
+  // feature today, so this is 1920x1080 in practice; reading the engine keeps it
+  // correct if avatar ever gains doc markers.
+  const { data: projRow } = await sb
+    .from("projects")
+    .select("engine")
+    .eq("id", projectId)
+    .maybeSingle();
+  const { width: canvasW, height: canvasH } = renderCanvasFor(
+    ((projRow?.engine as string | null) ?? "sourced") === "synthetic" ? "synthetic" : "sourced"
+  );
   const url = (marker.youtube_url as string | null | undefined)?.trim();
   if (!url) {
     await markFailed(sb, markerId, "marker has no youtube_url");
@@ -146,7 +161,7 @@ export async function processScriptClipJob(
     await normalizeClip({
       inputPath: trimmedTmp,
       outputPath: normalizedTmp,
-      width: RENDER_WIDTH, height: RENDER_HEIGHT, fps: 30,
+      width: canvasW, height: canvasH, fps: 30,
       keepAudio: true,
       startOffsetSeconds: headTrim > 0 ? headTrim : undefined,
       pinDurationSeconds: duration,

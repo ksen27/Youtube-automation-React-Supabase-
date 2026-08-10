@@ -169,19 +169,33 @@ describe('GeneratedPageAssembler — per-book elements', () => {
         ]),
       });
 
-    it('lists every chapter with how much is in it', () => {
+    it('lists every chapter, numbered, with its key points', () => {
       const html = withOutline();
       expect(html).toContain('The $22 Tool That Beats Dealerships');
       expect(html).toContain('ECU Resets You Do Free');
-      expect(html).toContain('2 methods');
-      expect(html).toContain('1 method'); // singular
+      expect(html).toContain('Chapter 01');
+      expect(html).toContain('Chapter 02');
+      // Specifics are what make the section persuasive rather than a table of
+      // contents (client feedback 2026-08-06).
+      expect(html).toContain('Buy the $22 Topdon ArtiLink 200');
+      expect(html).toContain('Disconnect negative terminal 45 minutes');
     });
 
-    it('never prints the key points themselves', () => {
-      const html = withOutline();
-      expect(html).not.toContain('Topdon ArtiLink');
-      expect(html).not.toContain('Disconnect negative terminal');
-      expect(html).not.toContain('Read P0420 codes');
+    it('caps the points shown and counts the rest, so the book is not given away', () => {
+      const html = assemble('<section>{{CONTENTS}}</section>', [
+        product({
+          sections: [
+            {
+              title: 'Long Chapter',
+              items: ['point one', 'point two', 'point three', 'point four', 'point five', 'point six'],
+            },
+          ],
+        }),
+      ]);
+      expect(html).toContain('point four'); // the 4th is shown...
+      expect(html).not.toContain('point five'); // ...the 5th is not
+      expect(html).not.toContain('point six');
+      expect(html).toContain('+2 more');
     });
   });
 

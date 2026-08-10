@@ -175,7 +175,16 @@ const COMPONENT_CSS = `
 
   .guarantee { border: 2px solid var(--accent); border-radius: 12px; padding: 22px 24px; margin: 10px 0; }
 
-  .contents { display: grid; gap: 20px; }
+  /* Three columns, matching the reference template. One long stacked list of
+     fourteen chapters read as a table of contents and pushed the CTA down the
+     page (client feedback 2026-08-06). */
+  .contents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 900px) { .contents { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 620px) { .contents { grid-template-columns: 1fr; } }
+  .contents-item { border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  .contents-num { font-size: .68rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 .5em; }
+  .contents-more { font-size: .76rem; color: var(--accent); margin: .4em 0 0; }
   .contents-item h3 { margin: 0 0 .2em; color: var(--heading); }
   .contents-count { font-size: .74rem; letter-spacing: .1em; text-transform: uppercase;
                     color: var(--accent); margin: 0 0 6px; }
@@ -412,30 +421,48 @@ function coverMarkup(p: LandingProduct | undefined): string {
 }
 
 /**
- * The table of contents: what each chapter is called, and how much is in it.
+ * How many of a chapter's key points a card shows. Mirrors the constant of the
+ * same name in LandingPageHtmlRenderer — the two renderers are independent paths
+ * (built-in vs cloned template) that deliberately share no code, so the value is
+ * duplicated rather than imported across them. Keep the two in step.
+ */
+const MAX_POINTS_PER_CARD = 4;
+
+/**
+ * The contents section: what each chapter is called and what is in it.
  *
- * The chapter's key points are DELIBERATELY not printed. They are the book's
- * substance — "Buy the $22 Topdon ArtiLink 200", "Disconnect the negative
- * terminal 45 minutes with the brake pedal held" — and a fourteen-chapter book
- * put roughly seventy of them on a free public page. That is the product being
- * given away by the page selling it, and it buried the CTA under a wall of text
- * the reference template never had.
+ * A FEW of each chapter's key points are printed — capped at
+ * MAX_POINTS_PER_CARD, with the remainder counted rather than listed.
  *
- * The count stays, because "14 chapters, 70 methods" is the persuasive part and
- * costs the seller nothing.
+ * This reverses an earlier decision to print none of them. The concern behind
+ * that was real: the points are the book's substance ("Buy the $22 Topdon
+ * ArtiLink 200"), and a fourteen-chapter book has roughly seventy, which on a
+ * free page is the product being given away by the page selling it. But showing
+ * only "5 methods" left a contents section with nothing concrete in it, which
+ * reads as a table of contents rather than a reason to buy — and the client's
+ * reference page shows specifics (feedback 2026-08-06).
+ *
+ * The cap is the compromise: enough specifics to prove the book deals in
+ * concrete claims, few enough that the chapter still has to be bought.
  */
 function contentsMarkup(p: LandingProduct | undefined): string {
   const sections = p?.sections ?? [];
   if (sections.length === 0) return '';
   return `<div class="contents stagger">${sections
-    .map(
-      (s) =>
-        `<div class="contents-item"><h3>${esc(s.title)}</h3>` +
-        (s.items.length > 0
-          ? `<p class="contents-count">${s.items.length} ${s.items.length === 1 ? 'method' : 'methods'}</p>`
+    .map((s, i) => {
+      const shown = s.items.slice(0, MAX_POINTS_PER_CARD);
+      const rest = s.items.length - shown.length;
+      return (
+        `<div class="contents-item">` +
+        `<p class="contents-num">Chapter ${String(i + 1).padStart(2, '0')}</p>` +
+        `<h3>${esc(s.title)}</h3>` +
+        (shown.length > 0
+          ? `<ul>${shown.map((it) => `<li>${esc(it)}</li>`).join('')}</ul>`
           : '') +
-        '</div>',
-    )
+        (rest > 0 ? `<p class="contents-more">+${rest} more</p>` : '') +
+        '</div>'
+      );
+    })
     .join('')}</div>`;
 }
 

@@ -57,6 +57,15 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
     const numeral = counter();
 
     const body = [
+      // ORDER IS THE ARGUMENT. A direct-response page sells the problem before
+      // the product: the reader has to feel what their situation costs, and see
+      // that what they have already tried cannot fix it, BEFORE the book is
+      // introduced. So failedAlternatives and the discovery story run ahead of
+      // the product blocks, not after them. Each is omitted when its copy is
+      // absent, which is also how a page generated before these existed still
+      // renders unchanged.
+      sectionFailedAlternatives(model, numeral),
+      sectionDiscovery(model, numeral),
       sectionTheBook(model, primary, numeral),
       sectionTheMath(model, numeral),
       // The reference's own sections, written from this book. They sit after
@@ -64,11 +73,17 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
       // carries the template's material rather than dropping it silently.
       ...(model.copy.templateSections ?? []).map((s) => templateSection(s, numeral)),
       sectionWhatsInside(model, primary, numeral),
+      // The curiosity block sits directly after the contents: the reader has
+      // just seen WHAT is in the book, and these say why each part matters
+      // without giving any of it away. Immediately before the order block, so
+      // the page peaks at the moment it asks for the sale.
+      sectionFascinations(model, numeral),
       sectionReaderResults(model, numeral),
       sectionAuthors(model),
       sectionOrder(model, primary, numeral),
       sectionFaq(model, numeral),
       sectionLastCall(model, primary),
+      sectionPostscripts(model),
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -180,9 +195,35 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
   .source { font-size: .78rem; color: var(--muted); margin-top: 12px; }
 
   /* ── lists ────────────────────────────────────────────────────────────── */
-  .cat { margin-bottom: 26px; }
-  .cat h3 { margin-bottom: .3em; }
-  .cat-count { font-size: .78rem; letter-spacing: .1em; text-transform: uppercase; color: var(--accent); }
+  /* Chapter cards. A three-column grid rather than one long stacked list:
+     fourteen full-width rows pushed the CTA off the page and read as a table of
+     contents instead of as a reason to buy (client feedback 2026-08-06). */
+  .cats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 900px) { .cats { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 620px) { .cats { grid-template-columns: 1fr; } }
+  .cat {
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 20px 20px 18px;
+    background: var(--card, transparent);
+  }
+  .cat h3 { margin-bottom: .45em; font-size: 1.02rem; line-height: 1.35; }
+  .cat-num { font-size: .7rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: .5em; }
+  /* The teaser points. Capped in the renderer, not here — see contentsPoints. */
+  .cat-points { list-style: none; margin: 0; padding: 0; }
+  .cat-points li {
+    position: relative;
+    padding-left: 14px;
+    margin-bottom: .5em;
+    font-size: .86rem;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  .cat-points li::before {
+    content: ""; position: absolute; left: 0; top: .55em;
+    width: 5px; height: 5px; border-radius: 50%; background: var(--accent); opacity: .7;
+  }
+  .cat-more { font-size: .76rem; color: var(--accent); margin-top: .2em; }
   .items { list-style: none; padding: 0; margin: 8px 0 0; }
   .items li { padding: 5px 0 5px 20px; position: relative; font-size: .95rem; color: var(--muted); }
   .items li::before { content: "·"; position: absolute; left: 6px; color: var(--accent); }
@@ -191,6 +232,33 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
   .checks li { padding: 10px 0 10px 26px; position: relative; border-bottom: 1px solid var(--border); }
   .checks li:last-child { border-bottom: 0; }
   .checks li::before { content: "✓"; position: absolute; left: 0; color: var(--accent); }
+  /* The mirror of .checks, for what does NOT work — failed alternatives and the
+     "not for" list. Muted rather than alarming: these are things the reader has
+     honestly tried, not mistakes to shame them for. */
+  .crosses { list-style: none; padding: 0; margin: 0; }
+  .crosses li { padding: 10px 0 10px 26px; position: relative; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .crosses li:last-child { border-bottom: 0; }
+  .crosses li::before { content: "✕"; position: absolute; left: 0; opacity: .55; }
+  /* A measure of ~62 characters. Long prose at the page's full width is the
+     fastest way to make a reader stop reading. */
+  .narrow { max-width: 34rem; }
+  .story { margin: 0 0 1em; line-height: 1.75; }
+  .fascinations { list-style: none; padding: 0; margin: 0; }
+  .fascinations li {
+    padding: 11px 0 11px 26px; position: relative;
+    border-bottom: 1px solid var(--border); line-height: 1.55;
+  }
+  .fascinations li:last-child { border-bottom: 0; }
+  .fascinations li::before {
+    content: ""; position: absolute; left: 2px; top: 1.15em;
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  }
+  .fasc-ch {
+    white-space: nowrap; font-size: .72rem; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--accent); opacity: .85;
+  }
+  .ps { margin: 0 0 1em; line-height: 1.7; }
+  .ps strong { color: var(--heading, inherit); }
 
   .pains { list-style: none; padding: 0; margin: 0; }
   .pains li { padding: 13px 0 13px 26px; position: relative; border-bottom: 1px solid var(--border); }
@@ -458,6 +526,30 @@ function sectionTheMath(model: LandingPageModel, n: () => string): string {
   </section>`;
 }
 
+/**
+ * How many of a chapter's key points a card shows.
+ *
+ * The previous behaviour printed NONE of them — only "5 methods" — on the
+ * reasoning that a fourteen-chapter book would put ~70 specifics on the free
+ * page selling it. The client's reference page shows them, and specifics are
+ * what make a contents section persuasive rather than a table of contents.
+ *
+ * Four is the compromise the cap encodes: enough that a buyer sees the book
+ * deals in concrete claims, few enough that the chapter still has to be bought
+ * to be useful. The remainder is COUNTED rather than listed ("+3 more"), which
+ * keeps the old "there is more in here" signal without giving it away.
+ */
+const MAX_POINTS_PER_CARD = 4;
+
+function contentsPoints(items: readonly string[]): string {
+  if (items.length === 0) return '';
+  const shown = items.slice(0, MAX_POINTS_PER_CARD);
+  const rest = items.length - shown.length;
+  return `<ul class="cat-points">
+            ${shown.map((it) => `<li>${esc(it)}</li>`).join('\n            ')}
+          </ul>${rest > 0 ? `\n          <p class="cat-more">+${rest} more</p>` : ''}`;
+}
+
 function sectionWhatsInside(model: LandingPageModel, p: LandingProduct | undefined, n: () => string): string {
   const { copy } = model;
   const cats = p?.sections ?? [];
@@ -467,16 +559,13 @@ function sectionWhatsInside(model: LandingPageModel, p: LandingProduct | undefin
       <h2>What is inside</h2>
       ${
         cats.length > 0
-          ? `<div class="stagger">
+          ? `<div class="cats stagger">
         ${cats
           .map(
-            // Chapter title and how much is in it — NOT the key points
-          // themselves. Those are the book's substance, and printing every one
-          // put the product on the free page selling it. See contentsMarkup in
-          // GeneratedPageAssembler for the same reasoning on the other path.
-          (c) => `<div class="cat">
+            (c, i) => `<div class="cat">
+          <p class="cat-num">Chapter ${String(i + 1).padStart(2, '0')}</p>
           <h3>${esc(c.title)}</h3>
-          ${c.items.length > 0 ? `<p class="cat-count">${c.items.length} ${c.items.length === 1 ? 'method' : 'methods'}</p>` : ''}
+          ${contentsPoints(c.items)}
         </div>`,
           )
           .join('\n        ')}
@@ -494,6 +583,110 @@ function sectionWhatsInside(model: LandingPageModel, p: LandingProduct | undefin
       </ul>`
           : ''
       }
+      ${
+        // The disqualifying list. It sells harder than the one above it: a
+        // reader who sees themselves excluded from the wrong group reads that
+        // as confirmation they belong in the right one.
+        (copy.notFor ?? []).length > 0
+          ? `<h3>${esc(copy.notForHeading?.trim() || 'Who this is not for')}</h3>
+      <ul class="crosses">
+        ${(copy.notFor ?? []).map((w) => `<li>${esc(w)}</li>`).join('\n        ')}
+      </ul>`
+          : ''
+      }
+    </div>
+  </section>`;
+}
+
+/**
+ * What the reader has already tried, and why it failed them.
+ *
+ * Runs BEFORE the product is introduced. Its job is to close the exits: a reader
+ * who believes a forum thread or a phone call would solve this has no reason to
+ * buy anything.
+ */
+function sectionFailedAlternatives(model: LandingPageModel, n: () => string): string {
+  const items = model.copy.failedAlternatives ?? [];
+  if (items.length === 0) return '';
+  return `  <section class="reveal">
+    <div class="wrap">
+      <p class="mark">${n()}</p>
+      <h2>You have probably tried this already</h2>
+      <ul class="crosses stagger">
+        ${items.map((it) => `<li>${esc(it)}</li>`).join('\n        ')}
+      </ul>
+    </div>
+  </section>`;
+}
+
+/**
+ * The origin story. First person, and the only place on the page where the
+ * author speaks as "I" rather than being described in the third person.
+ */
+function sectionDiscovery(model: LandingPageModel, n: () => string): string {
+  const story = (model.copy.discoveryStory ?? '').trim();
+  if (!story) return '';
+  const heading = model.copy.discoveryHeading?.trim() || 'How I found this out';
+  // Blank-line-separated paragraphs; the model is asked for prose, not markup.
+  const paras = story.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  return `  <section class="reveal">
+    <div class="wrap narrow">
+      <p class="mark">${n()}</p>
+      <h2>${esc(heading)}</h2>
+      ${paras.map((p) => `<p class="story">${esc(p)}</p>`).join('\n      ')}
+    </div>
+  </section>`;
+}
+
+/**
+ * The curiosity block — the hardest-selling section on the page.
+ *
+ * Each line teases a mechanism without revealing it. The chapter reference is
+ * what makes the book feel dense and real; it is a REAL chapter number, never a
+ * page number, because nothing in this system knows what page a fact lands on
+ * and an invented one would be a false claim repeated down the whole list.
+ */
+function sectionFascinations(model: LandingPageModel, n: () => string): string {
+  const items = model.copy.fascinations ?? [];
+  if (items.length === 0) return '';
+  const heading = model.copy.fascinationsHeading?.trim() || 'What you will know by the end';
+  return `  <section class="reveal">
+    <div class="wrap">
+      <p class="mark">${n()}</p>
+      <h2>${esc(heading)}</h2>
+      <ul class="fascinations stagger">
+        ${items
+          .map(
+            (f) =>
+              `<li>${esc(f.text)}${
+                typeof f.chapter === 'number'
+                  ? ` <span class="fasc-ch">Chapter ${f.chapter}</span>`
+                  : ''
+              }</li>`,
+          )
+          .join('\n        ')}
+      </ul>
+    </div>
+  </section>`;
+}
+
+/**
+ * The P.S. blocks. Deliberately outside the numbered sections and after the
+ * final CTA — a sales letter's postscript is read by people who scrolled past
+ * everything else, so #1 restates the whole offer on its own.
+ */
+function sectionPostscripts(model: LandingPageModel): string {
+  const items = (model.copy.postscripts ?? []).map((p) => p.trim()).filter(Boolean);
+  if (items.length === 0) return '';
+  return `  <section class="reveal">
+    <div class="wrap narrow">
+      ${items
+        .map(
+          // P.S. → P.P.S. → P.P.P.S., the usual convention for successive
+          // postscripts.
+          (p, i) => `<p class="ps"><strong>${'P.'.repeat(i + 1)}S.</strong> ${esc(p)}</p>`,
+        )
+        .join('\n      ')}
     </div>
   </section>`;
 }

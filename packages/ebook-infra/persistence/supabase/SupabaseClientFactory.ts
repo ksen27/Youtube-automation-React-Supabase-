@@ -21,7 +21,14 @@ export const EBOOK_SCHEMA = 'ebook';
  * is pinned to `"public"`, so repositories must annotate their injected client
  * with THIS alias — otherwise the schema shows up as a type mismatch at every
  * construction site.
+ *
+ * The database generic is deliberately untyped: this project has no generated
+ * `Database` types (`supabase gen types`), so every repository already treats
+ * rows as unknown shapes it validates itself. `any` here is that absence stated
+ * explicitly, not a shortcut — swapping in generated types later is a one-line
+ * change to this alias.
  */
+/* eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above */
 export type EbookSupabaseClient = SupabaseClient<any, typeof EBOOK_SCHEMA, any>;
 
 /**

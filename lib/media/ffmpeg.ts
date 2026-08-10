@@ -7,13 +7,33 @@ import { probeFile } from "@/lib/media/probe";
 // All FFmpeg invocations use spawn with an argument array — no shell strings.
 // This is critical when input filenames are derived from external IDs/URLs.
 
-// THE render canvas — client 2026-08-02: every export is 4K, both engines.
-// Anything that pre-normalizes a clip for the final concat (the render loop
-// itself, and scriptClipProcessor's doc clips) MUST use these exact dims: the
-// concat stream-copies (-c:v copy), so a segment at different dimensions fails
-// the demuxer instead of being silently rescaled.
+// THE render canvas. Anything that pre-normalizes a clip for the final concat
+// (the render loop itself, and scriptClipProcessor's doc clips) MUST use the
+// dims of the render it belongs to: the concat stream-copies (-c:v copy), so a
+// segment at different dimensions fails the demuxer instead of being silently
+// rescaled.
+//
+// The canvas is PER ENGINE (client 2026-08-08). The 2026-08-02 cutover moved
+// both engines to 4K; at 4x the pixels celebrity renders went to a ~59min
+// median (measured, render-time-audit.ts) and the client asked for CelebForge
+// to go back to 1080p. Encode cost scales with pixel count, so this is the
+// single biggest render-speed lever available:
+//   • sourced (celebrity / CelebForge): 1920x1080
+//   • synthetic (AI avatar): 3840x2160 — unchanged, client still wants 4K there
+// RENDER_WIDTH/RENDER_HEIGHT remain the 4K values so any caller that has not
+// been made engine-aware keeps its historical behavior; prefer
+// renderCanvasFor(engine).
 export const RENDER_WIDTH = 3840;
 export const RENDER_HEIGHT = 2160;
+
+export const SOURCED_RENDER_WIDTH = 1920;
+export const SOURCED_RENDER_HEIGHT = 1080;
+
+export function renderCanvasFor(engine: RenderEngine): { width: number; height: number } {
+  return engine === "synthetic"
+    ? { width: RENDER_WIDTH, height: RENDER_HEIGHT }
+    : { width: SOURCED_RENDER_WIDTH, height: SOURCED_RENDER_HEIGHT };
+}
 
 // Shared H.264 codec flags for EVERY per-segment encode (still images, clips,
 // split-screens, xfades, mixed boundaries, black filler). ALL segments in one
@@ -25,12 +45,13 @@ export const RENDER_HEIGHT = 2160;
 // the same worker, so it can't be a per-worker env):
 //   • synthetic (AI avatar): SYNTHETIC_X264_PRESET / SYNTHETIC_X264_CRF
 //     (default veryfast/crf21) for sharper output.
-//   • sourced (celebrity): the SAME env knobs since the 4K cutover. It used to be
-//     hard-pinned to ultrafast/crf25 to keep celebrity output byte-for-byte
-//     identical, but the 4K canvas already changes every byte, so that guarantee
-//     was void — and ultrafast at 3840×2160 emits enormous files for visibly worse
-//     quality (ultrafast disables most rate-distortion work, which costs far more
-//     at 4x the pixels). Encode time per frame rises; the 8x render VMs absorb it.
+//   • sourced (celebrity): its OWN knobs, SOURCED_X264_PRESET /
+//     SOURCED_X264_CRF (default veryfast/crf21). Between the 2026-08-02 4K
+//     cutover and 2026-08-08 this shared the synthetic knobs, because at
+//     3840×2160 the old hard-pinned ultrafast/crf25 emitted enormous files for
+//     visibly worse quality. Now that sourced is back on a 1920×1080 canvas
+//     (see renderCanvasFor) that pressure is gone, and a separate knob lets the
+//     celebrity path be tuned for speed without touching avatar quality.
 // renderProcessor resolves this ONCE per render and passes the result into every
 // segment encoder via the `vcodecArgs` option, so the whole video is uniform.
 // Encoders that aren't given vcodecArgs fall back to the sourced default, which
@@ -48,12 +69,12 @@ export function segmentVcodecArgsFor(engine: RenderEngine): string[] {
       "-pix_fmt", "yuv420p",
     ];
   }
-  // sourced (celebrity): same knobs as synthetic since the 4K cutover (see above).
+  // sourced (celebrity): own knobs — 1080p canvas, tuned for render speed.
   const env = getEnv();
   return [
     "-c:v", "libx264",
-    "-preset", env.SYNTHETIC_X264_PRESET,
-    "-crf", String(env.SYNTHETIC_X264_CRF),
+    "-preset", env.SOURCED_X264_PRESET,
+    "-crf", String(env.SOURCED_X264_CRF),
     "-pix_fmt", "yuv420p",
   ];
 }

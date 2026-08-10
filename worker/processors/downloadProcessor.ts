@@ -130,11 +130,13 @@ export async function processDownloadJob(
   const tmp = await ensureTmp(`source/${safeId}`);
   try {
     const result = await downloadYoutubeVideo({
-      // 1080p, not 2160p: the export is 4K but the FOOTAGE need not be (client
-      // 2026-08-03). Raised from 720 anyway because the 3840x2160 canvas would
-      // upscale 720p footage 3x across most of a celebrity video's screen time,
-      // and yt-dlp costs bandwidth only — no per-unit price. Raise to 2160 if real
-      // 4K footage is ever wanted (few YouTube sources actually carry it).
+      // 1080p. This is now an EXACT match for the celebrity render canvas
+      // (client 2026-08-08 moved sourced exports back to 1920x1080), so footage
+      // is scaled 1:1 rather than up- or down-sampled — the cheapest and
+      // sharpest case. Was raised 720 -> 1080 on 2026-08-03 when the canvas was
+      // 4K and 720p footage would have been upscaled 3x. yt-dlp costs bandwidth
+      // only, no per-unit price. Only raise above 1080 if the celebrity canvas
+      // itself goes back up.
       url: youtubeUrl, outputDir: tmp, videoId: safeId, maxHeight: 1080,
       onLog: () => { /* keep stdout clean — high-volume */ },
     });

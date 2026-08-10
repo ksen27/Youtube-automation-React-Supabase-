@@ -320,6 +320,27 @@ const CopySchema = z.object({
   // not a page.
   closingHeading: z.string().default(''),
   closingBody: z.string().default(''),
+  // ── direct-response sections ──
+  // All defaulted, like their neighbours above and for the same reason: a model
+  // that judges one of these redundant must cost a section, not the whole page.
+  // Every renderer omits its section when the field is empty.
+  failedAlternatives: z.array(z.string()).default([]),
+  discoveryHeading: z.string().default(''),
+  discoveryStory: z.string().default(''),
+  fascinationsHeading: z.string().default(''),
+  fascinations: z
+    .array(
+      z.object({
+        text: z.string(),
+        // Tolerant of the model returning a string ("4") or omitting it: this is
+        // decoration on a curiosity line, never worth failing a generation over.
+        chapter: z.coerce.number().int().positive().nullable().catch(null).default(null),
+      }),
+    )
+    .default([]),
+  notForHeading: z.string().default(''),
+  notFor: z.array(z.string()).default([]),
+  postscripts: z.array(z.string()).default([]),
   fontFamily: z.enum(['serif', 'sans']).default('sans'),
   // One entry per reference section, so the page can follow the whole template
   // rather than only the parts the fixed fields above happen to cover.

@@ -119,6 +119,58 @@ export interface LandingCopy {
    * whole page, as they always did.
    */
   templateSections: LandingTemplateSection[];
+
+  // ── direct-response sections ──────────────────────────────────────────────
+  // Added 2026-08-10 to the client's master prompt. The page previously read as
+  // a book DESCRIPTION — headline, benefits, FAQ. These are the parts that make
+  // it a sales letter: the reader must feel the cost of their situation, see
+  // that what they have already tried cannot fix it, and meet a person who
+  // solved it, all before the product is named.
+  //
+  // Every one is optional so a page generated before this change still renders:
+  // each section is simply omitted when its field is absent or empty.
+
+  /** Dismisses what the reader has already tried, and why each failed. */
+  failedAlternatives?: string[];
+
+  /**
+   * First-person origin story — ordinary person, painful event, discovery,
+   * result. Under ~250 words. Grounded in the channel and the book's
+   * positioning; it is the author's story, never an invented biography.
+   */
+  discoveryStory?: string;
+  discoveryHeading?: string;
+
+  /**
+   * Curiosity bullets — the hardest-selling block on the page. Each teases a
+   * specific mechanism WITHOUT revealing it, anchored to the chapter that
+   * delivers it.
+   *
+   * `chapter` is a real chapter number, not a page number: the master prompt's
+   * formula asks for "(page 47)", but nothing in this system knows which page a
+   * given fact lands on, so a model asked for one invents it — a small false
+   * claim repeated twenty times down the page. The chapter is the honest
+   * equivalent and carries the same "this book is dense and real" signal.
+   */
+  fascinations?: LandingFascination[];
+  fascinationsHeading?: string;
+
+  /** The "NOT for" list. Does more selling than the "for" list it sits beside. */
+  notForHeading?: string;
+  notFor?: string[];
+
+  /**
+   * The P.S. blocks. Many readers scroll straight past the page to these, so
+   * the first restates the whole offer.
+   */
+  postscripts?: string[];
+}
+
+export interface LandingFascination {
+  /** The curiosity line. Teases the mechanism; never explains it. */
+  text: string;
+  /** 1-based chapter this comes from, or null when it spans the book. */
+  chapter: number | null;
 }
 
 interface LandingPageProps {

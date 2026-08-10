@@ -309,22 +309,134 @@ describe('LandingPageHtmlRenderer', () => {
     });
   });
 
-  it('builds the contents from the book’s own outline, with counts', () => {
+  it('builds the contents from the book’s own outline, as numbered cards', () => {
     const html = render(model());
     expect(html).toContain('Reading the dashboard');
-    expect(html).toContain('2 methods');
-    expect(html).toContain('1 method'); // singular, not "1 methods"
+    expect(html).toContain('Pricing a job');
+    expect(html).toContain('Chapter 01');
+    expect(html).toContain('Chapter 02');
+    expect(html).toContain('class="cats stagger"'); // grid, not a stacked list
   });
 
-  // The key points are the book's substance — "Buy the $22 Topdon ArtiLink
-  // 200", "Disconnect the negative terminal 45 minutes with the brake pedal
-  // held". A fourteen-chapter book put roughly seventy of them on a free public
-  // page, which is the product being given away by the page selling it.
-  it('lists the chapters without printing what is in them', () => {
+  // Specifics are what make a contents section persuasive rather than a table of
+  // contents (client feedback 2026-08-06) — but see the cap below: the book's
+  // full substance still isn't given away by the page selling it.
+  it('prints each chapter’s key points', () => {
     const html = render(model());
-    expect(html).not.toContain('Amber vs red');
-    expect(html).not.toContain('When to stop now');
-    expect(html).not.toContain('Parts vs labour');
+    expect(html).toContain('Amber vs red');
+    expect(html).toContain('When to stop now');
+    expect(html).toContain('Parts vs labour');
+  });
+
+  it('caps the points per chapter and counts the remainder', () => {
+    const html = render(
+      model({
+        products: [
+          product({
+            sections: [
+              { title: 'Long Chapter', items: ['one', 'two', 'three', 'four', 'five', 'six'] },
+            ],
+          }),
+        ],
+      }),
+    );
+    expect(html).toContain('<li>four</li>'); // the 4th shows...
+    expect(html).not.toContain('<li>five</li>'); // ...the 5th does not
+    expect(html).toContain('+2 more');
+  });
+
+  // The direct-response sections. Every one is optional: a page generated
+  // before they existed must still render, which is why each is omitted rather
+  // than emitted empty.
+  describe('direct-response sections', () => {
+    it('omits every one of them when the copy has none', () => {
+      const html = render(model());
+      expect(html).not.toContain('You have probably tried this already');
+      expect(html).not.toContain('class="fascinations');
+      expect(html).not.toContain('class="ps"');
+      expect(html).not.toContain('class="crosses"');
+    });
+
+    it('runs the problem sections BEFORE the product is introduced', () => {
+      const html = render(
+        model({
+          copy: {
+            ...copy,
+            failedAlternatives: ['You could call the dealer and wait 40 minutes.'],
+            discoveryStory: 'I spent eleven years under other people’s cars.',
+            discoveryHeading: 'How I found this out',
+          },
+        }),
+      );
+      const tried = html.indexOf('You have probably tried this already');
+      const story = html.indexOf('How I found this out');
+      const product = html.indexOf(copy.whatsInsideHeading);
+      expect(tried).toBeGreaterThan(-1);
+      expect(story).toBeGreaterThan(-1);
+      // Selling the problem before the product is the whole point of the order.
+      expect(tried).toBeLessThan(product);
+      expect(story).toBeLessThan(product);
+    });
+
+    it('renders fascinations with their chapter, and never a page number', () => {
+      const html = render(
+        model({
+          copy: {
+            ...copy,
+            fascinations: [
+              { text: 'The three-word phrase that gets the fee waived', chapter: 4 },
+              { text: 'Why the dashboard light means less than you think', chapter: null },
+            ],
+          },
+        }),
+      );
+      expect(html).toContain('The three-word phrase that gets the fee waived');
+      expect(html).toContain('Chapter 4');
+      // A null chapter renders the line alone rather than "Chapter null".
+      expect(html).toContain('Why the dashboard light means less than you think');
+      expect(html).not.toContain('Chapter null');
+      expect(html).not.toMatch(/\bpage \d+/i);
+    });
+
+    it('numbers postscripts P.S., P.P.S., P.P.P.S.', () => {
+      const html = render(model({ copy: { ...copy, postscripts: ['one', 'two', 'three'] } }));
+      expect(html).toContain('<strong>P.S.</strong>');
+      expect(html).toContain('<strong>P.P.S.</strong>');
+      expect(html).toContain('<strong>P.P.P.S.</strong>');
+    });
+
+    it('renders the "not for" list beside the "for" list', () => {
+      const html = render(
+        model({ copy: { ...copy, notFor: ['Anyone who would rather overpay than ask.'] } }),
+      );
+      expect(html).toContain('Who this is not for');
+      expect(html).toContain('Anyone who would rather overpay than ask.');
+    });
+
+    // Copy is model-authored; it may never become markup.
+    it('escapes hostile copy in the new sections', () => {
+      const html = render(
+        model({
+          copy: {
+            ...copy,
+            failedAlternatives: ['<script>alert(1)</script>'],
+            discoveryStory: '<img src=x onerror=alert(2)>',
+            fascinations: [{ text: '<b>bold</b>', chapter: 1 }],
+            postscripts: ['<script>alert(3)</script>'],
+            notFor: ['<script>alert(4)</script>'],
+          },
+        }),
+      );
+      expect(html).not.toContain('<script>alert(1)</script>');
+      // What matters is that no live TAG survives — the escaped text still
+      // contains the characters "onerror=alert(2)", inertly, inside
+      // "&lt;img …&gt;", so asserting on the substring would test the wrong thing.
+      expect(html).not.toMatch(/<img[^>]+onerror/i);
+      expect(html).toContain('&lt;img src=x onerror=alert(2)&gt;');
+      expect(html).not.toContain('<b>bold</b>');
+      expect(html).not.toContain('<script>alert(3)</script>');
+      expect(html).not.toContain('<script>alert(4)</script>');
+    });
   });
 
   it('falls back to the model’s bullets when the outline is empty', () => {

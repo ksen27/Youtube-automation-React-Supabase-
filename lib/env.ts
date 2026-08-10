@@ -275,18 +275,28 @@ const ServerEnvSchema = z.object({
   FFMPEG_PATH: z.string().default("ffmpeg"),
   FFPROBE_PATH: z.string().default("ffprobe"),
   YTDLP_PATH: z.string().default("yt-dlp"),
-  // Per-segment H.264 encode quality (libx264) for the SYNTHETIC engine only.
-  // Both engines render on the same worker, so quality is chosen per-render by
-  // project.engine (see renderProcessor), NOT per-worker. Celebrity (sourced)
-  // renders are HARD-PINNED in code to the original ultrafast/crf25 and ignore
-  // these vars entirely, so celebrity output is byte-for-byte unchanged. These
-  // only tune the synthetic path; defaults give synthetic the sharper
-  // veryfast/crf21. EVERY segment in one render shares the chosen values so the
-  // final concat stays on the -c:v copy fast path.
+  // Per-segment H.264 encode quality (libx264), chosen PER RENDER by
+  // project.engine (see segmentVcodecArgsFor) — both engines render on the same
+  // worker, so this can never be a per-worker setting. EVERY segment in one
+  // render shares the chosen values so the final concat stays on the -c:v copy
+  // fast path.
+  //
+  // SYNTHETIC_* tunes the AI-avatar path, which renders on the 3840x2160 canvas.
   SYNTHETIC_X264_PRESET: z
     .enum(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
     .default("veryfast"),
   SYNTHETIC_X264_CRF: z.coerce.number().int().min(0).max(51).default(21),
+  // SOURCED_* tunes the celebrity/CelebForge path, which renders on the
+  // 1920x1080 canvas (client 2026-08-08 moved it back off 4K for render speed —
+  // see renderCanvasFor in lib/media/ffmpeg.ts). Split out from the SYNTHETIC_*
+  // knobs on the same date so celebrity encode speed can be traded against
+  // quality without changing avatar output. At 1080p, veryfast/crf21 is roughly
+  // 4x cheaper per frame than the same settings at 4K; drop to superfast (or
+  // raise CRF a point or two) if renders still need to be faster.
+  SOURCED_X264_PRESET: z
+    .enum(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
+    .default("veryfast"),
+  SOURCED_X264_CRF: z.coerce.number().int().min(0).max(51).default(21),
   // Ken Burns supersample factor for still segments (buildStillVideo). zoompan
   // samples from this upscaled canvas, so it needs enough headroom to cover the
   // 1.12x max zoom without resampling its own output grid — but no more.
