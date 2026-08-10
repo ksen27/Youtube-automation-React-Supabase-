@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, ExternalLink, Globe, Loader2, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, ExternalLink, Globe, Image as ImageIcon, Loader2, RefreshCw, Upload } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,7 @@ interface Settings {
   siblings: SiblingSetting[];
   bundlePriceCents: number | null;
   bundleCheckoutUrl: string;
+  authorPhotoPath: string;
 }
 
 interface PageState {
@@ -110,6 +111,12 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [bundleUrl, setBundleUrl] = useState("");
   const [candidates, setCandidates] = useState<Candidate[]>([]);
 
+  // The author portrait. Stored (not embedded) so it survives regeneration —
+  // the page reads it back from the saved path each time it is written.
+  const [photoPath, setPhotoPath] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
   const load = useCallback(async (isCancelled?: () => boolean) => {
     try {
       const [sRes, cRes] = await Promise.all([
@@ -132,6 +139,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setMode(s.mode ?? "single");
       setBundlePrice(centsToInput(s.bundlePriceCents));
       setBundleUrl(s.bundleCheckoutUrl ?? "");
+      setPhotoPath(s.authorPhotoPath ?? "");
       setSiblings(
         Array.from({ length: SIBLING_SLOTS }, (_, i) => {
           const saved = s.siblings?.[i];
@@ -166,6 +174,54 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
 
   function updateSibling(i: number, patch: Partial<SiblingDraft>) {
     setSiblings((prev) => prev.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  }
+
+  /**
+   * Upload the author portrait.
+   *
+   * Sent as multipart form-data with a `file` field — the route sniffs the
+   * actual bytes for a PNG/JPEG/WebP signature rather than trusting the
+   * filename or content-type, so there is no point pre-filtering here beyond
+   * giving the file picker a sensible `accept`.
+   */
+  async function uploadPhoto(file: File) {
+    setUploading(true);
+    setErr(null);
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch(`/api/books/projects/${projectId}/landing-page/avatar`, {
+        method: "POST",
+        body,
+      });
+      const data = await res.json();
+      if (!res.ok) setErr(data.error ?? "Could not upload that photo");
+      else setPhotoPath(data.path ?? "");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not upload that photo");
+    } finally {
+      setUploading(false);
+      // Let the same file be picked again after a failure.
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  async function removePhoto() {
+    setUploading(true);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/books/projects/${projectId}/landing-page/avatar`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setErr(data.error ?? "Could not remove the photo");
+      } else {
+        setPhotoPath("");
+      }
+    } finally {
+      setUploading(false);
+    }
   }
 
   async function saveSettings() {
@@ -361,6 +417,49 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
               />
             </div>
           </div>
+        </div>
+
+        {/* ── author portrait ────────────────────────────────────────────── */}
+        <div className="space-y-2">
+          <Label>Author photo</Label>
+          <div className="flex flex-wrap items-center gap-3">
+            {photoPath ? (
+              <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-fg-muted">
+                <ImageIcon className="h-3.5 w-3.5" />
+                Photo uploaded
+              </span>
+            ) : (
+              <span className="text-xs text-fg-subtle">
+                Optional — the page simply shows no portrait without one.
+              </span>
+            )}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void uploadPhoto(f);
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={uploading || busy}
+              onClick={() => fileRef.current?.click()}
+            >
+              {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+              {photoPath ? "Replace" : "Upload"}
+            </Button>
+            {photoPath && (
+              <Button type="button" variant="ghost" size="sm" disabled={uploading || busy} onClick={removePhoto}>
+                Remove
+              </Button>
+            )}
+          </div>
+          <p className="text-xs text-fg-subtle">PNG, JPEG or WebP, up to 5MB.</p>
         </div>
 
         {/* ── the other two books ────────────────────────────────────────── */}

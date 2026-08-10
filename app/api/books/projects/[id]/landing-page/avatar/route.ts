@@ -3,8 +3,14 @@ import { container, json, error, handle, ownerId } from '@/lib/ebook/server';
 
 export const runtime = 'nodejs';
 
-/** The bucket the covers and exports already live in. */
-const BUCKET = 'exports';
+/**
+ * The bucket the covers and exports already live in.
+ *
+ * Prefixed `ebook-` like every other bucket this product uses: storage.buckets
+ * is GLOBAL, not schema-scoped, so a bare `exports` would share a namespace with
+ * anything the video engines add later (see migration 0031).
+ */
+const BUCKET = 'ebook-exports';
 
 /** A portrait for a web page, not a camera original. */
 const MAX_BYTES = 5_000_000;
