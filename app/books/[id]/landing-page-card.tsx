@@ -147,6 +147,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [cloneUrl, setCloneUrl] = useState("");
   const [attest, setAttest] = useState(false);
   const [cloning, setCloning] = useState(false);
+  const [cloneMsg, setCloneMsg] = useState<string | null>(null);
 
   const load = useCallback(async (isCancelled?: () => boolean) => {
     try {
@@ -254,13 +255,14 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * a COMPLETE copy of someone's page, which is a different act from taking
    * design inspiration, and not a call the system can make for the seller.
    */
-  async function cloneTemplate() {
+  async function cloneTemplate(): Promise<string | null> {
     const url = cloneUrl.trim();
-    if (!url) return setErr("Paste the URL of the page to copy.");
-    if (!isHttpUrl(url)) return setErr("The template URL must be a full URL (https://…).");
-    if (!attest) return setErr("Confirm you have the right to copy that page.");
+    if (!url) { setErr("Paste the URL of the page to copy."); return null; }
+    if (!isHttpUrl(url)) { setErr("The template URL must be a full URL (https://…)."); return null; }
+    if (!attest) { setErr("Confirm you have the right to copy that page."); return null; }
     setCloning(true);
     setErr(null);
+    setCloneMsg(null);
     try {
       const res = await fetch(`/api/books/landing-templates`, {
         method: "POST",
@@ -270,14 +272,23 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       const data = await res.json();
       if (!res.ok) {
         setErr(data.error ?? "Could not start the copy");
-        return;
+        return null;
       }
       // Select it immediately: an already-extracted template is usable now, and
       // a queued one becomes usable when it finishes.
       if (data.templateId) setTemplateId(data.templateId);
-      setCloneUrl("");
+      // SAY WHAT HAPPENED. Re-copying a URL that is already READY returns the
+      // existing template instantly and enqueues nothing — correct (a second
+      // Chromium capture of the same page is wasted work), but with no message
+      // the button looks broken and there is no worker log to explain it.
+      setCloneMsg(
+        data.alreadyExtracted
+          ? "That site was already copied — selected it above."
+          : "Copying that site now. It appears in the list above when it is ready.",
+      );
       setAttest(false);
       await load();
+      return data.templateId ?? null;
     } finally {
       setCloning(false);
     }
@@ -301,7 +312,17 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     }
   }
 
-  async function saveSettings() {
+  /**
+   * Persist the form. Returns false when validation or the request failed, so
+   * callers that need the settings STORED before they act (generate, publish)
+   * can stop rather than run against stale values.
+   */
+  async function saveSettings(
+    // Explicit overrides. React state updates are asynchronous, so a value set
+    // by the caller a moment ago (a freshly-copied templateId, the enable flag)
+    // is not yet readable from state here and must be passed in.
+    override: { enabled?: boolean; templateId?: string } = {},
+  ): Promise<boolean> {
     setBusy(true);
     setErr(null);
     try {
@@ -312,20 +333,20 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       if (mode === "triple") {
         if (chosen.length < SIBLING_SLOTS) {
           setErr(`A 3-book page needs exactly ${SIBLING_SLOTS} other finished books selected.`);
-          return;
+          return false;
         }
         if (new Set(chosen.map((s) => s.projectId)).size !== chosen.length) {
           setErr("Pick two different books.");
-          return;
+          return false;
         }
         if (bundleUrl.trim() && !isHttpUrl(bundleUrl)) {
           setErr("The bundle checkout link must be a full URL (https://…).");
-          return;
+          return false;
         }
       }
       if (checkoutUrl.trim() && !isHttpUrl(checkoutUrl)) {
         setErr("The checkout link must be a full URL (https://…).");
-        return;
+        return false;
       }
 
       const ownCents = parsePrice(price);
@@ -334,10 +355,14 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          checkoutUrl: checkoutUrl.trim(),
-          ...(ownCents !== null ? { priceCents: ownCents } : {}),
-          landingPage: enabled,
-          landingTemplateId: templateId,
+          // NOTE the `landing` prefix on BOTH of these. The DTO's fields are
+          // landingCheckoutUrl / landingPriceCents; sending the bare names is
+          // not an error — Zod strips unknown keys silently — it just means the
+          // checkout link and price were never saved at all.
+          landingCheckoutUrl: checkoutUrl.trim(),
+          ...(ownCents !== null ? { landingPriceCents: ownCents } : {}),
+          landingPage: override.enabled ?? enabled,
+          landingTemplateId: override.templateId ?? templateId,
           landingTemplateUrl: templateUrl.trim(),
           landingMode: mode,
           landingSiblings: chosen.map((s) => {
@@ -353,14 +378,48 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         }),
       });
       const data = await res.json();
-      if (!res.ok) setErr(data.error ?? "Could not save");
-      else await load();
+      if (!res.ok) {
+        setErr(data.error ?? "Could not save");
+        return false;
+      }
+      await load();
+      return true;
     } finally {
       setBusy(false);
     }
   }
 
+  /**
+   * The one action: make the page.
+   *
+   * Does the whole sequence so the user does not have to know it exists —
+   * copy the reference site if one was pasted, turn the sales page on, persist
+   * the settings, then enqueue the render. The settings live on the project row
+   * and the WORKER reads that row rather than this form, which is why the save
+   * is not optional: skipping it silently generated against the old values.
+   */
   async function generate(publish: boolean) {
+    const pasted = cloneUrl.trim();
+    let useTemplateId = templateId;
+
+    if (pasted) {
+      if (!isHttpUrl(pasted)) return setErr("That does not look like a full URL (https://…).");
+      if (!attest) return setErr("Confirm you have the right to copy that page.");
+      // Returns the template id: instantly for a URL already copied, or the id
+      // of the job just queued. Either way the settings below can reference it.
+      const id = await cloneTemplate();
+      if (!id) return; // cloneTemplate already reported why
+      useTemplateId = id;
+      setTemplateId(id);
+      setCloneUrl("");
+    }
+
+    // Generating IS asking for the page, so enabling it needs no separate tick.
+    setEnabled(true);
+    // Overrides passed explicitly: the two setState calls above are async and
+    // are not readable from state inside saveSettings on this tick.
+    if (!(await saveSettings({ enabled: true, templateId: useTemplateId }))) return;
+
     setBusy(true);
     setErr(null);
     try {
@@ -374,6 +433,8 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   }
 
   async function publish() {
+    // Same reasoning as generate(): publishing checks the STORED checkout links.
+    if (!(await saveSettings())) return;
     setBusy(true);
     setErr(null);
     try {
@@ -445,86 +506,33 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </ul>
         )}
 
-        {/* ── master switch ──────────────────────────────────────────────── */}
-        <label className="flex items-start gap-2.5 rounded-md border border-border p-3">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="mt-0.5 h-4 w-4 rounded border-border accent-[var(--color-brand-500)]"
-          />
-          <span className="min-w-0">
-            <span className="block text-sm font-medium text-fg">Enable the sales page</span>
-            <span className="block text-xs text-fg-subtle">
-              Off by default. Generation is refused until this is on and saved.
-            </span>
-          </span>
-        </label>
+        {/* ── design ─────────────────────────────────────────────────────────
+            ONE control. Paste the page to copy and press Generate; everything
+            else — enabling the sales page, copying the site, saving the
+            settings — happens behind that single action.
 
-        {/* ── reference site ─────────────────────────────────────────────── */}
+            It used to be six steps (tick enable → paste → tick attest → Copy
+            site → wait → select → Save → Generate), which is how a user ended
+            up with a page that would not generate and no indication why. */}
         <div className="space-y-3">
-          <Label>Design</Label>
-          <select
-            value={templateId}
-            onChange={(e) => setTemplateId(e.target.value)}
-            className="flex h-9 w-full rounded-md border border-border bg-surface px-3 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
-          >
-            <option value="">Built-in design (no copied template)</option>
-            {templates.map((t) => (
-              <option key={t.id} value={t.id} disabled={t.state !== "READY"}>
-                {t.name?.trim() || t.sourceUrl}
-                {t.state !== "READY" ? ` — ${t.state.toLowerCase()}…` : ""}
-                {t.stale ? " (rebuilds on use)" : ""}
-              </option>
-            ))}
-          </select>
+          <Label htmlFor="cloneUrl">Copy a site&apos;s design</Label>
+          <Input
+            id="cloneUrl"
+            value={cloneUrl}
+            onChange={(e) => setCloneUrl(e.target.value)}
+            placeholder="https://the-page-to-copy.com"
+          />
           <p className="text-xs text-fg-subtle">
-            {templateId
-              ? "The page will BE this template, with your book's content swapped in."
-              : "The built-in design. Add a reference below to copy a site's look instead."}
+            Your page will look like that page — same layout, fonts and colours,
+            with your book&apos;s words in place of theirs. Leave blank to use the
+            built-in design.
           </p>
 
-          {templates.some((t) => t.state === "EXTRACTING") && (
-            <p className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              A template is still being copied — it becomes selectable when it finishes.
-            </p>
-          )}
-
-          {templates.find((t) => t.id === templateId)?.failureReason && (
-            <p className="text-xs text-amber-300">
-              {templates.find((t) => t.id === templateId)?.failureReason}
-            </p>
-          )}
-
-          <div className="rounded-md border border-border p-3 space-y-2.5">
-            <Label htmlFor="cloneUrl" className="text-xs">
-              Copy a site&apos;s design
-            </Label>
-            <p className="text-xs text-fg-subtle">
-              Makes your page look like that page — same layout, fonts and colours,
-              with your book&apos;s words in place of theirs. This is what you want to
-              match a sample site.
-            </p>
-            <div className="flex flex-wrap gap-2">
-              <Input
-                id="cloneUrl"
-                value={cloneUrl}
-                onChange={(e) => setCloneUrl(e.target.value)}
-                placeholder="https://the-page-to-copy.com"
-                className="min-w-[16rem] flex-1"
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={cloning || busy}
-                onClick={cloneTemplate}
-              >
-                {cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />}
-                Copy site
-              </Button>
-            </div>
+          {/* The attestation cannot be assumed: this makes a COMPLETE copy of
+              someone's page, the API requires it explicitly, and it is recorded.
+              Shown only when a URL is actually entered, so the built-in path
+              carries no legal furniture it does not need. */}
+          {cloneUrl.trim() && (
             <label className="flex items-start gap-2 text-xs text-fg-muted">
               <input
                 type="checkbox"
@@ -532,34 +540,40 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 onChange={(e) => setAttest(e.target.checked)}
                 className="mt-0.5 h-3.5 w-3.5 rounded border-border accent-[var(--color-brand-500)]"
               />
-              {/* Required by the API, and deliberately not pre-ticked: this makes a
-                  complete copy of someone's page. */}
               I have the right to copy this page&apos;s design.
             </label>
-            <p className="text-xs text-fg-subtle">
-              Takes a minute or two — it opens the page in a browser and captures its
-              layout, styles and assets.
-            </p>
-          </div>
+          )}
 
-          {!templateId && (
+          {/* Previously-copied sites, so a second book can reuse one without
+              waiting for another capture. Hidden until there are any. */}
+          {templates.length > 0 && !cloneUrl.trim() && (
             <div className="space-y-1.5">
-              <Label htmlFor="templateUrl" className="text-xs">
-                Or: follow a page&apos;s section order only
+              <Label htmlFor="templatePick" className="text-xs">
+                Or reuse a design you already copied
               </Label>
-              <Input
-                id="templateUrl"
-                value={templateUrl}
-                onChange={(e) => setTemplateUrl(e.target.value)}
-                placeholder="https://a-page-to-take-the-section-order-from.com"
-              />
-              <p className="text-xs text-fg-subtle">
-                Keeps our own look, but writes the same sections in the same order as
-                that page. Nothing of theirs is copied. Leave this blank if you used
-                &ldquo;Copy a site&apos;s design&rdquo; above.
-              </p>
+              <select
+                id="templatePick"
+                value={templateId}
+                onChange={(e) => setTemplateId(e.target.value)}
+                className="flex h-9 w-full rounded-md border border-border bg-surface px-3 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
+              >
+                <option value="">Built-in design</option>
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id} disabled={t.state !== "READY"}>
+                    {t.name?.trim() || t.sourceUrl}
+                    {t.state !== "READY" ? ` — ${t.state.toLowerCase()}…` : ""}
+                  </option>
+                ))}
+              </select>
             </div>
           )}
+
+          {templates.find((t) => t.id === templateId)?.failureReason && (
+            <p className="text-xs text-amber-300">
+              {templates.find((t) => t.id === templateId)?.failureReason}
+            </p>
+          )}
+          {cloneMsg && <p className="text-xs text-emerald-400">{cloneMsg}</p>}
         </div>
 
         {/* ── page shape ─────────────────────────────────────────────────── */}
@@ -758,16 +772,21 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         )}
 
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" disabled={busy} onClick={saveSettings}>
-            Save
-          </Button>
-          <Button variant="outline" size="sm" disabled={busy || working} onClick={() => generate(false)}>
-            <RefreshCw className="h-4 w-4" />
-            {page?.hasDraft ? "Regenerate" : "Generate"}
+          {/* No Save button: Generate and Publish both persist first. A separate
+              Save was a step users reasonably skipped, and skipping it generated
+              against stale settings with a confusing error. */}
+          <Button
+            size="sm"
+            variant={page?.hasDraft ? "outline" : "gradient"}
+            disabled={busy || working || cloning}
+            onClick={() => generate(false)}
+          >
+            {busy || cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {cloning ? "Copying site…" : page?.hasDraft ? "Regenerate" : "Generate page"}
           </Button>
           <Button
             size="sm"
-            variant="gradient"
+            variant="outline"
             disabled={busy || working || !page?.hasDraft || !canPublish}
             onClick={publish}
           >
