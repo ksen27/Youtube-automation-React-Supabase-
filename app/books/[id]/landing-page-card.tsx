@@ -128,6 +128,12 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Master switch. Defaults to FALSE in the domain (landingPage in
+  // SubmitChannel.dto.ts), and BOTH engines refuse outright with "Landing page
+  // is not enabled for this project" until it is on — so it must be settable
+  // here, not merely readable.
+  const [enabled, setEnabled] = useState(false);
+
   // The reference site. TWO different mechanisms, deliberately kept apart in the
   // UI because they produce very different pages:
   //   templateId  → the CLONE engine: the page IS that site with our content
@@ -167,6 +173,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setBundlePrice(centsToInput(s.bundlePriceCents));
       setBundleUrl(s.bundleCheckoutUrl ?? "");
       setPhotoPath(s.authorPhotoPath ?? "");
+      setEnabled(Boolean(s.enabled));
       setTemplateId(s.templateId ?? "");
       setTemplateUrl(s.templateUrl ?? "");
       setTemplates(tData.templates ?? []);
@@ -329,6 +336,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         body: JSON.stringify({
           checkoutUrl: checkoutUrl.trim(),
           ...(ownCents !== null ? { priceCents: ownCents } : {}),
+          landingPage: enabled,
           landingTemplateId: templateId,
           landingTemplateUrl: templateUrl.trim(),
           landingMode: mode,
@@ -437,6 +445,22 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </ul>
         )}
 
+        {/* ── master switch ──────────────────────────────────────────────── */}
+        <label className="flex items-start gap-2.5 rounded-md border border-border p-3">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-border accent-[var(--color-brand-500)]"
+          />
+          <span className="min-w-0">
+            <span className="block text-sm font-medium text-fg">Enable the sales page</span>
+            <span className="block text-xs text-fg-subtle">
+              Off by default. Generation is refused until this is on and saved.
+            </span>
+          </span>
+        </label>
+
         {/* ── reference site ─────────────────────────────────────────────── */}
         <div className="space-y-3">
           <Label>Design</Label>
@@ -475,8 +499,13 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
 
           <div className="rounded-md border border-border p-3 space-y-2.5">
             <Label htmlFor="cloneUrl" className="text-xs">
-              Copy a new reference site
+              Copy a site&apos;s design
             </Label>
+            <p className="text-xs text-fg-subtle">
+              Makes your page look like that page — same layout, fonts and colours,
+              with your book&apos;s words in place of theirs. This is what you want to
+              match a sample site.
+            </p>
             <div className="flex flex-wrap gap-2">
               <Input
                 id="cloneUrl"
@@ -516,7 +545,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           {!templateId && (
             <div className="space-y-1.5">
               <Label htmlFor="templateUrl" className="text-xs">
-                Or follow a page&apos;s structure only
+                Or: follow a page&apos;s section order only
               </Label>
               <Input
                 id="templateUrl"
@@ -525,8 +554,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 placeholder="https://a-page-to-take-the-section-order-from.com"
               />
               <p className="text-xs text-fg-subtle">
-                The built-in design writes the same sections, in the same order, in our
-                own styling. Nothing is copied.
+                Keeps our own look, but writes the same sections in the same order as
+                that page. Nothing of theirs is copied. Leave this blank if you used
+                &ldquo;Copy a site&apos;s design&rdquo; above.
               </p>
             </div>
           )}
