@@ -327,6 +327,12 @@ export class GenerateClonedLandingPageUseCase {
 
     const scalars: Record<string, string> = {
       ...written.value.slots,
+      // A buy button with no label is a broken page, not a cosmetic gap — an
+      // empty scalar binds to '' and the button renders blank. The model is
+      // asked for CTA_TEXT and usually supplies it, but "usually" is not a
+      // guarantee worth shipping on the one element the whole page exists to
+      // get clicked. Written AFTER the spread so a real value still wins.
+      CTA_TEXT: written.value.slots['CTA_TEXT']?.trim() || 'Get the book',
       BRAND_NAME: channel?.title ?? title,
       AUTHOR_NAME: strategy?.author ?? channel?.title ?? '',
       PRICE: formatMoney(project.options.landingPriceCents, project.options.landingCurrency),

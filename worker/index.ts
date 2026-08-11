@@ -25,7 +25,7 @@ import { processImageGenJob }         from "./processors/synthetic/imageGenProce
 import { processImageToVideoJob }     from "./processors/synthetic/imageToVideoProcessor";
 import { processAvatarJob }           from "./processors/synthetic/avatarProcessor";
 import { processPitchGenJob }         from "./processors/synthetic/pitchGenProcessor";
-import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments, sweepZombieRenderJobs } from "./reconcile";
+import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments, sweepZombieRenderJobs, sweepAdmissionSlots } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
 import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
@@ -384,6 +384,15 @@ const sweepTimer = setInterval(() => {
         if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.undispatched_sweep.done", projectsRedispatched: n }));
       })
       .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.undispatched_sweep.error", err: (e as Error).message })));
+    // Admission-control top-up: promote waiting 'plan_ready' projects into any
+    // free generation slot. The normal promotion happens inline when a project
+    // finishes; this is the safety net for a promotion lost to a worker restart
+    // or a wedged slot, which would otherwise deadlock the whole waiting queue.
+    void sweepAdmissionSlots()
+      .then((n) => {
+        if (n > 0) console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.admission_sweep.done", projectsPromoted: n }));
+      })
+      .catch((e) => console.error(JSON.stringify({ ts: new Date().toISOString(), msg: "reconcile.admission_sweep.error", err: (e as Error).message })));
   }
   // Render-cache reaping applies to ANY worker that runs renders. Both roles do
   // now: sourced renders celebrity videos, synthetic renders avatar videos on the

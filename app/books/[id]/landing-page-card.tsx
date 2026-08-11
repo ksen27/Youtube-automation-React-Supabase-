@@ -573,6 +573,16 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
               {templates.find((t) => t.id === templateId)?.failureReason}
             </p>
           )}
+          {/* A cloned page only replaces what the extractor TAGGED; untagged text
+              ships as the reference wrote it. This is where that gets fixed. */}
+          {templateId && (
+            <a
+              href={`/books/templates/${templateId}`}
+              className="inline-block text-xs text-brand-300 hover:underline"
+            >
+              Review what this design replaces →
+            </a>
+          )}
           {cloneMsg && <p className="text-xs text-emerald-400">{cloneMsg}</p>}
         </div>
 

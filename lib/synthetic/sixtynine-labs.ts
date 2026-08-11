@@ -336,6 +336,9 @@ type ImageStatus = TtsStatus;
 interface ImageStatusResponse {
   id: string;
   status: ImageStatus;
+  // Present on FAILED jobs. Carries provider-side moderation refusals, which
+  // 69labs surfaces as FAILED rather than CENSORED — see the poll loop.
+  userMessage?: string;
 }
 
 // Internal: one nano-banana attempt with a SPECIFIC api key. Returns the image
@@ -356,6 +359,14 @@ async function generateNanoBananaImage(
     // Called with the freshly-submitted jobId BEFORE polling begins, so the
     // caller can persist it and resume this exact generation on a retry.
     onSubmit?: (jobId: string) => Promise<void> | void;
+    // Per-call model/resolution override (CelebForge uses gpt-image-2 for real
+    // celebrity likeness; the synthetic engine stays on nano-banana). Omitted =
+    // the SIXTYNINE_LABS_IMAGE_MODEL / _RESOLUTION env defaults.
+    model?: string;
+    // "" (empty string) deliberately OMITS the resolution field — required for
+    // models that expose qualityOptions instead of a resolutions[] array, which
+    // 400 when sent `resolution`. Distinct from undefined (= use env default).
+    resolution?: string;
   } = {},
 ): Promise<{ image: Buffer; contentType: string }> {
   const c = cfg();
@@ -384,12 +395,16 @@ async function generateNanoBananaImage(
         headers: authJson,
         body: JSON.stringify({
           prompt,
-          model: c.imageModel,
+          model: opts.model || c.imageModel,
           aspectRatio: "16:9",
           // Request a higher resolution (1K/2K/4K, Nano Banana Pro) so stills are
-          // sharp at the 1080p render. Omitted when the env value is empty so the
+          // sharp at the 1080p render. Omitted when the value is empty so the
           // provider default applies. Field name per 69labs' generate contract.
-          ...(c.imageResolution ? { resolution: c.imageResolution } : {}),
+          // opts.resolution === "" means "omit" (see the option's doc comment).
+          ...(() => {
+            const res = opts.resolution !== undefined ? opts.resolution : c.imageResolution;
+            return res ? { resolution: res } : {};
+          })(),
         }),
         timeoutMs: 60_000,
       }),
@@ -459,7 +474,20 @@ async function generateNanoBananaImage(
     const st = (await statusRes.json()) as ImageStatusResponse;
     if (st.status === "COMPLETED") break;
     if (st.status === "FAILED" || st.status === "CANCELLED") {
-      throw new Error(`69labs image: job ${st.status} (job ${jobId})`);
+      // A provider-side MODERATION refusal arrives as FAILED — not CENSORED —
+      // with the reason only in userMessage (verified 2026-08-10 on gpt-image-2:
+      // "This image request was blocked by the model's safety checks."). Without
+      // this branch such a job looks like a transient failure, so the key-failover
+      // loop sweeps every account and the Gemini/fal fallback chain runs too —
+      // minutes of paid calls that CANNOT succeed, since every provider refuses
+      // the same content. Re-label it as CENSORED so isCensored() short-circuits.
+      const userMessage = (st as { userMessage?: string }).userMessage ?? "";
+      if (/safety check|blocked by|restricted content|content polic/i.test(userMessage)) {
+        throw new Error(`69labs image: CENSORED (job ${jobId}) — ${userMessage}`);
+      }
+      throw new Error(
+        `69labs image: job ${st.status} (job ${jobId})${userMessage ? ` — ${userMessage}` : ""}`,
+      );
     }
     if (st.status === "CENSORED") {
       throw new Error(`69labs image: CENSORED (job ${jobId}) — edit the prompt and retry`);
@@ -524,6 +552,7 @@ function isCensored(err: unknown): boolean {
 async function generate69labsImage(
   prompt: string,
   resume?: ImageResume,
+  modelOpts: { model?: string; resolution?: string } = {},
 ): Promise<GenerateImageResult> {
   // GLOBAL per-account cap (Redis-coordinated across both worker machines). The
   // old SIXTYNINE_IMAGE_CONCURRENCY was a per-PROCESS semaphore, so cap × machines
@@ -559,6 +588,8 @@ async function generate69labsImage(
           onSubmit: resume?.onSubmit
             ? (jobId) => resume.onSubmit!(jobId, keyIdx)
             : undefined,
+          model: modelOpts.model,
+          resolution: modelOpts.resolution,
         }),
       );
       return { image, contentType, provider: "sixtynine_image" };
@@ -592,19 +623,45 @@ async function generate69labsImage(
   throw lastErr ?? new Error("generateImage: no 69labs key configured");
 }
 
+/**
+ * Options for callers that are NOT the synthetic engine. Defaults keep
+ * generateImage byte-identical to its previous behaviour.
+ */
+export interface GenerateImageOptions {
+  // Skip the mandatory synthetic STYLE_PROMPT ("amateur smartphone photo …
+  // slightly low quality"). That look is deliberate for the AI Avatar product
+  // but wrong for CelebForge, whose stills are intercut with real broadcast
+  // footage and must read as press photography. When true, basePrompt is sent
+  // verbatim — the caller owns the whole prompt including its own style.
+  rawPrompt?: boolean;
+  // Per-call model / resolution override (see generateNanoBananaImage opts).
+  model?: string;
+  resolution?: string;
+  // Skip the Gemini → fal.ai fallback chain. That chain exists because Gemini
+  // IS nano-banana and matches the synthetic look; for a celebrity still it is
+  // actively wrong — Gemini/FLUX refuse real public figures, so the fallback
+  // burns minutes to produce either a refusal or an off-model image. Callers
+  // that set this handle their own fallback (CelebForge: scraped photos).
+  noFallback?: boolean;
+}
+
 export async function generateImage(
   basePrompt: string,
   resume?: ImageResume,
+  options: GenerateImageOptions = {},
 ): Promise<GenerateImageResult> {
   cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
-  const prompt = withStylePrompt(basePrompt);
+  const prompt = options.rawPrompt ? basePrompt : withStylePrompt(basePrompt);
+  const modelOpts = { model: options.model, resolution: options.resolution };
 
   try {
     // The resume path re-polls a prior attempt's 69labs generation instead of
     // resubmitting (zombie-loop fix). Only the 69labs path resumes — the fal.ai
     // fallback below always submits fresh (it has no per-account concurrency wall).
-    return await generate69labsImage(prompt, resume);
+    return await generate69labsImage(prompt, resume, modelOpts);
   } catch (err) {
+    // Caller owns its own fallback (see GenerateImageOptions.noFallback).
+    if (options.noFallback) throw err;
     // FALLBACK: 69labs failed past its retry budget / all accounts are down or
     // blocked. EXCEPT on CENSORED — a content rejection would fail on any provider
     // too; the fix is to edit the prompt, not switch provider. Surface it.

@@ -605,6 +605,8 @@ export const DETECT_REPEATERS = `(function () {
   const out = [];
   const containers = document.querySelectorAll('body *');
 
+  // STRICT signature: tag + classes + a 3-deep tag skeleton. Two cards match
+  // only if they are structurally identical all the way down.
   const signature = (el) => {
     const cls = String(el.className || '').split(/\\s+/).filter(Boolean).sort().join('.');
     const skeleton = [];
@@ -619,28 +621,67 @@ export const DETECT_REPEATERS = `(function () {
     return el.tagName.toLowerCase() + '|' + cls + '|' + skeleton.join(',');
   };
 
+  /**
+   * LOOSE signature: tag + first class only.
+   *
+   * Real card grids are rarely identical. A chapter card with three bullets and
+   * one with five differ in their tag skeleton; a Tailwind card carrying an
+   * extra utility class differs in its class list. Under the strict signature
+   * each variation is its own group, none reaches MIN_COVERAGE, and a grid of
+   * fourteen obvious cards is reported as NO repeater at all — which is what
+   * happened to a 17-card page whose articles used just two class strings
+   * ("surface p-8" and "surface flex flex-col p-7").
+   *
+   * A missed repeater is expensive: the container's items keep the original
+   * seller's words on the new seller's page, and a chapter grid is the single
+   * largest block of copy on a sales page. So the strict pass runs first, and
+   * this is the fallback for containers it could not resolve.
+   */
+  const looseSignature = (el) => {
+    const first = String(el.className || '').split(/\\s+/).filter(Boolean)[0] || '';
+    return el.tagName.toLowerCase() + '|' + first;
+  };
+
   for (let i = 0; i < containers.length; i++) {
     const container = containers[i];
     const children = container.children;
     if (children.length < 2) continue;
 
-    const counts = new Map();
-    for (let c = 0; c < children.length; c++) {
-      const sig = signature(children[c]);
-      counts.set(sig, (counts.get(sig) || 0) + 1);
-    }
-    let bestSig = null;
-    let bestCount = 0;
-    counts.forEach((count, sig) => { if (count > bestCount) { bestCount = count; bestSig = sig; } });
+    // Strict first; fall back to the loose signature only when strict fails to
+    // find a dominant group. Structurally identical cards therefore still group
+    // exactly as before — the fallback only rescues containers that would
+    // otherwise be reported as having no repeat at all.
+    var sigOf = signature;
+    var bestSig = null;
+    var bestCount = 0;
+    var candidates = [signature, looseSignature];
 
-    if (bestCount < 2 || bestCount / children.length < MIN_COVERAGE) continue;
+    for (var k = 0; k < candidates.length; k++) {
+      var candidate = candidates[k];
+      var counts = new Map();
+      for (var c2 = 0; c2 < children.length; c2++) {
+        var s2 = candidate(children[c2]);
+        counts.set(s2, (counts.get(s2) || 0) + 1);
+      }
+      var topSig = null;
+      var topCount = 0;
+      counts.forEach(function (n, s) { if (n > topCount) { topCount = n; topSig = s; } });
+      if (topCount >= 2 && topCount / children.length >= MIN_COVERAGE) {
+        sigOf = candidate;
+        bestSig = topSig;
+        bestCount = topCount;
+        break;
+      }
+    }
+
+    if (!bestSig || bestCount < 2) continue;
 
     // A container whose repeating children are themselves containers of a
     // deeper repeat would be reported twice; keep the innermost, which is the
     // one whose items are the cards.
     let first = null;
     for (let c = 0; c < children.length; c++) {
-      if (signature(children[c]) === bestSig) { first = children[c]; break; }
+      if (sigOf(children[c]) === bestSig) { first = children[c]; break; }
     }
     if (!first) continue;
 

@@ -119,7 +119,14 @@ const ServerEnvSchema = z.object({
   // converts the lowest visual_priority image blocks to footage. 0.30 = 30:70
   // image:footage; set 0.40 for 40:60. Range (0,1). Client direction
   // (2026-06): shift ~10% from stills to footage, so 0.40 → 0.30.
-  MAX_IMAGE_RATIO: z.coerce.number().gt(0).lt(1).default(0.30),
+  //
+  // 2026-08-10 (client): "you can do 50% footage and 50% ai images" — raised to
+  // 0.50 alongside CELEB_IMAGE_ENABLED. The earlier 60:40 / 70:30 rules existed
+  // because stills were SCRAPED (a small verified pool repeated and read as a
+  // slideshow); AI stills are unique per block, which is what makes the higher
+  // image share acceptable. If CELEB_IMAGE_ENABLED is off, consider putting this
+  // back to 0.30 — 50% scraped stills would revive the repetition problem.
+  MAX_IMAGE_RATIO: z.coerce.number().gt(0).lt(1).default(0.50),
   // Subject-first source-video target. The number of source videos we aim to
   // SELECT scales with voiceover duration instead of a flat constant: the
   // longer the narration, the more distinct footage sources it needs. Client
@@ -437,6 +444,34 @@ const ServerEnvSchema = z.object({
   // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).
   SIXTYNINE_LABS_TTS_MODEL: z.string().default("eleven_multilingual_v2"),
   SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana-2"),
+  // --- CelebForge (sourced engine) AI still images -------------------------
+  // Client request 2026-08-10: "add ai images for the still images … you can use
+  // GROK IMAGE or GPT Image model. They can generate celebrity images."
+  //
+  // Measured 2026-08-10 (scripts/celeb-image-spike.ts) against the 69labs model
+  // list: gpt-image-2 renders NAMED public figures with true likeness at press
+  // quality (Musk / Charles / Ronaldo verified by eye). grok-imagine-image was
+  // reporting health "major_issues / temporarily_unavailable" and, unlike the
+  // nano-banana family, exposes qualityOptions instead of a `resolutions` array —
+  // so it would 400 on the `resolution` field we send. gpt-image-2 is therefore
+  // the default; switch here if 69labs' Grok model recovers (and blank
+  // CELEB_IMAGE_RESOLUTION when you do).
+  CELEB_IMAGE_ENABLED: z.coerce.boolean().default(false),
+  CELEB_IMAGE_MODEL: z.string().default("gpt-image-2"),
+  // "" omits the resolution field (required for models with no resolutions[]).
+  CELEB_IMAGE_RESOLUTION: z.string().default("2k"),
+  // Max AI stills generated per project. Generation is paid + rate-limited, and
+  // any block we don't generate simply keeps today's scraped image, so this is a
+  // spend ceiling rather than a quality setting. 0 = unlimited.
+  CELEB_IMAGE_MAX_PER_PROJECT: z.coerce.number().int().nonnegative().default(40),
+  // Per-image wall clock before we give up and keep the scraped photo. A HEALTHY
+  // gpt-image-2 returns in ~30-75s; a DEGRADED one sits until the provider's own
+  // ~240s timeout (measured 2026-08-11, when 69labs reported the model's health
+  // as "unknown" and 12 straight jobs died at ~240s with "This job failed to
+  // complete"). Generation runs inline in the match job, so without this cap a
+  // 40-image project on a bad day adds ~2.6 HOURS of stalling to matching.
+  // 90s keeps healthy generations while failing fast to the fallback.
+  CELEB_IMAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
   // Output resolution for nano-banana image generation. The 69labs UI exposes a
   // 1K/2K/4K selector (Nano Banana Pro); the API defaulted to 1K (~720p), which
   // is BELOW the 1080p synthetic render, so images were upscaled and soft.
@@ -836,6 +871,47 @@ const ServerEnvSchema = z.object({
   // transcript/audio mismatch collapses this toward 0, so 0.4 leaves healthy
   // plans plenty of headroom while still catching the catastrophic case.
   SYNTHETIC_PLAN_MIN_ANCHOR_FRACTION: z.coerce.number().min(0).max(1).default(0.4),
+  // Skip the manual review gate (client request 2026-08-10: after step 1 the
+  // AI Avatar flow should go straight to "generate assets"). When true, the
+  // planner fans the freshly-built plan out to the asset queues itself instead
+  // of parking the project at 'plan_ready' and waiting for the review screen's
+  // "Generate assets" click. The button/route stay in place either way — they
+  // are idempotent and still needed to re-dispatch after a partial failure.
+  // Set to false to restore the gate (inspect/edit blocks before paid calls).
+  // NOTE: z.coerce.boolean() is the repo convention here, but it makes ANY
+  // non-empty string truthy — "false"/"0" both coerce to TRUE. To turn this off
+  // you must UNSET the var, not set it to "false".
+  SYNTHETIC_AUTO_DISPATCH: z.coerce.boolean().default(true),
+  // ADMISSION CONTROL: how many synthetic projects may be generating assets at
+  // once. Auto-dispatch (above) removed the human review gate that used to
+  // serialise this, so every project that finished planning fanned its whole
+  // segment list into the image queue at once — observed 2026-08-11: 12 projects
+  // in generating_images and 2,666 queued image_gen jobs.
+  //
+  // BullMQ is ONE FIFO queue with no per-project fairness, so those 2,666 jobs
+  // interleave and every project finishes at roughly the same (very late) time:
+  // ~13h at 8 concurrent × ~140s/image, with NO completed video until the end.
+  // Capping admitted projects converts that into "one finished video every ~40
+  // min" for the same total throughput — same work, far better delivery.
+  //
+  // Projects over the cap WAIT at 'plan_ready' (the existing gate status) and
+  // are promoted automatically as earlier ones finish. Raising this does NOT
+  // make images generate faster: the real throughput limit is the 69labs
+  // account slots (SIXTYNINE_ACCOUNT_CONCURRENCY × keys), not this number.
+  SYNTHETIC_MAX_GENERATING_PROJECTS: z.coerce.number().int().positive().default(3),
+  // Auto-render (client request 2026-08-10: "if all assets are generated, the
+  // rendering should be done"). When true, finalize enqueues the render itself
+  // instead of parking at 'ready_for_review' for the Render click.
+  //
+  // CLEAN-ONLY: auto-render fires only when EVERY segment is 'ready'. A project
+  // finalizes with failed/skipped blocks too (they're terminal states), and
+  // auto-rendering those would silently ship a video with blocks missing — so
+  // any failure falls back to the manual gate for a human to retry first.
+  // See SYNTHETIC_AUTO_RENDER_ALLOW_FAILED to override that.
+  SYNTHETIC_AUTO_RENDER: z.coerce.boolean().default(true),
+  // Escape hatch: auto-render even when some blocks failed/were skipped. Off by
+  // default — a failed block means a gap in the delivered video.
+  SYNTHETIC_AUTO_RENDER_ALLOW_FAILED: z.coerce.boolean().default(false),
   SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
   SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
   // Minimum on-screen hold for a single visual block (client feedback 2026-06:

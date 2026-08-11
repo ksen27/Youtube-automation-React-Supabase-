@@ -98,13 +98,18 @@ export function pickAvgBlockSeconds(voiceoverSeconds: number): {
 export function planTimeline(voiceoverSeconds: number): TimelinePlan {
   const safeVo = Math.max(1, Math.round(voiceoverSeconds));
   const { avg, bucket } = pickAvgBlockSeconds(safeVo);
-  // 70/30 split is on TIME ON SCREEN, not block count. Footage uses 4–6s
+  // The split is on TIME ON SCREEN, not block count. Footage uses 4–6s
   // windows; images are fixed at 5s. A count-based split made images
   // dominate visual time when image holds were 8–12s; computing from
-  // target seconds gives ~70% footage ON SCREEN — what users mean by
-  // "70% footage."
-  const targetFootageSec = safeVo * 0.7;
-  const targetImageSec   = safeVo * 0.3;
+  // target seconds gives the intended footage share ON SCREEN — what users
+  // mean by "50% footage."
+  //
+  // Client 2026-08-10: "50% footage and 50% ai images" (was 70/30 here). Kept in
+  // step with MAX_IMAGE_RATIO (lib/env.ts), which is what matchProcessor's final
+  // enforcement pass actually uses — if these two disagree, the plan and the
+  // enforcement fight each other and blocks get converted after the fact.
+  const targetFootageSec = safeVo * 0.5;
+  const targetImageSec   = safeVo * 0.5;
   // Footage avg ~5s, image fixed at 5s. Both 5 in current ranges; the avg
   // computation handles future range tweaks without touching this math.
   const footageAvg = (DURATION_RANGES.footage.min + DURATION_RANGES.footage.max) / 2;   // 5

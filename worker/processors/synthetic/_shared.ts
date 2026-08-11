@@ -4,7 +4,9 @@ import {
   enqueueImageGeneration,
   enqueueImageToVideo,
   enqueueAvatar,
+  enqueueRender,
 } from "@/lib/jobs/queue";
+import { getEnv } from "@/lib/env";
 import type { SyntheticSegment, ProjectStatus } from "@/lib/types";
 import { estimateSegmentCost } from "@/lib/synthetic/cost";
 
@@ -257,6 +259,26 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
 
   await setProjectStatus(projectId, "ready_for_review");
 
+  // Assets are done and the timeline is materialized — kick the render if
+  // auto-render is on. Deliberately AFTER ready_for_review so a refused or
+  // failed auto-render leaves the project exactly where the manual flow would:
+  // sitting at the review screen with a working Render button.
+  await maybeAutoRender(projectId, all);
+
+  // This project just released its generation slot — pull the next waiting
+  // project in. Runs after auto-render because rendering does NOT hold a
+  // generation slot (it's a different queue), so the slot is free either way.
+  // Safe to call repeatedly: it no-ops when no slot is free or nothing waits.
+  try {
+    await promoteNextQueuedProject();
+  } catch (err) {
+    // Never let promotion failure fail the asset job that triggered finalize —
+    // the reconcile sweep will promote on its next pass.
+    await logJob({ projectId }, "synthetic.admission.promote_error", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   // Coarse project cost summary, reconstructed from the READY segment rows
   // (block_type + provider + duration). The per-call logProviderCall lines only
   // reach stdout, so this finalize line is the one greppable per-project total.
@@ -281,6 +303,226 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     costUsdEstimate: Number(totalUsd.toFixed(2)),
     costByBlockType: byType,
   });
+}
+
+// Statuses that mean "this project is actively generating assets" and therefore
+// occupies one of the SYNTHETIC_MAX_GENERATING_PROJECTS slots.
+const GENERATING_STATUSES: readonly ProjectStatus[] = [
+  "generating_images",
+  "generating_clips",
+  "generating_avatars",
+];
+
+/**
+ * How many synthetic projects are currently generating assets.
+ *
+ * Counts by project STATUS rather than by in-flight media_jobs on purpose: a
+ * project between two segment jobs (one finished, next not yet picked up) still
+ * owns its slot. Counting jobs would briefly read 0 and let an extra project in.
+ */
+export async function countGeneratingProjects(): Promise<number> {
+  const sb = getServerSupabase();
+  const { count } = await sb
+    .from("projects")
+    .select("id", { count: "exact", head: true })
+    .eq("engine", "synthetic")
+    .in("status", GENERATING_STATUSES as unknown as string[]);
+  return count ?? 0;
+}
+
+/**
+ * Admit a project to asset generation if there is a free slot.
+ *
+ * Returns true when the project was dispatched, false when it must WAIT at
+ * 'plan_ready' — the same status the manual review gate uses, so a waiting
+ * project still shows a working "Generate assets" button and can be started by
+ * hand at any time.
+ *
+ * Not race-free by construction: two planners finishing in the same instant can
+ * both read the same count and both admit. That overshoots by one project, not
+ * by twelve, and self-corrects on the next promotion — worth far less than the
+ * complexity of a distributed lock here.
+ */
+export async function admitProjectIfSlotFree(projectId: string): Promise<boolean> {
+  const max = getEnv().SYNTHETIC_MAX_GENERATING_PROJECTS;
+  const active = await countGeneratingProjects();
+  if (active >= max) {
+    await setProjectStatus(projectId, "plan_ready");
+    await logJob({ projectId }, "synthetic.admission.queued", { active, max });
+    return false;
+  }
+
+  const enqueued = await dispatchSegments(projectId);
+  await setProjectStatus(projectId, enqueued > 0 ? "generating_images" : "plan_ready");
+  await logJob({ projectId }, "synthetic.admission.admitted", { active, max, enqueued });
+  return enqueued > 0;
+}
+
+/**
+ * Promote the OLDEST waiting project into a freed slot.
+ *
+ * Called when a project leaves the generating states (finalize / auto-render).
+ * Oldest-first (by updated_at) keeps it FIFO so a project can't starve behind
+ * newer arrivals.
+ *
+ * A 'plan_ready' project is only a promotion candidate if it has PENDING
+ * segments — a project sitting at plan_ready with everything already generated
+ * would otherwise be "promoted" forever, burning a slot and blocking the queue.
+ */
+export async function promoteNextQueuedProject(): Promise<string | null> {
+  const sb = getServerSupabase();
+  const max = getEnv().SYNTHETIC_MAX_GENERATING_PROJECTS;
+  const active = await countGeneratingProjects();
+  if (active >= max) return null;
+
+  const { data: waiting } = await sb
+    .from("projects")
+    .select("id")
+    .eq("engine", "synthetic")
+    .eq("status", "plan_ready")
+    .order("updated_at", { ascending: true })
+    .limit(20);
+
+  for (const p of waiting ?? []) {
+    const projectId = p.id as string;
+    const { count } = await sb
+      .from("synthetic_segments")
+      .select("id", { count: "exact", head: true })
+      .eq("project_id", projectId)
+      .eq("status", "pending");
+    if (!count || count === 0) continue; // nothing to generate; not a candidate
+
+    const enqueued = await dispatchSegments(projectId);
+    if (enqueued > 0) {
+      await setProjectStatus(projectId, "generating_images");
+      await logJob({ projectId }, "synthetic.admission.promoted", { active, max, enqueued });
+      return projectId;
+    }
+  }
+  return null;
+}
+
+// Render-side duration tolerance. MUST match DURATION_TOLERANCE_SECONDS in
+// app/api/projects/[id]/render/route.ts — we pre-check the same gate here so a
+// mismatched timeline is reported as a skipped auto-render rather than being
+// enqueued and failing downstream.
+const AUTO_RENDER_TOLERANCE_SECONDS = 3;
+
+// Synthetic block types that consume voiceover time. Mirrors the render route's
+// DURATION_BEARING_TYPES, restricted to the synthetic set. pitch_video is
+// excluded on purpose: it plays its own audio while narration pauses, so it
+// consumes video time but NOT voiceover time.
+const AUTO_RENDER_DURATION_TYPES = new Set(["avatar", "ai_clip", "image", "split_2"]);
+
+/**
+ * Enqueue the render automatically once every asset is done (client request
+ * 2026-08-10). Called at the tail of maybeFinalizeSynthetic, i.e. exactly when
+ * the project reaches ready_for_review.
+ *
+ * This is a best-effort convenience, NOT a replacement for the Render button:
+ * every refusal path below leaves the project at ready_for_review so the user
+ * can still render manually. It never throws — an auto-render failure must not
+ * fail the asset job that happened to be the last one to finish.
+ *
+ * Idempotency matters here: finalize runs on EVERY asset completion and on the
+ * 5-min reconcile sweep, so this function is called many times per project. The
+ * in-flight//existing render-job checks below are what stop it re-rendering.
+ */
+async function maybeAutoRender(
+  projectId: string,
+  segments: Array<{ status: string; block_type: string }>,
+): Promise<void> {
+  try {
+    const env = getEnv();
+    if (!env.SYNTHETIC_AUTO_RENDER) return;
+
+    const sb = getServerSupabase();
+
+    // 1. Clean-only gate. failed/skipped are terminal, so finalize fires for a
+    // partially-broken project too; rendering that ships a video with gaps.
+    const broken = segments.filter((s) => s.status !== "ready").length;
+    if (broken > 0 && !env.SYNTHETIC_AUTO_RENDER_ALLOW_FAILED) {
+      await logJob({ projectId }, "synthetic.auto_render.skipped", {
+        reason: "segments_not_ready", broken, total: segments.length,
+      });
+      return;
+    }
+
+    // 2. Never render twice. Any render job for this project — queued, running,
+    // or already completed — means the user either has one in flight or has a
+    // finished video; a reconcile-triggered finalize must not start another.
+    const { data: priorRenders } = await sb
+      .from("render_jobs")
+      .select("id, status")
+      .eq("project_id", projectId)
+      .in("status", ["queued", "running", "completed"])
+      .limit(1);
+    if ((priorRenders ?? []).length > 0) return;
+
+    // 3. Pre-check the render route's duration gate. If the timeline doesn't
+    // match the voiceover, the route would 400 — surface that as a loud skip
+    // instead of a silent no-op, since it means a real planning/materialize bug
+    // (see the duplicate-materialize and alignment-lock-in cases).
+    const { data: proj } = await sb
+      .from("projects")
+      .select("voiceover_duration_seconds")
+      .eq("id", projectId)
+      .single();
+    const voiceoverSeconds = Number(proj?.voiceover_duration_seconds) || 0;
+
+    const { data: itemsRaw } = await sb
+      .from("timeline_items")
+      .select("id, type, duration")
+      .eq("project_id", projectId);
+    const items = itemsRaw ?? [];
+    if (items.length === 0) {
+      await logJob({ projectId }, "synthetic.auto_render.skipped", { reason: "empty_timeline" });
+      return;
+    }
+
+    if (voiceoverSeconds > 0) {
+      const timelineDuration = items
+        .filter((it) => AUTO_RENDER_DURATION_TYPES.has(String(it.type)))
+        .reduce((s, it) => s + (Number(it.duration) || 0), 0);
+      const delta = Math.abs(timelineDuration - voiceoverSeconds);
+      if (delta > AUTO_RENDER_TOLERANCE_SECONDS) {
+        await logJob({ projectId }, "synthetic.auto_render.skipped", {
+          reason: "duration_mismatch",
+          timelineDuration: Math.round(timelineDuration * 10) / 10,
+          voiceoverSeconds,
+          delta: Math.round(delta * 10) / 10,
+        });
+        return;
+      }
+    }
+
+    // 4. Enqueue. Mirrors the render route: a render_jobs row, a media_job that
+    // references it, then onto the SYNTHETIC render queue (served by the avatar
+    // worker) so it doesn't queue behind a celebrity render.
+    const { data: rj, error: rjErr } = await sb
+      .from("render_jobs")
+      .insert({ project_id: projectId, status: "queued", progress: 0 })
+      .select("id")
+      .single();
+    if (rjErr || !rj) {
+      await logJob({ projectId }, "synthetic.auto_render.error", { err: rjErr?.message });
+      return;
+    }
+
+    const mediaJobId = await createMediaJob({
+      projectId, type: "render", metadata: { renderJobId: rj.id, autoRender: true },
+    });
+    await enqueueRender({ projectId, mediaJobId, renderJobId: rj.id }, { synthetic: true });
+    await setProjectStatus(projectId, "rendering");
+    await logJob({ projectId }, "synthetic.auto_render.enqueued", {
+      renderJobId: rj.id, mediaJobId, blocks: items.length,
+    });
+  } catch (err) {
+    // Never let auto-render failure fail the asset job that triggered finalize.
+    await logJob({ projectId }, "synthetic.auto_render.error", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // Metadata flag stamped on the single sales-pitch timeline_item so we can find

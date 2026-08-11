@@ -34,7 +34,8 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { logJob } from "@/lib/jobs/db";
 import { getQueue, QUEUE_NAMES } from "@/lib/jobs/queue";
 import { maybeEnqueueMatch } from "./processors/_shared";
-import { dispatchSegments } from "./processors/synthetic/_shared";
+import { dispatchSegments, promoteNextQueuedProject } from "./processors/synthetic/_shared";
+import { getEnv } from "@/lib/env";
 
 // Reconcile a synthetic SEGMENT stuck at 'generating' when its media_job died
 // without reaching the processor's own terminal write.
@@ -437,4 +438,33 @@ export async function sweepUndispatchedSegments(): Promise<number> {
     }
   }
   return redispatched;
+}
+
+// Admission-control safety net (SYNTHETIC_MAX_GENERATING_PROJECTS).
+//
+// Projects over the cap wait at 'plan_ready' and are normally promoted by
+// maybeFinalizeSynthetic when a slot frees. Two things can break that chain and
+// leave the whole queue deadlocked — every waiting project stuck forever:
+//   1. The promoting call itself died (worker killed mid-finalize, deploy).
+//   2. A project is wedged in generating_* holding a slot it will never release
+//      (its jobs are all terminal but finalize never ran to completion).
+// Case 2 is already repaired by sweepUndispatchedSegments / the segment sweeps,
+// which flip such a project out of generating_*; this sweep then fills the slot.
+//
+// So this is a pure top-up: if fewer projects are generating than the cap and
+// something is waiting, promote. Idempotent and cheap — promoteNextQueuedProject
+// re-checks the count itself and no-ops when there is no room.
+export async function sweepAdmissionSlots(): Promise<number> {
+  let promoted = 0;
+  // Bounded loop: fill at most the whole cap in one sweep, so a long backlog
+  // drains over successive ticks rather than in one burst.
+  for (let i = 0; i < getEnv().SYNTHETIC_MAX_GENERATING_PROJECTS; i++) {
+    const id = await promoteNextQueuedProject().catch(async (e) => {
+      await logJob({}, "reconcile.admission_sweep.error", { err: (e as Error).message });
+      return null;
+    });
+    if (!id) break;
+    promoted++;
+  }
+  return promoted;
 }

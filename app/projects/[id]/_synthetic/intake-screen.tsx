@@ -282,8 +282,8 @@ export function SyntheticIntakeScreen({
         {error && <span className="text-xs text-danger">{error}</span>}
       </div>
       <p className="text-xs text-fg-subtle">
-        “Build plan” generates the voiceover (if needed), aligns it, and segments your script — then stops so you can
-        review every block before any image/clip/avatar is generated.
+        “Build plan” generates the voiceover (if needed), aligns it, segments your script, and then starts generating
+        the images, clips and avatars automatically. You can watch each block’s progress on the next screen.
       </p>
     </div>
   );

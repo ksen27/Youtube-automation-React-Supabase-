@@ -307,6 +307,34 @@ export class ExtractTemplateUseCase {
     const repeaters = annotated.value.repeaters;
     findings.push(...annotated.value.findings);
 
+    // COVERAGE. Everything the annotator did not label keeps the ORIGINAL
+    // seller's words — their chapter names, their examples, their bonuses — on
+    // the new seller's page. A sparse map is therefore not a small quality
+    // issue, it is the difference between a cloned page and the original page
+    // with the price changed, and it is invisible until someone reads the
+    // finished page and recognises the wrong product.
+    //
+    // Measured against the TEXT nodes in the inventory (images and links carry
+    // no prose to leak). The threshold is deliberately generous: navigation,
+    // furniture headings and legal links are legitimately unlabelled, so this
+    // fires only when most of the page's prose was left behind.
+    const textNodes = page.inventory.filter((n) => typeof n.text === 'string' && n.text.trim().length > 1);
+    if (textNodes.length >= 40) {
+      const labelledIds = new Set(placeholders.map((p) => p.tplId));
+      const covered = textNodes.filter((n) => labelledIds.has(n.tplId)).length;
+      const ratio = covered / textNodes.length;
+      if (ratio < 0.35) {
+        findings.push({
+          severity: 'WARN',
+          code: 'SPARSE_LABELLING',
+          message:
+            `Only ${covered} of ${textNodes.length} text regions were labelled (${Math.round(ratio * 100)}%). ` +
+            "The rest keep the reference site's own wording, so a page built from this template will read " +
+            'as the original product. Review the template and relabel, or copy a simpler reference page.',
+        });
+      }
+    }
+
     // ── STAGE 4: parameterise ────────────────────────────────────────────────
     const parameterised = await this.capturer.parameterise({
       cleanHtml: stored.value.cleanHtml,

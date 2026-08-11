@@ -49,3 +49,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Throwaway output from scripts/celeb-image-spike.ts
+scripts/.spike-out/

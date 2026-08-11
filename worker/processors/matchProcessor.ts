@@ -19,6 +19,7 @@ import {
 } from "@/lib/ai/timeline-plan";
 import { estimateDurationSeconds, type BlockPlan, type BlockEntityType, type SegmentUnderstanding } from "@/lib/ai/segments";
 import { fetchImages, rehostImageToR2 } from "@/lib/images/fetch";
+import { buildCelebImagePrompt, generateCelebImage } from "@/lib/images/celeb-generate";
 import { getEnv } from "@/lib/env";
 import {
   verifyPoolAssetWithRetry,
@@ -1412,7 +1413,9 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     runsLeftUnbroken: rhythmRunsLeftUnbroken,
   });
 
-  // ---- Final 60:40 footage:image enforcement (by screen time) ----------
+  // ---- Final footage:image ratio enforcement (by screen time) ----------
+  // Ratio comes from MAX_IMAGE_RATIO (lib/env.ts), 0.50 since the client's
+  // 2026-08-10 "50% footage and 50% ai images" — not the older 60:40.
   // The builder caps images at MAX_IMAGE_RATIO of content blocks at plan
   // time, but the passes above (split_4 downgrade, entity dedup, rhythm
   // swaps) can shift the realized ratio. The final video's percentage is
@@ -5032,6 +5035,103 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
     }
 
     return "blank";
+  }
+
+  // ---- AI-generated stills (CelebForge) --------------------------------
+  // Client 2026-08-10: "add ai images for the still images … 50% footage and
+  // 50% ai images". Runs BEFORE the empty-block rescue below so a block the
+  // scrapers couldn't fill becomes a generated celebrity still instead of being
+  // downgraded to footage (which is what would otherwise silently push the mix
+  // back toward footage and defeat the 50/50 split).
+  //
+  // Every failure here is non-fatal: a refused or errored generation simply
+  // leaves image_url empty and falls through to the existing rescue path, so
+  // the worst case is exactly today's behaviour.
+  if (getEnv().CELEB_IMAGE_ENABLED) {
+    const maxGen = getEnv().CELEB_IMAGE_MAX_PER_PROJECT;
+    let generated = 0;
+    let refused = 0;
+    let attempted = 0;
+    let fellBackToScraped = 0;
+
+    for (const item of items) {
+      if (item.type !== "image") continue;
+      if (maxGen > 0 && generated >= maxGen) break;
+
+      // AI-FIRST (client 2026-08-11, Lucky + Joey: "add the fallback … in
+      // general it will generate the images"). We attempt generation on EVERY
+      // image block, including ones the scrapers already filled, and keep the
+      // scraped photo only when generation fails. The earlier build ran
+      // generate-only-on-empty, which meant the scrapers won almost every block
+      // and hardly any AI stills were produced.
+      //
+      // The scraped url is preserved below until generation SUCCEEDS, so a
+      // refusal/timeout silently keeps exactly what this project would have
+      // shipped before the feature existed.
+      const scrapedUrl = (item.image_url as string | null) ?? null;
+
+      const meta = (item.metadata ?? {}) as Record<string, unknown>;
+      const blockIdx = meta.block_index as number | undefined;
+      if (blockIdx == null) continue;
+
+      const entity = blockClosedWorldEntities[blockIdx];
+      const prompt = buildCelebImagePrompt({
+        entityName: entity?.name ?? null,
+        entityType: entity?.type ?? null,
+        resolvedSubject: (meta.resolved_subject as string | null) ?? null,
+        visualReferences: (meta.specific_visual_references as string[] | null) ?? null,
+        mainCelebrity: mainCelebrity ?? null,
+        scriptText: (item.script_text as string | null) ?? null,
+      });
+      if (!prompt) continue;
+
+      attempted++;
+      const gen = await generateCelebImage(projectId, prompt, blockIdx);
+      if (!gen) {
+        refused++;
+        // FALLBACK (client-approved 2026-08-11): generation was refused by the
+        // provider's safety checks or failed/timed out. Keep whatever the
+        // scrapers found — item.image_url is untouched, so a block that had a
+        // Wikipedia/Brave/CSE photo still ships with it, and one that had
+        // nothing falls through to the empty-block rescue below.
+        if (scrapedUrl) fellBackToScraped++;
+        continue;
+      }
+
+      generated++;
+      item.image_url = gen.url;
+      item.image_source = "generated";
+      item.image_query = prompt.slice(0, 200);
+      item.image_entity_type = entity?.type ?? "celebrity_default";
+      item.image_entity_name = entity?.name ?? mainCelebrity ?? "";
+      // 'skipped', not 'yes': the verify gate checks a SCRAPED photo really
+      // depicts the subject. A generated still has no source to verify against,
+      // and image_verified's CHECK constraint only allows yes/no/uncertain/skipped.
+      item.image_verified = "skipped";
+      item.image_prompt = prompt;
+      item.metadata = {
+        ...meta,
+        image_pick_source: "ai_generated",
+        image_source_provider: gen.provider,
+        image_reason: "ai_generated_celebrity_still",
+      };
+    }
+
+    await logJob({ projectId, jobId: mediaJobId }, "match.celeb_image_generate", {
+      attempted,
+      generated,
+      // Failures are expected and non-fatal. Two distinct causes, split in the
+      // per-image celeb_image.refused / celeb_image.error log lines:
+      //   - moderation: the provider blocks that specific person (deterministic,
+      //     no retry helps — measured on Depp/Swift, where even a bare name is
+      //     refused)
+      //   - provider degradation: ~240s timeouts when the model is unhealthy
+      // Both keep the scraped photo, which is why this is safe to leave on.
+      refusedOrFailed: refused,
+      fellBackToScraped,
+      model: getEnv().CELEB_IMAGE_MODEL,
+      cap: maxGen,
+    });
   }
 
   let emptyImageDowngradedCount = 0;
