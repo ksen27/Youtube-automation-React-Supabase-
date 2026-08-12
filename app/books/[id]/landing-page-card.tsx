@@ -14,6 +14,13 @@ type LandingMode = "single" | "triple";
 /** The domain rejects a `triple` page that doesn't name exactly this many others. */
 const SIBLING_SLOTS = 2;
 
+/**
+ * How long a GENERATING/PUBLISHING row is believed before the card treats it as
+ * abandoned. Mirrors the stale guard in the POST route, deliberately — if the
+ * API would accept a fresh run, the button must not still be disabled.
+ */
+const STALE_RUN_MS = 10 * 60_000;
+
 interface SiblingSetting {
   projectId: string;
   priceCents: number | null;
@@ -135,6 +142,8 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [page, setPage] = useState<PageState | null>(null);
   const [publisherConfigured, setPublisherConfigured] = useState(false);
+  // See `working` below: a GENERATING/PUBLISHING row whose run never reported back.
+  const [stalled, setStalled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -192,6 +201,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       const s: Settings = data.settings;
       setSettings(s);
       setPage(data.page);
+      setStalled(
+        data.page ? Date.now() - new Date(data.page.updatedAt).getTime() > STALE_RUN_MS : false,
+      );
       setPublisherConfigured(Boolean(data.publisherConfigured));
       setCheckoutUrl(s.checkoutUrl ?? "");
       setPrice(centsToInput(s.priceCents));
@@ -217,7 +229,22 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     }
   }, [projectId]);
 
-  const working = page?.state === "GENERATING" || page?.state === "PUBLISHING";
+  /**
+   * A run this card should wait for, as opposed to one that never finished.
+   *
+   * GENERATING/PUBLISHING live on the landing_pages row, and a worker that dies
+   * mid-run (a redeploy during a publish is the easy way to see it) leaves the
+   * row in that state permanently — which disabled BOTH buttons with no way
+   * back, because the row says a run is in flight and nothing ever contradicts
+   * it. The POST route already stops believing such a row after ten minutes; the
+   * card has to agree or the page is stuck for good.
+   *
+   * `stalled` is evaluated when the row is FETCHED, not during render: a clock read
+   * in render is impure (react-hooks/purity) and would make the verdict depend
+   * on unrelated re-renders. The five-second poll re-evaluates it while a run is
+   * genuinely live, which is exactly when it can change.
+   */
+  const working = (page?.state === "GENERATING" || page?.state === "PUBLISHING") && !stalled;
 
   useEffect(() => {
     let cancelled = false;
@@ -498,6 +525,25 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const publishBlocked =
     !publisherConfigured || missingCheckoutHere.length > 0 || !(page?.isPublishable ?? true);
 
+  /**
+   * Why Publish is greyed out, in the order the user has to fix them.
+   *
+   * A disabled button with no explanation is indistinguishable from a broken
+   * one: every gate below lives somewhere else (an env var on the server, a
+   * field further up this form, a verification verdict on the draft, a queue
+   * job), and a seller looking at the button has no way to tell which. Rendered
+   * beside the button rather than logged.
+   */
+  const publishHint =
+    working ? "A run is in progress — this becomes available when it finishes."
+    : !page?.hasDraft ? "Generate the page before publishing it."
+    : !publisherConfigured ? "Publishing needs NETLIFY_AUTH_TOKEN set for the web app, not only the worker."
+    : missingCheckoutHere.length > 0
+      ? `Add a checkout link for ${missingCheckoutHere.length === 1 ? "book" : "books"} ${missingCheckoutHere.join(", ")}.`
+    : !(page?.isPublishable ?? true)
+      ? "This draft did not pass verification — fix the points above, then regenerate."
+    : null;
+
   // A sibling must be a DIFFERENT finished book, so exclude the other slot's pick.
   const optionsFor = (i: number) =>
     candidates.filter((c) => !siblings.some((s, j) => j !== i && s.projectId === c.projectId));
@@ -537,6 +583,13 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
               </a>
             )}
             {working && <Loader2 className="h-4 w-4 animate-spin text-fg-subtle" />}
+            {/* Says out loud why a row reading "generating"/"publishing" is not
+                spinning: nothing is running, the run just never reported back. */}
+            {stalled && (page.state === "GENERATING" || page.state === "PUBLISHING") && (
+              <span className="text-xs text-amber-300">
+                this run stopped without finishing — start it again
+              </span>
+            )}
           </div>
         )}
 
@@ -816,20 +869,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </p>
         )}
 
-        {missingCheckoutHere.length > 0 && (
-          <p className="text-xs text-amber-300">
-            {missingCheckoutHere.length === 1 ? "Book" : "Books"} {missingCheckoutHere.join(", ")} still{" "}
-            {missingCheckoutHere.length === 1 ? "needs a" : "need"} checkout{" "}
-            {missingCheckoutHere.length === 1 ? "link" : "links"} before publishing.
-          </p>
-        )}
-
-        {!publisherConfigured && (
-          <p className="text-xs text-fg-subtle">
-            Publishing is unavailable until NETLIFY_AUTH_TOKEN is set. The page can
-            still be generated and previewed.
-          </p>
-        )}
+        {/* The two standing notes that used to live here — "book N needs a
+            checkout link" and "NETLIFY_AUTH_TOKEN is not set" — are now part of
+            publishHint below, next to the button they explain. Two places saying
+            the same thing let them disagree. */}
 
         <div className="flex flex-wrap gap-2">
           {/* No Save button: Generate and Publish both persist first. A separate
@@ -864,6 +907,8 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
             </Button>
           )}
         </div>
+
+        {publishHint && <p className="text-xs text-amber-300">Publish: {publishHint}</p>}
       </CardContent>
     </Card>
   );
