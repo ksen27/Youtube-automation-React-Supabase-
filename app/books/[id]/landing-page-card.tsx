@@ -519,12 +519,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     ...(mode === "triple" ? siblings.flatMap((s, i) => (s.checkoutUrl.trim() ? [] : [i + 2])) : []),
   ];
   // Everything that must be true before a draft may go live, EXCEPT the stored
-  // checkout links (above). `isPublishable` is the post-substitution
-  // verification verdict — a cloned page whose buy buttons still point at the
-  // template owner's store must not ship.
-  // Verification findings are NOT part of this — see markPublishing(). They are
-  // shown above for review and the seller decides; the two gates left are ones
-  // no review can satisfy (no token, no buy link).
+  // checkout links (above). Verification is NOT part of it — see
+  // markPublishing(); the seller reviews the rendered page and decides. The two
+  // gates left are the ones no review can satisfy: no token, no buy link.
   const publishBlocked = !publisherConfigured || missingCheckoutHere.length > 0;
 
   /**
@@ -600,20 +597,12 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </div>
         )}
 
-        {/* Advisory since verification stopped vetoing a publish — said plainly,
-            because an unexplained amber list next to a working Publish button
-            reads as "this is broken and you are about to ship it anyway". */}
-        {page?.blockers && page.blockers.length > 0 && (
-          <ul className="space-y-1 text-sm text-amber-300">
-            <li className="text-xs text-fg-muted">
-              Checks worth a look before you publish — preview the page and decide;
-              these no longer stop you.
-            </li>
-            {page.blockers.map((b) => (
-              <li key={b}>• {b}</li>
-            ))}
-          </ul>
-        )}
+        {/* The verification findings are NOT shown. They stopped gating the
+            publish, and as advice they were wrong often enough to be noise: the
+            page renders correctly and the report still named an empty FAQ
+            repeater and 18% "drift" against the template. The API still returns
+            `blockers`, and the worker still logs them, so a real regression
+            across several books is still visible where it belongs. */}
 
         {/* ── design ─────────────────────────────────────────────────────────
             ONE control. Paste the page to copy and press Generate; everything
