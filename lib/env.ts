@@ -460,10 +460,41 @@ const ServerEnvSchema = z.object({
   CELEB_IMAGE_MODEL: z.string().default("gpt-image-2"),
   // "" omits the resolution field (required for models with no resolutions[]).
   CELEB_IMAGE_RESOLUTION: z.string().default("2k"),
-  // Max AI stills generated per project. Generation is paid + rate-limited, and
-  // any block we don't generate simply keeps today's scraped image, so this is a
-  // spend ceiling rather than a quality setting. 0 = unlimited.
-  CELEB_IMAGE_MAX_PER_PROJECT: z.coerce.number().int().nonnegative().default(40),
+  // What SHARE of the planner's image blocks are AI-generated. 1.0 (default) =
+  // every image block; the rest keep their scraped photo.
+  //
+  // This replaced a fixed per-project COUNT as the primary knob (client
+  // 2026-08-12: the AI share must be a proportion, not a fixed number). A count
+  // cannot express a share — at CELEB_IMAGE_MAX_PER_PROJECT=10 a 131-image
+  // project shipped 10 AI stills and 121 scraped ones (observed 2026-08-11),
+  // and the same number means something entirely different on a 10-minute video
+  // than on a 40-minute one.
+  //
+  // NOTE the division of labour: the 50:50 footage:image split is decided at
+  // PLAN time by MAX_IMAGE_RATIO (lib/ai/transcript-driven-builder.ts). This
+  // fraction then says how many of those image blocks are AI rather than
+  // scraped. Leaving it at 1.0 with MAX_IMAGE_RATIO=0.50 is what makes "50% of
+  // the assets are AI-generated" true.
+  CELEB_IMAGE_FRACTION: z.coerce.number().gt(0).max(1).default(1.0),
+  // Absolute SPEND backstop on AI stills per project, applied after
+  // CELEB_IMAGE_FRACTION. 0 (default) = unlimited — the fraction alone decides
+  // coverage. Set a positive number only to bound cost on unusually long
+  // videos; because it clips coverage it is logged (eligible vs target in
+  // match.celeb_image_generate) rather than silently truncating.
+  CELEB_IMAGE_MAX_PER_PROJECT: z.coerce.number().int().nonnegative().default(0),
+  // How many AI stills generate CONCURRENTLY inside the match job. The old
+  // sequential loop serialised every generation (~27s each), which is why a
+  // 131-image project would have taken ~1 hour inline while the avatar engine
+  // generates far more images far faster — avatar enqueues one BullMQ job per
+  // image and drains them in parallel, so the difference was dispatch, not the
+  // provider.
+  //
+  // CEILING: 69labs enforces a per-key concurrency tier, and BOTH engines share
+  // one mega key — the avatar worker is generating from another machine at the
+  // same time. This default is deliberately below what the key alone could take
+  // so the two engines' combined in-flight images stay under the account limit.
+  // Raise it with SIXTYNINE_IMAGE_CONCURRENCY in view, not on its own.
+  CELEB_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
   // Per-image wall clock before we give up and keep the scraped photo. A HEALTHY
   // gpt-image-2 returns in ~30-75s; a DEGRADED one sits until the provider's own
   // ~240s timeout (measured 2026-08-11, when 69labs reported the model's health

@@ -1143,6 +1143,7 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         shortSentencesMerged: built.shortSentencesMerged,
         imageSplitCount: built.imageSplitCount,
         imagesConvertedToFootage: built.imagesConvertedToFootage,
+        footageConvertedToImages: built.footageConvertedToImages,
         maxImageRatio: getEnv().MAX_IMAGE_RATIO,
         blocksProduced: built.blocks.length,
       });
@@ -5048,32 +5049,51 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
   // leaves image_url empty and falls through to the existing rescue path, so
   // the worst case is exactly today's behaviour.
   if (getEnv().CELEB_IMAGE_ENABLED) {
-    const maxGen = getEnv().CELEB_IMAGE_MAX_PER_PROJECT;
+    // WHICH blocks to generate. The planner has already fixed the 50:50
+    // footage:image split (maxImageRatio, see transcript-driven-builder), so
+    // "50% of the assets are AI" is achieved by generating the image blocks it
+    // produced — NOT by a second ratio here.
+    //
+    // CELEB_IMAGE_FRACTION (default 1.0 = every image block) replaces the old
+    // fixed CELEB_IMAGE_MAX_PER_PROJECT count, which could not express a share:
+    // at cap=10 a 131-image project shipped 10 AI stills and 121 scraped ones
+    // (observed 2026-08-11), and the same fixed number means something totally
+    // different on a 10-minute video than on a 40-minute one. The absolute cap
+    // remains as an optional SPEND backstop (0 = unlimited, the default) so one
+    // unusually long video cannot run up an unbounded bill.
+    const env0 = getEnv();
+    const eligible = items.filter((it) => {
+      if (it.type !== "image") return false;
+      const m = (it.metadata ?? {}) as Record<string, unknown>;
+      return (m.block_index as number | undefined) != null;
+    });
+    const byFraction = Math.ceil(eligible.length * env0.CELEB_IMAGE_FRACTION);
+    const hardCap = env0.CELEB_IMAGE_MAX_PER_PROJECT;
+    const target = hardCap > 0 ? Math.min(byFraction, hardCap) : byFraction;
+    const selected = eligible.slice(0, target);
+
     let generated = 0;
     let refused = 0;
     let attempted = 0;
     let fellBackToScraped = 0;
 
-    for (const item of items) {
-      if (item.type !== "image") continue;
-      if (maxGen > 0 && generated >= maxGen) break;
-
-      // AI-FIRST (client 2026-08-11, Lucky + Joey: "add the fallback … in
-      // general it will generate the images"). We attempt generation on EVERY
-      // image block, including ones the scrapers already filled, and keep the
-      // scraped photo only when generation fails. The earlier build ran
-      // generate-only-on-empty, which meant the scrapers won almost every block
-      // and hardly any AI stills were produced.
-      //
-      // The scraped url is preserved below until generation SUCCEEDS, so a
-      // refusal/timeout silently keeps exactly what this project would have
-      // shipped before the feature existed.
-      const scrapedUrl = (item.image_url as string | null) ?? null;
-
+    // Build every prompt FIRST (pure, synchronous), then generate through a
+    // bounded concurrency pool. The previous shape was a sequential `for` with
+    // an `await` inside, which serialised every generation: ~27s per image x N,
+    // inline in the match job. The avatar engine does not have this problem
+    // because it enqueues one BullMQ job per image and drains them in parallel
+    // (IMAGE_GEN_CONCURRENCY) — the provider is the same speed for both, the
+    // dispatch was the difference. Generating in parallel here closes most of
+    // that gap without moving celebrity image generation onto its own queue.
+    //
+    // CELEB_IMAGE_CONCURRENCY is capped by 69labs' per-key tier limit, which the
+    // avatar engine draws on CONCURRENTLY from another machine (both apps share
+    // one mega key). Keep the two engines' combined in-flight images under the
+    // account's ceiling; that is why this defaults lower than it could be.
+    const jobs: { item: (typeof items)[number]; meta: Record<string, unknown>; blockIdx: number; entity: (typeof blockClosedWorldEntities)[number]; prompt: string }[] = [];
+    for (const item of selected) {
       const meta = (item.metadata ?? {}) as Record<string, unknown>;
-      const blockIdx = meta.block_index as number | undefined;
-      if (blockIdx == null) continue;
-
+      const blockIdx = meta.block_index as number;
       const entity = blockClosedWorldEntities[blockIdx];
       const prompt = buildCelebImagePrompt({
         entityName: entity?.name ?? null,
@@ -5084,38 +5104,62 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
         scriptText: (item.script_text as string | null) ?? null,
       });
       if (!prompt) continue;
-
-      attempted++;
-      const gen = await generateCelebImage(projectId, prompt, blockIdx);
-      if (!gen) {
-        refused++;
-        // FALLBACK (client-approved 2026-08-11): generation was refused by the
-        // provider's safety checks or failed/timed out. Keep whatever the
-        // scrapers found — item.image_url is untouched, so a block that had a
-        // Wikipedia/Brave/CSE photo still ships with it, and one that had
-        // nothing falls through to the empty-block rescue below.
-        if (scrapedUrl) fellBackToScraped++;
-        continue;
-      }
-
-      generated++;
-      item.image_url = gen.url;
-      item.image_source = "generated";
-      item.image_query = prompt.slice(0, 200);
-      item.image_entity_type = entity?.type ?? "celebrity_default";
-      item.image_entity_name = entity?.name ?? mainCelebrity ?? "";
-      // 'skipped', not 'yes': the verify gate checks a SCRAPED photo really
-      // depicts the subject. A generated still has no source to verify against,
-      // and image_verified's CHECK constraint only allows yes/no/uncertain/skipped.
-      item.image_verified = "skipped";
-      item.image_prompt = prompt;
-      item.metadata = {
-        ...meta,
-        image_pick_source: "ai_generated",
-        image_source_provider: gen.provider,
-        image_reason: "ai_generated_celebrity_still",
-      };
+      jobs.push({ item, meta, blockIdx, entity, prompt });
     }
+
+    // AI-FIRST (client 2026-08-11, Lucky + Joey: "add the fallback … in general
+    // it will generate the images"). We attempt generation on EVERY selected
+    // image block, including ones the scrapers already filled, and keep the
+    // scraped photo only when generation fails. The earlier build ran
+    // generate-only-on-empty, which meant the scrapers won almost every block
+    // and hardly any AI stills were produced.
+    //
+    // The scraped url is preserved until generation SUCCEEDS, so a
+    // refusal/timeout silently keeps exactly what this project would have
+    // shipped before the feature existed.
+    let cursor = 0;
+    const lanes = Math.max(1, Math.min(env0.CELEB_IMAGE_CONCURRENCY, jobs.length));
+    await Promise.all(
+      Array.from({ length: lanes }, async () => {
+        for (;;) {
+          const j = jobs[cursor++];
+          if (!j) return;
+          const scrapedUrl = (j.item.image_url as string | null) ?? null;
+          attempted++;
+          // generateCelebImage never throws — it returns null on refusal,
+          // timeout, provider outage or upload failure — so one bad image can
+          // never reject this lane and abort the others.
+          const gen = await generateCelebImage(projectId, j.prompt, j.blockIdx);
+          if (!gen) {
+            refused++;
+            // FALLBACK (client-approved 2026-08-11): keep whatever the scrapers
+            // found — item.image_url is untouched, so a block that had a
+            // Wikipedia/Brave/CSE photo still ships with it, and one that had
+            // nothing falls through to the empty-block rescue below.
+            if (scrapedUrl) fellBackToScraped++;
+            continue;
+          }
+          generated++;
+          j.item.image_url = gen.url;
+          j.item.image_source = "generated";
+          j.item.image_query = j.prompt.slice(0, 200);
+          j.item.image_entity_type = j.entity?.type ?? "celebrity_default";
+          j.item.image_entity_name = j.entity?.name ?? mainCelebrity ?? "";
+          // 'skipped', not 'yes': the verify gate checks a SCRAPED photo really
+          // depicts the subject. A generated still has no source to verify
+          // against, and image_verified's CHECK constraint only allows
+          // yes/no/uncertain/skipped.
+          j.item.image_verified = "skipped";
+          j.item.image_prompt = j.prompt;
+          j.item.metadata = {
+            ...j.meta,
+            image_pick_source: "ai_generated",
+            image_source_provider: gen.provider,
+            image_reason: "ai_generated_celebrity_still",
+          };
+        }
+      }),
+    );
 
     await logJob({ projectId, jobId: mediaJobId }, "match.celeb_image_generate", {
       attempted,
@@ -5129,8 +5173,16 @@ export async function processMatchJob(data: MatchJobData): Promise<void> {
       // Both keep the scraped photo, which is why this is safe to leave on.
       refusedOrFailed: refused,
       fellBackToScraped,
-      model: getEnv().CELEB_IMAGE_MODEL,
-      cap: maxGen,
+      model: env0.CELEB_IMAGE_MODEL,
+      // Coverage telemetry: eligible is every image block the planner produced,
+      // target is what the fraction/backstop admitted. eligible > target means
+      // the spend backstop clipped coverage — the silent-truncation case worth
+      // seeing in the logs rather than inferring from a low `generated`.
+      eligible: eligible.length,
+      target,
+      fraction: env0.CELEB_IMAGE_FRACTION,
+      cap: hardCap,
+      concurrency: lanes,
     });
   }
 

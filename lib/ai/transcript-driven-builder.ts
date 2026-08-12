@@ -26,7 +26,7 @@ import type { AlignedSentence } from "./sentence-alignment";
 import type { EnrichmentLookup } from "./gemini-enrichment";
 import { enrichmentForSentence } from "./gemini-enrichment";
 import type { PlannedBlockWithHint } from "./timeline-plan";
-import { IMAGE_HOLD_SECONDS } from "./timeline-plan";
+import { IMAGE_HOLD_SECONDS, IMAGE_SPLIT_THRESHOLD } from "./timeline-plan";
 
 // Sentence shorter than this is considered "short" — its visual block
 // looks too brief on its own, so we try to fold it into a neighbor's
@@ -135,9 +135,14 @@ export interface TranscriptBuildResult {
   // fewer 1-2s flash blocks in the final editor view.
   shortSentencesMerged: number;
   // Number of image blocks converted to footage by the image:footage ratio
-  // cap (lowest visual_priority first). 0 when Gemini's split was already
-  // within the cap.
+  // pass (lowest visual_priority first), when Gemini typed MORE images than
+  // the target. 0 when the split was already at or below it.
   imagesConvertedToFootage: number;
+  // Number of footage blocks promoted to image by the same pass (highest
+  // visual_priority first), when Gemini typed FEWER images than the target.
+  // Mutually exclusive with imagesConvertedToFootage — the ratio is corrected
+  // in one direction per build.
+  footageConvertedToImages: number;
 }
 
 // Decide which neighbor a short sentence groups with.
@@ -589,20 +594,37 @@ export function buildBlockSequenceFromTranscript(
     blockIsTitleCard.push(false);
   }
 
-  // ---- image:footage ratio cap ----------------------------------------
-  // Gemini's per-sentence recommended_visual_type lands ~50% images on a
-  // typical biography script. That over-draws the verified image pool (the
-  // same celebrity photo repeats across many slots) and reads as a slideshow.
-  // Footage supply is plentiful, so cap images at maxImageRatio of all
-  // CONTENT blocks (image + footage; title cards / intro excluded) and
-  // convert the surplus — the LOWEST visual_priority image blocks first, so
-  // the images that genuinely matter (high-priority portraits, logos,
-  // posters) stay images while generic descriptive sentences become footage.
+  // ---- image:footage ratio TARGET --------------------------------------
+  // maxImageRatio is a TARGET the block mix is steered TOWARD in both
+  // directions, not a one-way ceiling.
+  //
+  // HISTORY (why this used to be a cap): Gemini's per-sentence
+  // recommended_visual_type lands ~50% images on a typical biography script.
+  // When stills were SCRAPED that over-drew the verified image pool (the same
+  // celebrity photo repeating across many slots) and read as a slideshow, so
+  // this pass only ever converted the surplus DOWN to footage.
+  //
+  // 2026-08-12 (client): CelebForge stills are now AI-GENERATED per block
+  // (CELEB_IMAGE_* — see worker/processors/matchProcessor.ts), so every image
+  // is unique and the slideshow pressure that justified a one-way cap is gone.
+  // The client's spec is an explicit 50:50 footage:image split decided HERE at
+  // plan time, with all image blocks then AI-generated. A ratio that only ever
+  // pushed DOWN could never reach the target from below: a script Gemini typed
+  // at 42% images stayed at 42% (observed 2026-08-11: 131 images / 311 assets).
+  // So the surplus < 0 branch below promotes footage UP to image.
+  //
+  // Both directions are visual_priority-ordered, mirroring each other:
+  //   • surplus > 0 (too many images): convert the LOWEST-priority images, so
+  //     the stills that genuinely matter (portraits, logos, posters) survive.
+  //   • surplus < 0 (too few images): promote the HIGHEST-priority footage, so
+  //     the blocks that most deserve a composed still become one, and generic
+  //     descriptive sentences stay in motion.
   const maxImageRatio = typeof args.maxImageRatio === "number"
     && args.maxImageRatio > 0 && args.maxImageRatio < 1
     ? args.maxImageRatio
     : 0.30;
   let imagesConvertedToFootage = 0;
+  let footageConvertedToImages = 0;
   {
     // Content blocks only — title cards (overlays) and intro don't count
     // toward the visual-style ratio.
@@ -616,8 +638,8 @@ export function buildBlockSequenceFromTranscript(
       (i) => blocks[i].type === "image" || blocks[i].type === "split_2",
     );
     const contentTotal = contentIdxs.length;
-    const maxImages = Math.floor(contentTotal * maxImageRatio);
-    const surplus = imageIdxs.length - maxImages;
+    const targetImages = Math.floor(contentTotal * maxImageRatio);
+    const surplus = imageIdxs.length - targetImages;
     if (surplus > 0) {
       // Convert the surplus lowest-priority image blocks to footage. Sort by
       // visual_priority ascending (lowest first); ties broken by longer
@@ -637,6 +659,33 @@ export function buildBlockSequenceFromTranscript(
         blocks[idx] = { ...blocks[idx], type: "footage" };
         imagesConvertedToFootage++;
       }
+    } else if (surplus < 0) {
+      // Too FEW images: promote footage up to image until the target is met.
+      // Highest visual_priority first (the mirror of the downgrade above);
+      // ties broken by SHORTER duration first, because a long footage block
+      // turned into a static still is the most slideshow-like outcome — the
+      // exact failure mode the old one-way cap existed to prevent. Blocks
+      // longer than IMAGE_SPLIT_THRESHOLD are excluded entirely for the same
+      // reason (the later oversized-image split would fragment them into
+      // repeated holds of the same subject).
+      //
+      // 'intro' and title cards are already excluded by isContent, and split_2
+      // is not a promotion target (it needs a second verified subject image,
+      // which the AI generator does not produce).
+      const promotable = contentIdxs
+        .filter((i) => blocks[i].type === "footage")
+        .filter((i) => Number(blocks[i].duration ?? 0) <= IMAGE_SPLIT_THRESHOLD)
+        .sort((a, b) => {
+          const pa = Number(blocks[a].visual_priority ?? 0);
+          const pb = Number(blocks[b].visual_priority ?? 0);
+          if (pa !== pb) return pb - pa;
+          return Number(blocks[a].duration ?? 0) - Number(blocks[b].duration ?? 0);
+        });
+      const toPromote = promotable.slice(0, -surplus);
+      for (const idx of toPromote) {
+        blocks[idx] = { ...blocks[idx], type: "image" };
+        footageConvertedToImages++;
+      }
     }
   }
 
@@ -650,5 +699,6 @@ export function buildBlockSequenceFromTranscript(
     imageSplitCount,
     shortSentencesMerged,
     imagesConvertedToFootage,
+    footageConvertedToImages,
   };
 }
