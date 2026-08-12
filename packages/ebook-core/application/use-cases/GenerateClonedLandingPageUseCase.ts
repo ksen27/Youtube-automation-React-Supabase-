@@ -678,7 +678,18 @@ export class GenerateClonedLandingPageUseCase {
     // as a broken page. The schema defaults `repeats` to {}, so an omission is
     // silent; ask once more for exactly the keys that came back missing rather
     // than shipping the hole.
-    const missing = input.repeaters.filter((r) => (parsed.value.repeats[r.key]?.length ?? 0) === 0);
+    //
+    // "Usable" is per FIELD, not per key. The observed failure was not an
+    // omitted repeater at all: FAQ_ITEMS came back with items, so this retry
+    // never fired, but the items carried no `question`/`answer` values — and an
+    // item with no fields renders exactly the empty card an omitted repeater
+    // would. bindTemplate reports those as `FAQ_ITEMS.question`, with the field
+    // suffix, which is how the two are told apart.
+    const usableItems = (key: string, fields: Array<{ name: string }>) =>
+      (parsed.value.repeats[key] ?? []).filter((item) =>
+        fields.some((f) => typeof item[f.name] === 'string' && item[f.name] !== ''),
+      );
+    const missing = input.repeaters.filter((r) => usableItems(r.key, r.fields).length === 0);
     if (missing.length > 0) {
       const retryPrompt = TemplateCopyPrompt.build({
         ...input,
@@ -698,9 +709,27 @@ export class GenerateClonedLandingPageUseCase {
         if (reparsed.isOk()) {
           for (const r of missing) {
             const items = reparsed.value.repeats[r.key];
-            if (items && items.length > 0) parsed.value.repeats[r.key] = items;
+            // Accepted only if the retry's items actually carry the fields. An
+            // item shaped like the last one replaces a broken grid with an
+            // identically broken one, and hides that the retry achieved nothing.
+            if (
+              items &&
+              items.some((item) => r.fields.some((f) => typeof item[f.name] === 'string' && item[f.name] !== ''))
+            ) {
+              parsed.value.repeats[r.key] = items;
+            }
           }
         }
+      }
+      // Whatever survives, no card renders half-empty. An item carrying none of
+      // its fields is dropped, and a repeater left with nothing is dropped
+      // whole — bindTemplate then REMOVES that region instead of cloning blanks
+      // into it, so the page comes up a section short rather than showing a
+      // grid of empty cards, which is what a reader reads as broken.
+      for (const r of input.repeaters) {
+        const usable = usableItems(r.key, r.fields);
+        if (usable.length > 0) parsed.value.repeats[r.key] = usable;
+        else delete parsed.value.repeats[r.key];
       }
       // Still missing after the retry is a real defect, but a page with one
       // empty grid still beats no page at all — bindTemplate reports the

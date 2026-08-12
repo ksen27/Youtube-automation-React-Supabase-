@@ -75,6 +75,26 @@ const AnnotationSchema = z.object({
   repeaters: lenientArray(AnnotationRepeater),
 });
 
+type Annotation = z.infer<typeof AnnotationSchema>;
+
+/**
+ * The repair pass, plus whatever the first pass labelled that it left alone.
+ *
+ * `repair` wins every node and every container it names — it saw the errors and
+ * is the corrected answer. `earlier` only fills gaps, so a second sweep that
+ * came back thinner cannot lose labels the first one got right. The result is
+ * resolved as a single annotation, so single-use rules and the vocabulary check
+ * apply to the union rather than to either half.
+ */
+function mergeAnnotations(repair: Annotation, earlier: Annotation): Annotation {
+  const labelledNodes = new Set(repair.map.map((e) => e.nodeId));
+  const namedContainers = new Set(repair.repeaters.map((r) => r.containerTplId));
+  return {
+    map: [...repair.map, ...earlier.map.filter((e) => !labelledNodes.has(e.nodeId))],
+    repeaters: [...repair.repeaters, ...earlier.repeaters.filter((r) => !namedContainers.has(r.containerTplId))],
+  };
+}
+
 /** Copy may run 15% longer than the words the template's CSS was tuned to. */
 const LENGTH_HEADROOM = 1.15;
 
@@ -474,6 +494,22 @@ export class ExtractTemplateUseCase {
     const byId = new Map(page.inventory.map((n) => [n.tplId, n]));
     const findings: Finding[] = [];
     let repairErrors: string[] | undefined;
+    /**
+     * The first attempt's labels, kept so the repair pass ADDS to them.
+     *
+     * The repair used to replace them wholesale, and a second pass is a fresh
+     * sweep of a long inventory rather than an edit of the first: it fixes the
+     * one entry that erred and silently drops a dozen it had labelled
+     * correctly. The observed result was a re-copied template that labelled
+     * FEWER prices and repeater fields than the capture it replaced — the page
+     * came back with the template's own "$67" beside a buy button and empty
+     * benefit cards, and re-copying looked like it made things worse.
+     *
+     * Only entries for nodes the repair did not touch are carried over, and the
+     * merged map goes through resolveAnnotation as one, so single-use rules are
+     * enforced against the whole thing rather than per attempt.
+     */
+    let firstPass: Annotation | null = null;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const prompt = TemplateAnnotationPrompt.build({
@@ -518,9 +554,11 @@ export class ExtractTemplateUseCase {
         continue;
       }
 
-      const resolved = resolveAnnotation(parsed.value, page, byId);
+      const annotation = firstPass ? mergeAnnotations(parsed.value, firstPass) : parsed.value;
+      const resolved = resolveAnnotation(annotation, page, byId);
       if (resolved.errors.length > 0 && attempt === 0) {
         repairErrors = resolved.errors;
+        firstPass = parsed.value;
         continue;
       }
       findings.push(...resolved.findings);
