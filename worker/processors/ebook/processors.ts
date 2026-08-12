@@ -398,7 +398,10 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
               blockers: blockers.length,
             });
             if (blockers.length > 0) {
-              container.logger.warn('cloned page failed verification — it will not publish', {
+              // Advisory, not a veto — the publish goes ahead and the seller
+              // reviews these on the card. Still logged: a run of these across
+              // several books points at the extractor, not at one page.
+              container.logger.warn('cloned page has verification findings — publishing anyway', {
                 projectId: p.projectId,
                 blockers: blockers.map((f) => `${f.code}: ${f.message}`),
               });

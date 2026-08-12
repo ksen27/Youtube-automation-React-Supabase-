@@ -73,10 +73,10 @@ export const GET = handle(async (_req: Request, { params }: { params: Promise<{ 
       : null,
     // Surfaced so the UI can explain a disabled Publish button instead of
     // failing the request after the user clicks it.
+    // Verification findings are reported (`blockers` above) but no longer part
+    // of this: the seller reviews the rendered page and decides.
     canPublish:
-      c.sitePublisher.isConfigured() &&
-      project.options.missingCheckoutPositions().length === 0 &&
-      (page?.isPublishable ?? true),
+      c.sitePublisher.isConfigured() && project.options.missingCheckoutPositions().length === 0,
     // Which books still need a buy link, so the UI can name them rather than
     // just greying the button out.
     missingCheckoutPositions: project.options.missingCheckoutPositions(),

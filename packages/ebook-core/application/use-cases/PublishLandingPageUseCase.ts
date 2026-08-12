@@ -62,16 +62,14 @@ export class PublishLandingPageUseCase {
     const html = page.html;
     if (!html) return Result.fail('Nothing to publish — generate the page first');
 
-    // The verification gate. A cloned page whose buy buttons still point at the
-    // template owner's store, or that carries an unfilled token as literal
-    // braces, is worse live than absent — and this is the first version of the
-    // system that can tell, because v1's checks all ran before substitution.
-    if (!page.isPublishable) {
-      return Result.fail(
-        `This page did not pass verification and will not be published: ${page.blockers.slice(0, 3).join(' · ')}`,
-      );
-    }
-
+    // Verification does NOT gate this any more. It stays a report the seller
+    // reads before pressing Publish (the card lists every blocker) rather than a
+    // refusal they cannot overrule: both BLOCKER findings — a screenshot diff
+    // against the template, and an empty repeater — fire on pages that are
+    // perfectly sellable, and a human looking at the rendered page is the better
+    // judge. The checkout-link gate above is deliberately NOT relaxed with it:
+    // that one is not a matter of taste, since a live page with dead buy buttons
+    // takes no money.
     const marked = page.markPublishing(this.clock.now());
     if (marked.isFail()) return Result.fail(marked.error);
     // State only: the html is what we are about to publish, not something to

@@ -522,8 +522,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   // checkout links (above). `isPublishable` is the post-substitution
   // verification verdict — a cloned page whose buy buttons still point at the
   // template owner's store must not ship.
-  const publishBlocked =
-    !publisherConfigured || missingCheckoutHere.length > 0 || !(page?.isPublishable ?? true);
+  // Verification findings are NOT part of this — see markPublishing(). They are
+  // shown above for review and the seller decides; the two gates left are ones
+  // no review can satisfy (no token, no buy link).
+  const publishBlocked = !publisherConfigured || missingCheckoutHere.length > 0;
 
   /**
    * Why Publish is greyed out, in the order the user has to fix them.
@@ -540,8 +542,6 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     : !publisherConfigured ? "Publishing needs NETLIFY_AUTH_TOKEN set for the web app, not only the worker."
     : missingCheckoutHere.length > 0
       ? `Add a checkout link for ${missingCheckoutHere.length === 1 ? "book" : "books"} ${missingCheckoutHere.join(", ")}.`
-    : !(page?.isPublishable ?? true)
-      ? "This draft did not pass verification — fix the points above, then regenerate."
     : null;
 
   // A sibling must be a DIFFERENT finished book, so exclude the other slot's pick.
@@ -600,8 +600,15 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </div>
         )}
 
+        {/* Advisory since verification stopped vetoing a publish — said plainly,
+            because an unexplained amber list next to a working Publish button
+            reads as "this is broken and you are about to ship it anyway". */}
         {page?.blockers && page.blockers.length > 0 && (
           <ul className="space-y-1 text-sm text-amber-300">
+            <li className="text-xs text-fg-muted">
+              Checks worth a look before you publish — preview the page and decide;
+              these no longer stop you.
+            </li>
             {page.blockers.map((b) => (
               <li key={b}>• {b}</li>
             ))}
