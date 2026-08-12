@@ -152,14 +152,29 @@ export function validateTemplate(input: TemplateValidationInput): Result<void, F
   //
   // Requiring exact equality made both directions fatal, and the model finding
   // a seventh buy button on a six-button page failed the whole extraction.
+  //
+  // BOTH directions are warnings now. A shortfall does not mean an unlabelled
+  // buy button survived, because the model does not get the last word on this:
+  // resolveAnnotation force-assigns CHECKOUT_URL to EVERY detected cta id
+  // ("the guard that outranks the model"). A token can therefore only go
+  // missing when its markup went with it — the node was dropped as no longer
+  // present (NODES_DROPPED), or it sat in a repeating region whose extra items
+  // are collapsed to one <template> item by design, which is how a 3-card
+  // pricing grid turns three detected buttons into one token.
+  //
+  // Blocking cost a real template its whole extraction over exactly that
+  // ("7 buy buttons but only 5 were labelled"), and the danger it named is
+  // covered directly below: a link still pointing at the template's own host is
+  // a BLOCKER via residualSourceLinks, which reads the finished markup rather
+  // than inferring from a count.
   const ctaCount = occurrences(html, token('CHECKOUT_URL'));
   if (input.originalCtaCount > 0 && ctaCount < input.originalCtaCount) {
     findings.push(
-      blocker(
+      warn(
         'CTA_COUNT_CHANGED',
         `The template had ${input.originalCtaCount} buy ${input.originalCtaCount === 1 ? 'button' : 'buttons'} but ` +
-          `only ${ctaCount} ${ctaCount === 1 ? 'was' : 'were'} labelled. Every one must carry the checkout link, ` +
-          "or the page ships a live link to the template owner's store.",
+          `only ${ctaCount} ${ctaCount === 1 ? 'carries' : 'carry'} the checkout token. The rest were dropped with ` +
+          'their markup — usually a repeating region collapsed to one item — so no unlabelled button ships.',
       ),
     );
   } else if (input.originalCtaCount > 0 && ctaCount > input.originalCtaCount) {

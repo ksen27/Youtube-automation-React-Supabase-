@@ -104,18 +104,26 @@ describe('validateTemplate', () => {
       expect(rejected(result).map((f: Finding) => f.code)).toContain('MISSING_REQUIRED_PLACEHOLDER');
     });
 
-    // Missing one is a live link to the owner's store. An extra one points at
-    // the seller's own checkout and costs nothing, so it must not be fatal.
+    // An extra one points at the seller's own checkout and costs nothing.
     it('warns rather than blocks when MORE buy buttons were labelled than detected', () => {
       const html = `${COMPLETE_HTML}<a href="{{CHECKOUT_URL}}">Buy again</a>`;
       const result = validateTemplate(baseInput({ html, originalCtaCount: 1 }));
       expect(result.isOk()).toBe(true);
     });
 
-    it('still blocks when FEWER were labelled than the template had', () => {
+    // Nor is a shortfall fatal: every detected cta is force-labelled upstream,
+    // so a missing token means the markup went too — a collapsed repeater item,
+    // typically. A button that really did survive is caught by its href.
+    it('warns rather than blocks when FEWER carry the token than were detected', () => {
       const result = validateTemplate(baseInput({ originalCtaCount: 4 }));
-      const finding = rejected(result).find((f: Finding) => f.code === 'CTA_COUNT_CHANGED');
-      expect(finding?.message).toContain('only 1');
+      expect(result.isOk()).toBe(true);
+    });
+
+    it('still blocks a surviving buy button that points at the template owner', () => {
+      const result = validateTemplate(
+        baseInput({ html: `${COMPLETE_HTML}<a href="https://themechanicbible.com/buy">Buy</a>`, originalCtaCount: 4 }),
+      );
+      expect(rejected(result).map((f: Finding) => f.code)).toContain('SOURCE_LINK_SURVIVED');
     });
   });
 
