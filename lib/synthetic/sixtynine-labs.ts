@@ -1,14 +1,37 @@
 import { getEnv } from "@/lib/env";
-import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/http";
+import {
+  fetchOrThrow,
+  withHttpRetry,
+  isAuthForbidden,
+  isAbortError,
+  sleepUnlessAborted,
+} from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
 import { generateFalImage, isFalImageConfigured } from "@/lib/synthetic/falai";
 import { generateGeminiImage, isGeminiImageConfigured } from "@/lib/synthetic/gemini-image";
 
-// Stable per-account id for the Redis slot pool. We key by the api key's short
-// prefix (never the full secret) so each 69labs account gets its own global
-// semaphore and the key value itself never lands in a Redis key name or a log.
+// Stable per-account id for the Redis slot pool. The slot cap this feeds is
+// enforced by 69labs PER ACCOUNT, not per key — so this id must identify the
+// ACCOUNT, and two keys issued by the SAME account must map to the SAME id.
+//
+// The default (the key's short prefix — never the full secret, so the key value
+// never lands in a Redis key name or a log) silently assumes one key = one
+// account. That assumption breaks in BOTH directions:
+//   - two keys from ONE account with different prefixes look like two accounts,
+//     so the cluster hands out cap × 2 slots against a single real ceiling of 7
+//     → chronic 403 "Concurrent image generation limit reached (7)" + cooldowns.
+//     (Observed 2026-08-12: a dedicated CelebForge key issued from the same
+//     account as the avatar key, giving 6 + 6 = 12 slots for a 7-slot account.)
+//   - two keys from DIFFERENT accounts that share a prefix collapse into one
+//     semaphore, wasting the second account's capacity.
+// Neither is detectable from the key text, so account identity has to be
+// DECLARED. Set SIXTYNINE_ACCOUNT_ID when every configured 69labs key belongs to
+// one account: all keys then share one semaphore and the cap means what it says.
+// Leave it unset only when the keys really are separate accounts.
 function accountIdFor(key: string): string {
+  const declared = (getEnv().SIXTYNINE_ACCOUNT_ID || "").trim();
+  if (declared) return declared;
   return key.slice(0, 10);
 }
 
@@ -367,6 +390,10 @@ async function generateNanoBananaImage(
     // models that expose qualityOptions instead of a resolutions[] array, which
     // 400 when sent `resolution`. Distinct from undefined (= use env default).
     resolution?: string;
+    // Caller cancellation. When this aborts we stop polling and return
+    // immediately, which is what lets the CALLER's slot be released instead of
+    // being held by a generation nobody is waiting for (see generate69labsImage).
+    signal?: AbortSignal;
   } = {},
 ): Promise<{ image: Buffer; contentType: string }> {
   const c = cfg();
@@ -407,8 +434,9 @@ async function generateNanoBananaImage(
           })(),
         }),
         timeoutMs: 60_000,
+        signal: opts.signal,
       }),
-      { attempts: 2, baseMs: 1000 },
+      { attempts: 2, baseMs: 1000, signal: opts.signal },
     );
     const parsed = (await submit.json()) as { id: string; queuePosition?: number };
     if (!parsed.id) throw new Error("69labs image: submit returned no job id");
@@ -436,6 +464,12 @@ async function generateNanoBananaImage(
   // adds negligible latency while cutting poll demand by 60%.
   const pollIntervalMs = 5000;
   while (Date.now() < deadline) {
+    // The caller gave up (its own generation deadline expired). Stop polling at
+    // once so the account slot held around this call is released NOW rather than
+    // at the 300s provider poll timeout — the slot-starvation cascade fix.
+    if (opts.signal?.aborted) {
+      throw opts.signal.reason ?? new Error(`69labs image: aborted (job ${jobId})`);
+    }
     // CRITICAL: a 429 on the STATUS endpoint must NOT fail a job that is still
     // generating — and must not STALL the lane either. The old strategy (8
     // withHttpRetry attempts, exponential backoff to ~12 min) parked every
@@ -458,14 +492,18 @@ async function generateNanoBananaImage(
         return fetchOrThrow(`${c.base}/api/v1/images/status/${jobId}`, {
           headers: authOnly,
           timeoutMs: 30_000,
+          signal: opts.signal,
         });
       },
-        { attempts: 3, baseMs: 1000 },
+        { attempts: 3, baseMs: 1000, signal: opts.signal },
       );
     } catch (e) {
+      // An abort is the caller cancelling, not a missed tick — surface it.
+      if (isAbortError(e) || opts.signal?.aborted) throw e;
       if (/-> 429/.test((e as Error).message ?? "")) {
-        await new Promise((r) =>
-          setTimeout(r, Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5))),
+        await sleepUnlessAborted(
+          Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5)),
+          opts.signal,
         );
         continue;
       }
@@ -494,7 +532,10 @@ async function generateNanoBananaImage(
     }
     // Jitter the cadence (±50%) so concurrent jobs don't lock-step their status
     // calls into a synchronized burst that trips the request-rate 429.
-    await new Promise((r) => setTimeout(r, Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5))));
+    await sleepUnlessAborted(
+      Math.round(pollIntervalMs * (0.75 + Math.random() * 0.5)),
+      opts.signal,
+    );
   }
   if (Date.now() >= deadline) throw new Error(`69labs image: poll timed out (job ${jobId})`);
 
@@ -504,7 +545,9 @@ async function generateNanoBananaImage(
     fetchOrThrow(`${c.base}/api/v1/images/download/${jobId}`, {
       headers: authOnly,
       timeoutMs: 120_000,
+      signal: opts.signal,
     }),
+    { signal: opts.signal },
   );
   return {
     image: Buffer.from(await dl.arrayBuffer()),
@@ -545,6 +588,15 @@ function isCensored(err: unknown): boolean {
   return /CENSORED/i.test((err as Error)?.message ?? "");
 }
 
+// The caller's own per-image generation deadline expired (generationTimeoutMs).
+// Distinct from 69labs' internal poll timeout: it means WE ran out of patience,
+// so hopping to the next account or falling back to another provider would only
+// spend more of a budget that is already gone. Terminal — surface it.
+const DEADLINE_MSG = "image generation deadline exceeded";
+export function isGenerationDeadline(err: unknown): boolean {
+  return new RegExp(DEADLINE_MSG, "i").test((err as Error)?.message ?? "");
+}
+
 // Run the 69labs (nano-banana) pool: round-robin across keys, each under the
 // GLOBAL per-account slot cap. Throws when every key is exhausted (all accounts
 // down/blocked, persistent rate-limit, poll timeout). This is the PRIMARY path;
@@ -552,7 +604,13 @@ function isCensored(err: unknown): boolean {
 async function generate69labsImage(
   prompt: string,
   resume?: ImageResume,
-  modelOpts: { model?: string; resolution?: string } = {},
+  modelOpts: {
+    model?: string;
+    resolution?: string;
+    generationTimeoutMs?: number;
+    acquireTimeoutMs?: number;
+    apiKey?: string;
+  } = {},
 ): Promise<GenerateImageResult> {
   // GLOBAL per-account cap (Redis-coordinated across both worker machines). The
   // old SIXTYNINE_IMAGE_CONCURRENCY was a per-PROCESS semaphore, so cap × machines
@@ -569,9 +627,20 @@ async function generate69labsImage(
   // loop). We only resume when a real jobId was recorded AND the recorded key
   // still exists in the pool; otherwise fall through to a normal round-robin
   // submit (onSubmit still fires so the fresh job is persisted for next time).
+  // PINNED KEY: the caller supplied the exact key to use (CelebForge pins its
+  // dedicated gpt-image-2 key). Round-robin is wrong there — it would send half
+  // the celebrity stills out on the avatar's key, which may not be entitled to
+  // the same model, and half the avatar's images out on the celebrity key. A
+  // pinned key is used ALONE, with no failover: the point of pinning is that the
+  // other keys are not interchangeable for this call.
+  const pinned = (modelOpts.apiKey || "").trim();
   const canResume =
-    !!resume?.jobId && resume.keyIdx >= 0 && resume.keyIdx < pool.length;
-  const order = canResume ? [pool[resume!.keyIdx]] : nextKeyOrder(pool);
+    !pinned && !!resume?.jobId && resume.keyIdx >= 0 && resume.keyIdx < pool.length;
+  const order = pinned
+    ? [pinned]
+    : canResume
+      ? [pool[resume!.keyIdx]]
+      : nextKeyOrder(pool);
   let lastErr: unknown;
   for (let i = 0; i < order.length; i++) {
     const key = order[i];
@@ -582,15 +651,56 @@ async function generate69labsImage(
     try {
       // Hold a GLOBAL account slot for the whole submit→poll→download so each
       // account's cluster-wide in-flight image work stays under the real cap.
-      const { image, contentType } = await withAccountSlot(accountIdFor(key), cap, () =>
-        generateNanoBananaImage(prompt, key, {
-          resumeJobId,
-          onSubmit: resume?.onSubmit
-            ? (jobId) => resume.onSubmit!(jobId, keyIdx)
-            : undefined,
-          model: modelOpts.model,
-          resolution: modelOpts.resolution,
-        }),
+      //
+      // The caller's generation deadline is armed INSIDE this callback — i.e.
+      // only once the slot is actually held. Charging slot-wait to the per-image
+      // budget is what made every celeb still die at exactly its timeout without
+      // ever reaching 69labs: with the lanes oversubscribed against the account
+      // cap, the whole budget was spent in withAccountSlot's acquire loop.
+      // Slot-wait is bounded separately by acquireTimeoutMs.
+      const { image, contentType } = await withAccountSlot(
+        accountIdFor(key),
+        cap,
+        async () => {
+          const ac = new AbortController();
+          const ms = modelOpts.generationTimeoutMs;
+          const timer = ms
+            ? setTimeout(
+                () => ac.abort(new Error(`69labs image: ${DEADLINE_MSG} after ${ms}ms`)),
+                ms,
+              )
+            : undefined;
+          // unref so a pending timer never holds the worker process open.
+          timer?.unref?.();
+          try {
+            return await generateNanoBananaImage(prompt, key, {
+              resumeJobId,
+              onSubmit: resume?.onSubmit
+                ? (jobId) => resume.onSubmit!(jobId, keyIdx)
+                : undefined,
+              model: modelOpts.model,
+              resolution: modelOpts.resolution,
+              signal: ms ? ac.signal : undefined,
+            });
+          } catch (e) {
+            // Normalise every downstream shape OUR abort can take (the poll-loop
+            // check, a fetch AbortError, a rejected backoff sleep) into one
+            // recognisable deadline error the key-failover loop treats as
+            // terminal. Keyed strictly on ac.signal.aborted, never on
+            // isAbortError(e): fetchOrThrow's own per-request timeouts also raise
+            // AbortError, and mislabelling one of those as a caller deadline
+            // would wrongly suppress the failover that should ride it out.
+            if (ac.signal.aborted) {
+              throw ac.signal.reason instanceof Error
+                ? ac.signal.reason
+                : new Error(`69labs image: ${DEADLINE_MSG} after ${ms}ms`);
+            }
+            throw e;
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        },
+        { acquireTimeoutMs: modelOpts.acquireTimeoutMs },
       );
       return { image, contentType, provider: "sixtynine_image" };
     } catch (err) {
@@ -598,6 +708,10 @@ async function generate69labsImage(
       // CENSORED is a content rejection — do NOT try other keys (every account
       // rejects it) and do NOT fall back to fal (see generateImage). Surface it.
       if (isCensored(err)) throw err;
+      // Our own generation deadline expired — do NOT sweep the remaining
+      // accounts. The budget that would pay for the next attempt is already
+      // spent, so a failover here just multiplies the stall by the pool size.
+      if (isGenerationDeadline(err)) throw err;
       // Try the NEXT account on (a) a permanent auth 403 (dead key) OR (b) the
       // concurrent-limit 403 / poll timeout — another account may have a free
       // slot while this one is jammed by zombies. Each key now fails FAST (short
@@ -643,6 +757,23 @@ export interface GenerateImageOptions {
   // burns minutes to produce either a refusal or an off-model image. Callers
   // that set this handle their own fallback (CelebForge: scraped photos).
   noFallback?: boolean;
+  // Wall clock for ONE generation (submit → poll → download), measured from the
+  // moment the per-account slot is held — NOT from the call, so time spent
+  // queueing for a slot is not charged to it. On expiry the poll is ABORTED and
+  // the slot released immediately, instead of being held to the provider's own
+  // 300s poll timeout for an image no one will read. Omitted = no caller
+  // deadline (the provider poll timeout is the only bound, as before).
+  generationTimeoutMs?: number;
+  // Cap on how long to WAIT for a free per-account slot before giving up.
+  // Defaults to withAccountSlot's own 5 min.
+  acquireTimeoutMs?: number;
+  // Use EXACTLY this 69labs key instead of round-robining the pool, and do not
+  // fail over to the others. For a caller whose key is provisioned differently
+  // from the rest (CelebForge's gpt-image-2 key), the pool's keys are not
+  // interchangeable, so spreading its calls across them is a correctness bug,
+  // not load balancing. The key still shares its ACCOUNT's slot cap — see
+  // accountIdFor / SIXTYNINE_ACCOUNT_ID.
+  apiKey?: string;
 }
 
 export async function generateImage(
@@ -652,7 +783,13 @@ export async function generateImage(
 ): Promise<GenerateImageResult> {
   cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
   const prompt = options.rawPrompt ? basePrompt : withStylePrompt(basePrompt);
-  const modelOpts = { model: options.model, resolution: options.resolution };
+  const modelOpts = {
+    model: options.model,
+    resolution: options.resolution,
+    generationTimeoutMs: options.generationTimeoutMs,
+    acquireTimeoutMs: options.acquireTimeoutMs,
+    apiKey: options.apiKey,
+  };
 
   try {
     // The resume path re-polls a prior attempt's 69labs generation instead of
@@ -666,6 +803,10 @@ export async function generateImage(
     // blocked. EXCEPT on CENSORED — a content rejection would fail on any provider
     // too; the fix is to edit the prompt, not switch provider. Surface it.
     if (isCensored(err)) throw err;
+    // Same for our own deadline: the caller asked to be back by a fixed time and
+    // that time has passed, so starting a fresh generation on another provider
+    // would blow the budget it was meant to enforce.
+    if (isGenerationDeadline(err)) throw err;
 
     // PREFERRED fallback is Gemini's own image model: 69labs resells Google's
     // nano-banana, so a Gemini still matches the 69labs look (fal.ai FLUX reads

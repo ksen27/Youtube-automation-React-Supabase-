@@ -174,29 +174,43 @@ export async function generateCelebImage(
 ): Promise<CelebImageResult | null> {
   const env = getEnv();
   try {
-    // Race the generation against our own deadline. generateImage's internal
-    // poll budget is far longer than we can afford here (this runs INLINE in
-    // the match job), and a degraded provider parks every call at ~240s. On
-    // timeout we abandon the call and keep the scraped photo. The 69labs job
-    // itself keeps running provider-side — harmless, we just stop waiting.
-    const out = await Promise.race([
-      generateImage(prompt, undefined, {
-        // Own the whole prompt: no synthetic STYLE_PROMPT, no low-fi degrade.
-        rawPrompt: true,
-        model: env.CELEB_IMAGE_MODEL,
-        resolution: env.CELEB_IMAGE_RESOLUTION,
-        // Gemini/FLUX refuse named public figures; scraped photos are our fallback.
-        noFallback: true,
-      }),
-      new Promise<never>((_, reject) => {
-        // unref so a pending timer never holds the worker process open.
-        const t = setTimeout(
-          () => reject(new Error(`celeb image: timed out after ${env.CELEB_IMAGE_TIMEOUT_MS}ms`)),
-          env.CELEB_IMAGE_TIMEOUT_MS,
-        );
-        t.unref?.();
-      }),
-    ]);
+    // Bound the generation with our own deadline: generateImage's internal poll
+    // budget is far longer than we can afford here (this runs INLINE in the
+    // match job), and a degraded provider parks every call at ~240s.
+    //
+    // This used to be a Promise.race against a local timer, which was wrong in
+    // two ways that together produced a self-sustaining stall (observed
+    // 2026-08-12: every still failing at exactly the timeout, generation getting
+    // slower as the project ran):
+    //
+    //  1. Promise.race does not CANCEL the loser. The abandoned generation kept
+    //     polling and kept holding its cluster-wide 69labs account slot until the
+    //     provider's own 300s poll timeout — so each timeout removed a slot from
+    //     the shared pool for minutes, to produce an image nobody would read.
+    //     Fewer free slots → longer waits → more timeouts → fewer free slots.
+    //  2. The clock started at the CALL, but generateImage first blocks in the
+    //     Redis acquire loop waiting for one of those slots. With the celeb lanes
+    //     oversubscribed against SIXTYNINE_ACCOUNT_CONCURRENCY (shared with the
+    //     avatar worker on the same key), the whole budget was routinely spent
+    //     QUEUEING and the call died having never submitted anything to 69labs.
+    //
+    // generationTimeoutMs now starts once the slot is held and genuinely aborts
+    // the poll, releasing the slot immediately; slot-wait is bounded separately.
+    const out = await generateImage(prompt, undefined, {
+      // Own the whole prompt: no synthetic STYLE_PROMPT, no low-fi degrade.
+      rawPrompt: true,
+      model: env.CELEB_IMAGE_MODEL,
+      resolution: env.CELEB_IMAGE_RESOLUTION,
+      // Gemini/FLUX refuse named public figures; scraped photos are our fallback.
+      noFallback: true,
+      generationTimeoutMs: env.CELEB_IMAGE_TIMEOUT_MS,
+      acquireTimeoutMs: env.CELEB_IMAGE_SLOT_WAIT_MS,
+      // Pin the dedicated CelebForge key when configured. The shared pool's keys
+      // are not interchangeable here: only this one is provisioned for
+      // CELEB_IMAGE_MODEL, so round-robin would send half these stills out on a
+      // key that cannot serve it. Unset = pool round-robin, as before.
+      apiKey: env.CELEB_IMAGE_API_KEY,
+    });
 
     const key = `projects/${projectId}/generated/${Date.now()}_${index}.jpg`;
     const up = await uploadBuffer(out.image, key, out.contentType);

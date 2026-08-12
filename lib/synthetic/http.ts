@@ -47,20 +47,54 @@ export function isAuthForbidden(err: unknown): boolean {
   return !/concurrent.*limit reached/i.test(text);
 }
 
+// True when an error is (or was caused by) an AbortSignal firing. Node's fetch
+// surfaces this as an AbortError / "The operation was aborted", which none of
+// the transient patterns above match — so an aborted call is never retried.
+// Callers use this to tell "we cancelled" apart from "the provider failed".
+export function isAbortError(err: unknown): boolean {
+  const e = err as { name?: string; message?: string };
+  return e?.name === "AbortError" || /operation was aborted|aborted/i.test(e?.message ?? "");
+}
+
+/**
+ * setTimeout as a promise that rejects as soon as `signal` aborts, so a backoff
+ * sleep can't outlive a cancelled operation. Without this, aborting mid-retry
+ * still waits out the full delay before anyone notices.
+ */
+export function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function withHttpRetry<T>(
   label: string,
   fn: () => Promise<T>,
-  opts: { attempts?: number; baseMs?: number } = {},
+  opts: { attempts?: number; baseMs?: number; signal?: AbortSignal } = {},
 ): Promise<T> {
   const attempts = opts.attempts ?? 3;
   const baseMs = opts.baseMs ?? 1000;
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
+    // Bail before spending an attempt on work the caller has already abandoned.
+    if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("aborted");
     try {
       return await fn();
     } catch (e) {
       lastErr = e;
-      if (i === attempts - 1 || !isRetryableHttp(e)) throw e;
+      // An abort is the caller cancelling, never a transient provider failure:
+      // surface it immediately instead of burning the retry budget.
+      if (i === attempts - 1 || !isRetryableHttp(e) || isAbortError(e)) throw e;
       const delay = Math.round(baseMs * Math.pow(3, i) * (0.5 + Math.random()));
       console.warn(JSON.stringify({
         msg: "synthetic.http.retry",
@@ -69,7 +103,7 @@ export async function withHttpRetry<T>(
         nextDelayMs: delay,
         err: (e as Error).message?.slice(0, 200),
       }));
-      await new Promise((r) => setTimeout(r, delay));
+      await sleepUnlessAborted(delay, opts.signal);
     }
   }
   throw lastErr;
@@ -81,11 +115,28 @@ export async function fetchOrThrow(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {},
 ): Promise<Response> {
-  const { timeoutMs, ...rest } = init;
-  const controller = timeoutMs ? new AbortController() : undefined;
-  const timer = timeoutMs ? setTimeout(() => controller!.abort(), timeoutMs) : undefined;
+  const { timeoutMs, signal: callerSignal, ...rest } = init;
+  // The per-request timeout and the CALLER's signal must BOTH be able to abort
+  // the fetch. The old shape let the timeout controller replace rest.signal
+  // outright, so a caller-supplied cancellation was silently dropped whenever a
+  // timeoutMs was also set — which is every call in this module.
+  const needsController = Boolean(timeoutMs || callerSignal);
+  const controller = needsController ? new AbortController() : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onCallerAbort: (() => void) | undefined;
+  if (controller) {
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        controller.abort(callerSignal.reason);
+      } else {
+        onCallerAbort = () => controller.abort(callerSignal.reason);
+        callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+      }
+    }
+    if (timeoutMs) timer = setTimeout(() => controller.abort(), timeoutMs);
+  }
   try {
-    const res = await fetch(url, { ...rest, signal: controller?.signal ?? rest.signal });
+    const res = await fetch(url, { ...rest, signal: controller?.signal });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       // Include the response body in the message so the worker's job.failed log
@@ -114,5 +165,6 @@ export async function fetchOrThrow(
     throw err;
   } finally {
     if (timer) clearTimeout(timer);
+    if (callerSignal && onCallerAbort) callerSignal.removeEventListener("abort", onCallerAbort);
   }
 }

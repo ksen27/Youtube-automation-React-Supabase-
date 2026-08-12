@@ -458,6 +458,17 @@ const ServerEnvSchema = z.object({
   // CELEB_IMAGE_RESOLUTION when you do).
   CELEB_IMAGE_ENABLED: z.coerce.boolean().default(false),
   CELEB_IMAGE_MODEL: z.string().default("gpt-image-2"),
+  // Dedicated 69labs key for CelebForge stills. When set, celebrity image
+  // generation uses EXACTLY this key and never round-robins the shared pool —
+  // which matters when this key is provisioned for CELEB_IMAGE_MODEL and the
+  // avatar engine's keys are not, since the pool would otherwise send half the
+  // celebrity stills out on a key that cannot serve the model.
+  //
+  // This does NOT add concurrency. If the key was issued from an account that
+  // already has a key in the pool, set SIXTYNINE_ACCOUNT_ID so both share one
+  // slot semaphore — otherwise the cluster over-subscribes the account.
+  // Unset = round-robin the shared pool (previous behaviour).
+  CELEB_IMAGE_API_KEY: z.string().optional(),
   // "" omits the resolution field (required for models with no resolutions[]).
   CELEB_IMAGE_RESOLUTION: z.string().default("2k"),
   // What SHARE of the planner's image blocks are AI-generated. 1.0 (default) =
@@ -489,11 +500,18 @@ const ServerEnvSchema = z.object({
   // image and drains them in parallel, so the difference was dispatch, not the
   // provider.
   //
-  // CEILING: 69labs enforces a per-key concurrency tier, and BOTH engines share
-  // one mega key — the avatar worker is generating from another machine at the
-  // same time. This default is deliberately below what the key alone could take
-  // so the two engines' combined in-flight images stay under the account limit.
-  // Raise it with SIXTYNINE_IMAGE_CONCURRENCY in view, not on its own.
+  // CEILING: these lanes contend for the SAME cluster-wide per-ACCOUNT slots
+  // (SIXTYNINE_ACCOUNT_CONCURRENCY) as the avatar worker on the other machine.
+  // Lanes are DEMAND, not capacity: raising this past the number of free slots
+  // buys no throughput, it only converts generation time into queue time. Adding
+  // a key from an account that already has one does not help either — the 69labs
+  // limit is per ACCOUNT (see SIXTYNINE_ACCOUNT_ID). Only a genuinely separate
+  // account raises the ceiling.
+  //
+  // Safe to run at 4 as of 2026-08-12: the Redis semaphore now enforces the
+  // account cap correctly, so excess lanes WAIT rather than earning a 403, and a
+  // lane's generation deadline no longer starts until its slot is held (which is
+  // what previously turned queueing into a cascade of fake 90s timeouts).
   CELEB_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
   // Per-image wall clock before we give up and keep the scraped photo. A HEALTHY
   // gpt-image-2 returns in ~30-75s; a DEGRADED one sits until the provider's own
@@ -501,8 +519,19 @@ const ServerEnvSchema = z.object({
   // as "unknown" and 12 straight jobs died at ~240s with "This job failed to
   // complete"). Generation runs inline in the match job, so without this cap a
   // 40-image project on a bad day adds ~2.6 HOURS of stalling to matching.
-  // 90s keeps healthy generations while failing fast to the fallback.
-  CELEB_IMAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
+  //
+  // Measured from when the 69labs ACCOUNT SLOT IS HELD, not from the call — slot
+  // wait is bounded by CELEB_IMAGE_SLOT_WAIT_MS instead. Raised 90s -> 180s
+  // (2026-08-12): 90s left almost no margin over a healthy generation's ~75s
+  // once the submit retry and the download (allowed 120s on its own) are inside
+  // the same budget, so healthy-but-slow stills were being thrown away.
+  CELEB_IMAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+  // How long an AI still may WAIT for a free 69labs account slot before giving
+  // up and keeping the scraped photo. Separate from CELEB_IMAGE_TIMEOUT_MS so a
+  // busy account shows up as queueing rather than as a fake generation timeout.
+  // Below withAccountSlot's own 5-min default because this runs inline in the
+  // match job, where a long queue is worse than a scraped photo.
+  CELEB_IMAGE_SLOT_WAIT_MS: z.coerce.number().int().positive().default(120_000),
   // Output resolution for nano-banana image generation. The 69labs UI exposes a
   // 1K/2K/4K selector (Nano Banana Pro); the API defaulted to 1K (~720p), which
   // is BELOW the 1080p synthetic render, so images were upscaled and soft.
@@ -847,6 +876,22 @@ const ServerEnvSchema = z.object({
   // (7)" 403 — enforced across all machines/lanes, not per-process. Add more
   // 69labs accounts (SIXTYNINE_LABS_API_KEY_*) to raise total throughput.
   SIXTYNINE_ACCOUNT_CONCURRENCY: z.coerce.number().int().positive().default(6),
+
+  // DECLARED account identity for the cap above. Set this to any stable label
+  // (e.g. "main") when EVERY configured 69labs key belongs to ONE account: all
+  // keys then share a single semaphore, so the cap is enforced once for the
+  // account instead of once per key.
+  //
+  // Set it whenever you issue a second key from an existing account rather than
+  // opening a new one. Without it, key identity is inferred from the key's first
+  // 10 characters — which reads two keys of ONE account as two accounts and
+  // hands out cap × 2 slots against a single 7-slot ceiling (observed 2026-08-12
+  // with a dedicated CelebForge key issued from the avatar account: 12 slots for
+  // 7, i.e. guaranteed 403 "Concurrent image generation limit reached (7)").
+  //
+  // Leave UNSET when the keys are genuinely separate accounts — setting it then
+  // collapses them into one pool and throws away the extra account's capacity.
+  SIXTYNINE_ACCOUNT_ID: z.string().optional(),
 
   // GLOBAL (cluster-wide) 69labs STATUS-poll rate budget, in requests/second and
   // burst size. The status endpoint is rate-limited SEPARATELY from generation
