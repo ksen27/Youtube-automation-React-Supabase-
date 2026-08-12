@@ -46,6 +46,15 @@ interface Draft {
   replacement: string;
 }
 
+/** "https://example.com/x" → "example.com". Falls back to the raw value. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 /**
  * Template review.
  *
@@ -329,8 +338,13 @@ export function TemplateReview({ templateId }: { templateId: string }) {
         <Button size="sm" variant="gradient" disabled={busy} onClick={save}>
           <Save className="h-4 w-4" /> Save corrections
         </Button>
+        {/* NAMES the site. This button copies the template being viewed, not
+            anything typed on the book card, and the card links here from
+            whichever design that book currently uses — so "Copy the site again"
+            re-copied a site the user had not been looking at, while they waited
+            for a copy of the one they had just pasted. */}
         <Button size="sm" variant="outline" disabled={busy} onClick={recopy}>
-          <RefreshCw className="h-4 w-4" /> Copy the site again
+          <RefreshCw className="h-4 w-4" /> Copy {hostOf(data.sourceUrl)} again
         </Button>
         <Button size="sm" variant="ghost" disabled={busy} onClick={remove}>
           <Trash2 className="h-4 w-4" /> Delete template
