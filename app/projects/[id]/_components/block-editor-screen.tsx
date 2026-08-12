@@ -325,6 +325,15 @@ export function BlockEditorScreen({
                 overlayText={it.overlay_text}
                 durationSec={it.duration}
                 type={it.type}
+                // The matcher stamps BOTH of these on a successfully generated
+                // still (image_source column + metadata.image_pick_source).
+                // Checking either keeps the badge correct for rows written
+                // before one of the two existed.
+                aiGenerated={
+                  it.image_source === "generated" ||
+                  (it.metadata as Record<string, unknown> | null | undefined)
+                    ?.image_pick_source === "ai_generated"
+                }
                 approved={it.approved}
                 selected={selectedId === it.id}
                 onSelect={() => onSelect(selectedId === it.id ? null : it.id)}

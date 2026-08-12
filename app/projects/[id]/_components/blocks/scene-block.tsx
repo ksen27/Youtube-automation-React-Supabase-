@@ -26,6 +26,14 @@ export interface SceneBlockProps {
   overlayText?: string | null;
   durationSec: number;
   type: string;
+  /**
+   * True when this block's still was AI-GENERATED (CelebForge gpt-image-2 via
+   * 69labs) rather than scraped from image search. Surfaced as an "AI" badge so
+   * the two visually indistinguishable sources can be told apart at a glance —
+   * generation silently falls back to the scraped photo on a moderation refusal
+   * or provider timeout, so a block's source is not predictable from settings.
+   */
+  aiGenerated?: boolean;
   approved?: boolean;
   selected?: boolean;
   matchScore?: number;
@@ -136,6 +144,19 @@ export function SceneBlock(p: SceneBlockProps) {
           <div className="grid h-full w-full place-items-center text-xs text-fg-subtle">
             {p.type}
           </div>
+        )}
+        {/* AI-generated marker. Top-left so it never collides with the
+            bottom-right duration chip. Only rendered when the still actually
+            came back from the generator — a block whose generation failed keeps
+            its scraped photo and stays unbadged, which is exactly the
+            distinction this badge exists to show. */}
+        {p.aiGenerated && (
+          <span
+            className="absolute top-1 left-1 rounded bg-violet-500/90 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white"
+            title="AI-generated still (gpt-image-2 via 69labs)"
+          >
+            AI
+          </span>
         )}
         <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 text-[10px] font-medium tabular-nums text-white">
           {Math.round(p.durationSec)}s
