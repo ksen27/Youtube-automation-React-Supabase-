@@ -573,8 +573,8 @@ function resolveAnnotation(
       continue;
     }
 
-    // Single-use core tokens, with four exemptions — all of them things a sales
-    // page repeats by design:
+    // Single-use core tokens, with the exemptions below — all of them things a
+    // sales page repeats by design:
     //   CHECKOUT_URL / CTA_TEXT — every buy button, or one links to the
     //     original site.
     //   PRICE / COMPARE_AT_PRICE — the price appears in the hero, again in the
@@ -584,11 +584,22 @@ function resolveAnnotation(
     //     next to a live buy button. A price the seller did not set is the one
     //     leftover that actively misleads a buyer, so every occurrence must be
     //     labellable.
+    //   BOOK_COVER / BOOK_COVER_ALT — the cover is shown in the hero, again in
+    //     a mockup or "what you get" block, again beside the buy button. Only
+    //     the first could be labelled, and a duplicate label failed the whole
+    //     annotation and was retried, so the model dropped the second node to
+    //     satisfy the rule. The unlabelled <img> then keeps the template's own
+    //     src, and rewriteHtmlAssets DELETES an img whose asset did not rehost
+    //     (rather than leave it loading from the copied site) — which is how a
+    //     published page ends up with one cover rendered and the other slot
+    //     empty. Its best case was no better: the original seller's cover.
     const repeatable =
       entry.placeholder === 'CHECKOUT_URL' ||
       entry.placeholder === 'CTA_TEXT' ||
       entry.placeholder === 'PRICE' ||
-      entry.placeholder === 'COMPARE_AT_PRICE';
+      entry.placeholder === 'COMPARE_AT_PRICE' ||
+      entry.placeholder === 'BOOK_COVER' ||
+      entry.placeholder === 'BOOK_COVER_ALT';
     const isCore = Boolean(CORE_PLACEHOLDERS[entry.placeholder]);
     if (isCore && !repeatable) {
       const already = claimed.get(entry.placeholder);
