@@ -62,6 +62,16 @@ const MAX_UNMASKED_DRIFT = 0.02;
  */
 const MIN_MASKED_CHANGE = 0.005;
 
+/**
+ * Items to request for a repeater whose container was never measured.
+ *
+ * Only used by the orphaned-field recovery below: the real count comes from the
+ * detected container, and when there isn't one the template's own markup decides
+ * how many cards exist. Twelve covers a typical chapter grid or FAQ list without
+ * asking the model for prose nobody will see.
+ */
+const DEFAULT_REPEATER_COUNT = 12;
+
 const CopyResponseSchema = z.object({
   slots: z.record(z.string()).default({}),
   repeats: z.record(z.array(z.record(z.string()))).default({}),
@@ -250,7 +260,41 @@ export class GenerateClonedLandingPageUseCase {
 
     // ── STAGE 5: copy ────────────────────────────────────────────────────────
     const copySlots = template.placeholders.filter((p) => isCopyKey(p.placeholder) && !splitRepeaterField(p.placeholder));
-    const repeaterBriefs = template.repeaters
+
+    // RECOVERY: repeater FIELDS labelled without their CONTAINER.
+    //
+    // The annotator can label CONTENTS_ITEMS.title / .body while the mechanical
+    // container detector reports no repeating region — the observed case is a
+    // card grid whose items vary enough (different bullet counts, an extra
+    // utility class) that no signature reaches the coverage threshold. The
+    // fields then exist with nothing to drive them: `template.repeaters` is
+    // empty, so the brief below is empty, so the copy call is never ASKED for
+    // those items, and every card in the grid renders blank.
+    //
+    // The field slots are themselves proof the region repeats, so the brief is
+    // reconstructed from them. `originalCount` is unknown here — the container
+    // was never measured — so it falls back to the vocabulary's own idea of a
+    // sensible run, and the binder trims or pads to whatever the markup holds.
+    const declared = new Set(template.repeaters.map((r) => r.key));
+    const orphanedFields = new Map<string, string[]>();
+    for (const p of template.placeholders) {
+      const split = splitRepeaterField(p.placeholder);
+      if (!split || declared.has(split.key)) continue;
+      if (REPEATER_PLACEHOLDERS[split.key]?.source !== 'copy') continue;
+      const fields = orphanedFields.get(split.key) ?? [];
+      if (!fields.includes(split.field)) fields.push(split.field);
+      orphanedFields.set(split.key, fields);
+    }
+    const recoveredRepeaters = [...orphanedFields.entries()].map(([key, fields]) => ({
+      key,
+      fields,
+      // No measured container, so no measured count. The template's own grid
+      // decides how many slots exist; this only has to be enough to fill it.
+      originalCount: DEFAULT_REPEATER_COUNT,
+      flexibleCount: true,
+    }));
+
+    const repeaterBriefs = [...template.repeaters, ...recoveredRepeaters]
       // System-rendered regions are excluded. The offer grid is built from the
       // product records below — with several different buy links on one page,
       // the model never decides which link sells which book — and testimonials
@@ -325,6 +369,9 @@ export class GenerateClonedLandingPageUseCase {
     const coverAccent = await this.coverAccent(book.coverImagePath);
     const theme = adaptTheme({ theme: template.theme, coverAccent });
 
+    // Stripped ONCE, then used for both the spread and the CTA fallback below.
+    const writtenSlots = stripPrices(written.value.slots);
+
     const scalars: Record<string, string> = {
       // Model-written slots, with any currency amount REMOVED.
       //
@@ -338,13 +385,18 @@ export class GenerateClonedLandingPageUseCase {
       //
       // A prompt rule alone is not enough for a defect that misstates what
       // someone will be charged, so the figure is stripped deterministically.
-      ...stripPrices(written.value.slots),
+      ...writtenSlots,
       // A buy button with no label is a broken page, not a cosmetic gap — an
       // empty scalar binds to '' and the button renders blank. The model is
       // asked for CTA_TEXT and usually supplies it, but "usually" is not a
       // guarantee worth shipping on the one element the whole page exists to
-      // get clicked. Written AFTER the spread so a real value still wins.
-      CTA_TEXT: written.value.slots['CTA_TEXT']?.trim() || 'Get the book',
+      // get clicked.
+      //
+      // Reads from the STRIPPED slots, not the raw ones. Reading the raw value
+      // here put the template's price straight back onto the button —
+      // "Get the Book — $37" — silently undoing the strip two lines above,
+      // which is exactly the defect it was added to prevent.
+      CTA_TEXT: writtenSlots['CTA_TEXT']?.trim() || 'Get the book',
       BRAND_NAME: channel?.title ?? title,
       AUTHOR_NAME: strategy?.author ?? channel?.title ?? '',
       PRICE: formatMoney(project.options.landingPriceCents, project.options.landingCurrency),
@@ -470,10 +522,17 @@ export class GenerateClonedLandingPageUseCase {
 
     findings.push({ severity: 'INFO', code: 'THEME', message: input.themeReason });
     for (const slot of input.unresolved) {
+      // A repeater field left unresolved is not one blank line — it empties
+      // EVERY card in that grid, which reads as a broken page rather than a
+      // missing sentence. Severity reflects that difference.
+      const isRepeaterField = slot.includes('.');
       findings.push({
-        severity: 'WARN',
-        code: 'SLOT_EMPTY',
-        message: `${slot} had no value, so that part of the page is blank.`,
+        severity: isRepeaterField ? 'BLOCKER' : 'WARN',
+        code: isRepeaterField ? 'REPEATER_EMPTY' : 'SLOT_EMPTY',
+        message: isRepeaterField
+          ? `${slot} had no items, so every card in that section renders empty. The copy call did not ` +
+            'return this repeater; regenerate to retry it.'
+          : `${slot} had no value, so that part of the page is blank.`,
       });
     }
 
@@ -612,6 +671,40 @@ export class GenerateClonedLandingPageUseCase {
     for (const [key, value] of Object.entries(parsed.value.slots)) {
       const budget = input.slots.find((s) => s.placeholder === key)?.maxChars;
       slots[key] = budget && value.length > budget ? `${value.slice(0, budget - 1).trimEnd()}…` : value;
+    }
+
+    // A repeater the model skipped is not a missing sentence — it is a whole
+    // grid of cards rendering with empty headings, which is what a reader sees
+    // as a broken page. The schema defaults `repeats` to {}, so an omission is
+    // silent; ask once more for exactly the keys that came back missing rather
+    // than shipping the hole.
+    const missing = input.repeaters.filter((r) => (parsed.value.repeats[r.key]?.length ?? 0) === 0);
+    if (missing.length > 0) {
+      const retryPrompt = TemplateCopyPrompt.build({
+        ...input,
+        slots: [],
+        repeaters: missing,
+      });
+      const retry = await this.ai.generate({
+        model: 'claude-sonnet-4-6',
+        system: retryPrompt.system,
+        messages: [{ role: 'user', content: retryPrompt.user }],
+        maxTokens: 16_000,
+        cacheControl: { systemPrefix: true },
+        metadata: { projectId: input.projectId, stage: 'landing-page-copy-repeats' },
+      });
+      if (retry.isOk()) {
+        const reparsed = parseJsonCompletion(retry.value.text, CopyResponseSchema);
+        if (reparsed.isOk()) {
+          for (const r of missing) {
+            const items = reparsed.value.repeats[r.key];
+            if (items && items.length > 0) parsed.value.repeats[r.key] = items;
+          }
+        }
+      }
+      // Still missing after the retry is a real defect, but a page with one
+      // empty grid still beats no page at all — bindTemplate reports the
+      // unresolved keys and the fidelity report surfaces them.
     }
 
     return Result.ok({ slots, repeats: parsed.value.repeats });
