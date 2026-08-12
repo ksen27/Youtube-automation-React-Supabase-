@@ -76,6 +76,14 @@ export const TemplateCopyPrompt = {
         "the original slot made a numeric claim and you have no equivalent fact,",
         'write the same kind of sentence without the number.',
         '',
+        'SELL ONLY WHAT IS LISTED. The products on this page are exactly the ones',
+        'named below and nothing else. Never write a bundle, package, tier, edition,',
+        'upgrade, bonus, workbook, course, community or "everything included" offer',
+        'that was not given to you — a slot you find hard to fill is not an invitation',
+        'to invent something to sell. This is not a matter of tone: every buy button',
+        'on the page charges for the products listed, so an offer you invent is one a',
+        'buyer pays for and never receives.',
+        '',
         ...(others.length > 0
           ? [
               `THIS PAGE SELLS ${others.length + 1} BOOKS. Where a slot describes what the`,
