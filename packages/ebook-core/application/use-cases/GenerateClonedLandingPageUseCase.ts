@@ -326,7 +326,19 @@ export class GenerateClonedLandingPageUseCase {
     const theme = adaptTheme({ theme: template.theme, coverAccent });
 
     const scalars: Record<string, string> = {
-      ...written.value.slots,
+      // Model-written slots, with any currency amount REMOVED.
+      //
+      // The prompt forbids prices, but the model is also shown each slot's
+      // original text and told to match its length — and a template whose button
+      // reads "Get the Book — $37" reliably produces "Get the Book — $37" back.
+      // That is the PREVIOUS seller's price sitting on a live buy button, so a
+      // buyer reads $37 and is charged whatever this seller actually set. The
+      // page's real prices come from {{PRICE}} / {{COMPARE_AT_PRICE}} below,
+      // which are rendered from the project's own settings.
+      //
+      // A prompt rule alone is not enough for a defect that misstates what
+      // someone will be charged, so the figure is stripped deterministically.
+      ...stripPrices(written.value.slots),
       // A buy button with no label is a broken page, not a cosmetic gap — an
       // empty scalar binds to '' and the button renders blank. The model is
       // asked for CTA_TEXT and usually supplies it, but "usually" is not a
@@ -762,6 +774,48 @@ function emptyFidelity(): LandingFidelity {
 }
 
 const CURRENCY_SYMBOLS: Record<string, string> = { USD: '$', EUR: '€', GBP: '£', CAD: 'CA$', AUD: 'A$' };
+
+/**
+ * Slots where a stray currency amount is DANGEROUS rather than merely untidy.
+ *
+ * A buy button is the case that matters: "Get the Book — $37" beside a checkout
+ * that charges $20 tells the buyer a price they will not be charged. These slots
+ * are short labels, so removing a trailing "— $37" leaves a clean, sensible
+ * string ("Get the Book").
+ *
+ * Prose slots are deliberately NOT in this list. Cutting "$57" out of "reduced
+ * from $57 to $37" yields "reduced from to ." — ungrammatical text is a worse
+ * defect than the one being fixed, and prose prices are already caught by the
+ * templateContract check, which reports them for a human to resolve.
+ */
+const PRICE_UNSAFE_SLOTS = new Set(['CTA_TEXT', 'PROMO_LINE', 'BADGE_TEXT']);
+
+/**
+ * Removes currency amounts from the short label slots above.
+ *
+ * The page's real prices come from {{PRICE}} / {{COMPARE_AT_PRICE}}, rendered by
+ * the system from the project's own settings. A figure in a model-written label
+ * is the PREVIOUS seller's price copied out of the template's original text.
+ *
+ * Matches a currency SYMBOL followed by digits ("$37", "£19.99", "€47") — bare
+ * numbers are left alone, because "101 secrets" and "90 days" are content.
+ */
+function stripPrices(slots: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { ...slots };
+  for (const key of PRICE_UNSAFE_SLOTS) {
+    const value = out[key];
+    if (typeof value !== 'string' || !/[$£€]\s?\d/.test(value)) continue;
+    const cleaned = value
+      .replace(/[$£€]\s?\d[\d,]*(\.\d{2})?/g, '')
+      // Tidy the join the removal left behind: "Get the Book — " → "Get the Book".
+      .replace(/\s*[—–-]\s*$/, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    // Never leave the button blank — that is a worse failure than a wrong price.
+    if (cleaned) out[key] = cleaned;
+  }
+  return out;
+}
 
 function formatMoney(cents: number | undefined, currency: string): string {
   if (cents === undefined) return '';

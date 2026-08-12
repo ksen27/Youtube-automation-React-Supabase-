@@ -573,9 +573,22 @@ function resolveAnnotation(
       continue;
     }
 
-    // Single-use core tokens. CTA_TEXT and CHECKOUT_URL are exempt: a sales
-    // page repeats its buy button and every one must be labelled.
-    const repeatable = entry.placeholder === 'CHECKOUT_URL' || entry.placeholder === 'CTA_TEXT';
+    // Single-use core tokens, with four exemptions — all of them things a sales
+    // page repeats by design:
+    //   CHECKOUT_URL / CTA_TEXT — every buy button, or one links to the
+    //     original site.
+    //   PRICE / COMPARE_AT_PRICE — the price appears in the hero, again in the
+    //     offer stack, often again in a sticky bar. Rejecting the second
+    //     occurrence left it as literal template text ("$57 $37" baked into the
+    //     markup), so a page whose checkout charges $20 still advertised $37
+    //     next to a live buy button. A price the seller did not set is the one
+    //     leftover that actively misleads a buyer, so every occurrence must be
+    //     labellable.
+    const repeatable =
+      entry.placeholder === 'CHECKOUT_URL' ||
+      entry.placeholder === 'CTA_TEXT' ||
+      entry.placeholder === 'PRICE' ||
+      entry.placeholder === 'COMPARE_AT_PRICE';
     const isCore = Boolean(CORE_PLACEHOLDERS[entry.placeholder]);
     if (isCore && !repeatable) {
       const already = claimed.get(entry.placeholder);

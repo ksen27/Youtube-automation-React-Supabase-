@@ -129,7 +129,19 @@ export class SupabaseLandingTemplateRepository implements LandingTemplateReposit
       revision: input.revision,
       state: 'EXTRACTING' satisfies LandingTemplateState,
     });
-    if (error) return Result.fail(queryError('landing_templates', 'create', error).message);
+    // 23505 = unique_violation. The row this job is creating is keyed by an id
+    // the job itself carries, so a collision means THIS job already created it
+    // and is being re-delivered — BullMQ retries this queue once, and a first
+    // attempt that dies after the insert (a transient "too many connections" on
+    // the storage write is the observed case) leaves its own row behind.
+    //
+    // Failing here turns a recoverable mid-run error into a terminal one and
+    // strands the row at EXTRACTING forever, which is what the user sees as
+    // "copy the site does nothing". Treating it as success lets the retry
+    // continue and overwrite the row it owns.
+    if (error && error.code !== '23505') {
+      return Result.fail(queryError('landing_templates', 'create', error).message);
+    }
     return Result.ok();
   }
 
