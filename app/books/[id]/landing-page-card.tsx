@@ -86,6 +86,35 @@ function parsePrice(v: string): number | null {
 const isHttpUrl = (v: string): boolean => /^https?:\/\//i.test(v.trim());
 
 /**
+ * One entry per copied SITE, not per extraction attempt.
+ *
+ * The API returns every row, and a re-copy inserts a NEW row rather than
+ * overwriting: the extract route only hands back an existing template when it
+ * is READY (landing-templates/route.ts), so every failed or abandoned attempt
+ * on a URL leaves a row behind. Until extraction succeeds those rows have no
+ * name and are labelled by their source URL, so the dropdown filled up with
+ * several identical-looking entries for the one site the user copied.
+ *
+ * Which row of a group survives, in order:
+ *   1. the one this project already has SELECTED — dropping it would blank the
+ *      select and silently look like the design had been unset;
+ *   2. the newest READY one — the only kind that can actually be picked;
+ *   3. the newest of the rest, so a site still EXTRACTING (or one that failed,
+ *      with its reason) is still visible.
+ * `templates` arrives newest-first, so "newest" is simply "first seen".
+ */
+function dedupeBySource(list: Template[], selectedId: string): Template[] {
+  const chosen = new Map<string, Template>();
+  for (const t of list) {
+    const prev = chosen.get(t.sourceUrl);
+    if (!prev) { chosen.set(t.sourceUrl, t); continue; }
+    if (prev.id === selectedId) continue;
+    if (t.id === selectedId || (prev.state !== "READY" && t.state === "READY")) chosen.set(t.sourceUrl, t);
+  }
+  return list.filter((t) => chosen.get(t.sourceUrl)?.id === t.id);
+}
+
+/**
  * The sales landing page for a finished book — a side-car, not a pipeline stage.
  * It is written by its own queue after the book completes, and a failure here
  * never marks the book FAILED (see SIDECAR_QUEUES in the worker factory).
@@ -105,9 +134,7 @@ const isHttpUrl = (v: string): boolean => /^https?:\/\//i.test(v.trim());
 export function LandingPageCard({ projectId }: { projectId: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [page, setPage] = useState<PageState | null>(null);
-  const [canPublish, setCanPublish] = useState(false);
   const [publisherConfigured, setPublisherConfigured] = useState(false);
-  const [missingCheckout, setMissingCheckout] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -165,9 +192,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       const s: Settings = data.settings;
       setSettings(s);
       setPage(data.page);
-      setCanPublish(Boolean(data.canPublish));
       setPublisherConfigured(Boolean(data.publisherConfigured));
-      setMissingCheckout(data.missingCheckoutPositions ?? []);
       setCheckoutUrl(s.checkoutUrl ?? "");
       setPrice(centsToInput(s.priceCents));
       setMode(s.mode ?? "single");
@@ -177,7 +202,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setEnabled(Boolean(s.enabled));
       setTemplateId(s.templateId ?? "");
       setTemplateUrl(s.templateUrl ?? "");
-      setTemplates(tData.templates ?? []);
+      setTemplates(dedupeBySource(tData.templates ?? [], s.templateId ?? ""));
       setSiblings(
         Array.from({ length: SIBLING_SLOTS }, (_, i) => {
           const saved = s.siblings?.[i];
@@ -448,6 +473,30 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   }
 
   if (!settings) return null;
+
+  /**
+   * Which books on this page have no buy link, as 1-based positions — computed
+   * from the FORM, not from the saved project.
+   *
+   * The server's `missingCheckoutPositions` reads the STORED values, and the
+   * form's only two persistence paths are Generate and Publish itself. Gating
+   * the Publish button on the stored list therefore deadlocks anyone who typed
+   * their checkout link and did not regenerate: the button that would save it is
+   * the button the missing value disables, and the amber warning kept naming a
+   * field that was visibly filled in. `publish()` calls saveSettings() before it
+   * PUTs, so the form is the honest signal here — and the use case still refuses
+   * outright if the value somehow never landed.
+   */
+  const missingCheckoutHere = [
+    ...(checkoutUrl.trim() ? [] : [1]),
+    ...(mode === "triple" ? siblings.flatMap((s, i) => (s.checkoutUrl.trim() ? [] : [i + 2])) : []),
+  ];
+  // Everything that must be true before a draft may go live, EXCEPT the stored
+  // checkout links (above). `isPublishable` is the post-substitution
+  // verification verdict — a cloned page whose buy buttons still point at the
+  // template owner's store must not ship.
+  const publishBlocked =
+    !publisherConfigured || missingCheckoutHere.length > 0 || !(page?.isPublishable ?? true);
 
   // A sibling must be a DIFFERENT finished book, so exclude the other slot's pick.
   const optionsFor = (i: number) =>
@@ -767,10 +816,11 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           </p>
         )}
 
-        {missingCheckout.length > 0 && (
+        {missingCheckoutHere.length > 0 && (
           <p className="text-xs text-amber-300">
-            {missingCheckout.length === 1 ? "Book" : "Books"} {missingCheckout.join(", ")} still{" "}
-            {missingCheckout.length === 1 ? "needs a" : "need"} checkout {missingCheckout.length === 1 ? "link" : "links"} before publishing.
+            {missingCheckoutHere.length === 1 ? "Book" : "Books"} {missingCheckoutHere.join(", ")} still{" "}
+            {missingCheckoutHere.length === 1 ? "needs a" : "need"} checkout{" "}
+            {missingCheckoutHere.length === 1 ? "link" : "links"} before publishing.
           </p>
         )}
 
@@ -797,7 +847,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           <Button
             size="sm"
             variant="outline"
-            disabled={busy || working || !page?.hasDraft || !canPublish}
+            disabled={busy || working || !page?.hasDraft || publishBlocked}
             onClick={publish}
           >
             Publish
