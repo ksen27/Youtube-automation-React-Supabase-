@@ -102,23 +102,28 @@ const isHttpUrl = (v: string): boolean => /^https?:\/\//i.test(v.trim());
  * name and are labelled by their source URL, so the dropdown filled up with
  * several identical-looking entries for the one site the user copied.
  *
- * Which row of a group survives, in order:
- *   1. the one this project already has SELECTED — dropping it would blank the
- *      select and silently look like the design had been unset;
- *   2. the newest READY one — the only kind that can actually be picked;
- *   3. the newest of the rest, so a site still EXTRACTING (or one that failed,
- *      with its reason) is still visible.
- * `templates` arrives newest-first, so "newest" is simply "first seen".
+ * Which row of a group survives: the newest READY one, else the newest of the
+ * rest — so a site still EXTRACTING, or one that failed with its reason, stays
+ * visible. `templates` arrives newest-first, so "newest" is simply "first seen".
+ *
+ * The SELECTED row is kept too when it is not that survivor, and this is not a
+ * nicety. Re-copying a site mints a NEW template id rather than overwriting the
+ * old one, and nothing re-points the project at it, so after a re-copy the
+ * project still names the previous capture. Preferring the selected row hid the
+ * new one completely: the seller re-copied to pick up better labelling,
+ * regenerated, and got the old labelling back with no way to see why. The
+ * superseded row is marked so the two are told apart.
  */
-function dedupeBySource(list: Template[], selectedId: string): Template[] {
+function dedupeBySource(list: Template[], selectedId: string): Array<Template & { superseded?: boolean }> {
   const chosen = new Map<string, Template>();
   for (const t of list) {
     const prev = chosen.get(t.sourceUrl);
     if (!prev) { chosen.set(t.sourceUrl, t); continue; }
-    if (prev.id === selectedId) continue;
-    if (t.id === selectedId || (prev.state !== "READY" && t.state === "READY")) chosen.set(t.sourceUrl, t);
+    if (prev.state !== "READY" && t.state === "READY") chosen.set(t.sourceUrl, t);
   }
-  return list.filter((t) => chosen.get(t.sourceUrl)?.id === t.id);
+  return list
+    .filter((t) => chosen.get(t.sourceUrl)?.id === t.id || t.id === selectedId)
+    .map((t) => (chosen.get(t.sourceUrl)?.id === t.id ? t : { ...t, superseded: true }));
 }
 
 /**
@@ -177,7 +182,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   //                 means, and it requires cloning the site first.
   //   templateUrl → the BUILT-IN renderer reads that page for its section
   //                 STRUCTURE and writes our own design from it.
-  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templates, setTemplates] = useState<Array<Template & { superseded?: boolean }>>([]);
   const [templateId, setTemplateId] = useState("");
   const [templateUrl, setTemplateUrl] = useState("");
   const [cloneUrl, setCloneUrl] = useState("");
@@ -660,10 +665,24 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                   <option key={t.id} value={t.id} disabled={t.state !== "READY"}>
                     {t.name?.trim() || t.sourceUrl}
                     {t.state !== "READY" ? ` — ${t.state.toLowerCase()}…` : ""}
+                    {/* Named, because "the same site twice" is otherwise
+                        indistinguishable and picking the wrong one regenerates
+                        against the labelling the re-copy was meant to replace. */}
+                    {t.superseded ? " — older copy" : ""}
                   </option>
                 ))}
               </select>
             </div>
+          )}
+
+          {/* The re-copy trap: a forced re-copy mints a new template and leaves
+              this project on the old one, so regenerating quietly rebuilds the
+              page from the labelling that was just replaced. */}
+          {templates.find((t) => t.id === templateId)?.superseded && (
+            <p className="text-xs text-amber-300">
+              You copied this site again since this page was built. Pick the newer
+              copy above and regenerate to use its labelling.
+            </p>
           )}
 
           {templates.find((t) => t.id === templateId)?.failureReason && (
