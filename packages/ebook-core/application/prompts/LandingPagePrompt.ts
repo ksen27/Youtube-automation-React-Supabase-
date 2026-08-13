@@ -58,6 +58,66 @@ export const LandingSlotCopyPrompt = {
         'design physically holds; going over breaks the layout it was written for.',
         'Write to the length, do not pad to it.',
         '',
+        // The client's standing note on every page so far: "the texts are way
+        // too complicated… it needs to be simple english". This prompt had no
+        // reading-level rule of any kind, and its tone line ("write for an
+        // intelligent reader") pushed the other way, which is how a page about
+        // thrift-store finds came back opening with "information asymmetry is
+        // intentional and profitable for pickers". The sibling prompt for the
+        // built-in renderer has carried a grade 5-6 rule all along; this one
+        // writes every word on a reference-driven page and never did.
+        'PLAIN ENGLISH. This is the rule the page lives or dies by.',
+        '  · Grade 5-6 reading level. If a 12-year-old would stumble on a word, it is',
+        '    the wrong word.',
+        '  · Short sentences. One idea each. Fragments are fine. Like this.',
+        '  · Everyday words only: "hidden" not "latent", "the seller knows more than',
+        '    you" not "information asymmetry", "how to tell" not "authentication',
+        '    methodology", "what it is worth" not "valuation criteria".',
+        '  · No abstract nouns where a plain verb works. Say what someone DOES.',
+        '  · Talk to one person as "you", the way a knowledgeable friend would.',
+        '  · Never use two words where one does, and never a long word where a short',
+        '    one carries the same meaning.',
+        '',
+        // The client's sales-copy playbook, mapped onto slots. His structure is
+        // written for a page you compose from scratch; here the SECTIONS come
+        // from the reference site, so what carries over is the JOB each kind of
+        // slot does and the moves that make it convert. Three of his items are
+        // deliberately adapted, not dropped — see the hard rules below: no
+        // invented "join thousands of readers", no ROI figures the book does not
+        // support, and no price written into copy (the system renders every
+        // price from the seller's own settings).
+        'HOW TO FILL EACH KIND OF SLOT.',
+        '  · A HEADLINE promises one specific, numbered result — "101 things that…",',
+        '    not "the ultimate guide". Say what the reader ends up able to DO.',
+        '  · An EYEBROW or kicker frames the knowledge as hidden, overlooked or',
+        '    handed down, rather than describing the product.',
+        '  · An OPENING or intro slot challenges an assumption the reader holds',
+        '    ("expensive means better", "more effort means better results") and',
+        '    suggests the answer was in plain sight all along.',
+        '  · A STORY or about slot says where the knowledge came from — a tradition,',
+        '    a trade, years of doing the thing — and stresses that it is practical',
+        '    and cheap rather than insider or complicated. If it is being forgotten,',
+        '    say so; that is the reason to act now.',
+        '  · BENEFIT slots each carry a DIFFERENT kind of win — money, time, results,',
+        '    waste, confidence, doing it right first time. Frame each as a change in',
+        '    the reader, never as a chapter title.',
+        '  · A POSITIONING slot says what this is NOT ("not a textbook", "not a',
+        '    course") and then what it IS in one plain image — a notebook, a cheat',
+        '    sheet, a field guide.',
+        '  · A WHO-IT-IS-FOR slot lists real reader situations, one per line, each a',
+        '    different motive.',
+        '  · A VALUE slot does small, believable arithmetic the reader can check, and',
+        '    only with numbers the book itself supports.',
+        '  · A DELIVERY slot states format, how fast access is, and that it is theirs',
+        '    for good.',
+        '  · A CTA says what happens next in the imperative — "get instant access",',
+        '    "start today". Never a price.',
+        '',
+        'MOVES THAT WORK: contrast pairs ("not X — Y"), specific numbers over vague',
+        'ones, the pain named before the fix, one idea per line so the page can be',
+        'skimmed. Avoid hype words — amazing, incredible, revolutionary, game-changing.',
+        'Grounded and specific outsells excited.',
+        '',
         'HARD RULES.',
         '1. NEVER invent testimonials, reviews, ratings, sales figures, subscriber',
         '   counts, awards or endorsements. Fabricated social proof is not a stylistic',
@@ -76,7 +136,11 @@ export const LandingSlotCopyPrompt = {
         '5. Figures may appear only if the book supports them, and the slot whose',
         '   purpose mentions a source must say where they come from.',
         '',
-        `Tone: ${input.tone}. Write for an intelligent reader; concrete beats clever.`,
+        // NOT "write for an intelligent reader" any more. Respecting the reader
+        // means being easy to read, not sounding educated at them — and that
+        // line was read as licence for exactly the vocabulary the plain-English
+        // rule above now forbids.
+        `Tone: ${input.tone}. Concrete beats clever, and plain beats concrete.`,
       ].join('\n'),
       user: [
         `=== BOOK ===\nTitle: ${input.bookTitle}`,
@@ -150,7 +214,19 @@ export const LandingPagePrompt = {
         'D. EVERY CLAIM GETS A "BECAUSE". Attach the reason or mechanism to each promise ' +
         '("...because the airline is required to, but only if you ask in this exact order").\n' +
         'E. GRADE 5-6 READING LEVEL. Short sentences. Short paragraphs, one to three lines. ' +
-        'No jargon. Sentence fragments are allowed. Like this.\n\n' +
+        'No jargon. Sentence fragments are allowed. Like this.\n' +
+        // The rule as written was being satisfied on sentence LENGTH while the
+        // vocabulary stayed academic — "information asymmetry", "authentication
+        // methodology", "evaluation criteria" — which is what the client keeps
+        // sending back. Naming the swap is what makes it land.
+        '   Everyday words, not educated ones: "the seller knows more than you", never ' +
+        '"information asymmetry"; "how to tell if it is real", never "authentication ' +
+        'methodology"; "what it is worth", never "valuation criteria". If a 12-year-old ' +
+        'would stumble on a word, it is the wrong word. Say what someone DOES instead of ' +
+        'naming an abstraction, and never use a long word where a short one carries the ' +
+        'same meaning.\n' +
+        'F. NO HYPE WORDS. Amazing, incredible, revolutionary, game-changing, ultimate. ' +
+        'Grounded and specific outsells excited.\n\n' +
         'VOICE CALIBRATION. Before writing, silently ask how a trusted insider IN THIS NICHE ' +
         'actually talks, and match their vocabulary, humour and formality. A page for readers ' +
         'over 60 is warm, respectful and plain — never hypey, never condescending. A page for ' +

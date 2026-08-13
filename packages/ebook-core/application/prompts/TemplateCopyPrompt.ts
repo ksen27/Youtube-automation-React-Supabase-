@@ -66,6 +66,18 @@ export const TemplateCopyPrompt = {
         'reproduced exactly; padding to reach it wastes a reader\'s attention. The',
         "original text's length is given for each slot — write to roughly that.",
         '',
+        // Same rule as LandingSlotCopyPrompt, and for the same client note:
+        // "the texts are way too complicated… it needs to be simple english".
+        // Length was the only writing constraint here, and matching a
+        // sophisticated template's register made the copy harder to read, not
+        // better.
+        'PLAIN ENGLISH. Grade 5-6 reading level. Short sentences, one idea each.',
+        'Everyday words only — "the seller knows more than you", never "information',
+        'asymmetry"; "how to tell", never "authentication methodology". Say what',
+        'someone DOES rather than naming an abstraction, and talk to one person as',
+        '"you". Matching the original\'s LENGTH never means matching its vocabulary:',
+        'if the template says it in long words, say it in short ones.',
+        '',
         'MATCH THE ORIGINAL\'S JOB, NOT ITS WORDS. Each slot shows what the template',
         'said for a different product. Use it to understand what belongs there — the',
         'angle, the register, the specificity — then write the equivalent for THIS',
