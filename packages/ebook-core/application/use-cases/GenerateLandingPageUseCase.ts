@@ -62,7 +62,12 @@ const EXPORTS_BUCKET = 'ebook-exports';
  * failing as a Postgres 57014 on one attempt and a Cloudflare 502 on the next.
  * At these widths the same page is a few hundred KB.
  */
-const INLINE_WIDTHS = { cover: 720, authorPhoto: 400, logo: 240 } as const;
+// The portrait sits above the 2×-CSS rule the others follow: layouts frame it
+// in a circle or square with `object-fit: cover`, which keeps the middle and
+// discards the sides, so at 400px the visible face was roughly 200px and looked
+// soft wherever the frame was large. One image per page, so the row stays well
+// inside the limits that motivated these widths.
+const INLINE_WIDTHS = { cover: 720, authorPhoto: 900, logo: 240 } as const;
 
 /** Re-encode quality for inlined images. 72 is visually clean for WebP. */
 const INLINE_QUALITY = 72;

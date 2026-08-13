@@ -77,8 +77,17 @@ const CopyResponseSchema = z.object({
   repeats: z.record(z.array(z.record(z.string()))).default({}),
 });
 
-/** Displayed image widths, in device pixels — roughly 2× their CSS width. */
-const IMAGE_WIDTHS = { cover: 720, authorPhoto: 400, logo: 240 } as const;
+/**
+ * Displayed image widths, in device pixels — roughly 2× their CSS width.
+ *
+ * The PORTRAIT is sized well above that rule on purpose. Templates frame the
+ * author in a circle or a square with `object-fit: cover`, which keeps the
+ * middle and throws the sides away — so a 400px upload showed a face barely
+ * 200px across, which the browser then stretched back up. Downscaling is
+ * `withoutEnlargement`, so nothing here upsamples a small original: this is a
+ * ceiling, and a seller who uploads a proper portrait gets a sharp one.
+ */
+const IMAGE_WIDTHS = { cover: 720, authorPhoto: 900, logo: 240 } as const;
 const IMAGE_QUALITY = 72;
 
 /** One product on the page: a book, or the all-books bundle. */
