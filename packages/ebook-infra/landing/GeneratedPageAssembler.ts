@@ -179,6 +179,12 @@ const COMPONENT_CSS = `
   /* Three columns, matching the reference template. One long stacked list of
      fourteen chapters read as a table of contents and pushed the CTA down the
      page (client feedback 2026-08-06). */
+  /* HELD TO A READABLE COLUMN. A layout that puts the grid in a full-bleed
+     section stretched it across the whole viewport — on a wide monitor that is
+     three cards of ~600px each, with four-word bullets adrift in them, and the
+     section reads as enormous however few chapters it holds. The measure is
+     what made it feel like a wall; the count never was. */
+  .contents, .contents-list { max-width: 1080px; margin-inline: auto; }
   .contents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
   @media (max-width: 900px) { .contents { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 620px) { .contents { grid-template-columns: 1fr; } }
@@ -446,16 +452,16 @@ function coverMarkup(p: LandingProduct | undefined): string {
 const MAX_POINTS_PER_CARD = 4;
 
 /**
- * How many chapter cards the contents section shows before it stops.
+ * The contents section lists EVERY chapter.
  *
- * Nine fills three tidy rows of the three-column grid. Uncapped, a 101-category
- * guide rendered twenty-odd cards — a wall that ran for two screens, pushed the
- * offer far below it, and turned the most persuasive section on the page into
- * an index. The remainder is COUNTED rather than dropped: "+12 more chapters"
- * sells the book's depth in one line, where printing all of them sold nothing
- * and gave the outline away.
+ * It was capped at nine while the grid ran the full width of the screen, which
+ * made the section feel enormous for the wrong reason: the problem was the
+ * measure, not the count. With the grid held to a readable column (see
+ * `.contents` below) the whole list reads as a table of contents rather than a
+ * wall, and the seller's judgement is that a buyer should see everything the
+ * book covers. The per-card points are still capped — those are the book's
+ * substance, and printing all of them gives the product away.
  */
-const MAX_CONTENTS_CARDS = 9;
 
 /**
  * The contents section: what each chapter is called and what is in it.
@@ -475,15 +481,9 @@ const MAX_CONTENTS_CARDS = 9;
  * concrete claims, few enough that the chapter still has to be bought.
  */
 function contentsMarkup(p: LandingProduct | undefined): string {
-  const all = p?.sections ?? [];
-  if (all.length === 0) return '';
-  const sections = all.slice(0, MAX_CONTENTS_CARDS);
-  const hidden = all.length - sections.length;
-  const more =
-    hidden > 0
-      ? `<p class="contents-rest">+${hidden} more ${hidden === 1 ? 'chapter' : 'chapters'} inside the book</p>`
-      : '';
-  return `${`<div class="contents stagger">${sections
+  const sections = p?.sections ?? [];
+  if (sections.length === 0) return '';
+  return `<div class="contents stagger">${sections
     .map((s, i) => {
       const shown = s.items.slice(0, MAX_POINTS_PER_CARD);
       const rest = s.items.length - shown.length;
@@ -498,28 +498,23 @@ function contentsMarkup(p: LandingProduct | undefined): string {
         '</div>'
       );
     })
-    .join('')}</div>`}${more}`;
+    .join('')}</div>`;
 }
 
 /**
  * The chapters as a plain list — one line each, numbered, no cards.
  *
  * For references whose "what you get" is a short stack rather than a grid of
- * cards. Same cap and the same counted remainder as the grid: the difference is
- * presentation, not how much of the book is given away.
+ * cards. Every chapter, like the grid: the difference between the two is
+ * presentation, never how much of the book is shown.
  */
 function contentsListMarkup(p: LandingProduct | undefined): string {
-  const all = p?.sections ?? [];
-  if (all.length === 0) return '';
-  const shown = all.slice(0, MAX_CONTENTS_CARDS);
-  const hidden = all.length - shown.length;
+  const sections = p?.sections ?? [];
+  if (sections.length === 0) return '';
   return (
-    `<ul class="contents-list stagger">${shown
+    `<ul class="contents-list stagger">${sections
       .map((s, i) => `<li><span class="contents-list-num">${String(i + 1).padStart(2, '0')}</span>${esc(s.title)}</li>`)
-      .join('')}</ul>` +
-    (hidden > 0
-      ? `<p class="contents-rest">+${hidden} more ${hidden === 1 ? 'chapter' : 'chapters'} inside the book</p>`
-      : '')
+      .join('')}</ul>`
   );
 }
 

@@ -203,17 +203,18 @@ describe('GeneratedPageAssembler — per-book elements', () => {
       expect(html).toContain('+2 more');
     });
 
-    // A 101-category guide rendered twenty-odd cards: two screens of index
-    // above the offer. The grid stops at nine and counts the rest.
-    it('caps the number of chapter cards and counts the remainder', () => {
+    // The section felt enormous because the grid ran the full width of the
+    // screen; the count was never the problem, and a buyer should see the whole
+    // list of what the book covers. The measure is held in CSS instead.
+    it('lists every chapter, however many there are', () => {
       const html = assemble('<section>{{CONTENTS}}</section>', [
         product({
           sections: Array.from({ length: 14 }, (_, i) => ({ title: `Chapter Title ${i + 1}`, items: [] })),
         }),
       ]);
       expect(html).toContain('Chapter Title 9');
-      expect(html).not.toContain('Chapter Title 10');
-      expect(html).toContain('+5 more chapters inside the book');
+      expect(html).toContain('Chapter Title 14');
+      expect(html).not.toContain('more chapters inside the book');
     });
   });
 
