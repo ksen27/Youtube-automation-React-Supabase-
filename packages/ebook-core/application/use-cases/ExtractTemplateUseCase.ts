@@ -327,33 +327,15 @@ export class ExtractTemplateUseCase {
     const repeaters = annotated.value.repeaters;
     findings.push(...annotated.value.findings);
 
-    // COVERAGE. Everything the annotator did not label keeps the ORIGINAL
-    // seller's words — their chapter names, their examples, their bonuses — on
-    // the new seller's page. A sparse map is therefore not a small quality
-    // issue, it is the difference between a cloned page and the original page
-    // with the price changed, and it is invisible until someone reads the
-    // finished page and recognises the wrong product.
-    //
-    // Measured against the TEXT nodes in the inventory (images and links carry
-    // no prose to leak). The threshold is deliberately generous: navigation,
-    // furniture headings and legal links are legitimately unlabelled, so this
-    // fires only when most of the page's prose was left behind.
-    const textNodes = page.inventory.filter((n) => typeof n.text === 'string' && n.text.trim().length > 1);
-    if (textNodes.length >= 40) {
-      const labelledIds = new Set(placeholders.map((p) => p.tplId));
-      const covered = textNodes.filter((n) => labelledIds.has(n.tplId)).length;
-      const ratio = covered / textNodes.length;
-      if (ratio < 0.35) {
-        findings.push({
-          severity: 'WARN',
-          code: 'SPARSE_LABELLING',
-          message:
-            `Only ${covered} of ${textNodes.length} text regions were labelled (${Math.round(ratio * 100)}%). ` +
-            "The rest keep the reference site's own wording, so a page built from this template will read " +
-            'as the original product. Review the template and relabel, or copy a simpler reference page.',
-        });
-      }
-    }
+    // NO COVERAGE RATIO. A warning stood here demanding 35% of text nodes be
+    // labelled, and it was the companion of the maximalist annotation rule that
+    // has now been narrowed back to the sibling project's conservative one (see
+    // TemplateAnnotationPrompt rule 3). Under a prompt that deliberately leaves
+    // uncertain nodes alone, that ratio fires on healthy templates, and a
+    // warning that cries wolf on the normal case teaches the seller to skip the
+    // whole report. What the unlabelled remainder actually costs — the original
+    // wording surviving in places — is visible on the template review screen,
+    // node by node, which is also where it can be corrected.
 
     // ── STAGE 4: parameterise ────────────────────────────────────────────────
     const parameterised = await this.capturer.parameterise({
