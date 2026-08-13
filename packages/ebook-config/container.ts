@@ -202,7 +202,7 @@ export function buildContainer(env: Env = loadEnv()) {
     startBookPolish: new StartBookPolishUseCase(projects, books, queue),
     polishChapter: new PolishChapterUseCase(books, knowledge, ai, clock),
     generateFrontBackMatter: new GenerateFrontBackMatterUseCase(books, ai, ids),
-    generateCoverImage: new GenerateCoverImageUseCase(books, knowledge, images, storage),
+    generateCoverImage: new GenerateCoverImageUseCase(books, knowledge, images, storage, imageProcessor, logger.child({ useCase: 'cover-image' })),
     generateIllustrations: new GenerateIllustrationsUseCase(books, projects, illustrationImages, imageProcessor, storage, ids, logger.child({ useCase: 'illustrations' })),
     assembleEbook: new AssembleEbookUseCase(books, knowledge, clock, storage, projects),
     exportEbook: new ExportEbookUseCase(exporters, storage, artifacts),
