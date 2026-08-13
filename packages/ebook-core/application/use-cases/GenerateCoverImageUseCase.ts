@@ -3,9 +3,25 @@ import { ProjectId } from '../../domain/project/ProjectId';
 import type { BookRepository } from '../ports/repositories/BookRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
 import type { ImageGenerator } from '../ports/services/ImageGenerator';
+import type { ImageProcessor } from '../ports/services/ImageProcessor';
 import type { ObjectStorage } from '../ports/services/ObjectStorage';
+import type { Logger } from '../ports/Logger';
 import { CoverImagePrompt } from '../prompts/CoverImagePrompt';
 import { EXPORT_BUCKET } from './ExportEbookUseCase';
+
+/**
+ * The cover is inlined as base64 into the exported PDF, so its stored size is
+ * paid twice over in the artifact. gpt-image-1 returns a ~4MB PNG; re-encoded as
+ * JPEG it is a few hundred KB with no visible difference at the size a cover
+ * renders — and the export artifact has a hard size ceiling in storage.
+ *
+ * Width matches the source (the model returns 1024x1536), so this is a re-encode
+ * rather than a downscale — `withoutEnlargement` means nothing is upscaled.
+ * Quality is a notch above the illustrations': the cover is the one image that
+ * fills a whole page.
+ */
+const COVER_MAX_WIDTH = 1024;
+const COVER_JPEG_QUALITY = 85;
 
 /**
  * Generates one cover illustration per book and stores it in the exports bucket.
@@ -25,6 +41,8 @@ export class GenerateCoverImageUseCase {
     private readonly knowledge: KnowledgeRepository,
     private readonly images: ImageGenerator,
     private readonly storage: ObjectStorage,
+    private readonly imageProcessor: ImageProcessor,
+    private readonly logger: Logger,
   ) {}
 
   async execute(cmd: { projectId: string }): Promise<Result<{ generated: boolean }>> {
@@ -59,8 +77,27 @@ export class GenerateCoverImageUseCase {
     const image = await this.images.generate({ prompt, size: '1024x1536' });
     if (image.isFail()) return Result.fail(image.error);
 
-    const path = `${projectId.value}/cover.png`;
-    const put = await this.storage.put(EXPORT_BUCKET, path, image.value.bytes, image.value.contentType);
+    // Re-encode before storing, exactly as illustrations are. If that fails we
+    // still store the original — a book with a heavy cover beats a book with no
+    // cover — but SAY SO, because the silent version of this fallback is what
+    // makes an oversized export impossible to explain later.
+    const shrunk = await this.imageProcessor.downscaleToJpeg({
+      bytes: image.value.bytes,
+      maxWidth: COVER_MAX_WIDTH,
+      quality: COVER_JPEG_QUALITY,
+    });
+    if (shrunk.isFail()) {
+      this.logger.warn('🖼️  cover re-encode failed — storing the original PNG', {
+        projectId: projectId.value,
+        bytes: image.value.bytes.byteLength,
+        error: shrunk.error,
+      });
+    }
+    const bytes = shrunk.isOk() ? shrunk.value.bytes : image.value.bytes;
+    const contentType = shrunk.isOk() ? shrunk.value.contentType : image.value.contentType;
+
+    const path = `${projectId.value}/cover.${contentType === 'image/jpeg' ? 'jpg' : 'png'}`;
+    const put = await this.storage.put(EXPORT_BUCKET, path, bytes, contentType);
     if (put.isFail()) return Result.fail(put.error);
 
     book.setCoverImagePath(path);

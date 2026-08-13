@@ -1157,7 +1157,12 @@ export class GenerateLandingPageUseCase {
    * else's book — cover, title and all — on their own sales page.
    */
   private async loadSiblingProduct(
-    sibling: { projectId: string; priceCents?: number | undefined; checkoutUrl?: string | undefined },
+    sibling: {
+      projectId: string;
+      priceCents?: number | undefined;
+      compareAtCents?: number | undefined;
+      checkoutUrl?: string | undefined;
+    },
     ownerId: string,
   ): Promise<Result<LandingProduct>> {
     const siblingId = ProjectId.from(sibling.projectId);
@@ -1199,7 +1204,9 @@ export class GenerateLandingPageUseCase {
       // Price and link come from THIS sibling's own entry, never from the
       // project it points at — the seller sets them per page.
       priceCents: sibling.priceCents ?? null,
-      compareAtCents: null,
+      // Its own "was" price, so a set can be discounted card by card rather
+      // than only on the book whose page this is.
+      compareAtCents: sibling.compareAtCents ?? null,
       checkoutUrl: sibling.checkoutUrl ?? null,
       kind: 'book',
     });

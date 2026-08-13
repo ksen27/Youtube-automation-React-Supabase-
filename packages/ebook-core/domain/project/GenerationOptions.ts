@@ -155,7 +155,13 @@ interface GenerationOptionsProps {
    * link — every card on the page buys a different product, so the links live
    * with the books they sell.
    */
-  landingSiblings: Array<{ projectId: string; priceCents?: number | undefined; checkoutUrl?: string | undefined }>;
+  landingSiblings: Array<{
+    projectId: string;
+    priceCents?: number | undefined;
+    /** This book's own "was" price, so every card can carry its own discount. */
+    compareAtCents?: number | undefined;
+    checkoutUrl?: string | undefined;
+  }>;
   /** The all-books bundle: its own store product, price and link. */
   landingBundlePriceCents?: number | undefined;
   landingBundleCheckoutUrl?: string | undefined;
@@ -227,6 +233,9 @@ export class GenerationOptions extends ValueObject<GenerationOptionsProps> {
           projectId: sib.projectId,
           ...(typeof sib.priceCents === 'number' && Number.isFinite(sib.priceCents)
             ? { priceCents: Math.max(0, Math.round(sib.priceCents)) }
+            : {}),
+          ...(typeof sib.compareAtCents === 'number' && Number.isFinite(sib.compareAtCents)
+            ? { compareAtCents: Math.max(0, Math.round(sib.compareAtCents)) }
             : {}),
           ...(sib.checkoutUrl?.trim() ? { checkoutUrl: sib.checkoutUrl.trim() } : {}),
         })),

@@ -48,6 +48,7 @@ export const GET = handle(async (_req: Request, { params }: { params: Promise<{ 
       siblings: project.options.landingSiblings.map((s) => ({
         projectId: s.projectId,
         priceCents: s.priceCents ?? null,
+        compareAtCents: s.compareAtCents ?? null,
         checkoutUrl: s.checkoutUrl ?? '',
       })),
       bundlePriceCents: project.options.landingBundlePriceCents ?? null,

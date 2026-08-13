@@ -24,6 +24,7 @@ const STALE_RUN_MS = 10 * 60_000;
 interface SiblingSetting {
   projectId: string;
   priceCents: number | null;
+  compareAtCents: number | null;
   checkoutUrl: string;
 }
 
@@ -77,10 +78,12 @@ interface Template {
 interface SiblingDraft {
   projectId: string;
   price: string;
+  /** The struck-through "was" price for this book's card. Blank = no discount. */
+  compareAt: string;
   checkoutUrl: string;
 }
 
-const EMPTY_SIBLING: SiblingDraft = { projectId: "", price: "", checkoutUrl: "" };
+const EMPTY_SIBLING: SiblingDraft = { projectId: "", price: "", compareAt: "", checkoutUrl: "" };
 
 const centsToInput = (c: number | null): string => (typeof c === "number" ? (c / 100).toFixed(2) : "");
 
@@ -157,6 +160,13 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   // This book's own fields.
   const [checkoutUrl, setCheckoutUrl] = useState("");
   const [price, setPrice] = useState("");
+  /**
+   * The "was" price. Rendered struck through beside the real one, with a
+   * "Save $X" badge — the placeholders and both renderers have always supported
+   * it; the form simply never offered a way to set it, so no page ever showed a
+   * discount.
+   */
+  const [compareAt, setCompareAt] = useState("");
 
   // Triple-mode fields.
   const [mode, setMode] = useState<LandingMode>("single");
@@ -221,6 +231,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setPublisherConfigured(Boolean(data.publisherConfigured));
       setCheckoutUrl(s.checkoutUrl ?? "");
       setPrice(centsToInput(s.priceCents));
+      setCompareAt(centsToInput(s.compareAtCents));
       setMode(s.mode ?? "single");
       setBundlePrice(centsToInput(s.bundlePriceCents));
       setBundleUrl(s.bundleCheckoutUrl ?? "");
@@ -237,7 +248,12 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         Array.from({ length: SIBLING_SLOTS }, (_, i) => {
           const saved = s.siblings?.[i];
           return saved
-            ? { projectId: saved.projectId, price: centsToInput(saved.priceCents), checkoutUrl: saved.checkoutUrl ?? "" }
+            ? {
+                projectId: saved.projectId,
+                price: centsToInput(saved.priceCents),
+                compareAt: centsToInput(saved.compareAtCents),
+                checkoutUrl: saved.checkoutUrl ?? "",
+              }
             : EMPTY_SIBLING;
         }),
       );
@@ -420,6 +436,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       }
 
       const ownCents = parsePrice(price);
+      const ownCompareCents = parsePrice(compareAt);
       const bundleCents = parsePrice(bundlePrice);
       const res = await fetch(`/api/books/projects/${projectId}/landing-page`, {
         method: "PATCH",
@@ -431,16 +448,23 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           // checkout link and price were never saved at all.
           landingCheckoutUrl: checkoutUrl.trim(),
           ...(ownCents !== null ? { landingPriceCents: ownCents } : {}),
+          // Sent as 0 when cleared, not omitted: an omitted key leaves the
+          // stored value alone, so a seller who deleted the "was" price would
+          // still be advertising a discount that no longer exists. 0 renders
+          // nothing, which is what clearing it means.
+          landingCompareAtCents: ownCompareCents ?? 0,
           landingPage: override.enabled ?? enabled,
           landingTemplateId: override.templateId ?? templateId,
           landingTemplateUrl: templateUrl.trim(),
           landingMode: mode,
           landingSiblings: chosen.map((s) => {
             const cents = parsePrice(s.price);
+            const compareCents = parsePrice(s.compareAt);
             return {
               projectId: s.projectId,
               checkoutUrl: s.checkoutUrl.trim(),
               ...(cents !== null ? { priceCents: cents } : {}),
+              ...(compareCents !== null ? { compareAtCents: compareCents } : {}),
             };
           }),
           ...(mode === "triple" && bundleCents !== null ? { landingBundlePriceCents: bundleCents } : {}),
@@ -871,6 +895,25 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
               />
             </div>
           </div>
+          {/* The discount. Every price on the page renders as "37" beside a
+              struck-through "57" with a "Save $20" badge — the renderers have
+              always done this, and this field is the part that was missing. */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="compareAt">Was ({settings.currency})</Label>
+              <Input
+                id="compareAt"
+                value={compareAt}
+                onChange={(e) => setCompareAt(e.target.value)}
+                placeholder="57.00"
+                inputMode="decimal"
+              />
+              <p className="text-xs text-fg-subtle">
+                Optional. Shown struck through beside the price, with the saving.
+                Leave blank to show one price.
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* ── author portrait ────────────────────────────────────────────── */}
@@ -958,6 +1001,19 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                       value={sib.price}
                       onChange={(e) => updateSibling(i, { price: e.target.value })}
                       placeholder="19.00"
+                      inputMode="decimal"
+                    />
+                  </div>
+                  {/* Per book, not per page: on a three-book page each card
+                      carries its own discount, so one book can be on offer
+                      while another is not. */}
+                  <div className="space-y-1.5">
+                    <Label htmlFor={`sib-was-${i}`}>Was ({settings.currency})</Label>
+                    <Input
+                      id={`sib-was-${i}`}
+                      value={sib.compareAt}
+                      onChange={(e) => updateSibling(i, { compareAt: e.target.value })}
+                      placeholder="57.00"
                       inputMode="decimal"
                     />
                   </div>

@@ -25,6 +25,8 @@ const LandingOptionFields = {
       z.object({
         projectId: z.string().uuid(),
         priceCents: z.number().int().min(0).max(10_000_00).optional(),
+        /** The struck-through "was" price for THIS book's card. */
+        compareAtCents: z.number().int().min(0).max(10_000_00).optional(),
         checkoutUrl: z.string().url().max(2000).optional().or(z.literal('')),
       }),
     )

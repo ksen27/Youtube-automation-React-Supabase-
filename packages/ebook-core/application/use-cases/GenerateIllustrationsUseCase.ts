@@ -58,6 +58,33 @@ export class GenerateIllustrationsUseCase {
     private readonly logger: Logger,
   ) {}
 
+  /**
+   * Downscale + re-encode to JPEG before storing, so the inlined PDF stays small
+   * (gpt-image-1 PNGs are ~3MB each, and a book carries dozens).
+   *
+   * Best-effort: if processing fails we store the original bytes rather than
+   * drop the image — but we LOG it. This fallback used to be silent, and its
+   * only downstream symptom is an export artifact too large for storage, which
+   * gives no hint that a resize failed dozens of steps earlier.
+   */
+  private async encodeForStorage(
+    image: { bytes: Uint8Array; contentType: string },
+    ctx: { projectId: string; subject: string; order?: number },
+  ): Promise<{ bytes: Uint8Array; contentType: string }> {
+    const shrunk = await this.imageProcessor.downscaleToJpeg({
+      bytes: image.bytes,
+      maxWidth: GenerateIllustrationsUseCase.MAX_IMAGE_WIDTH,
+      quality: GenerateIllustrationsUseCase.JPEG_QUALITY,
+    });
+    if (shrunk.isOk()) return { bytes: shrunk.value.bytes, contentType: shrunk.value.contentType };
+    this.logger.warn('🖼️  image re-encode failed — storing the original at full size', {
+      ...ctx,
+      bytes: image.bytes.byteLength,
+      error: shrunk.error,
+    });
+    return { bytes: image.bytes, contentType: image.contentType };
+  }
+
   async execute(cmd: { projectId: string }): Promise<Result<{ generated: number; attempted: number; error?: string }>> {
     const projectId = ProjectId.from(cmd.projectId);
 
@@ -171,16 +198,11 @@ export class GenerateIllustrationsUseCase {
           return { error: `generate: ${image.error}` };
         }
 
-        // Downscale + re-encode to JPEG before storing so the inlined PDF stays
-        // small (gpt-image-1 PNGs are ~3MB). Best-effort: if processing fails we
-        // store the original bytes rather than dropping the illustration.
-        const shrunk = await this.imageProcessor.downscaleToJpeg({
-          bytes: image.value.bytes,
-          maxWidth: GenerateIllustrationsUseCase.MAX_IMAGE_WIDTH,
-          quality: GenerateIllustrationsUseCase.JPEG_QUALITY,
+        const { bytes, contentType } = await this.encodeForStorage(image.value, {
+          projectId: projectId.value,
+          subject: slot.chapterTitle,
+          order: slot.order,
         });
-        const bytes = shrunk.isOk() ? shrunk.value.bytes : image.value.bytes;
-        const contentType = shrunk.isOk() ? shrunk.value.contentType : image.value.contentType;
         const ext = contentType === 'image/jpeg' ? 'jpg' : 'png';
 
         const path = `${projectId.value}/illustrations/${slot.chapterId}-${slot.order}.${ext}`;
@@ -278,13 +300,10 @@ export class GenerateIllustrationsUseCase {
           });
           return { error: `generate: ${image.error}` };
         }
-        const shrunk = await this.imageProcessor.downscaleToJpeg({
-          bytes: image.value.bytes,
-          maxWidth: GenerateIllustrationsUseCase.MAX_IMAGE_WIDTH,
-          quality: GenerateIllustrationsUseCase.JPEG_QUALITY,
+        const { bytes, contentType } = await this.encodeForStorage(image.value, {
+          projectId: projectId.value,
+          subject: slot.recipe.title,
         });
-        const bytes = shrunk.isOk() ? shrunk.value.bytes : image.value.bytes;
-        const contentType = shrunk.isOk() ? shrunk.value.contentType : image.value.contentType;
         const ext = contentType === 'image/jpeg' ? 'jpg' : 'png';
         const path = `${projectId.value}/illustrations/${slot.chapterId}-0.${ext}`;
         const put = await this.storage.put(EXPORT_BUCKET, path, bytes, contentType);

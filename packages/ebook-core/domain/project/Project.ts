@@ -135,7 +135,12 @@ export class Project extends AggregateRoot<ProjectProps, ProjectId> {
       landingTemplateId?: string | undefined;
       landingMode?: 'single' | 'triple' | undefined;
       landingSiblings?:
-        | Array<{ projectId: string; priceCents?: number | undefined; checkoutUrl?: string | undefined }>
+        | Array<{
+            projectId: string;
+            priceCents?: number | undefined;
+            compareAtCents?: number | undefined;
+            checkoutUrl?: string | undefined;
+          }>
         | undefined;
       landingBundlePriceCents?: number | undefined;
       landingBundleCheckoutUrl?: string | undefined;

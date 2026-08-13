@@ -1,4 +1,5 @@
 import { Result } from '../../domain/shared/Result';
+import { NonRetryableError } from '../errors';
 import { ExportArtifact, ExportFormat } from '../../domain/export/ExportArtifact';
 import type { DocumentExporter, AssembledDocument } from '../ports/services/DocumentExporter';
 import type { ObjectStorage } from '../ports/services/ObjectStorage';
@@ -6,6 +7,13 @@ import type { ExportArtifactRepository } from '../ports/repositories/ExportArtif
 
 /** Storage bucket holding rendered ebook artifacts (private; served via signed URLs). */
 export const EXPORT_BUCKET = 'ebook-exports';
+
+/** Supabase Storage's wording when an upload is over the bucket's size limit. */
+const OVERSIZED = /exceeded the maximum allowed size|payload too large|entity too large/i;
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
 
 /** Renders the assembled document to the requested formats and stores artifacts. */
 export class ExportEbookUseCase {
@@ -32,7 +40,20 @@ export class ExportEbookUseCase {
       const ext = format === ExportFormat.PDF ? 'pdf' : 'docx';
       const path = `${input.projectId}/v${input.bookVersion}/ebook.${ext}`;
       const put = await this.storage.put(EXPORT_BUCKET, path, rendered.value.bytes, rendered.value.contentType);
-      if (put.isFail()) return Result.fail(put.error);
+      if (put.isFail()) {
+        // Storage rejects an oversized object with a message that names neither
+        // the size nor the limit, and rendering is deterministic — so retrying
+        // spends another full Chromium render to be refused identically. Say how
+        // big the artifact actually is, and stop.
+        if (OVERSIZED.test(put.error)) {
+          throw new NonRetryableError(
+            `${format} export is ${megabytes(rendered.value.bytes.byteLength)} — over the storage limit for ` +
+              `bucket '${EXPORT_BUCKET}'. Raise the bucket's file_size_limit, or reduce the book's illustrations ` +
+              '(count is targetPages ÷ illustrationEveryPages).',
+          );
+        }
+        return Result.fail(put.error);
+      }
 
       await this.artifacts.save(
         ExportArtifact.create({
