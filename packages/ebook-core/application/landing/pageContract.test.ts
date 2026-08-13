@@ -258,9 +258,17 @@ describe('validateGeneratedPage', () => {
   });
 
   describe('structure', () => {
-    it.each(['hero', 'inside', 'order', 'faq'])('requires the %s section', (name) => {
+    it.each(['hero', 'order'])('requires the %s section', (name) => {
       const p = page({ bodyHtml: page().bodyHtml.replace(`data-section="${name}"`, 'data-x="y"') });
       expect(errorsOf(p).some((e) => e.includes(name))).toBe(true);
+    });
+
+    // Requiring these forced a layout to invent them: a reference with no FAQ
+    // and no chapter grid still produced both, and the page stopped reading as
+    // a copy of that site. Only hero and order are structural.
+    it.each(['inside', 'faq'])('does NOT require the %s section — the reference decides', (name) => {
+      const p = page({ bodyHtml: page().bodyHtml.replace(`data-section="${name}"`, 'data-x="y"') });
+      expect(errorsOf(p).some((e) => e.includes(`data-section="${name}"`))).toBe(false);
     });
 
     // Truncated completions are the common failure and show up here first.

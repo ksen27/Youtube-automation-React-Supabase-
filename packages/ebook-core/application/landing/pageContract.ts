@@ -82,8 +82,19 @@ export const PLACEHOLDERS = {
 /** A page without these is not a sales page. */
 const REQUIRED_PLACEHOLDERS = [PLACEHOLDERS.cta, PLACEHOLDERS.price, PLACEHOLDERS.cover, PLACEHOLDERS.legal];
 
-/** Marked with `data-section` so the structure can be checked mechanically. */
-const REQUIRED_SECTIONS = ['hero', 'inside', 'order', 'faq'] as const;
+/**
+ * Marked with `data-section` so the structure can be checked mechanically.
+ *
+ * Only two, and deliberately: a page needs somewhere to open and somewhere to
+ * ask for the sale, and both are structural rather than editorial. `inside` and
+ * `faq` used to be here too, which meant a layout following a reference that
+ * has neither was FORCED to invent them — a chapter grid and a questions block
+ * appeared on pages whose reference had no such thing, and the page stopped
+ * reading as a copy of that site. What a section contains is still checked
+ * (a buy button, a price, a cover, the legal line are all required tokens);
+ * how many sections there are is the reference's business.
+ */
+const REQUIRED_SECTIONS = ['hero', 'order'] as const;
 
 /** Palette variables the page may reference. Anything else is a raw colour. */
 export const PALETTE_VARS = [
