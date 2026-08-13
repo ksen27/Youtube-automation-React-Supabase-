@@ -20,7 +20,7 @@ import type { IdGenerator } from '../ports/IdGenerator';
 import type { Clock } from '../ports/Clock';
 import type { Hasher } from '../ports/Hasher';
 import { LandingPagePrompt, LandingSlotCopyPrompt } from '../prompts/LandingPagePrompt';
-import { LandingLayoutPrompt } from '../prompts/LandingLayoutPrompt';
+import { LandingLayoutPrompt, LANDING_LAYOUT_VERSION } from '../prompts/LandingLayoutPrompt';
 import { LayoutReviewPrompt } from '../prompts/LayoutReviewPrompt';
 import { parseJsonCompletion } from '../prompts/parse';
 import { validateGeneratedPage, fillCopySlots, type GeneratedPage } from '../landing/pageContract';
@@ -816,6 +816,12 @@ export class GenerateLandingPageUseCase {
       products: input.productCount,
       photo: input.hasAuthorPhoto,
       logo: input.hasLogo,
+      // What a good layout means, per LANDING_LAYOUT_VERSION. Without it, a
+      // deployed change to the prompt or the contract reached no reference that
+      // had ever been used: the cache answered first and the page came back
+      // identical, which reads as "the fix did nothing" rather than "the fix
+      // was never run".
+      layoutVersion: LANDING_LAYOUT_VERSION,
     });
 
     // Reuse only a layout captured under the SAME inputs.

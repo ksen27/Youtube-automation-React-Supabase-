@@ -18,6 +18,27 @@ import type { AiContentBlock } from '../ports/services/AiTextGenerator';
  * this returns, so no book's prose can be baked into a template that other
  * books will reuse.
  */
+/**
+ * What "a good layout" currently means. BUMP THIS whenever this prompt or the
+ * page contract changes in a way that should produce a different layout.
+ *
+ * A derived layout is cached per reference and reused by every book that
+ * follows it — that cache is what makes the second book free, and it returns
+ * BEFORE this prompt or the contract is reached. So a deployed change to either
+ * one silently did nothing to any reference already in the cache: the rules
+ * about not inventing sections, and about matching how the reference shows
+ * what's inside, landed and the next page came back exactly as before
+ * ("layoutRebuilt: false" in the worker log, which was the only clue).
+ *
+ * Folding this into the layout's input hash makes a deploy invalidate the
+ * layouts it actually affects, and nothing else — the same job LANDING_PIPELINE_VERSION
+ * does for cloned templates.
+ *
+ * 2: sections follow the reference (hero/order only are required),
+ *    {{CONTENTS_LIST}} added, design-plan and finish rules added.
+ */
+export const LANDING_LAYOUT_VERSION = 2;
+
 export const LandingLayoutPrompt = {
   build(input: {
     reference: ReferencePage | null;
