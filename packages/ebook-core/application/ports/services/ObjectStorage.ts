@@ -12,5 +12,12 @@ export interface ObjectStorage {
   /** Raw object contents, for callers that need the bytes themselves (e.g.
    * sampling a cover's colours, or bundling it into a site deploy). */
   getBytes(bucket: string, path: string): Promise<Result<{ bytes: Uint8Array; contentType: string }>>;
+  /**
+   * Whether an object is present, without transferring its bytes. Callers that
+   * can REBUILD a missing object (e.g. re-downloading audio a previous run
+   * deleted) use this to tell "gone" from "storage is unhappy", which a failed
+   * download can't distinguish.
+   */
+  exists(bucket: string, path: string): Promise<boolean>;
   remove(bucket: string, path: string): Promise<Result<void>>;
 }

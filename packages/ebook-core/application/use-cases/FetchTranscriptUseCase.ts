@@ -41,7 +41,11 @@ export class FetchTranscriptUseCase {
     }
 
     // No captions → download audio + enqueue Whisper fallback.
-    const audio = await this.audio.downloadAudio(video.youtubeId);
+    const audio = await this.audio.downloadAudio({
+      youtubeId: video.youtubeId,
+      projectId: cmd.projectId,
+      videoId: cmd.videoId,
+    });
     if (audio.isFail()) return Result.fail(audio.error);
     video.markAwaitingTranscription(audio.value.audioRef);
     await this.videos.save(video);

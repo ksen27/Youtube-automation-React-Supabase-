@@ -63,8 +63,12 @@ export class SupabaseVideoRepository implements VideoRepository {
     const { error } = await this.db.from('videos').upsert(this.videoRow(video), { onConflict: 'project_id,youtube_id' });
     if (error) throw new Error(error.message);
 
+    // Every child write is CHECKED. A swallowed error here is invisible and
+    // permanent: the caller believes the transcript is saved (and the Whisper
+    // stage then deletes the audio it was made from), while the next read finds
+    // a video with no transcript and no way to rebuild one.
     if (video.transcript) {
-      await this.db.from('transcripts').upsert(
+      const { error: transcriptError } = await this.db.from('transcripts').upsert(
         {
           video_id: video.id.value,
           source: video.transcript.source,
@@ -74,9 +78,10 @@ export class SupabaseVideoRepository implements VideoRepository {
         },
         { onConflict: 'video_id' },
       );
+      if (transcriptError) throw new Error(`transcript save failed: ${transcriptError.message}`);
     }
     if (video.comments.length > 0) {
-      await this.db.from('comments').upsert(
+      const { error: commentsError } = await this.db.from('comments').upsert(
         video.comments.map((c) => ({
           video_id: video.id.value,
           youtube_id: cYoutubeId(c),
@@ -86,9 +91,10 @@ export class SupabaseVideoRepository implements VideoRepository {
         })),
         { onConflict: 'video_id,youtube_id' },
       );
+      if (commentsError) throw new Error(`comments save failed: ${commentsError.message}`);
     }
     if (video.summary) {
-      await this.db.from('video_summaries').upsert(
+      const { error: summaryError } = await this.db.from('video_summaries').upsert(
         {
           video_id: video.id.value,
           summary: video.summary.summary,
@@ -98,6 +104,7 @@ export class SupabaseVideoRepository implements VideoRepository {
         },
         { onConflict: 'video_id' },
       );
+      if (summaryError) throw new Error(`video summary save failed: ${summaryError.message}`);
     }
   }
 

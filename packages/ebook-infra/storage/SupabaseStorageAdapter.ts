@@ -32,6 +32,18 @@ export class SupabaseStorageAdapter implements ObjectStorage {
     });
   }
 
+  async exists(bucket: string, path: string): Promise<boolean> {
+    // `list` is the only probe Supabase Storage offers that doesn't fetch the
+    // object. It searches WITHIN a folder, so the path is split; `search` is a
+    // substring filter, hence the exact-name check on the way out.
+    const slash = path.lastIndexOf('/');
+    const folder = slash === -1 ? '' : path.slice(0, slash);
+    const name = slash === -1 ? path : path.slice(slash + 1);
+    const { data, error } = await this.client.storage.from(bucket).list(folder, { limit: 100, search: name });
+    if (error || !data) return false;
+    return data.some((o) => o.name === name);
+  }
+
   async remove(bucket: string, path: string): Promise<Result<void>> {
     const { error } = await this.client.storage.from(bucket).remove([path]);
     return error ? Result.fail(error.message) : Result.ok();

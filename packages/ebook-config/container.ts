@@ -190,7 +190,7 @@ export function buildContainer(env: Env = loadEnv()) {
     ingestChannel: new IngestChannelUseCase(projects, videos, channels, youtube, queue, ids, clock),
     fetchVideoData: new FetchVideoDataUseCase(videos, youtube, queue),
     fetchTranscript: new FetchTranscriptUseCase(videos, transcripts, audio, queue, hasher),
-    transcribeAudio: new TranscribeAudioUseCase(videos, stt, storage, hasher),
+    transcribeAudio: new TranscribeAudioUseCase(videos, stt, storage, hasher, audio),
     summarizeVideo: new SummarizeVideoUseCase(videos, ai, hasher),
     analyzeComments: new AnalyzeCommentsUseCase(videos, knowledge, ai, hasher),
     buildKnowledgeBase: new BuildKnowledgeBaseUseCase(channels, knowledge, ai, hasher),

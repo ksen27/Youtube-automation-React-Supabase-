@@ -2,10 +2,20 @@ import { spawn } from 'node:child_process';
 import { readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Result, type AudioDownloader, type ObjectStorage } from '@ebook/core';
+import { Result, type AudioDownloader, type AudioDownloadTarget, type ObjectStorage } from '@ebook/core';
 import { youtubeProxyList } from '../net/ProxyRotator';
 
 const AUDIO_BUCKET = 'ebook-audio';
+
+/**
+ * The storage key for a run's audio — scoped to the project AND video, never to
+ * the youtube id alone. See AudioDownloadTarget for why: the Whisper stage
+ * deletes the object once it has transcribed it, so a shared key lets one run
+ * delete another's audio out from under it.
+ */
+export function audioRefFor(target: AudioDownloadTarget): string {
+  return `${target.projectId}/${target.videoId}.mp3`;
+}
 
 /**
  * Downloads a video's audio with yt-dlp, uploads it to storage, returns the ref.
@@ -44,8 +54,12 @@ export class YtDlpAudioDownloader implements AudioDownloader {
     private readonly denoPath: string | undefined = process.env.YT_DLP_DENO_PATH || undefined,
   ) {}
 
-  async downloadAudio(youtubeId: string): Promise<Result<{ audioRef: string }>> {
-    const localPath = join(tmpdir(), `${youtubeId}.mp3`);
+  async downloadAudio(target: AudioDownloadTarget): Promise<Result<{ audioRef: string }>> {
+    const { youtubeId } = target;
+    // Temp file keyed by the VIDEO row, not the youtube id: two runs of the same
+    // video download concurrently on one worker, and a shared temp path had them
+    // overwriting (and deleting) each other's partial file.
+    const localPath = join(tmpdir(), `${target.videoId}.mp3`);
     // Try each proxy in turn (a blocked IP is retried on the next one). Rotate the
     // starting proxy per call so sequential videos spread across the pool. With no
     // proxies configured, [undefined] means a single direct attempt.
@@ -58,7 +72,7 @@ export class YtDlpAudioDownloader implements AudioDownloader {
         try {
           await this.runYtDlp(youtubeId, localPath, proxy);
           const bytes = await readFile(localPath);
-          const audioRef = `${youtubeId}.mp3`;
+          const audioRef = audioRefFor(target);
           const put = await this.storage.put(AUDIO_BUCKET, audioRef, new Uint8Array(bytes), 'audio/mpeg');
           if (put.isFail()) return Result.fail(put.error);
           return Result.ok({ audioRef });
