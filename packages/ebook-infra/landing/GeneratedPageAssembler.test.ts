@@ -197,6 +197,19 @@ describe('GeneratedPageAssembler — per-book elements', () => {
       expect(html).not.toContain('point six');
       expect(html).toContain('+2 more');
     });
+
+    // A 101-category guide rendered twenty-odd cards: two screens of index
+    // above the offer. The grid stops at nine and counts the rest.
+    it('caps the number of chapter cards and counts the remainder', () => {
+      const html = assemble('<section>{{CONTENTS}}</section>', [
+        product({
+          sections: Array.from({ length: 14 }, (_, i) => ({ title: `Chapter Title ${i + 1}`, items: [] })),
+        }),
+      ]);
+      expect(html).toContain('Chapter Title 9');
+      expect(html).not.toContain('Chapter Title 10');
+      expect(html).toContain('+5 more chapters inside the book');
+    });
   });
 
   it('drops a price that sits directly on top of a buy button', () => {

@@ -185,6 +185,10 @@ const COMPONENT_CSS = `
   .contents-num { font-size: .68rem; letter-spacing: .12em; text-transform: uppercase;
     color: var(--accent); margin: 0 0 .5em; }
   .contents-more { font-size: .76rem; color: var(--accent); margin: .4em 0 0; }
+  /* The count of what the grid did NOT list. Centred under it, quiet — it is a
+     note about the book's depth, not another card competing with the offer. */
+  .contents-rest { font-size: .82rem; color: var(--muted); text-align: center; margin: 14px 0 0;
+                   letter-spacing: .04em; }
   .contents-item h3 { margin: 0 0 .2em; color: var(--heading); }
   .contents-count { font-size: .74rem; letter-spacing: .1em; text-transform: uppercase;
                     color: var(--accent); margin: 0 0 6px; }
@@ -429,6 +433,18 @@ function coverMarkup(p: LandingProduct | undefined): string {
 const MAX_POINTS_PER_CARD = 4;
 
 /**
+ * How many chapter cards the contents section shows before it stops.
+ *
+ * Nine fills three tidy rows of the three-column grid. Uncapped, a 101-category
+ * guide rendered twenty-odd cards — a wall that ran for two screens, pushed the
+ * offer far below it, and turned the most persuasive section on the page into
+ * an index. The remainder is COUNTED rather than dropped: "+12 more chapters"
+ * sells the book's depth in one line, where printing all of them sold nothing
+ * and gave the outline away.
+ */
+const MAX_CONTENTS_CARDS = 9;
+
+/**
  * The contents section: what each chapter is called and what is in it.
  *
  * A FEW of each chapter's key points are printed — capped at
@@ -446,9 +462,15 @@ const MAX_POINTS_PER_CARD = 4;
  * concrete claims, few enough that the chapter still has to be bought.
  */
 function contentsMarkup(p: LandingProduct | undefined): string {
-  const sections = p?.sections ?? [];
-  if (sections.length === 0) return '';
-  return `<div class="contents stagger">${sections
+  const all = p?.sections ?? [];
+  if (all.length === 0) return '';
+  const sections = all.slice(0, MAX_CONTENTS_CARDS);
+  const hidden = all.length - sections.length;
+  const more =
+    hidden > 0
+      ? `<p class="contents-rest">+${hidden} more ${hidden === 1 ? 'chapter' : 'chapters'} inside the book</p>`
+      : '';
+  return `${`<div class="contents stagger">${sections
     .map((s, i) => {
       const shown = s.items.slice(0, MAX_POINTS_PER_CARD);
       const rest = s.items.length - shown.length;
@@ -463,7 +485,7 @@ function contentsMarkup(p: LandingProduct | undefined): string {
         '</div>'
       );
     })
-    .join('')}</div>`;
+    .join('')}</div>`}${more}`;
 }
 
 function guaranteeMarkup(model: LandingPageModel): string {

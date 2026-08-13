@@ -210,6 +210,10 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
   .cat h3 { margin-bottom: .45em; font-size: 1.02rem; line-height: 1.35; }
   .cat-num { font-size: .7rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin-bottom: .5em; }
   /* The teaser points. Capped in the renderer, not here — see contentsPoints. */
+  /* The chapters the grid did not print. Quiet and centred — a note about the
+     book's depth, not a tenth card competing with the buy button. */
+  .cats-rest { font-size: .82rem; color: var(--muted); text-align: center; margin: 14px 0 0;
+               letter-spacing: .04em; }
   .cat-points { list-style: none; margin: 0; padding: 0; }
   .cat-points li {
     position: relative;
@@ -541,6 +545,13 @@ function sectionTheMath(model: LandingPageModel, n: () => string): string {
  */
 const MAX_POINTS_PER_CARD = 4;
 
+/**
+ * How many chapter cards "What is inside" shows. Mirrors MAX_CONTENTS_CARDS in
+ * GeneratedPageAssembler — the two renderers share no code by design, so the
+ * value is duplicated; keep them in step.
+ */
+const MAX_CONTENTS_CARDS = 9;
+
 function contentsPoints(items: readonly string[]): string {
   if (items.length === 0) return '';
   const shown = items.slice(0, MAX_POINTS_PER_CARD);
@@ -552,7 +563,12 @@ function contentsPoints(items: readonly string[]): string {
 
 function sectionWhatsInside(model: LandingPageModel, p: LandingProduct | undefined, n: () => string): string {
   const { copy } = model;
-  const cats = p?.sections ?? [];
+  // Capped like the other renderer's contents grid, and for the same reason: a
+  // 101-category guide printed twenty-odd cards, which reads as an index and
+  // pushes the offer two screens down. The rest is counted below the grid.
+  const allCats = p?.sections ?? [];
+  const cats = allCats.slice(0, MAX_CONTENTS_CARDS);
+  const hiddenCats = allCats.length - cats.length;
   return `  <section class="reveal">
     <div class="wrap">
       <p class="mark">${n()}</p>
@@ -569,7 +585,11 @@ function sectionWhatsInside(model: LandingPageModel, p: LandingProduct | undefin
         </div>`,
           )
           .join('\n        ')}
-      </div>`
+      </div>${
+        hiddenCats > 0
+          ? `\n      <p class="cats-rest">+${hiddenCats} more ${hiddenCats === 1 ? 'chapter' : 'chapters'} inside the book</p>`
+          : ''
+      }`
           : `<div class="stagger">
         ${copy.bullets.map((b) => `<div class="cat"><h3>${esc(b.title)}</h3><p class="muted">${esc(b.body)}</p></div>`).join('\n        ')}
       </div>`
