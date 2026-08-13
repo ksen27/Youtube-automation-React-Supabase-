@@ -52,6 +52,8 @@ interface PageState {
   updatedAt: string;
   isPublishable: boolean;
   blockers: string[];
+  /** Which renderer actually wrote this draft — see the fallback note below. */
+  engine: string | null;
 }
 
 interface Candidate {
@@ -630,6 +632,18 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
               </span>
             )}
           </div>
+        )}
+
+        {/* The fallback, stated. "Copy exactly" is still selected (the template
+            id is stored) but the draft was written by the reference engine,
+            which only happens when the clone failed and the job fell through
+            rather than dying. Left silent, the page would simply not be the
+            replica that was asked for, with nothing saying why. */}
+        {design === "exact" && page?.hasDraft && page.engine === "builtin" && (
+          <p className="text-xs text-amber-300">
+            The exact copy did not work for this site, so this page was designed in
+            its style instead. Regenerate to try the exact copy again.
+          </p>
         )}
 
         {page?.error && (

@@ -381,17 +381,35 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
           // two structurally unrelated renderers based on whether a layout
           // derivation happened to succeed, and said so only in this log.
           const project = await container.repositories.projects.findById(ProjectId.from(p.projectId));
-          if (project?.options.landingEngine === 'clone') {
-            const cloned = await useCases.generateClonedLandingPage.execute({
+          const cloned =
+            project?.options.landingEngine === 'clone'
+              ? await useCases.generateClonedLandingPage.execute({ projectId: p.projectId, force: true })
+              : null;
+          // FALLBACK, not failure. A clone can fail for reasons that say nothing
+          // about whether a good page is possible from this reference — a
+          // template that would not extract, an offer grid the labelling missed,
+          // an asset that vanished. The reference engine below needs none of
+          // what the clone needs: it reads and photographs the page and writes
+          // our own markup. Falling through to it turns a dead end into a page
+          // that still follows the site, and the seller is not left with a
+          // FAILED row and no output.
+          //
+          // Nothing money-critical is waved through by this: the built-in path
+          // runs the same checkout-link and price rules, and publishing is
+          // gated separately.
+          if (cloned?.isFail()) {
+            container.logger.warn('exact copy failed — designing from the reference instead', {
               projectId: p.projectId,
-              force: true,
+              template: project?.options.landingTemplateId,
+              reason: cloned.error,
             });
-            if (cloned.isFail()) throw new Error(cloned.error);
+          }
+          if (cloned?.isOk()) {
             const blockers = cloned.value.fidelity.findings.filter((f) => f.severity === 'BLOCKER');
             container.logger.info('🛒 cloned landing page ready', {
               projectId: p.projectId,
               engine: 'clone',
-              template: project.options.landingTemplateId,
+              template: project?.options.landingTemplateId,
               // The number worth watching: how much of the page moved outside
               // the regions where content was replaced on purpose.
               drift: cloned.value.fidelity.visual.find((v) => v.width === 1280)?.mismatchRatio ?? null,
@@ -416,10 +434,20 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
             return publishedClone.value;
           }
 
+          // On the fallback path, keep following the site the seller chose. Its
+          // URL lives on the template row rather than in the project's landing
+          // settings, so without this the fallback would design from nothing
+          // and come back looking like neither the reference nor a choice.
+          const fallbackReference =
+            cloned?.isFail() && project?.options.landingTemplateId
+              ? (await container.repositories.landingTemplates.findById(project.options.landingTemplateId))?.sourceUrl
+              : undefined;
+
           const generated = await useCases.generateLandingPage.execute({
             projectId: p.projectId,
             force: true,
             rebuildLayout: p.rebuildLayout,
+            ...(fallbackReference ? { referenceUrl: fallbackReference } : {}),
           });
           if (generated.isFail()) throw new Error(generated.error);
           // Which layout was used is the number worth watching on early runs:

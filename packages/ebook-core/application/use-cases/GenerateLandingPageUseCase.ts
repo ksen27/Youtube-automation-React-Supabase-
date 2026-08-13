@@ -379,6 +379,16 @@ export interface GenerateLandingPageInput {
    * cache is what keeps pages identical, so re-deriving is an explicit act.
    */
   rebuildLayout?: boolean;
+  /**
+   * Follow this page instead of the project's own `landingTemplateUrl`.
+   *
+   * Set by the fallback path: when an exact copy fails, the site the seller
+   * chose is still the right reference — it is only the DOM-cloning of it that
+   * did not work — but that URL lives on the template row, not in the project's
+   * landing settings. Without this the fallback would quietly design from
+   * nothing and the page would come back looking like neither.
+   */
+  referenceUrl?: string;
 }
 
 /**
@@ -487,7 +497,7 @@ export class GenerateLandingPageUseCase {
       checkout: project.options.landingCheckoutUrl ?? '',
       guarantee: project.options.landingGuaranteeDays,
       // Pointing the book at a different reference must rebuild the layout.
-      template: referenceUrlFor(project.options.landingMode, project.options.landingTemplateUrl) ?? '',
+      template: referenceUrlFor(project.options.landingMode, input.referenceUrl ?? project.options.landingTemplateUrl) ?? '',
       // Mode and every sibling's price and link. Without these, changing a
       // sibling's price would serve the cached page still advertising the old
       // one — the same reason this book's own price is in the hash.
@@ -508,7 +518,10 @@ export class GenerateLandingPageUseCase {
     // ── the reference page this book's layout should follow ──
     // Which reference depends on the MODE, not on the project: a three-book
     // page always follows the three-book template.
-    const referenceUrl = referenceUrlFor(project.options.landingMode, project.options.landingTemplateUrl);
+    const referenceUrl = referenceUrlFor(
+      project.options.landingMode,
+      input.referenceUrl ?? project.options.landingTemplateUrl,
+    );
 
     // Strictly best-effort: the reference is someone else's live site and may
     // be down, slow or blocking us. A book still gets a landing page.
