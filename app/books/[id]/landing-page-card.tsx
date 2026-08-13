@@ -492,7 +492,17 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * and the WORKER reads that row rather than this form, which is why the save
    * is not optional: skipping it silently generated against the old values.
    */
-  async function generate(publish: boolean) {
+  /**
+   * @param fromScratch Re-derive the page's LAYOUT instead of reusing the one
+   *   stored for this reference. The cache is what makes every book after the
+   *   first cost nothing, and it answers before the layout prompt or the page
+   *   contract is reached — so a page that came back with the wrong structure
+   *   kept coming back that way however often it was regenerated, and improved
+   *   rules only reached references nobody had used yet. This is the way out
+   *   for one page without waiting for a version bump.
+   */
+  async function generate(publish: boolean, fromScratch = false) {
+    const rebuild = fromScratch ? "&rebuildLayout=true" : "";
     // "Design it in a site's style" builds nothing first — the reference is
     // fetched and photographed inside the generation job. The template id is
     // cleared EXPLICITLY: it is what selects the clone engine server-side, so a
@@ -509,7 +519,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setBusy(true);
       setErr(null);
       try {
-        const res = await fetch(`/api/books/projects/${projectId}/landing-page?publish=${publish}`, { method: "POST" });
+        const res = await fetch(
+          `/api/books/projects/${projectId}/landing-page?publish=${publish}${rebuild}`,
+          { method: "POST" },
+        );
         const data = await res.json();
         if (!res.ok) setErr(data.error ?? "Could not start generation");
         else await load();
@@ -543,7 +556,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     setBusy(true);
     setErr(null);
     try {
-      const res = await fetch(`/api/books/projects/${projectId}/landing-page?publish=${publish}`, { method: "POST" });
+      const res = await fetch(
+        `/api/books/projects/${projectId}/landing-page?publish=${publish}${rebuild}`,
+        { method: "POST" },
+      );
       const data = await res.json();
       if (!res.ok) setErr(data.error ?? "Could not start generation");
       else await load();
@@ -1074,6 +1090,25 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
             {busy || cloning ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
             {cloning ? "Copying site…" : page?.hasDraft ? "Regenerate" : "Generate page"}
           </Button>
+          {/* Regenerate reuses the layout stored for this reference — that cache
+              is what keeps every book on a template identical and makes the
+              second one free. This is the escape hatch: when the STRUCTURE is
+              wrong, or improved rules have shipped since, redoing the copy
+              against the same layout changes nothing.
+
+              Only on the reference path: a cloned page has no derived layout,
+              and its equivalent is re-copying the site from the review screen. */}
+          {design === "style" && page?.hasDraft && (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy || working || cloning}
+              onClick={() => generate(false, true)}
+              title="Rebuild the page's structure from the reference, not just its words"
+            >
+              Rebuild from scratch
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
