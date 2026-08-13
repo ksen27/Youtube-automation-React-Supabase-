@@ -303,8 +303,10 @@ export class LandingPageHtmlRenderer implements LandingPageRenderer {
                 font-size: .66rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
                 padding: 4px 10px; border-radius: 999px; }
   .offer-art { display: flex; justify-content: center; }
-  .offer-art img, .offer-art span { width: min(140px, 45%); aspect-ratio: 2/3; object-fit: cover;
-    border-radius: 4px; box-shadow: 0 10px 26px -10px rgba(0,0,0,.4); }
+  /* contain, not cover — see the same rule in GeneratedPageAssembler: a 2:3 box
+     cropped the sides off covers whose artwork is not 2:3, slicing the title. */
+  .offer-art img, .offer-art span { width: min(140px, 45%); aspect-ratio: 2/3; object-fit: contain;
+    border-radius: 4px; filter: drop-shadow(0 8px 20px rgba(0,0,0,.35)); }
   .offer-art-stack img { width: min(104px, 32%); }
   .offer-art-stack > * + * { margin-left: -32px; }
   .offer h3 { margin: 0; font-size: 1.1rem; }

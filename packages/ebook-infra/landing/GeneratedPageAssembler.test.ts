@@ -124,16 +124,21 @@ describe('GeneratedPageAssembler — per-book elements', () => {
   });
 
   // The copy's ctaLabel names the FEATURED book, so reusing it across the offer
-  // grid put "Get The DIY Repair Bible" on every card, bundle included.
-  it('labels each offer button by price, never by the featured book', () => {
+  // grid put "Get The DIY Repair Bible" on every card, bundle included. Nor
+  // does a card's button repeat the price printed directly above it.
+  it('labels each offer button without the price or the featured title', () => {
     const withBundle = [
       ...THREE,
       product({ title: 'The complete set', kind: 'bundle', priceCents: 8000, coverDataUri: null }),
     ];
     const html = assemble('<section>{{OFFER_GRID}}</section>', withBundle);
 
-    expect(html).toContain('Get it for $27');
-    expect(html).toContain('Get it for $80');
+    expect(html).toContain('Get this book');
+    expect(html).toContain('Get the complete set');
+    expect(html).not.toContain('Get it for $27');
+    // Each card still SHOWS its own price, once, above the button.
+    expect(html).toContain('$27');
+    expect(html).toContain('$80');
     // The global label belongs to the hero, not to a card.
     const cards = html.split(/<div class="offer[" ]/).slice(1);
     for (const card of cards) expect(card).not.toContain('Get the book —');

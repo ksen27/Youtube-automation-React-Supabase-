@@ -273,8 +273,13 @@ const COMPONENT_CSS = `
     padding: 4px 10px; border-radius: 999px;
   }
   .offer-art { display: flex; justify-content: center; gap: 6px; }
+  /* CONTAIN, not cover. A cover forced into a 2:3 box was cropped left and
+     right, so each card showed a vertical strip through the middle of the
+     artwork with the title sliced in half — the one image whose whole job is to
+     be read. The box keeps its shape so the cards still line up; the artwork
+     sits inside it whatever its own proportions are. */
   .offer-art img, .offer-art .cover-fallback { width: min(150px, 45%); aspect-ratio: 2/3;
-    object-fit: cover; border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,.18); }
+    object-fit: contain; border-radius: 6px; filter: drop-shadow(0 6px 14px rgba(0,0,0,.18)); }
   /* The bundle stacks its books; each cover overlaps the one before it. */
   .offer-art-stack img, .offer-art-stack .cover-fallback { width: min(110px, 32%); }
   .offer-art-stack > * + * { margin-left: -34px; }
@@ -608,8 +613,16 @@ function offerCardMarkup(p: LandingProduct, model: LandingPageModel): string {
  * price is the thing a buyer is choosing between anyway.
  */
 function offerCtaLabel(p: LandingProduct, model: LandingPageModel): string {
-  if (p.priceCents === null) return p.kind === 'bundle' ? 'Get the complete set' : 'Get this book';
-  return `Get it for ${money(p.priceCents, model.currency)}`;
+  // No price in the label. The card prints the price directly ABOVE the button,
+  // so "Get it for $50" under a large "$50" said the same number twice in two
+  // sizes — which reads as a mistake, and on a three-card row it is the noise
+  // that makes the cards hard to compare. The price row is where a buyer
+  // compares; the button is where they act.
+  //
+  // The label names no book on purpose either: with several cards on one page,
+  // "Get the <featured title>" is wrong on all but one of them.
+  if (p.kind === 'bundle') return 'Get the complete set';
+  return model.products.length > 1 ? 'Get this book' : 'Get the book';
 }
 
 /** A book shows its cover; a bundle shows the covers of everything in it. */
