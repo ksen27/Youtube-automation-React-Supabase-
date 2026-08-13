@@ -182,6 +182,13 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   //                 means, and it requires cloning the site first.
   //   templateUrl → the BUILT-IN renderer reads that page for its section
   //                 STRUCTURE and writes our own design from it.
+  /**
+   * Which engine builds the page. Defaults to "style" for a project that has
+   * not chosen — the reliable path, and the one the sibling project ships
+   * exclusively. A project already on a cloned template stays on "exact" so
+   * opening the card never silently changes how its page is built.
+   */
+  const [design, setDesign] = useState<"style" | "exact">("style");
   const [templates, setTemplates] = useState<Array<Template & { superseded?: boolean }>>([]);
   const [templateId, setTemplateId] = useState("");
   const [templateUrl, setTemplateUrl] = useState("");
@@ -219,6 +226,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       setEnabled(Boolean(s.enabled));
       setTemplateId(s.templateId ?? "");
       setTemplateUrl(s.templateUrl ?? "");
+      // The stored settings ARE the engine choice — `templateId` set means the
+      // clone engine runs — so the toggle reads from them rather than keeping a
+      // second copy of the truth that could disagree with the server.
+      setDesign(s.templateId ? "exact" : "style");
       setTemplates(dedupeBySource(tData.templates ?? [], s.templateId ?? ""));
       setSiblings(
         Array.from({ length: SIBLING_SLOTS }, (_, i) => {
@@ -456,6 +467,32 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * is not optional: skipping it silently generated against the old values.
    */
   async function generate(publish: boolean) {
+    // "Design it in a site's style" builds nothing first — the reference is
+    // fetched and photographed inside the generation job. The template id is
+    // cleared EXPLICITLY: it is what selects the clone engine server-side, so a
+    // project switching over with an old template still stored would otherwise
+    // keep cloning while the card showed a reference URL.
+    if (design === "style") {
+      const reference = templateUrl.trim();
+      if (reference && !isHttpUrl(reference)) {
+        return setErr("The reference page must be a full URL (https://…).");
+      }
+      setTemplateId("");
+      setEnabled(true);
+      if (!(await saveSettings({ enabled: true, templateId: "" }))) return;
+      setBusy(true);
+      setErr(null);
+      try {
+        const res = await fetch(`/api/books/projects/${projectId}/landing-page?publish=${publish}`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) setErr(data.error ?? "Could not start generation");
+        else await load();
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     const pasted = cloneUrl.trim();
     let useTemplateId = templateId;
 
@@ -610,13 +647,77 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
             across several books is still visible where it belongs. */}
 
         {/* ── design ─────────────────────────────────────────────────────────
-            ONE control. Paste the page to copy and press Generate; everything
-            else — enabling the sales page, copying the site, saving the
-            settings — happens behind that single action.
+            TWO engines, and until now only the riskier one was reachable.
 
-            It used to be six steps (tick enable → paste → tick attest → Copy
-            site → wait → select → Save → Generate), which is how a user ended
-            up with a page that would not generate and no indication why. */}
+            "style"  → GenerateLandingPageUseCase. The reference is fetched and
+                       photographed, and the model writes our own markup from
+                       its headings, CSS, type treatment and screenshots. No
+                       node labelling, no asset re-hosting, no repeater binding,
+                       no markup contract — the four stages every extraction
+                       failure has come from. The sibling ebookgenerator project
+                       ships ONLY this, which is why it copies sites reliably.
+            "exact"  → the clone engine: that page's own markup with our content
+                       swapped in. Pixel-faithful when it works, and it is the
+                       only way to get a replica, so it stays — as a choice
+                       someone makes rather than the only road.
+
+            The engine is chosen server-side by `landingTemplateId ? clone :
+            builtin`, so picking "style" must CLEAR that id — which is why
+            generate() passes an explicit override rather than leaving a stale
+            template selected underneath a reference URL. */}
+        <div className="space-y-3">
+          <Label>How should this page look?</Label>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {([
+              {
+                value: "style" as const,
+                label: "Design it in a site's style",
+                hint: "Recommended — reliable, and looks like that site",
+              },
+              {
+                value: "exact" as const,
+                label: "Copy a page exactly",
+                hint: "A replica of that page. Can fail on complex sites",
+              },
+            ]).map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setDesign(opt.value)}
+                className={cn(
+                  "flex-1 rounded-md border px-3 py-2 text-left transition-colors",
+                  design === opt.value
+                    ? "border-brand-500 bg-surface-hover"
+                    : "border-border hover:bg-surface-hover",
+                )}
+              >
+                <div className="text-sm font-medium text-fg">{opt.label}</div>
+                <div className="text-xs text-fg-subtle">{opt.hint}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {design === "style" && (
+          <div className="space-y-3">
+            <Label htmlFor="referenceUrl">Reference page to copy the layout from</Label>
+            <Input
+              id="referenceUrl"
+              value={templateUrl}
+              onChange={(e) => setTemplateUrl(e.target.value)}
+              placeholder="https://the-page-to-follow.com"
+              inputMode="url"
+            />
+            <p className="text-xs text-fg-subtle">
+              That page is read and photographed, and your page is built to follow
+              it — same section order, palette and type treatment, written around
+              your book. Not a pixel copy, and nothing of theirs is republished.
+              Leave blank for the built-in design.
+            </p>
+          </div>
+        )}
+
+        {design === "exact" && (
         <div className="space-y-3">
           <Label htmlFor="cloneUrl">Copy a site&apos;s design</Label>
           <Input
@@ -702,6 +803,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           )}
           {cloneMsg && <p className="text-xs text-emerald-400">{cloneMsg}</p>}
         </div>
+        )}
 
         {/* ── page shape ─────────────────────────────────────────────────── */}
         <div className="space-y-2">
