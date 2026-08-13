@@ -405,6 +405,7 @@ describe('fillPlaceholders', () => {
       paymentMarks: '<p>Visa</p>',
       testimonials: '',
       contents: '<ul><li>One</li></ul>',
+      contentsList: '<ul class="contents-list"><li>One</li></ul>',
       legal: '<p>Disclaimer</p>',
       logo: '<img src="data:image/png;base64,BB">',
       offerGrid: '<div class="offers"></div>',
@@ -420,8 +421,8 @@ describe('fillPlaceholders', () => {
 
   it('drops a placeholder whose content is empty', () => {
     const out = fillPlaceholders('<div>{{TESTIMONIALS}}</div>', {
-      cta: '', price: '', cover: '', guarantee: '', paymentMarks: '', testimonials: '', contents: '', legal: '',
-      logo: '', offerGrid: '', authorPhoto: '', coverStack: '', bookBreakdown: '',
+      cta: '', price: '', cover: '', guarantee: '', paymentMarks: '', testimonials: '', contents: '',
+      contentsList: '', legal: '', logo: '', offerGrid: '', authorPhoto: '', coverStack: '', bookBreakdown: '',
     });
     expect(out).toBe('<div></div>');
   });

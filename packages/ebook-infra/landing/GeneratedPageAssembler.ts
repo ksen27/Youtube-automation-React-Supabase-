@@ -36,6 +36,7 @@ export class GeneratedPageAssembler implements LandingPageAssembler {
       price: priceMarkup(primary, model),
       cover: '',
       contents: contentsMarkup(primary),
+      contentsList: contentsListMarkup(primary),
       guarantee: guaranteeMarkup(model),
       paymentMarks: paymentMarkup(model),
       testimonials: testimonialsMarkup(model),
@@ -189,6 +190,13 @@ const COMPONENT_CSS = `
      note about the book's depth, not another card competing with the offer. */
   .contents-rest { font-size: .82rem; color: var(--muted); text-align: center; margin: 14px 0 0;
                    letter-spacing: .04em; }
+  /* The compact variant: a stack of lines, the shape a reference uses when its
+     "what you get" sits beside the price rather than filling a section. */
+  .contents-list { list-style: none; margin: 0; padding: 0; }
+  .contents-list li { display: flex; gap: 12px; align-items: baseline; padding: 10px 0;
+                      border-bottom: 1px solid var(--border); color: var(--heading); }
+  .contents-list li:last-child { border-bottom: 0; }
+  .contents-list-num { font-size: .7rem; letter-spacing: .12em; color: var(--accent); flex: none; }
   .contents-item h3 { margin: 0 0 .2em; color: var(--heading); }
   .contents-count { font-size: .74rem; letter-spacing: .1em; text-transform: uppercase;
                     color: var(--accent); margin: 0 0 6px; }
@@ -486,6 +494,28 @@ function contentsMarkup(p: LandingProduct | undefined): string {
       );
     })
     .join('')}</div>`}${more}`;
+}
+
+/**
+ * The chapters as a plain list — one line each, numbered, no cards.
+ *
+ * For references whose "what you get" is a short stack rather than a grid of
+ * cards. Same cap and the same counted remainder as the grid: the difference is
+ * presentation, not how much of the book is given away.
+ */
+function contentsListMarkup(p: LandingProduct | undefined): string {
+  const all = p?.sections ?? [];
+  if (all.length === 0) return '';
+  const shown = all.slice(0, MAX_CONTENTS_CARDS);
+  const hidden = all.length - shown.length;
+  return (
+    `<ul class="contents-list stagger">${shown
+      .map((s, i) => `<li><span class="contents-list-num">${String(i + 1).padStart(2, '0')}</span>${esc(s.title)}</li>`)
+      .join('')}</ul>` +
+    (hidden > 0
+      ? `<p class="contents-rest">+${hidden} more ${hidden === 1 ? 'chapter' : 'chapters'} inside the book</p>`
+      : '')
+  );
 }
 
 function guaranteeMarkup(model: LandingPageModel): string {

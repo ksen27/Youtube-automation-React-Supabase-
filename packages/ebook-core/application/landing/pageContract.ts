@@ -26,6 +26,18 @@ export const PLACEHOLDERS = {
   paymentMarks: '{{PAYMENT_MARKS}}',
   testimonials: '{{TESTIMONIALS}}',
   contents: '{{CONTENTS}}',
+  /**
+   * The same chapters as a COMPACT LIST — one line each, no cards, no key
+   * points.
+   *
+   * `{{CONTENTS}}` always expands to a three-column card grid, so a reference
+   * that presents "what you get" as a short priced stack still came back with a
+   * wall of chapter cards: the section existed on our page in a shape the
+   * reference never had, and it pushed the offer below two screens of index.
+   * The layout can now match what it is looking at instead of being handed one
+   * fixed treatment.
+   */
+  contentsList: '{{CONTENTS_LIST}}',
   legal: '{{FOOTER_LEGAL}}',
   /** The channel avatar as a small round brand mark. Optional. */
   logo: '{{LOGO}}',
