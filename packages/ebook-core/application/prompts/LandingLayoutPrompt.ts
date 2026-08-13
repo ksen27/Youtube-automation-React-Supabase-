@@ -192,6 +192,18 @@ export const LandingLayoutPrompt = {
       '  no external URLs anywhere, no @import, no remote url() — system font stacks only',
       '  close every tag; unbalanced markup is rejected',
       '',
+      // Small, cheap rules that separate a designed page from a generated one,
+      // and one accessibility floor. None of them costs a section or a slot.
+      'FINISH. Applies with or without a reference:',
+      '  - buttons and small labels in sentence case, not Title Case',
+      '  - at most two weights in the page chrome (nav, labels, buttons); weight is',
+      '    for the headings, not for everything at once',
+      '  - the accent colour belongs to the buy button. Using it for headings,',
+      '    borders and icons as well removes the one signal that says where to click',
+      '  - every interactive element gets a VISIBLE :focus-visible state — an outline',
+      '    or ring in the accent colour. A keyboard buyer who cannot see where they',
+      '    are cannot check out',
+      '',
       'NO PROSE. You write no sentences about any book — every one of them is a',
       'slot. You MAY wrap a slot in styling tags to match the template, e.g. an',
       'accent-coloured <span> around {{COPY:hero.headline.emphasis}} beside',
@@ -411,6 +423,28 @@ export const LandingLayoutPrompt = {
           'Build a conventional long-form sales page: hero with the cover, the problem,',
           'what is inside, who it is for, the author, the order block, questions, and a',
           'closing call to action.',
+          '',
+          // With a reference, its own screenshots supply the design decisions.
+          // With none, the model is designing from scratch — which is exactly
+          // where an unguided call reaches for the same three looks every time.
+          'DECIDE THE DESIGN BEFORE YOU WRITE MARKUP. Settle the palette, the display /',
+          'body type pairing, and one structural idea for the page — then check that',
+          'choice against the list below and change it if it matches.',
+          '',
+          'REJECT THE DEFAULT LOOKS. These are what an unguided page always becomes,',
+          'and a seller can spot them at a glance because every AI page has them:',
+          '  - cream background + high-contrast serif + terracotta accent',
+          '  - near-black background + one neon accent',
+          '  - broadsheet columns with hairline rules and zero border-radius',
+          'Pick a treatment that suits THIS book\'s subject rather than landing pages in',
+          'general, and ground it in the palette variables, which are derived from the',
+          'book\'s own cover.',
+          '',
+          'ONE SIGNATURE ELEMENT. Choose a single structural device that carries the',
+          'page — a recurring rule, a numbered progression, a repeated card shape, a',
+          'motif in the section headers — and use it in the hero and at least twice',
+          'more. Spend restraint everywhere else. A page of evenly-weighted sections',
+          'reads as assembled; one device used three times reads as designed.',
         ].join('\n');
 
     // No book is named here on purpose. This layout is stored and reused by
