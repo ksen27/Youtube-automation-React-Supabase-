@@ -230,9 +230,15 @@ export const CoverImagePrompt = {
         'mid-century recipe books (1900s-1960s).',
       '',
       'OVERALL LOOK:',
-      'An old, well-loved cookbook cover — aged, slightly worn and faded, as if photographed from a real ' +
-        'antique book. It should look like a genuine period artifact, NOT a modern or digital design, and NOT ' +
-        'glossy or photorealistic-modern.',
+      // Deliberately NOT "as if photographed from a real antique book" / "a
+      // genuine period artifact". An image model reads that as a request to
+      // reproduce a specific existing object and can refuse the whole prompt —
+      // and a refusal here is silent, because the cover step is best-effort and
+      // the book just ships with bare typography instead. This asks for an
+      // ORIGINAL illustration in a period STYLE, which is what was wanted.
+      'An original cookbook cover illustrated in a period style — aged, softly worn and faded in feel, ' +
+        'drawn rather than photographed. NOT a modern or digital design, and NOT glossy or ' +
+        'photorealistic-modern.',
       `Specifically: ${era.look}`,
       '',
       'MATERIAL & TEXTURE:',
@@ -242,9 +248,12 @@ export const CoverImagePrompt = {
       '',
       'COMPOSITION (classic cookbook cover):',
       `- ${era.frame}`,
-      '- A single framed CENTRAL ILLUSTRATION in a vintage style: a hand-drawn or engraved image of a ' +
-        'homemaker/cook, a laid table, produce, or a kitchen still-life — line-art or muted flat colour, ' +
-        'in the manner of old recipe-book engravings and lithographs (NOT a modern photo)',
+      // Subjects only, no people. A depicted person is the other half of what
+      // gets these prompts declined, and a laid table or a produce still-life
+      // carries the same period feel without it.
+      '- A single framed CENTRAL ILLUSTRATION in a vintage style: a laid table, produce, preserves, ' +
+        'kitchen implements or a kitchen still-life — line-art or muted flat colour, in the manner of old ' +
+        'recipe-book engravings and lithographs (NOT a modern photo). No people.',
       '- Symmetrical, centred, calm layout with generous margins',
       `- The illustration must be specific to THIS book's subject: """${subject}""".`,
       '',
@@ -275,7 +284,7 @@ export const CoverImagePrompt = {
       '  title (e.g. no "Grandma Used To Make"). Title only.',
       '',
       'OUTPUT:',
-      'Front cover only. Portrait book format. Ultra-high detail. Looks like a real antique cookbook.',
+      'Front cover only. Portrait book format. Ultra-high detail, in the style of a mid-century cookbook.',
     ].join('\n');
   },
 };

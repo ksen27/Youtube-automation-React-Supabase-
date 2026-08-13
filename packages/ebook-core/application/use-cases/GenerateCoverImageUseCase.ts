@@ -71,10 +71,25 @@ export class GenerateCoverImageUseCase {
     };
     // Cooking books get an antique vintage-cookbook cover; everything else gets the
     // premium blueprint-style nonfiction cover.
-    const prompt =
-      ctx.bookType === 'cooking' ? CoverImagePrompt.buildVintage(coverInput) : CoverImagePrompt.build(coverInput);
+    const vintage = ctx.bookType === 'cooking';
+    const prompt = vintage ? CoverImagePrompt.buildVintage(coverInput) : CoverImagePrompt.build(coverInput);
 
-    const image = await this.images.generate({ prompt, size: '1024x1536' });
+    let image = await this.images.generate({ prompt, size: '1024x1536' });
+    // FALL BACK TO THE STANDARD COVER. The vintage prompt is the only thing a
+    // cooking book does differently here — same key, same processor, same
+    // bucket as the normal books that are getting covers — so when only cooking
+    // books come back without one, this call is what failed, and an image model
+    // declining a period-pastiche prompt is the likely reason. A plainer cover
+    // is worth far more to the seller than no cover at all, which is what the
+    // failure produced: the step is best-effort, so the book simply shipped
+    // with bare typography and nothing said why.
+    if (vintage && image.isFail()) {
+      this.logger.warn('🖼️  vintage cookbook cover failed — retrying with the standard cover', {
+        projectId: projectId.value,
+        error: image.error,
+      });
+      image = await this.images.generate({ prompt: CoverImagePrompt.build(coverInput), size: '1024x1536' });
+    }
     if (image.isFail()) return Result.fail(image.error);
 
     // Re-encode before storing, exactly as illustrations are. If that fails we
