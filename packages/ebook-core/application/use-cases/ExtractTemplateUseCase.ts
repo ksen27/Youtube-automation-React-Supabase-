@@ -538,13 +538,29 @@ export class ExtractTemplateUseCase {
         model: 'claude-sonnet-4-6',
         system: prompt.system,
         messages: [{ role: 'user', content: prompt.user }],
-        maxTokens: 8_000,
+        // One entry per labelled node, and rule 3 asks the model to account for
+        // EVERY product node on the page — so the answer scales with the
+        // template, not with some fixed idea of "enough labels". A long sales
+        // page (22k tokens of inventory) hit the old 8k ceiling exactly, and
+        // the truncation path below then asked for FEWER labels, which is how a
+        // template came back with no cover labelled at all and failed
+        // extraction outright. The budget has to fit the page.
+        maxTokens: 24_000,
         cacheControl: { systemPrefix: true },
         metadata: { projectId: templateId, stage: 'landing-template-annotate' },
       });
       if (completion.isFail()) return Result.fail(`Template annotation failed: ${completion.error.type}`);
       if (completion.value.stopReason === 'max_tokens') {
-        repairErrors = ['Your response was cut off. Return fewer, higher-value labels — the essential ones only.'];
+        // Which labels to sacrifice is not the model's choice to make freely:
+        // dropping a cover or a buy button fails the extraction (or ships the
+        // template owner's artwork), whereas dropping a decorative caption
+        // costs one unlabelled line.
+        repairErrors = [
+          'Your response was cut off, so it could not be used. Return a SHORTER map — but keep every ' +
+            'BOOK_COVER (or <KEY>.coverSrc), CHECKOUT_URL, PRICE and COMPARE_AT_PRICE label, and every ' +
+            'repeater key. Drop decorative and secondary text instead; an unlabelled caption costs one line, ' +
+            'a missing cover or buy button costs the whole template.',
+        ];
         continue;
       }
 
