@@ -18,7 +18,7 @@ export const runtime = 'nodejs';
  * even if that reasoning were wrong the page runs in an opaque origin with no
  * access to the session cookie it sits beside.
  */
-export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   // proxy.ts already gated this request behind the shared password; the
   // sentinel owner is what the ported use cases expect.
@@ -32,12 +32,21 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const page = await c.repositories.landingPages.findByProject(ProjectId.from(id));
   if (!page?.html) return error('No draft yet', 404);
 
+  // Images are allowed from THIS origin, named explicitly rather than as
+  // `'self'`. A cloned draft does not inline them — it references
+  // `assets/cover.webp` beside it, which the sibling assets route serves — and
+  // `'self'` would not match: the sandbox below deliberately withholds
+  // allow-same-origin, so the document runs in an OPAQUE origin and `'self'`
+  // resolves to that, not to the server. Naming the origin keeps the sandbox
+  // intact and still reaches nothing but our own owner-checked route.
+  const origin = new URL(req.url).origin;
+
   return new Response(page.html, {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
       'Content-Security-Policy':
-        "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+        `default-src 'none'; img-src ${origin} data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; ` +
         "form-action 'none'; sandbox allow-scripts allow-popups",
       'X-Content-Type-Options': 'nosniff',
     },
