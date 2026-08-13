@@ -2,8 +2,28 @@ import { spawn } from 'node:child_process';
 import { readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Result, type AudioDownloader, type AudioDownloadTarget, type ObjectStorage } from '@ebook/core';
+import { NonRetryableError, Result, type AudioDownloader, type AudioDownloadTarget, type ObjectStorage } from '@ebook/core';
 import { youtubeProxyList } from '../net/ProxyRotator';
+import { ProxyHealth, classifyProxyFailure, maskProxy, youtubeProxyHealth, type ProxyFailureKind } from '../net/proxyHealth';
+
+/** Trimmed so a wall of yt-dlp stderr can't drown the per-proxy tally. */
+const LAST_ERROR_CHARS = 300;
+
+/**
+ * A per-proxy account of what went wrong, for the job log and the project's
+ * error field. Credentials are masked — these strings are persisted and shown
+ * in the UI. Previously only the LAST proxy's stderr survived, which is why a
+ * pool-wide auth failure was indistinguishable from one bad proxy.
+ */
+function summarize(failures: Array<{ proxy: string | undefined; kind: ProxyFailureKind; message: string }>): string {
+  if (failures.length === 0) return 'no attempts were made';
+  const tally = new Map<ProxyFailureKind, number>();
+  for (const f of failures) tally.set(f.kind, (tally.get(f.kind) ?? 0) + 1);
+  const counts = [...tally].map(([kind, n]) => `${kind}: ${n}`).join(', ');
+  const perProxy = failures.map((f) => `${maskProxy(f.proxy)} ${f.kind}`).join('; ');
+  const last = failures[failures.length - 1]!.message.slice(0, LAST_ERROR_CHARS);
+  return `${failures.length} proxies tried (${counts}) [${perProxy}] — last error: ${last}`;
+}
 
 const AUDIO_BUCKET = 'ebook-audio';
 
@@ -52,6 +72,9 @@ export class YtDlpAudioDownloader implements AudioDownloader {
     // without one, most downloads get the "confirm you're not a bot" block.
     // Point it at the deno binary when deno isn't on the worker's PATH.
     private readonly denoPath: string | undefined = process.env.YT_DLP_DENO_PATH || undefined,
+    // Shared with the rest of the YouTube-facing pipeline: a proxy that rejected
+    // our credentials here should not be re-tried elsewhere seconds later.
+    private readonly health: ProxyHealth = youtubeProxyHealth,
   ) {}
 
   async downloadAudio(target: AudioDownloadTarget): Promise<Result<{ audioRef: string }>> {
@@ -63,10 +86,20 @@ export class YtDlpAudioDownloader implements AudioDownloader {
     // Try each proxy in turn (a blocked IP is retried on the next one). Rotate the
     // starting proxy per call so sequential videos spread across the pool. With no
     // proxies configured, [undefined] means a single direct attempt.
-    const pool = this.proxies.length ? this.proxies : [undefined];
+    const configured = this.proxies.length > 0;
+    // Proxies that rejected our credentials recently are skipped rather than
+    // re-tried at three yt-dlp retries apiece, once per video.
+    const live = configured ? this.health.usable(this.proxies) : [];
+    if (configured && live.length === 0) {
+      throw new NonRetryableError(
+        `every proxy in the pool (${this.proxies.length}) recently rejected authentication — ` +
+          'check the proxy account (credentials, quota, IP allow-list). Retrying cannot fix a 407.',
+      );
+    }
+    const pool: Array<string | undefined> = configured ? live : [undefined];
     const start = this.cursor++ % pool.length;
     const ordered = pool.map((_, i) => pool[(start + i) % pool.length]);
-    let lastError = 'audio download failed';
+    const failures: Array<{ proxy: string | undefined; kind: ProxyFailureKind; message: string }> = [];
     try {
       for (const proxy of ordered) {
         try {
@@ -75,13 +108,24 @@ export class YtDlpAudioDownloader implements AudioDownloader {
           const audioRef = audioRefFor(target);
           const put = await this.storage.put(AUDIO_BUCKET, audioRef, new Uint8Array(bytes), 'audio/mpeg');
           if (put.isFail()) return Result.fail(put.error);
+          this.health.clear(proxy); // it works — trust it again
           return Result.ok({ audioRef });
         } catch (e) {
-          lastError = e instanceof Error ? e.message : String(e);
+          const message = e instanceof Error ? e.message : String(e);
+          const kind = classifyProxyFailure(message);
+          this.health.record(proxy, kind);
+          failures.push({ proxy, kind, message });
           await rm(localPath, { force: true }); // clear any partial file before the next proxy
         }
       }
-      return Result.fail(lastError);
+      // Whole pool exhausted. If EVERY proxy rejected our credentials, the fault
+      // is the proxy account, not this video — three more BullMQ attempts would
+      // spend minutes reproducing the same 407, so stop now and say why.
+      const summary = summarize(failures);
+      if (configured && failures.every((f) => f.kind === 'auth')) {
+        throw new NonRetryableError(`proxy pool rejected authentication — ${summary}`);
+      }
+      return Result.fail(`audio download failed — ${summary}`);
     } finally {
       await rm(localPath, { force: true });
     }

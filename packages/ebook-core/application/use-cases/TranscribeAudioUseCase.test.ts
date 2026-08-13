@@ -4,7 +4,7 @@ import { Result } from '../../domain/shared/Result';
 import { Video } from '../../domain/video/Video';
 import { VideoId } from '../../domain/video/VideoId';
 import { Transcript } from '../../domain/video/Transcript';
-import type { VideoRepository } from '../ports/repositories/VideoRepository';
+import type { VideoRepository, SummarizedVideo } from '../ports/repositories/VideoRepository';
 import type { ObjectStorage } from '../ports/services/ObjectStorage';
 import type { SpeechToText } from '../ports/services/SpeechToText';
 import type { AudioDownloader, AudioDownloadTarget } from '../ports/services/AudioDownloader';
@@ -46,6 +46,9 @@ class FakeVideoRepo implements VideoRepository {
     return this.stored && this.stored.id.value === id.value ? this.stored : null;
   }
   async findByProject(): Promise<Video[]> {
+    return [];
+  }
+  async findSummarizedByProject(): Promise<SummarizedVideo[]> {
     return [];
   }
   async countByProject(): Promise<number> {

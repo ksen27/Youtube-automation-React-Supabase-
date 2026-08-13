@@ -8,6 +8,7 @@ import {
   VideoSummary,
   TranscriptSource,
   type VideoRepository,
+  type SummarizedVideo,
 } from '@ebook/core';
 import { reviveVideoKnowledge } from './mappers/videoKnowledge';
 
@@ -36,6 +37,26 @@ export class SupabaseVideoRepository implements VideoRepository {
       .order('position');
     if (error) throw new Error(error.message);
     return (data ?? []).map((r) => this.toDomain(r));
+  }
+
+  /**
+   * Summarized videos only. The column list is the point: no `transcripts(*)`,
+   * no `comments(*)`. Callers that rank videos need a title and a summary, and
+   * embedding the full text of every transcript to get them is what timed the
+   * statement out. Videos not yet summarized are skipped — they can't be ranked.
+   */
+  async findSummarizedByProject(projectId: ProjectId): Promise<SummarizedVideo[]> {
+    const { data, error } = await this.db
+      .from('videos')
+      .select('id, title, video_summaries(summary, data, model, input_hash)')
+      .eq('project_id', projectId.value)
+      .order('position');
+    if (error) throw new Error(error.message);
+    return (data ?? []).flatMap((row) => {
+      const summaryRow = Array.isArray(row.video_summaries) ? row.video_summaries[0] : row.video_summaries;
+      if (!summaryRow) return [];
+      return [{ id: row.id, title: row.title, summary: VideoSummary.create(reviveVideoKnowledge(summaryRow)) }];
+    });
   }
 
   async countByProject(projectId: ProjectId): Promise<number> {

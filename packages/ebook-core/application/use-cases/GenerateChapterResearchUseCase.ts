@@ -46,21 +46,23 @@ export class GenerateChapterResearchUseCase {
     const chapter = book?.chapter(chapterId);
     if (!book || !chapter) return Result.fail('Chapter not found');
 
-    const videos = await this.videos.findByProject(projectId);
+    // Titles + summaries only. Ranking never reads transcripts or comments, and
+    // this runs once per chapter across concurrent books — pulling the whole
+    // corpus per call is what exhausted the database's statement timeout.
+    const videos = await this.videos.findSummarizedByProject(projectId);
     const terms = tokenize([chapter.title, chapter.topic, chapter.promise, ...chapter.keyPoints].join(' '));
 
     // Rank videos by keyword overlap with the chapter (the "retrieval" step).
     const ranked = videos
-      .filter((v) => v.summary)
       .map((v) => {
-        const haystack = tokenize(`${v.title} ${v.summary?.searchableText() ?? ''}`);
+        const haystack = tokenize(`${v.title} ${v.summary.searchableText()}`);
         return { v, score: overlap(terms, haystack) };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, TOP_VIDEOS_PER_CHAPTER);
 
     const candidateMaterial = ranked
-      .map(({ v }) => `Video: ${v.title}\n${v.summary!.toText()}`)
+      .map(({ v }) => `Video: ${v.title}\n${v.summary.toText()}`)
       .join('\n\n');
 
     const audienceQuestions = (await this.knowledge.listCommentInsights(projectId))
@@ -96,7 +98,7 @@ export class GenerateChapterResearchUseCase {
       ChapterResearch.create({
         chapterId: cmd.chapterId,
         chapterTitle: chapter.title,
-        relatedVideoIds: ranked.map(({ v }) => v.id.value),
+        relatedVideoIds: ranked.map(({ v }) => v.id),
         audienceQuestions,
         inputHash: cmd.inputHash,
         ...parsed.value,
