@@ -652,7 +652,12 @@ export class GenerateClonedLandingPageUseCase {
       model: 'claude-sonnet-4-6',
       system: prompt.system,
       messages: [{ role: 'user', content: prompt.user }],
-      maxTokens: 16_000,
+      // Same cliff the annotation call went over: the answer carries one value
+      // per labelled slot plus every repeater item, so it scales with how
+      // thoroughly the template was labelled. Hitting the ceiling fails the
+      // whole generation ("the template declares more slots than the budget
+      // allows") — and the better a template is labelled, the likelier it was.
+      maxTokens: 32_000,
       cacheControl: { systemPrefix: true },
       metadata: { projectId: input.projectId, stage: 'landing-page-copy' },
     });
