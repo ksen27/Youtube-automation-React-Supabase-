@@ -153,6 +153,21 @@ async function chromium(stealth: boolean) {
  * The rest of the list is there so a dead proxy is a one-line reorder rather
  * than a hunt for new credentials.
  */
+/**
+ * The exit the browser will use, named without leaking the password.
+ *
+ * Printed by both the connect CLI and the worker so a MISMATCH is visible
+ * rather than inferred. Payhip rejects a session used from a different IP than
+ * it was created on, and that failure looks identical to an ordinary expiry —
+ * "the dashboard redirected to the login page" — which sends the operator off
+ * to re-connect a session that was never stale. Seeing both ends say the same
+ * address is the difference between knowing and guessing.
+ */
+export function describeProxy(raw: string | undefined): string {
+  const proxy = raw ? pickProxy(raw) : null;
+  return proxy ? proxy.server : 'direct (no proxy)';
+}
+
 function pickProxy(raw: string): { server: string; username?: string; password?: string } | null {
   const first = raw
     .split(/[\r\n,]+/)

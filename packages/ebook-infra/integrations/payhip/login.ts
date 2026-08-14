@@ -1,4 +1,4 @@
-import { openPayhipContext, isLoginUrl, loginUrl, type PayhipBrowserConfig } from './PayhipBrowser';
+import { openPayhipContext, isLoginUrl, loginUrl, describeProxy, type PayhipBrowserConfig } from './PayhipBrowser';
 import { LOGGED_IN_MARKER } from './PayhipProductPage';
 import type { PayhipSessionStore } from './PayhipSessionStore';
 
@@ -33,6 +33,11 @@ export async function interactivePayhipLogin(
     const page = await context.newPage();
     const target = loginUrl(config.baseUrl);
     await page.goto(target, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    // Stated up front, because it is the single most common reason a freshly
+    // connected session is rejected minutes later: Payhip ties the session to
+    // the IP it was created on, and a login through your own connection cannot
+    // be used from the worker's proxy.
+    log(`Connecting via: ${describeProxy(config.proxy)} — this MUST match the worker's PAYHIP_PROXY.`);
     log(`A browser window opened at ${target} — log in by hand.`);
     log('Complete any captcha, 2FA or email code. Waiting for the dashboard to appear…');
 

@@ -11,7 +11,7 @@ import {
   type CheckoutPublishError,
   type Logger,
 } from '@ebook/core';
-import { openPayhipContext, withDiagnostics, type PayhipBrowserConfig } from './PayhipBrowser';
+import { openPayhipContext, withDiagnostics, describeProxy, type PayhipBrowserConfig } from './PayhipBrowser';
 import { PayhipProductPage } from './PayhipProductPage';
 import { PayhipSessionStore } from './PayhipSessionStore';
 import {
@@ -102,6 +102,20 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
     // session" verdict set by an earlier failure outlives the fix for it.
     await this.warmUp().catch(() => {});
 
+    // One info line per run naming the exit IP the browser will use.
+    //
+    // Payhip rejects a session used from a different address than it was
+    // created on, and that rejection is reported as "the dashboard redirected
+    // to the login page" — WORD FOR WORD what a genuinely stale session looks
+    // like. Without both ends stating their exit, the only way to tell an IP
+    // mismatch from a real expiry is to re-connect and see, which is exactly
+    // the wrong feedback loop for something a human has to do by hand.
+    this.logger.info('listing via', {
+      externalId: draft.externalId,
+      exit: describeProxy(this.config.proxy),
+      stealth: this.config.stealth ?? true,
+    });
+
     for (let attempt = 1; attempt <= backoff.length; attempt++) {
       if (attempt > 1) {
         const wait = backoff[attempt - 1] ?? 0;
@@ -155,7 +169,12 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
     };
 
     try {
-      step('launching the browser');
+      // Named on every run so the worker's exit can be compared against the one
+      // the connect CLI printed. A session created on one IP and used from
+      // another is rejected by Payhip as a login redirect, which is
+      // indistinguishable from a genuine expiry unless both ends say where they
+      // were.
+      step(`launching the browser via ${describeProxy(this.config.proxy)}`);
       ({ browser, context } = await openPayhipContext(this.config, session.storageState));
       page = await context.newPage();
       const dashboard = new PayhipProductPage(page, this.config.baseUrl);
