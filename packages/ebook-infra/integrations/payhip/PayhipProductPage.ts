@@ -126,6 +126,23 @@ const ROUTES = {
   create: '/product/create',
 } as const;
 
+/**
+ * The one signal that a page is logged in: the nav's Products link.
+ *
+ * Exported because TWO places need it — the automation, deciding whether a
+ * restored session still works, and the connect CLI, deciding whether a human
+ * has finished logging in. They had their own copies, and the copies drifted:
+ * when the dashboard marker was corrected here, the connect flow was left
+ * waiting for an "Add New Product" button that does not exist on this
+ * dashboard, so a perfectly good login sat there until the ten-minute timeout
+ * and saved nothing.
+ *
+ * Matched on href rather than text: the link is an icon plus a `<span>`, so its
+ * accessible name depends on how the icon is labelled, while the href is the
+ * destination itself and cannot drift without the route changing.
+ */
+export const LOGGED_IN_MARKER = 'a[href="/products"]';
+
 /** `payhip.com/b/AbC12` → `AbC12`. The store's own id for the product. */
 export function extractProductKey(url: string): string | null {
   const match = url.match(/payhip\.com\/b\/([A-Za-z0-9_-]+)/);
@@ -539,7 +556,7 @@ export class PayhipProductPage {
    * changing.
    */
   private navProducts(): Locator {
-    return this.page.locator(`a[href="${ROUTES.products}"]`).first();
+    return this.page.locator(LOGGED_IN_MARKER).first();
   }
 
   private titleField(): Locator {

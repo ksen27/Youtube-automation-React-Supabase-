@@ -1,4 +1,5 @@
 import { openPayhipContext, isLoginUrl, loginUrl, type PayhipBrowserConfig } from './PayhipBrowser';
+import { LOGGED_IN_MARKER } from './PayhipProductPage';
 import type { PayhipSessionStore } from './PayhipSessionStore';
 
 /**
@@ -38,15 +39,16 @@ export async function interactivePayhipLogin(
     // Success = off the login page AND showing a real dashboard control. The
     // URL alone is not enough: Payhip bounces through intermediate redirects,
     // and a snapshot taken mid-bounce is a session that expires immediately.
-    const addProduct = page
-      .getByRole('link', { name: /add new product|new product|add product/i })
-      .or(page.getByRole('button', { name: /add new product|new product|add product/i }))
-      .first();
+    // The SAME marker the automation uses to decide a session is alive — see
+    // LOGGED_IN_MARKER. Sharing it is the point: the two had separate copies,
+    // and when the automation's was corrected this one was left behind, so a
+    // successful login was never recognised and the session was never saved.
+    const dashboardReady = page.locator(LOGGED_IN_MARKER).first();
 
     const deadline = Date.now() + maxWaitMs;
     let authenticated = false;
     while (Date.now() < deadline) {
-      const visible = await addProduct
+      const visible = await dashboardReady
         .waitFor({ state: 'visible', timeout: 5_000 })
         .then(() => true)
         .catch(() => false);
