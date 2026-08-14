@@ -82,6 +82,41 @@ const EnvSchema = z.object({
   PAYHIP_HEADED: z.coerce.boolean().default(false),
   /** Slows a headed run down so a human can watch what it does. */
   PAYHIP_SLOWMO_MS: z.coerce.number().int().nonnegative().default(0),
+  /**
+   * Drive Payhip with patchright (stealth-patched Chromium) rather than vanilla
+   * Playwright. ON by default: Payhip is behind Cloudflare, which serves a
+   * "performing security verification" interstitial to browsers it reads as
+   * bots, and a plain headless Chromium is read that way every time.
+   */
+  PAYHIP_USE_STEALTH: z.coerce.boolean().default(true),
+  /**
+   * Residential proxy for the Payhip browser — `ip:port` or `ip:port:user:pass`.
+   *
+   * Cloudflare scores IP reputation as heavily as browser fingerprint, and
+   * datacenter ranges (Fly, most clouds) are challenged regardless of how clean
+   * the browser looks. Unset means "connect directly", which is right for a
+   * laptop and usually wrong for a worker.
+   */
+  PAYHIP_PROXY: z.string().optional(),
+  /**
+   * Route the one-time `payhip:connect` login through PAYHIP_PROXY too.
+   *
+   * Off by default because a human connects from their own machine and a broken
+   * proxy there just blocks the login. Turn it ON once the proxy works: a
+   * session created through the SAME exit IP the worker uses never shows Payhip
+   * an IP jump between login and use, which is itself a reason to re-challenge.
+   */
+  PAYHIP_CONNECT_USES_PROXY: z.coerce.boolean().default(false),
+  /**
+   * How often the worker visits Payhip to keep the stored session from lapsing.
+   *
+   * Payhip's window slides on USE, and listings come in bursts, so without this
+   * the session dies between them and an ordinary user meets a CLI they have no
+   * way to run. Longer than HeyGen's 30 minutes because Payhip sits behind
+   * Cloudflare and a needlessly chatty poll is itself a risk; an hour is ample
+   * to keep a sliding window open.
+   */
+  PAYHIP_KEEPALIVE_MINUTES: z.coerce.number().int().positive().default(60),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

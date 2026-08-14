@@ -36,6 +36,15 @@ function payhipConfig() {
     baseUrl: process.env.PAYHIP_BASE_URL || "https://payhip.com",
     timeoutMs: Number(process.env.PAYHIP_TIMEOUT_MS ?? 45_000),
     debugDir: process.env.PAYHIP_DEBUG_DIR || "/tmp/payhip-debug",
+    // Stealth here too, so the human sees the same site the worker will —
+    // including whether Cloudflare lets it through.
+    stealth: process.env.PAYHIP_USE_STEALTH !== "false",
+    // Opt-in: connecting through the worker's own exit IP means Payhip never
+    // sees the session's IP jump between login and use. Off by default because
+    // a broken proxy on a laptop just blocks the login outright.
+    ...(process.env.PAYHIP_CONNECT_USES_PROXY === "true" && process.env.PAYHIP_PROXY
+      ? { proxy: process.env.PAYHIP_PROXY }
+      : {}),
   };
 }
 

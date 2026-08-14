@@ -20,6 +20,34 @@ import type { PayhipStorageState } from './PayhipSessionStore';
 
 export interface PayhipBrowserConfig {
   baseUrl: string;
+  /**
+   * Use patchright — a stealth-patched Chromium — instead of vanilla Playwright.
+   *
+   * Payhip sits behind Cloudflare, which serves a "Just a moment... performing
+   * security verification" interstitial to browsers it thinks are bots. A
+   * headless Playwright Chromium announces itself in a dozen small ways, and on
+   * a datacenter IP that is enough to be challenged every time. patchright
+   * removes those tells at the engine level and exposes the SAME API, so
+   * nothing else in this module changes.
+   *
+   * The HeyGen automation reached the same conclusion (HEYGEN_USE_STEALTH); the
+   * Docker image already installs patchright's browser for it.
+   */
+  stealth?: boolean | undefined;
+  /**
+   * Residential proxy for the browser — one `ip:port[:user:pass]` per line, or
+   * comma-separated. Only the FIRST is used; see `pickProxy` for why a stable
+   * exit beats rotation for a logged-in session.
+   *
+   * Fingerprint is only half of what Cloudflare scores — IP reputation is the
+   * other half, and datacenter ranges like Fly's are challenged on sight
+   * however clean the browser looks. A residential exit is what actually moves
+   * that needle.
+   *
+   * Ideally the SAME exit the session was created through: a session whose IP
+   * jumps between login and use is itself a signal worth flagging.
+   */
+  proxy?: string | undefined;
   /** Per-action timeout. Uploads get their own, longer budget in the page object. */
   timeoutMs: number;
   /** Where screenshots + HTML snapshots of failed runs are written. */
@@ -89,9 +117,57 @@ export function isLoginUrl(rawUrl: string): boolean {
  * and the connect CLI — the only two things that actually drive a browser —
  * load it on first use.
  */
-async function chromium() {
+async function chromium(stealth: boolean) {
+  if (stealth) {
+    try {
+      // patchright ships the same `chromium` surface, so only the import differs.
+      // Required lazily and separately from Playwright because it carries its
+      // OWN patched browser build — the Dockerfile installs both.
+      const patchright = (await import('patchright')) as unknown as typeof import('playwright');
+      return patchright.chromium;
+    } catch {
+      // A host without patchright installed should degrade to a challenged
+      // browser rather than refuse to run at all — the operator sees the
+      // Cloudflare page in the error and can act on it.
+    }
+  }
   const playwright = await import('playwright');
   return playwright.chromium;
+}
+
+/**
+ * One proxy out of a pool → Playwright's proxy shape.
+ *
+ * Accepts a LIST (newline- or comma-separated), because proxy providers hand
+ * them out in bulk and the HeyGen pool already stores them that way. Entries are
+ * `ip:port` or `ip:port:user:pass` — the same format, so one set of credentials
+ * serves both. Deliberately a local copy of that parser rather than an import:
+ * the HeyGen module reaches into the database and the crypto box, none of which
+ * this needs.
+ *
+ * THE FIRST ENTRY WINS, AND THAT IS THE POINT. The obvious move is to rotate,
+ * which is right for scraping and wrong here: this session was created from one
+ * IP and Payhip is behind Cloudflare, which treats a logged-in session hopping
+ * between a different IP every few minutes as far more suspicious than one that
+ * simply stays put. A stable exit is what makes the session look like a person.
+ * The rest of the list is there so a dead proxy is a one-line reorder rather
+ * than a hunt for new credentials.
+ */
+function pickProxy(raw: string): { server: string; username?: string; password?: string } | null {
+  const first = raw
+    .split(/[\r\n,]+/)
+    .map((line) => line.trim())
+    .filter(Boolean)[0];
+  if (!first) return null;
+
+  const parts = first.split(':');
+  if (parts.length >= 4) {
+    const [ip, port, username, ...rest] = parts;
+    return { server: `http://${ip}:${port}`, username, password: rest.join(':') };
+  }
+  const [ip, port] = parts;
+  if (!ip || !port) return null;
+  return { server: `http://${ip}:${port}` };
 }
 
 /** Launch a browser and restore the stored session into a fresh context. */
@@ -99,12 +175,17 @@ export async function openPayhipContext(
   config: PayhipBrowserConfig,
   storageState: PayhipStorageState | null,
 ): Promise<{ browser: Browser; context: BrowserContext }> {
-  const browser = await (await chromium()).launch({
+  const browser = await (await chromium(config.stealth ?? true)).launch({
     headless: !config.headed,
     ...(config.headed && config.slowMoMs ? { slowMo: config.slowMoMs } : {}),
-    // The container essentials. No --disable-blink-features=AutomationControlled
-    // here: on a self-owned store account there is nothing to hide from, and
-    // that flag is itself a signal some detectors look for.
+    ...(() => {
+      const proxy = config.proxy ? pickProxy(config.proxy) : null;
+      return proxy ? { proxy } : {};
+    })(),
+    // The container essentials only. Notably NOT
+    // --disable-blink-features=AutomationControlled: that flag is itself
+    // something detectors look for, and patchright already handles the tells it
+    // was meant to hide.
     args: ['--no-sandbox', '--disable-dev-shm-usage'],
   });
   const context = await browser.newContext({

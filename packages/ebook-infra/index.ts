@@ -42,6 +42,7 @@ export * from './integrations/payhip/PayhipErrors';
 export * from './integrations/payhip/PayhipProductPage';
 export * from './integrations/payhip/PayhipBrowser';
 export * from './integrations/payhip/login';
+export * from './integrations/payhip/keepAlive';
 
 // ── YouTube ─────────────────────────────────────────────────────────────────
 export * from './youtube/YouTubeDataApiProvider';

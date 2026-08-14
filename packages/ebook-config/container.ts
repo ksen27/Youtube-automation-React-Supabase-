@@ -172,6 +172,8 @@ export function buildContainer(env: Env = loadEnv()) {
       headed: env.PAYHIP_HEADED,
       slowMoMs: env.PAYHIP_SLOWMO_MS,
       tmpDir: env.PAYHIP_TMP_DIR,
+      stealth: env.PAYHIP_USE_STEALTH,
+      proxy: env.PAYHIP_PROXY,
     },
     logger.child({ adapter: 'payhip' }),
   );

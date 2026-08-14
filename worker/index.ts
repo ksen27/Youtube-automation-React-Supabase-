@@ -309,6 +309,47 @@ if (runEbook) {
         msg: "worker.ebook.online",
         queues: ebookWorkers.length,
       }));
+
+      // Keep the Payhip session warm.
+      //
+      // Payhip's session lapses from DISUSE, not age, and books are listed in
+      // bursts — so it was routinely dead by the time anyone pressed the
+      // button, and the only cure was a human re-running `payhip:connect` from
+      // a terminal. Ordinary users of this app have neither a terminal nor a
+      // reason to own one. This is the same sweep that keeps the HeyGen pool
+      // logged in (see runKeepAlive below); its absence, not any difference in
+      // how the two authenticate, is why Payhip kept asking to be reconnected.
+      //
+      // Runs only on the ebook worker, which is the host that owns the Payhip
+      // browser. Never throws — a keep-alive must not be able to stop the
+      // queues it exists to serve.
+      const { getContainer } = await import("@ebook/config");
+      const { keepPayhipSessionAlive } = await import("@ebook/infra");
+      const c = getContainer();
+      const payhipKeepAlive = () => {
+        void keepPayhipSessionAlive(
+          c.payhipSessions,
+          {
+            baseUrl: c.env.PAYHIP_BASE_URL,
+            timeoutMs: c.env.PAYHIP_TIMEOUT_MS,
+            debugDir: c.env.PAYHIP_DEBUG_DIR,
+            stealth: c.env.PAYHIP_USE_STEALTH,
+            proxy: c.env.PAYHIP_PROXY,
+          },
+          (msg, meta) => console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...meta })),
+        )
+          .then((verdict) => {
+            console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "payhip.keepalive.done", verdict }));
+          })
+          .catch(() => {});
+      };
+      // Not immediately at boot: a deploy restarts the worker, and hitting a
+      // Cloudflare-protected dashboard the instant every machine comes up is
+      // the kind of pattern that gets an account challenged.
+      const payhipKickoff = setTimeout(payhipKeepAlive, 2 * 60_000);
+      payhipKickoff.unref?.();
+      const payhipTimer = setInterval(payhipKeepAlive, Math.max(10, c.env.PAYHIP_KEEPALIVE_MINUTES) * 60_000);
+      payhipTimer.unref?.();
     } catch (e) {
       // A misconfigured ebook env must not take the video engines down with it.
       console.error(JSON.stringify({
