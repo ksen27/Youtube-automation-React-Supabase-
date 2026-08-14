@@ -4,7 +4,6 @@ import {
   PayhipSessionExpired,
   PayhipTransientError,
   PayhipRejected,
-  PayhipProductCreatedButUnreadable,
 } from './PayhipErrors';
 
 /**
@@ -127,9 +126,38 @@ const ROUTES = {
   create: '/product/create',
 } as const;
 
+/**
+ * The one signal that a page is logged in: the nav's Products link.
+ *
+ * Exported because TWO places need it — the automation, deciding whether a
+ * restored session still works, and the connect CLI, deciding whether a human
+ * has finished logging in. They had their own copies, and the copies drifted:
+ * when the dashboard marker was corrected here, the connect flow was left
+ * waiting for an "Add New Product" button that does not exist on this
+ * dashboard, so a perfectly good login sat there until the ten-minute timeout
+ * and saved nothing.
+ *
+ * Matched on href rather than text: the link is an icon plus a `<span>`, so its
+ * accessible name depends on how the icon is labelled, while the href is the
+ * destination itself and cannot drift without the route changing.
+ */
+export const LOGGED_IN_MARKER = 'a[href="/products"]';
+
 /** `payhip.com/b/AbC12` → `AbC12`. The store's own id for the product. */
 export function extractProductKey(url: string): string | null {
   const match = url.match(/payhip\.com\/b\/([A-Za-z0-9_-]+)/);
+  return match?.[1] ?? null;
+}
+
+/**
+ * `/product/edit/AbC12` → `AbC12`.
+ *
+ * The product list links each row to its editor, and that path carries the same
+ * key the public buy link uses — which makes the list a second, independent way
+ * to recover a link the success page did not show us.
+ */
+export function extractEditKey(href: string): string | null {
+  const match = href.match(/\/product\/edit\/([A-Za-z0-9_-]+)/);
   return match?.[1] ?? null;
 }
 
@@ -179,10 +207,75 @@ export class PayhipProductPage {
       if (isLoginUrl(this.page.url())) {
         throw new PayhipSessionExpired('the dashboard redirected to the login page');
       }
+      // Say WHAT the page was, not just that it wasn't the dashboard.
+      //
+      // On a worker the screenshot is written to a container filesystem that
+      // does not survive a restart, so in practice the log line IS the
+      // evidence. "The dashboard did not finish loading" is true of a slow
+      // render, a bot challenge, and an error page alike — and those need
+      // completely different fixes. The title and first words of the body
+      // separate them at a glance: a Cloudflare interstitial announces itself,
+      // and so does a Payhip error page.
       throw new PayhipTransientError(
-        `the Payhip dashboard did not finish loading (still at ${this.page.url()})`,
+        `the Payhip dashboard did not finish loading (url=${this.page.url()}, ` +
+          `title=${JSON.stringify(await this.pageTitle())}, ` +
+          `text=${JSON.stringify(await this.pageSnippet())})`,
       );
     }
+  }
+
+  /**
+   * Whatever the form is complaining about, in Payhip's own words.
+   *
+   * Several selectors because a form's error styling is the least standardised
+   * thing on it: Bootstrap's `.help-block`/`.has-error`, the newer
+   * `.invalid-feedback`, a bare `.error`, and ARIA's `[role="alert"]` are all in
+   * play, and Payhip's own `js-` classes may use none of them. Visible text
+   * only — these pages carry hidden error templates for every field, and
+   * reporting one of those as the reason would be worse than reporting nothing.
+   *
+   * Returns null when the form is not complaining, which is the normal path.
+   */
+  private async readValidationErrors(): Promise<string | null> {
+    const candidates = [
+      '.error:visible',
+      '[role="alert"]:visible',
+      '.invalid-feedback:visible',
+      '.help-block:visible',
+      '.has-error:visible',
+      '.alert-danger:visible',
+      '.text-danger:visible',
+      '.form-error:visible',
+    ].join(', ');
+
+    // A short settle: the message is usually rendered by the same handler that
+    // blocked the submit, so it lands a moment after the click.
+    await this.page
+      .locator(candidates)
+      .first()
+      .waitFor({ state: 'visible', timeout: 5_000 })
+      .catch(() => {});
+
+    const messages = await this.page
+      .locator(candidates)
+      .allInnerTexts()
+      .catch(() => [] as string[]);
+
+    const cleaned = [...new Set(messages.map((m) => m.replace(/\s+/g, ' ').trim()).filter(Boolean))];
+    return cleaned.length > 0 ? cleaned.join(' | ').slice(0, 400) : null;
+  }
+
+  private async pageTitle(): Promise<string> {
+    return (await this.page.title().catch(() => '')) || '(no title)';
+  }
+
+  /** The first line or so of visible text — enough to recognise a challenge page. */
+  private async pageSnippet(): Promise<string> {
+    const text = await this.page
+      .locator('body')
+      .innerText({ timeout: 5_000 })
+      .catch(() => '');
+    return text.replace(/\s+/g, ' ').trim().slice(0, 300) || '(no visible text)';
   }
 
   /**
@@ -319,7 +412,7 @@ export class PayhipProductPage {
    * than composed from the title: Payhip assigns the key, and a guessed URL
    * that 404s would be written into a live sales page's buy button.
    */
-  async publishAndReadLink(): Promise<{ productKey: string; buyUrl: string }> {
+  async publishAndReadLink(title: string): Promise<{ productKey: string; buyUrl: string }> {
     await this.page.locator(SELECTORS.submit).first().click();
 
     // Submitting posts the whole form, including the file it just accepted, so
@@ -328,27 +421,47 @@ export class PayhipProductPage {
     // and the checks below can still find the link.
     await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
 
-    // Payhip surfaces validation failures (price rejected, file too large) as
-    // inline errors and simply stays on the form. Checked BEFORE waiting for a
-    // link, so the operator gets Payhip's own words instead of our timeout.
-    const validationError = this.page.locator('.error, [role="alert"]').first();
-    const rejected = await validationError
-      .waitFor({ state: 'visible', timeout: 3_000 })
-      .then(() => true)
-      .catch(() => false);
-    if (rejected) {
-      const text = (await validationError.textContent().catch(() => ''))?.trim();
-      if (text) throw new PayhipRejected(`Payhip rejected the product: ${text}`);
-    }
+    // Payhip surfaces validation failures as inline messages and simply stays
+    // on the form — the submit looks like it happened and nothing is created.
+    // Checked BEFORE the link read-back so the seller gets Payhip's own words
+    // rather than our "no link appeared", which explains nothing.
+    //
+    // The net is deliberately wide. A single `.error, [role="alert"]` probe
+    // found nothing on a form that had plainly refused to submit, and a missed
+    // message here is the difference between "Payhip says the file is too
+    // large" and a silent dead end.
+    const complaint = await this.readValidationErrors();
+    if (complaint) throw new PayhipRejected(`Payhip would not accept the product: ${complaint}`);
 
     const link = await this.readProductLink();
-    if (!link) {
-      // Past this point the product may well exist — the publish click was
-      // accepted and only the read-back failed. Its own error type, because
-      // this is the one failure a retry makes strictly worse.
-      throw new PayhipProductCreatedButUnreadable(`no payhip.com/b/... link appeared on ${this.page.url()}`);
-    }
-    return link;
+    if (link) return link;
+
+    // The success page did not show a buy link. Before concluding anything,
+    // ask the PRODUCT LIST whether the product exists — it is the only source
+    // that can tell the two possibilities apart, and they need opposite
+    // handling:
+    //
+    //   found     → the submit worked, only the read-back failed. Recover the
+    //               link from the row and carry on as a success. This is the
+    //               common case and it used to be reported as a dead end.
+    //   not found → the submit never went through, so nothing was created and
+    //               retrying is safe. Saying "it was created, do not re-run"
+    //               here would strand a seller who has no product at all.
+    const listed = await this.findExistingByTitle(title).catch(() => null);
+    if (listed) return listed;
+
+    // Nothing on the list either, so the save did not go through and NOTHING
+    // was created. Terminal rather than retried: an automatic retry would be
+    // safe if this reasoning is right, and would list the book twice if the
+    // list lookup is what's broken — and the seller, who can simply look at
+    // their dashboard, is far better placed to make that call than a loop is.
+    // The message says which way it leans and why.
+    throw new PayhipRejected(
+      `Saving did not create the product: no buy link appeared and no product named "${title}" ` +
+        `is on the product list. Nothing was created, so it is safe to try again. ` +
+        `(url=${this.page.url()}, title=${JSON.stringify(await this.pageTitle())}, ` +
+        `text=${JSON.stringify(await this.pageSnippet())})`,
+    );
   }
 
   /**
@@ -392,12 +505,42 @@ export class PayhipProductPage {
     // for every book — which quietly turned this duplicate guard into a no-op.
     await this.page.goto(`${this.baseUrl}${ROUTES.products}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
     if (isLoginUrl(this.page.url())) throw new PayhipSessionExpired();
+
     const row = this.page.getByText(title, { exact: true }).first();
     const present = await row
       .waitFor({ state: 'visible', timeout: 10_000 })
       .then(() => true)
       .catch(() => false);
     if (!present) return null;
+
+    // The list does not print buy links — each row links to the product's
+    // EDITOR, and that path carries the same key the public link uses. So the
+    // key is taken from the nearest edit link to the matched title, and the buy
+    // URL composed from it. Composing is safe here in a way that guessing from
+    // the title never is: the key came from Payhip, it just arrived by a
+    // different door.
+    const edit = this.page
+      .locator(`a[href*="/product/edit/"]`)
+      .filter({ hasText: title })
+      .first();
+    let href = await edit.getAttribute('href').catch(() => null);
+
+    if (!href) {
+      // The title is not always the link text — it may sit in a sibling cell.
+      // Walk up from the matched text to the nearest container that holds an
+      // edit link, which keeps the pairing correct on a list of many products.
+      href = await row
+        .locator('xpath=ancestor::*[.//a[contains(@href,"/product/edit/")]][1]')
+        .locator('a[href*="/product/edit/"]')
+        .first()
+        .getAttribute('href')
+        .catch(() => null);
+    }
+
+    const key = href ? extractEditKey(href) : null;
+    if (key) return { productKey: key, buyUrl: `https://payhip.com/b/${key}` };
+
+    // Last resort: the page may still carry a real buy link somewhere.
     return this.readProductLink();
   }
 
@@ -413,7 +556,7 @@ export class PayhipProductPage {
    * changing.
    */
   private navProducts(): Locator {
-    return this.page.locator(`a[href="${ROUTES.products}"]`).first();
+    return this.page.locator(LOGGED_IN_MARKER).first();
   }
 
   private titleField(): Locator {

@@ -83,13 +83,20 @@ export class CreateCheckoutProductUseCase {
       return Result.ok({ productKey: existingKey, buyUrl: existingUrl, reused: true });
     }
 
-    if (!this.publisher.isConfigured()) {
-      return fail(
-        'not-configured',
-        'No Payhip session is stored. Run `npm run payhip:connect` once to log in by hand.',
-      );
-    }
-
+    // NO `isConfigured()` PRE-CHECK HERE, deliberately.
+    //
+    // It is a cached answer, and a cache is exactly the wrong thing to gate a
+    // job on. The publisher sets it to false the moment a run reports an
+    // expired session — correct for greying out a button — and a worker process
+    // lives for days, so it kept refusing every listing long after the operator
+    // had reconnected. The database said the session was fine; only this
+    // process still believed otherwise, and nothing short of a redeploy could
+    // change its mind.
+    //
+    // `createProduct` reads the session from the database on every attempt and
+    // reports `not-configured` itself when there genuinely isn't one, with the
+    // same message. Letting it answer costs one indexed query and cannot go
+    // stale.
     // ── the book must be finished and priced ──
     if (project.status.value !== 'COMPLETED') {
       return fail('rejected', 'The book must finish generating before it can be listed for sale');

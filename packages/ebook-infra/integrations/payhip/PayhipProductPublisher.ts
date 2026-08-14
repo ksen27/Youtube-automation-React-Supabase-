@@ -97,6 +97,10 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
   ): Promise<Result<PublishedCheckoutProduct, CheckoutPublishError>> {
     let lastError: PayhipError | null = null;
     const backoff = this.config.backoffMs ?? DEFAULT_BACKOFF_MS;
+    // Re-read before doing anything, so a reconnect takes effect immediately in
+    // a process that has been running for days. Without this the cached "no
+    // session" verdict set by an earlier failure outlives the fix for it.
+    await this.warmUp().catch(() => {});
 
     for (let attempt = 1; attempt <= backoff.length; attempt++) {
       if (attempt > 1) {
@@ -206,7 +210,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       }
 
       step('publishing and reading back the buy link');
-      const link = await dashboard.publishAndReadLink();
+      const link = await dashboard.publishAndReadLink(draft.title);
       step(`done — ${link.buyUrl}`);
 
       // Re-save the now-fresh cookies so Payhip's sliding session window resets.

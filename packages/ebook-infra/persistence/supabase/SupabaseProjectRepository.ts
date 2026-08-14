@@ -182,7 +182,9 @@ export class SupabaseProjectRepository implements ProjectRepository {
       const book = (Array.isArray(rawBook) ? rawBook[0] : rawBook) as
         | { title: string | null; cover_image_path: string | null }
         | undefined;
-      const options = (r as { options?: { bookTitle?: string } }).options;
+      // `options` was already being selected and then thrown away apart from the
+      // title; the commerce fields ride along at no extra query cost.
+      const options = (r as { options?: ProjectRow['options'] }).options;
       return {
         projectId: r.id as string,
         // The book's own title wins; the requested title is the fallback for
@@ -191,6 +193,10 @@ export class SupabaseProjectRepository implements ProjectRepository {
         coverImagePath: book?.cover_image_path ?? null,
         channelUrl: r.channel_url as string,
         createdAt: r.created_at as string,
+        priceCents: options?.landingPriceCents ?? null,
+        compareAtCents: options?.landingCompareAtCents ?? null,
+        checkoutUrl: options?.landingCheckoutUrl ?? null,
+        checkoutProductKey: options?.landingCheckoutProductKey ?? null,
       };
     });
   }

@@ -330,8 +330,26 @@ describe('refusing to publish', () => {
     expect(result.error.kind).toBe('transient');
   });
 
+  /**
+   * The publisher answers this, not a cached flag on the use case.
+   *
+   * A worker process lives for days, and `isConfigured()` is a cache that an
+   * earlier expired-session failure sets to false. Gating the job on it meant
+   * every later listing was refused long after the operator had reconnected —
+   * the database said the session was fine and only that one process disagreed.
+   * So the check belongs where the session is actually read.
+   */
   it('tells the operator to connect a session when none is stored', async () => {
-    const publisher = fakePublisher({ isConfigured: () => false });
+    const publisher = fakePublisher({
+      // Reports configured, as a stale cache would, while the live lookup
+      // inside createProduct finds nothing.
+      isConfigured: () => true,
+      createProduct: async () =>
+        Result.fail({
+          kind: 'not-configured' as const,
+          message: 'No Payhip session is stored. Run `npm run payhip:connect` once to log in by hand.',
+        }),
+    });
     const { useCase } = build({ publisher });
 
     const result = await useCase.execute({ projectId: PROJECT_ID });
@@ -342,6 +360,19 @@ describe('refusing to publish', () => {
     // The message has to name the command, because the operator reading it is
     // the only thing that can fix it.
     expect(result.error.message).toMatch(/payhip:connect/);
+  });
+
+  it('does not refuse a listing on a stale "no session" cache', async () => {
+    // The exact production failure: a worker that had seen one expired session
+    // kept reporting "no session stored" in 100ms, without opening a browser,
+    // for every subsequent job — including after a successful reconnect.
+    const publisher = fakePublisher({ isConfigured: () => false });
+    const { useCase } = build({ publisher });
+
+    const result = await useCase.execute({ projectId: PROJECT_ID });
+
+    expect(result.isOk()).toBe(true);
+    expect(publisher.drafts).toHaveLength(1);
   });
 });
 

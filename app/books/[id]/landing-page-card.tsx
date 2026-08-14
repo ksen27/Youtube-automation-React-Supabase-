@@ -77,6 +77,19 @@ interface Candidate {
   title: string;
   channelUrl: string;
   sameChannel: boolean;
+  /**
+   * What this book already sells for, and where.
+   *
+   * Choosing a book fills its price and link in from these, rather than asking
+   * the seller to remember what they set on that book's own page. They are also
+   * what the renderers now resolve from, so the form shows the same numbers the
+   * page will.
+   */
+  priceCents: number | null;
+  compareAtCents: number | null;
+  checkoutUrl: string | null;
+  /** True when this book already has a Payhip product we created. */
+  hasProduct: boolean;
 }
 
 /** A cloned reference site this book's page can be built from. */
@@ -169,8 +182,15 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [publisherConfigured, setPublisherConfigured] = useState(false);
   // The store product behind the checkout link, when we made it.
   const [product, setProduct] = useState<ProductState | null>(null);
-  // A listing run is in flight. Drives the same 5s poll the page render uses.
-  const [listing, setListing] = useState(false);
+  /**
+   * The book currently being listed on Payhip, by project id — this book's own
+   * id, or one of the other two on a three-book page.
+   *
+   * An id rather than a boolean because all three Create buttons share one
+   * queue and one poll: a flag could not say WHICH book's spinner to show, and
+   * showing all three would suggest work that isn't happening.
+   */
+  const [listingId, setListingId] = useState<string | null>(null);
   // See `working` below: a GENERATING/PUBLISHING row whose run never reported back.
   const [stalled, setStalled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -254,11 +274,6 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       // picks it up. That is the whole reason this integration is one file.
       const pData: ProductState | null = pRes.ok ? await pRes.json() : null;
       setProduct(pData);
-      // A listing run is over the moment the product exists. Cleared HERE, on
-      // the poll's own result, rather than from an effect watching `product` —
-      // that shape is a cascading render, and this is the callback the fetch
-      // already gives us.
-      if (pData?.generated) setListing(false);
       setCheckoutUrl(s.checkoutUrl ?? "");
       setPrice(centsToInput(s.priceCents));
       setCompareAt(centsToInput(s.compareAtCents));
@@ -287,7 +302,19 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
             : EMPTY_SIBLING;
         }),
       );
-      setCandidates(cData.candidates ?? []);
+      const loadedCandidates: Candidate[] = cData.candidates ?? [];
+      setCandidates(loadedCandidates);
+
+      // A listing run is over the moment that book has a product. Cleared HERE,
+      // on the poll's own result, rather than from an effect watching state —
+      // that shape is a cascading render, and this is the callback the fetch
+      // already gives us. Book 1 is answered by the product endpoint; the other
+      // two by their own entry in the picker, which carries the same truth.
+      setListingId((current) => {
+        if (!current) return null;
+        if (current === projectId) return pData?.generated ? null : current;
+        return loadedCandidates.find((c) => c.projectId === current)?.hasProduct ? null : current;
+      });
     } catch {
       /* leave the card in its previous state */
     }
@@ -316,9 +343,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     queueMicrotask(() => {
       if (!cancelled) void load(isCancelled);
     });
-    // `listing` joins `working` here so the checkout field fills itself in when
-    // the worker finishes, instead of the seller reloading to find out.
-    if (!working && !listing) return () => { cancelled = true; };
+    // `listingId` joins `working` here so the checkout field fills itself in
+    // when the worker finishes, instead of the seller reloading to find out.
+    if (!working && !listingId) return () => { cancelled = true; };
     const t = setInterval(() => {
       if (!cancelled) void load(isCancelled);
     }, 5000);
@@ -326,7 +353,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       cancelled = true;
       clearInterval(t);
     };
-  }, [load, working, listing]);
+  }, [load, working, listingId]);
 
   /**
    * List the book on Payhip and let the poll fill the checkout field in.
@@ -336,30 +363,107 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * saving would put the book on sale at the previous price.
    */
   async function createProduct() {
+    if (parsePrice(price) === null) {
+      setErr("Set a price before creating the Payhip link — the store needs one.");
+      return;
+    }
     setErr(null);
+    // Saved first, deliberately: the worker reads the price from the stored
+    // project row, not from this form, so listing without saving would put the
+    // book on sale at whatever it was priced at before.
     if (!(await saveSettings())) return;
-    setListing(true);
+    await listBook(projectId);
+  }
+
+  /**
+   * List one of the OTHER two books on a three-book page.
+   *
+   * The price is written to that book's own project first, because that is
+   * where a book's price lives now — one book, one price, one Payhip product,
+   * whichever page you set it from. The worker then reads it back from there,
+   * so skipping this step would list the book at whatever it was priced at
+   * before, silently.
+   */
+  async function createSiblingProduct(i: number) {
+    const sib = siblings[i];
+    if (!sib?.projectId) {
+      setErr("Choose a book before creating its Payhip link.");
+      return;
+    }
+    if (parsePrice(sib.price) === null) {
+      setErr("Set a price for that book first — the store needs one.");
+      return;
+    }
+    setErr(null);
+    // Save THIS page too, so the book selection survives the round trip.
+    if (!(await saveSettings())) return;
+
+    const priced = await fetch(`/api/books/projects/${sib.projectId}/landing-page`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        landingPriceCents: parsePrice(sib.price),
+        // Sent as 0 when cleared, matching this page's own save: an omitted key
+        // would leave a stale "was" price advertising a discount that is gone.
+        landingCompareAtCents: parsePrice(sib.compareAt) ?? 0,
+      }),
+    }).catch(() => null);
+    if (!priced?.ok) {
+      setErr("Could not save that book's price.");
+      return;
+    }
+
+    await listBook(sib.projectId);
+  }
+
+  /** Queue the Payhip listing for one book and start watching for its link. */
+  async function listBook(bookProjectId: string) {
+    setListingId(bookProjectId);
     try {
-      const res = await fetch(`/api/books/projects/${projectId}/checkout-product`, { method: "POST" });
+      const res = await fetch(`/api/books/projects/${bookProjectId}/checkout-product`, { method: "POST" });
       const data = await res.json();
       if (!res.ok) {
         setErr(data.error ?? "Could not create the product");
-        setListing(false);
+        setListingId(null);
         return;
       }
       // Already listed: nothing was queued, so there is nothing to wait for.
       if (!data.queued) {
-        setListing(false);
+        setListingId(null);
         await load();
       }
     } catch {
       setErr("Could not reach the server");
-      setListing(false);
+      setListingId(null);
     }
+  }
+
+  /** The picker entry for a chosen book — its stored price, link and status. */
+  function candidateFor(bookProjectId: string): Candidate | undefined {
+    return candidates.find((c) => c.projectId === bookProjectId);
   }
 
   function updateSibling(i: number, patch: Partial<SiblingDraft>) {
     setSiblings((prev) => prev.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  }
+
+  /**
+   * Choosing a book pulls in what it already sells for.
+   *
+   * The seller should not have to remember, or re-type, a price that is already
+   * recorded against that book — and if they did re-type it differently, the
+   * form would be advertising one number while the Payhip product charges
+   * another. Blank fields for a book with no price yet, which is the cue to set
+   * one and press Create.
+   */
+  function chooseSibling(i: number, chosenProjectId: string) {
+    const candidate = candidateFor(chosenProjectId);
+    updateSibling(i, {
+      projectId: chosenProjectId,
+      price: centsToInput(candidate?.priceCents ?? null),
+      compareAt: centsToInput(candidate?.compareAtCents ?? null),
+      checkoutUrl: candidate?.checkoutUrl ?? "",
+    });
   }
 
   /**
@@ -954,44 +1058,25 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
           )}
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="checkoutUrl">Checkout link</Label>
-              <Input
-                id="checkoutUrl"
-                value={checkoutUrl}
-                onChange={(e) => setCheckoutUrl(e.target.value)}
-                placeholder="https://payhip.com/b/..."
+              <Label>Buy link</Label>
+              <CheckoutControl
+                url={checkoutUrl}
+                onUrlChange={setCheckoutUrl}
+                generated={Boolean(product?.generated)}
+                productKey={product?.productKey ?? null}
+                configured={Boolean(product?.configured)}
+                blocker={product?.blockers[0] ?? null}
+                busy={busy}
+                listing={listingId === projectId}
+                onCreate={createProduct}
+                inputId="checkoutUrl"
+                // Read from the FORM, not from the server's saved copy. The
+                // button is what saves the price, so gating it on the saved
+                // price meant a freshly-typed one could never enable it.
+                disabledReason={
+                  parsePrice(price) === null ? "Set a price for this book first" : undefined
+                }
               />
-              {/* The manual paste stays. Automation fills this field in; it does
-                  not take it over — a seller looking at a dead link needs to be
-                  able to fix it right here. */}
-              {product?.generated ? (
-                <p className="text-xs text-fg-subtle">Created on Payhip ({product.productKey}).</p>
-              ) : (
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={createProduct}
-                    disabled={
-                      busy || listing || !product?.configured || (product?.blockers.length ?? 0) > 0
-                    }
-                  >
-                    {listing ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
-                    {listing ? "Creating on Payhip…" : "Create product on Payhip"}
-                  </Button>
-                  {/* A disabled button that explains itself. Every reason here is
-                      real and fixable — no price set, book still generating, no
-                      store session connected. */}
-                  {!product?.configured ? (
-                    <span className="text-xs text-fg-subtle">
-                      Run <code>npm run payhip:connect</code> once to connect the store.
-                    </span>
-                  ) : product?.blockers[0] ? (
-                    <span className="text-xs text-fg-subtle">{product.blockers[0]}</span>
-                  ) : null}
-                </div>
-              )}
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="price">Price ({settings.currency})</Label>
@@ -1082,7 +1167,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 <p className="text-xs font-medium uppercase tracking-wide text-fg-subtle">Book {i + 2}</p>
                 <select
                   value={sib.projectId}
-                  onChange={(e) => updateSibling(i, { projectId: e.target.value })}
+                  onChange={(e) => chooseSibling(i, e.target.value)}
                   className="flex h-9 w-full rounded-md border border-border bg-surface px-3 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
                 >
                   <option value="">Select a finished book…</option>
@@ -1094,15 +1179,6 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                   ))}
                 </select>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <Label htmlFor={`sib-url-${i}`}>Checkout link</Label>
-                    <Input
-                      id={`sib-url-${i}`}
-                      value={sib.checkoutUrl}
-                      onChange={(e) => updateSibling(i, { checkoutUrl: e.target.value })}
-                      placeholder="https://payhip.com/b/..."
-                    />
-                  </div>
                   <div className="space-y-1.5">
                     <Label htmlFor={`sib-price-${i}`}>Price ({settings.currency})</Label>
                     <Input
@@ -1126,6 +1202,31 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                       inputMode="decimal"
                     />
                   </div>
+                </div>
+                {/* The same control book 1 uses. A book's price and link belong
+                    to the BOOK, so creating here also sets them on that book's
+                    own page — one book, one product, one price. */}
+                <div className="space-y-1.5">
+                  <Label>Buy link</Label>
+                  <CheckoutControl
+                    url={sib.checkoutUrl}
+                    onUrlChange={(v) => updateSibling(i, { checkoutUrl: v })}
+                    generated={Boolean(candidateFor(sib.projectId)?.hasProduct)}
+                    productKey={null}
+                    configured={Boolean(product?.configured)}
+                    blocker={null}
+                    busy={busy}
+                    listing={listingId === sib.projectId}
+                    onCreate={() => createSiblingProduct(i)}
+                    inputId={`sib-url-${i}`}
+                    disabledReason={
+                      !sib.projectId
+                        ? "Choose a book first"
+                        : parsePrice(sib.price) === null
+                          ? "Set a price for this book first"
+                          : undefined
+                    }
+                  />
                 </div>
               </div>
             ))}
@@ -1226,5 +1327,125 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         {publishHint && <p className="text-xs text-amber-300">Publish: {publishHint}</p>}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * The buy link for one book: create it, or see the one that exists.
+ *
+ * Shared by all three books on a page so they cannot drift apart — the seller
+ * should not have to learn a different control for book 2 than for book 1.
+ *
+ * The link is READ-ONLY by default. It is a Payhip product id we created, not
+ * something anyone should be retyping, and a free-text box beside a working
+ * automation invites exactly the mistake it cannot catch: a link pointing at
+ * the wrong product still looks like a link.
+ *
+ * The manual box is still one click away, behind "enter a link manually".
+ * Publishing is blocked until every book has a link, so if Payhip changes their
+ * form or the session lapses mid-launch, a seller with no way to paste a link
+ * cannot ship at all — and waiting on a code fix to publish a finished book is
+ * a worse failure than the tidier form is a win.
+ */
+function CheckoutControl(props: {
+  url: string;
+  onUrlChange: (value: string) => void;
+  generated: boolean;
+  productKey: string | null;
+  configured: boolean;
+  blocker: string | null;
+  busy: boolean;
+  listing: boolean;
+  onCreate: () => void;
+  inputId: string;
+  /** Shown instead of the Create button before a book has been chosen. */
+  disabledReason?: string | undefined;
+}) {
+  const [manual, setManual] = useState(false);
+
+  if (props.generated && !manual) {
+    return (
+      <div className="space-y-1">
+        <a
+          href={props.url}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-1.5 break-all text-sm text-brand-400 hover:underline"
+        >
+          {props.url}
+          <ExternalLink className="h-3 w-3 shrink-0" />
+        </a>
+        <p className="text-xs text-fg-subtle">
+          Created on Payhip{props.productKey ? ` (${props.productKey})` : ""}.{" "}
+          <button
+            type="button"
+            onClick={() => setManual(true)}
+            className="underline hover:text-fg"
+          >
+            replace it manually
+          </button>
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {manual ? (
+        <>
+          <Input
+            id={props.inputId}
+            value={props.url}
+            onChange={(e) => props.onUrlChange(e.target.value)}
+            placeholder="https://payhip.com/b/..."
+          />
+          <button
+            type="button"
+            onClick={() => setManual(false)}
+            className="text-xs text-fg-subtle underline hover:text-fg"
+          >
+            back to creating it automatically
+          </button>
+        </>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={props.onCreate}
+            disabled={
+              props.busy ||
+              props.listing ||
+              !props.configured ||
+              Boolean(props.disabledReason) ||
+              Boolean(props.blocker)
+            }
+          >
+            {props.listing ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+            {props.listing ? "Creating on Payhip…" : "Create Payhip link"}
+          </Button>
+          {/* A disabled button that explains itself. Every reason here is real
+              and fixable — no book chosen, no price set, book still generating,
+              or no store session connected. */}
+          {!props.configured ? (
+            <span className="text-xs text-fg-subtle">
+              Run <code>npm run payhip:connect</code> once to connect the store.
+            </span>
+          ) : props.disabledReason ? (
+            <span className="text-xs text-fg-subtle">{props.disabledReason}</span>
+          ) : props.blocker ? (
+            <span className="text-xs text-fg-subtle">{props.blocker}</span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => setManual(true)}
+            className="text-xs text-fg-subtle underline hover:text-fg"
+          >
+            enter a link manually
+          </button>
+        </div>
+      )}
+    </div>
   );
 }

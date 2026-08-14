@@ -73,6 +73,10 @@ class FakeQueue implements JobQueue {
   async enqueue(queue: QueueName): Promise<void> {
     this.enqueued.push(queue);
   }
+  /** Nothing holds an id in a fake queue, so every id is free. */
+  async settleState(): Promise<'none' | 'pending' | 'cleared'> {
+    return 'none';
+  }
   async failedStages(): Promise<QueueName[]> {
     return [];
   }

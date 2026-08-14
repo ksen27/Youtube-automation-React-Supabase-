@@ -4,6 +4,7 @@ import { ProjectId } from '../../domain/project/ProjectId';
 import { LandingPage, LandingPageId, type LandingCopy } from '../../domain/landing/LandingPage';
 import { normalizeBookTitle, type LandingMode } from '../../domain/project/GenerationOptions';
 import { Palette, parseHexColor } from '../../domain/landing/Palette';
+import { siblingCommerce } from '../landing/siblingCommerce';
 import type { ProjectRepository } from '../ports/repositories/ProjectRepository';
 import type { BookRepository } from '../ports/repositories/BookRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
@@ -1201,13 +1202,20 @@ export class GenerateLandingPageUseCase {
         title: e.title,
         items: e.keyPoints.slice(0, 6),
       })),
-      // Price and link come from THIS sibling's own entry, never from the
-      // project it points at — the seller sets them per page.
-      priceCents: sibling.priceCents ?? null,
-      // Its own "was" price, so a set can be discounted card by card rather
-      // than only on the book whose page this is.
-      compareAtCents: sibling.compareAtCents ?? null,
-      checkoutUrl: sibling.checkoutUrl ?? null,
+      // Price and link follow THE BOOK, not the page.
+      //
+      // This used to be the other way round — each page stored its own price
+      // and link for a book it merely referenced. That made sense while links
+      // were pasted in by hand, and stopped making sense the moment they became
+      // real Payhip products: one book has ONE product, so the page that
+      // references it has to show what that product actually charges. Storing a
+      // second price here just means two pages can sell the same product at two
+      // advertised prices, and only the buyer finds out.
+      //
+      // The stored entry survives as a FALLBACK so pages built under the old
+      // rule keep rendering: a book that never got its own price or link falls
+      // back to whatever this page recorded for it.
+      ...siblingCommerce(siblingProject.options, sibling),
       kind: 'book',
     });
   }

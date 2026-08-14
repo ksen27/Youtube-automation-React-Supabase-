@@ -41,6 +41,23 @@ export interface JobQueue {
     options: EnqueueOptions,
   ): Promise<void>;
 
+  /**
+   * Make a deterministic job id reusable after the run that claimed it finished.
+   *
+   * Deterministic ids are what stop a double-click from doing a thing twice —
+   * BullMQ ignores an `add` whose id already exists. The catch is that failed
+   * jobs are KEPT for inspection, so that same protection quietly becomes a
+   * permanent block: the first failure owns the id forever and every later
+   * attempt is swallowed without a trace, which looks exactly like the button
+   * doing nothing.
+   *
+   * Returns:
+   *   'none'    — no job holds this id; enqueue normally.
+   *   'pending' — a run is queued or in flight; do NOT enqueue a rival.
+   *   'cleared' — a finished job held the id and has been removed; enqueue now.
+   */
+  settleState(queue: QueueName, jobId: string): Promise<'none' | 'pending' | 'cleared'>;
+
   /** Queues that currently hold failed jobs for a project (for retry diagnosis). */
   failedStages(projectId: string): Promise<QueueName[]>;
 

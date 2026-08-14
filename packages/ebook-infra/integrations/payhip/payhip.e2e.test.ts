@@ -93,6 +93,32 @@ describe('parsing a Payhip product link', () => {
  * hazard, and it belongs inside a function that is called exclusively by the
  * worker and the connect CLI.
  */
+/**
+ * The connect CLI and the automation must agree on what "logged in" looks like.
+ *
+ * They once kept separate copies of it. When the automation's marker was
+ * corrected to the real dashboard, the connect flow was left waiting for an
+ * "Add New Product" button that does not exist — so a human logged in
+ * successfully, watched the browser sit there for ten minutes, and got
+ * "Login was not completed" with nothing saved. The login worked; only the
+ * detection was stale.
+ */
+describe('agreeing on what a logged-in page looks like', () => {
+  it('has the connect flow wait for the same marker the automation checks', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const { join, dirname } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const dir = dirname(fileURLToPath(import.meta.url));
+
+    const login = await readFile(join(dir, 'login.ts'), 'utf8');
+
+    // It must USE the shared constant, not merely happen to match it today.
+    expect(login).toContain('LOGGED_IN_MARKER');
+    // And must not have grown its own idea of the dashboard again.
+    expect(login).not.toMatch(/add (new )?product/i);
+  });
+});
+
 describe('keeping the browser out of the web bundle', () => {
   it('never imports playwright at the top level of any Payhip module', async () => {
     const { readdir, readFile } = await import('node:fs/promises');
