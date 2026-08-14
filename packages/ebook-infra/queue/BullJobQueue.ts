@@ -82,6 +82,25 @@ export class BullJobQueue implements JobQueue {
     });
   }
 
+  async settleState(queue: QueueName, jobId: string): Promise<'none' | 'pending' | 'cleared'> {
+    const q = this.queues.get(queue);
+    if (!q) throw new Error(`Unknown queue: ${queue}`);
+    const job = await q.getJob(toBullJobId(jobId));
+    if (!job) return 'none';
+
+    const state = await job.getState();
+    // Anything not yet finished is a live claim on the id — removing it would
+    // orphan a run that may be halfway through creating something.
+    if (state !== 'completed' && state !== 'failed') return 'pending';
+
+    // Finished, so the id is free to reuse. The job's record is what BullMQ
+    // keeps for dead-letter inspection; the failure has already been logged and
+    // reported to the operator, so dropping it here costs nothing that the logs
+    // do not already hold.
+    await job.remove();
+    return 'cleared';
+  }
+
   async failedStages(projectId: string): Promise<QueueName[]> {
     const stages: QueueName[] = [];
     for (const [name, q] of this.queues) {

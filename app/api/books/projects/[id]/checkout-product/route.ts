@@ -120,11 +120,19 @@ export const POST = handle(async (req: Request, { params }: { params: Promise<{ 
   // queue's. That is the point: BullMQ de-duplicates on it, so a second click
   // while the first run is still working joins the existing job instead of
   // starting a rival browser that would list the book a second time.
-  await c.queue.enqueue(
-    'checkout-product',
-    { projectId: id, force },
-    { jobId: `checkout-product:${id}` },
-  );
+  //
+  // But de-duplication does not expire, and failed jobs are kept for
+  // inspection — so the first failure owned this id permanently and every later
+  // click was silently dropped, with no job, no log, and a button that appeared
+  // to do nothing. Clearing a FINISHED job first restores retries while keeping
+  // the guarantee that matters: a run still in flight is never duplicated.
+  const jobId = `checkout-product:${id}`;
+  const prior = await c.queue.settleState('checkout-product', jobId);
+  if (prior === 'pending') {
+    return json({ queued: true, alreadyRunning: true }, 202);
+  }
+
+  await c.queue.enqueue('checkout-product', { projectId: id, force }, { jobId });
   return json({ queued: true }, 202);
 });
 
