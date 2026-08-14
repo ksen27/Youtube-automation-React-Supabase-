@@ -64,8 +64,17 @@ export const GET = handle(async (_req: Request, { params }: { params: Promise<{ 
     buyUrl: project.options.landingCheckoutUrl ?? null,
     /** True when the checkout link came from us rather than from the form. */
     generated: Boolean(productKey && project.options.landingCheckoutUrl),
-    // Named so a disabled button can explain itself rather than just sitting there.
-    blockers: listBlockers(project),
+    // Only the blockers the FORM CANNOT FIX.
+    //
+    // The price is deliberately not among them, even though creating without
+    // one fails. These blockers disable the Create button, and the price the
+    // server knows about is the SAVED one — while the button is what saves the
+    // form. Reporting an unsaved price as a blocker therefore disabled the only
+    // control that could clear it: type a price, watch the button stay grey
+    // forever. The form validates the price itself, from what is on screen,
+    // which is both accurate and instant. POST still rejects a missing one, so
+    // a caller going straight to the API is not let through.
+    blockers: unfixableBlockers(project),
   });
 });
 
@@ -119,12 +128,28 @@ export const POST = handle(async (req: Request, { params }: { params: Promise<{ 
   return json({ queued: true }, 202);
 });
 
-/** Why this book cannot be listed yet, in the order the seller should fix them. */
-function listBlockers(project: { status: { value: string }; options: { landingPriceCents?: number | undefined } }): string[] {
+type BlockerCheck = { status: { value: string }; options: { landingPriceCents?: number | undefined } };
+
+/**
+ * Reasons no amount of form-filling will help — the ones worth disabling the
+ * Create button over. Today that is just an unfinished book: the seller has to
+ * wait, and no keystroke changes that.
+ */
+function unfixableBlockers(project: BlockerCheck): string[] {
   const blockers: string[] = [];
   if (project.status.value !== 'COMPLETED') {
     blockers.push('The book must finish generating before it can be listed for sale');
   }
+  return blockers;
+}
+
+/**
+ * Everything that must be true before a listing is queued, checked against the
+ * SAVED project. Used only by POST — see the note on `blockers` above for why
+ * the price must not reach the button's disabled state.
+ */
+function listBlockers(project: BlockerCheck): string[] {
+  const blockers = unfixableBlockers(project);
   if (project.options.landingPriceCents === undefined) {
     blockers.push('Set the price before creating the product — the store needs one');
   }

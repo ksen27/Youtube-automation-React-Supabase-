@@ -363,7 +363,14 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * saving would put the book on sale at the previous price.
    */
   async function createProduct() {
+    if (parsePrice(price) === null) {
+      setErr("Set a price before creating the Payhip link — the store needs one.");
+      return;
+    }
     setErr(null);
+    // Saved first, deliberately: the worker reads the price from the stored
+    // project row, not from this form, so listing without saving would put the
+    // book on sale at whatever it was priced at before.
     if (!(await saveSettings())) return;
     await listBook(projectId);
   }
@@ -1063,6 +1070,12 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 listing={listingId === projectId}
                 onCreate={createProduct}
                 inputId="checkoutUrl"
+                // Read from the FORM, not from the server's saved copy. The
+                // button is what saves the price, so gating it on the saved
+                // price meant a freshly-typed one could never enable it.
+                disabledReason={
+                  parsePrice(price) === null ? "Set a price for this book first" : undefined
+                }
               />
             </div>
             <div className="space-y-1.5">
@@ -1209,7 +1222,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                     disabledReason={
                       !sib.projectId
                         ? "Choose a book first"
-                        : !sib.price.trim()
+                        : parsePrice(sib.price) === null
                           ? "Set a price for this book first"
                           : undefined
                     }
