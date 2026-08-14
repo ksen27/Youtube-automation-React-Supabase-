@@ -1,4 +1,4 @@
-import { openPayhipContext, isLoginUrl, type PayhipBrowserConfig } from './PayhipBrowser';
+import { openPayhipContext, isLoginUrl, loginUrl, type PayhipBrowserConfig } from './PayhipBrowser';
 import type { PayhipSessionStore } from './PayhipSessionStore';
 
 /**
@@ -30,8 +30,9 @@ export async function interactivePayhipLogin(
   const { browser, context } = await openPayhipContext({ ...config, headed: true }, null);
   try {
     const page = await context.newPage();
-    await page.goto(`${config.baseUrl}/login`, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    log(`A browser window opened at ${config.baseUrl}/login — log in by hand.`);
+    const target = loginUrl(config.baseUrl);
+    await page.goto(target, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    log(`A browser window opened at ${target} — log in by hand.`);
     log('Complete any captcha, 2FA or email code. Waiting for the dashboard to appear…');
 
     // Success = off the login page AND showing a real dashboard control. The

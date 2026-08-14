@@ -45,6 +45,88 @@ import {
 /** How long a file upload may take, over and above the per-action timeout. */
 const UPLOAD_TIMEOUT_MS = 10 * 60_000;
 
+/**
+ * Payhip's real routes, read off a live dashboard.
+ *
+ * NAVIGATING BEATS CLICKING here, and the first version of this file got it
+ * wrong. It assumed an "Add New Product" button on the dashboard and hunted for
+ * it by accessible name; the actual dashboard is a welcome panel and a nav bar,
+ * with no such button anywhere on it. The run failed at the first step with a
+ * timeout that blamed the dashboard for loading slowly.
+ *
+ * These paths are a far more stable contract than button labels: Payhip
+ * restyles and rewords, but `/product/add/digital` is the address of a thing.
+ * Each is still verified by a marker on arrival, so a moved route fails loudly
+ * rather than silently filling in the wrong form.
+ */
+/**
+ * The product form's real controls, read off a live `/product/add/digital`.
+ *
+ * FORM FIELDS ARE MATCHED BY `name`, NOT BY LABEL — a deliberate exception to
+ * this file's role/label-first policy, and the previous version's price locator
+ * is why. `getByLabel(/^price/i)` matched `pwyw_suggested_price`, the
+ * pay-what-you-want suggested amount, which sits hidden on the page unless that
+ * pricing mode is selected. Playwright dutifully waited 45 seconds for a field
+ * that is never going to be visible. The form has several plausible "price"
+ * fields — global price, sale price, per-variant price, PWYW suggestion — and
+ * an accessible-name regex cannot reliably tell them apart, whereas `p_price`
+ * is the exact field Payhip's own backend reads.
+ *
+ * The upload zones are scoped by their CONTAINER id for the same reason: the
+ * page carries seven file inputs (product file, product image, preview teaser,
+ * and four editor image pickers), all with generated plupload ids, so "the
+ * first file input" is a coin flip that silently uploads the ebook into the
+ * rich-text editor.
+ */
+const SELECTORS = {
+  title: 'input[name="p_name"]',
+  /**
+   * The global price. The per-variant field shares the id `p_price` but carries
+   * no `name`, so matching on name picks the real one unambiguously.
+   */
+  price: 'input[name="p_price"]',
+  /** Hidden, and the store account's setting — see `readCurrency`. */
+  currency: 'input[name="p_currency"]',
+  /** Where the description editor syncs its HTML; used to confirm it took. */
+  descriptionSync: 'input[name="p_desc"]',
+  /** The ebook itself — what the buyer downloads. */
+  productFileZone: '#ebook_files',
+  /** Cover art for the listing. */
+  productImageZone: '#upload_product_images_box',
+  /** A free teaser. We never touch it, but it owns a file input we must avoid. */
+  previewZone: '#ebook_preview',
+  /**
+   * One uploaded file, as rendered in the list. The row appears when the upload
+   * STARTS; the badge is what marks it finished, which for a 46 MB PDF are
+   * minutes apart.
+   */
+  uploadedFileRow: '.js-upload-digital-file-row',
+  uploadedFileBadge: '.js-digital-file-uploaded-badge',
+  /**
+   * The form's real submit control — an `<input type="submit" value="Add
+   * Product">`, not a `<button>`.
+   *
+   * The obvious `button` selectors are all traps here. The page carries six
+   * other submit buttons, every one of them inside the rich-text editor's image
+   * modals ("Save", "Edit Image", "Add selected files"), and `js-save-button`
+   * — which looks like exactly the right hook — is two of those modal buttons
+   * and never the product form. Clicking one submits an invisible dialog while
+   * leaving the product uncreated, which looks indistinguishable from success
+   * until the link read-back fails.
+   */
+  submit: '#addsubmit',
+} as const;
+
+const ROUTES = {
+  dashboard: '/dashboard',
+  /** The product list — where an already-created product can be found. */
+  products: '/products',
+  /** Straight to the digital product form. Sibling of `/product/add/physical`. */
+  addDigital: '/product/add/digital',
+  /** The product-type chooser, used as a fallback if the direct route moves. */
+  create: '/product/create',
+} as const;
+
 /** `payhip.com/b/AbC12` → `AbC12`. The store's own id for the product. */
 export function extractProductKey(url: string): string | null {
   const match = url.match(/payhip\.com\/b\/([A-Za-z0-9_-]+)/);
@@ -72,7 +154,7 @@ export class PayhipProductPage {
    * has no credentials and could not clear a captcha if it did.
    */
   async openDashboard(): Promise<void> {
-    await this.page.goto(`${this.baseUrl}/dashboard`, { waitUntil: 'domcontentloaded' }).catch(() => {
+    await this.page.goto(`${this.baseUrl}${ROUTES.dashboard}`, { waitUntil: 'domcontentloaded' }).catch(() => {
       // A failed navigation is not evidence of an expired session; let the URL
       // and marker checks below decide, and report a transient failure if the
       // page never arrives.
@@ -83,8 +165,13 @@ export class PayhipProductPage {
     // A positive marker, not merely "no login redirect": a blank page or an
     // error page is not a working dashboard, and treating it as one only moves
     // the failure to a more confusing step.
-    const addProduct = this.addProductButton();
-    const authed = await addProduct
+    //
+    // The marker is the nav's Products link, because the nav is the one thing
+    // present on EVERY logged-in page regardless of account state. The dashboard
+    // body is not: a new store shows a "Welcome to Payhip!" setup panel, an
+    // established one shows stats, and keying off anything in there means the
+    // automation works for one of them and not the other.
+    const authed = await this.navProducts()
       .waitFor({ state: 'visible' })
       .then(() => true)
       .catch(() => false);
@@ -98,21 +185,49 @@ export class PayhipProductPage {
     }
   }
 
-  /** Dashboard → Add New Product → Digital Product. */
+  /**
+   * Open the digital-product form.
+   *
+   * Goes straight to the route rather than clicking through the dashboard.
+   * Payhip offers several product kinds (digital, physical, membership, course,
+   * bundle) and picking the wrong one silently produces a product nobody can
+   * download — so the type is named in the URL, not inferred from which tile a
+   * click landed on.
+   *
+   * Falls back to the `/product/create` chooser if the direct route ever moves,
+   * and only then hunts for a "Digital" option by name.
+   */
   async startDigitalProduct(): Promise<void> {
-    await this.addProductButton().click();
-    // Payhip offers several product kinds (digital, membership, physical,
-    // coupon). Picking the wrong one silently produces a product that cannot be
-    // downloaded, so this is an explicit click and not a "first option" guess.
+    await this.page.goto(`${this.baseUrl}${ROUTES.addDigital}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    if (isLoginUrl(this.page.url())) throw new PayhipSessionExpired();
+
+    // The title field is the proof the form actually opened — without it the
+    // next step would type into whatever happened to be on screen.
+    const opened = await this.titleField()
+      .waitFor({ state: 'visible' })
+      .then(() => true)
+      .catch(() => false);
+    if (opened) return;
+
+    await this.page.goto(`${this.baseUrl}${ROUTES.create}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
     const digital = firstVisible(this.page, [
-      this.page.getByRole('link', { name: /digital product/i }),
-      this.page.getByRole('button', { name: /digital product/i }),
-      this.page.getByText(/^digital product$/i),
+      this.page.getByRole('link', { name: /digital/i }),
+      this.page.getByRole('button', { name: /digital/i }),
+      this.page.getByText(/digital (product|download)/i),
     ]);
-    await digital.click();
-    // The title field is the proof the digital-product form actually opened —
-    // without it the next step would type into whatever the click landed on.
-    await this.titleField().waitFor({ state: 'visible' });
+    await digital.click().catch(() => {
+      throw new PayhipTransientError(
+        `could not open the digital product form — neither ${ROUTES.addDigital} nor the ` +
+          `${ROUTES.create} chooser offered one (at ${this.page.url()})`,
+      );
+    });
+    await this.titleField()
+      .waitFor({ state: 'visible' })
+      .catch(() => {
+        throw new PayhipTransientError(
+          `the digital product form did not open (at ${this.page.url()})`,
+        );
+      });
   }
 
   async fillDetails(input: PayhipProductInput): Promise<void> {
@@ -132,6 +247,9 @@ export class PayhipProductPage {
       await description.pressSequentially(input.description);
     });
 
+    // The price field carries a default ("5.00"), so this must REPLACE rather
+    // than append — `fill` does, but it is worth being explicit about why the
+    // field is never empty when we arrive.
     await this.priceField().fill(input.priceText);
   }
 
@@ -146,10 +264,18 @@ export class PayhipProductPage {
    * are minutes apart.
    */
   async uploadPdf(pdfPath: string, filename: string): Promise<void> {
-    const input = this.page.locator('input[type="file"]').first();
+    const input = this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
     await input.setInputFiles(pdfPath);
+    // Completion is the "uploaded" BADGE on the file row.
+    //
+    // Not the filename as page text: Payhip renders it inside a row whose
+    // rename `<input>` lives in a collapsed dropdown, and an input's value is
+    // never matched by `getByText`. Waiting on the rename input directly is
+    // just as wrong — it is present but hidden, so a perfectly successful 46 MB
+    // upload sat there until the ten-minute budget expired, twice, with the
+    // finished file visible on screen the whole time.
     await this.page
-      .getByText(filename, { exact: false })
+      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileBadge}`)
       .first()
       .waitFor({ state: 'visible', timeout: UPLOAD_TIMEOUT_MS })
       .catch(() => {
@@ -168,18 +294,18 @@ export class PayhipProductPage {
    */
   async uploadCover(coverPath: string): Promise<boolean> {
     try {
-      const zone = firstVisible(this.page, [
-        this.page.getByLabel(/cover image|product image|thumbnail/i),
-        this.page.getByText(/cover image|product image/i),
-      ]);
-      await zone.scrollIntoViewIfNeeded();
-      // The cover input is the second file input on the form (the first is the
-      // product file). Scoped by position because these inputs are hidden and
-      // carry no accessible name of their own.
-      const inputs = this.page.locator('input[type="file"]');
-      const count = await inputs.count();
-      if (count < 2) return false;
-      await inputs.nth(1).setInputFiles(coverPath);
+      const input = this.page.locator(`${SELECTORS.productImageZone} input[type="file"]`).first();
+      await input.setInputFiles(coverPath);
+      // A thumbnail is small and fast; give it a fraction of the ebook's budget
+      // rather than letting a stuck image hold the whole run open for minutes.
+      // The thumbnail strip carries `display: none` until an image is actually
+      // attached, so its becoming visible is the honest signal. Waiting for an
+      // `img` instead would match the empty zone's camera placeholder and
+      // report success for an upload that never happened.
+      await this.page
+        .locator(`${SELECTORS.productImageZone} .js-preview-images-zone`)
+        .first()
+        .waitFor({ state: 'visible', timeout: 60_000 });
       return true;
     } catch {
       return false;
@@ -194,11 +320,13 @@ export class PayhipProductPage {
    * that 404s would be written into a live sales page's buy button.
    */
   async publishAndReadLink(): Promise<{ productKey: string; buyUrl: string }> {
-    const publish = firstVisible(this.page, [
-      this.page.getByRole('button', { name: /^(publish|save|create product)$/i }),
-      this.page.getByRole('button', { name: /publish|save/i }),
-    ]);
-    await publish.click();
+    await this.page.locator(SELECTORS.submit).first().click();
+
+    // Submitting posts the whole form, including the file it just accepted, so
+    // give the navigation room before concluding anything about the result.
+    // Not fatal on timeout: some flows update in place rather than navigating,
+    // and the checks below can still find the link.
+    await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
 
     // Payhip surfaces validation failures (price rejected, file too large) as
     // inline errors and simply stays on the form. Checked BEFORE waiting for a
@@ -259,7 +387,10 @@ export class PayhipProductPage {
    * creating turns that into a recovered link instead of a duplicate listing.
    */
   async findExistingByTitle(title: string): Promise<{ productKey: string; buyUrl: string } | null> {
-    await this.page.goto(`${this.baseUrl}/dashboard`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    // The PRODUCT LIST, not the dashboard. The dashboard shows a welcome panel
+    // or store stats and never lists products, so looking there found nothing
+    // for every book — which quietly turned this duplicate guard into a no-op.
+    await this.page.goto(`${this.baseUrl}${ROUTES.products}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
     if (isLoginUrl(this.page.url())) throw new PayhipSessionExpired();
     const row = this.page.getByText(title, { exact: true }).first();
     const present = await row
@@ -273,27 +404,64 @@ export class PayhipProductPage {
   // ── locators ──────────────────────────────────────────────────────────────
   // Named separately from their uses so the same control is described once.
 
-  private addProductButton(): Locator {
-    return firstVisible(this.page, [
-      this.page.getByRole('link', { name: /add new product|new product|add product/i }),
-      this.page.getByRole('button', { name: /add new product|new product|add product/i }),
-    ]);
+  /**
+   * The nav's Products link — the "you are logged in" marker.
+   *
+   * Matched on its href rather than its text: the link is an icon plus a
+   * `<span>`, so its accessible name depends on how the icon is labelled, while
+   * the href is the destination itself and cannot drift without the route
+   * changing.
+   */
+  private navProducts(): Locator {
+    return this.page.locator(`a[href="${ROUTES.products}"]`).first();
   }
 
   private titleField(): Locator {
-    return firstVisible(this.page, [
-      this.page.getByLabel(/product name|title/i),
-      this.page.getByPlaceholder(/product name|title/i),
-      this.page.getByRole('textbox', { name: /name|title/i }),
-    ]);
+    return this.page.locator(SELECTORS.title).first();
   }
 
   private priceField(): Locator {
-    return firstVisible(this.page, [
-      this.page.getByLabel(/^price/i),
-      this.page.getByPlaceholder(/price|0\.00/i),
-      this.page.getByRole('spinbutton', { name: /price/i }),
-    ]);
+    return this.page.locator(SELECTORS.price).first();
+  }
+
+  /**
+   * The currency the product will actually be sold in.
+   *
+   * Payhip sets this per STORE, not per product: the form carries it as a
+   * hidden input rather than a control. We cannot change it from here, so the
+   * only useful thing to do with it is compare — see `assertCurrency`.
+   */
+  async readCurrency(): Promise<string | null> {
+    const value = await this.page
+      .locator(SELECTORS.currency)
+      .first()
+      .getAttribute('value')
+      .catch(() => null);
+    return value?.trim().toUpperCase() || null;
+  }
+
+  /**
+   * Refuse to list the book if the store sells in a different currency than the
+   * landing page advertises.
+   *
+   * Silently listing a "$10" book that actually charges €10 is worse than
+   * failing: the sales page and the checkout disagree about what the buyer pays,
+   * nothing warns anyone, and the first person to notice is a customer. Since
+   * the currency is a store-level setting we cannot fix it here, so the honest
+   * move is to stop and name both values.
+   *
+   * A currency we cannot read is NOT treated as a mismatch — a missing hidden
+   * input means Payhip changed the form, and refusing every listing over that
+   * would be worse than the risk it guards against.
+   */
+  async assertCurrency(expected: string): Promise<void> {
+    const actual = await this.readCurrency();
+    if (!actual || actual === expected.trim().toUpperCase()) return;
+    throw new PayhipRejected(
+      `This book is priced in ${expected.toUpperCase()} but the Payhip store sells in ${actual}. ` +
+        'Payhip sets currency per store, not per product, so change it in Payhip → Settings, ' +
+        "or set the book's currency to match. Nothing was created.",
+    );
   }
 }
 

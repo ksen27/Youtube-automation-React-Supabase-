@@ -46,11 +46,18 @@ export const GET = handle(async (_req: Request, { params }: { params: Promise<{ 
   const { c, project } = auth;
 
   const productKey = project.options.landingCheckoutProductKey ?? null;
+  // Re-read rather than trusting the boot-time cache. `isConfigured()` is
+  // synchronous by the port's contract, so the publisher answers from a value
+  // resolved when the container was built — which means a session connected
+  // just now would not be noticed until the server restarted, and the operator
+  // would be staring at a disabled button they had already done the work to
+  // enable. One indexed lookup per card load is a fair price for that.
+  const configured = await c.checkoutPublisher.warmUp().catch(() => false);
   return json({
     // Whether a Payhip session has been connected. Surfaced so the UI can say
     // "run `npm run payhip:connect`" instead of offering a button that always
     // fails.
-    configured: c.checkoutPublisher.isConfigured(),
+    configured,
     // Set only when WE created the product; a hand-pasted link leaves it null,
     // which is exactly what makes "create" and "already created" distinguishable.
     productKey,

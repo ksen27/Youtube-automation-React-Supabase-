@@ -54,6 +54,16 @@ export interface PayhipPublisherConfig extends PayhipBrowserConfig {
    * flow interleaves real filesystem work with the delay.
    */
   backoffMs?: number[] | undefined;
+  /**
+   * Called as each step of the dashboard flow begins.
+   *
+   * The run is minutes long and spends most of it inside a single upload, so
+   * without this there is no way to tell "still uploading a 40MB PDF" from
+   * "hung on a selector that no longer matches" — which are the two things
+   * anyone debugging this actually needs to distinguish. `npm run
+   * payhip:debug-list` prints these beside a visible browser.
+   */
+  onProgress?: ((step: string) => void) | undefined;
 }
 
 export class PayhipProductPublisher implements CheckoutProductPublisher {
@@ -135,12 +145,18 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
     // line — without the attempt number a retry overwrites the first failure's
     // evidence, which is usually the more informative of the two.
     const label = `${draft.externalId}_attempt${attempt}`;
+    const step = (message: string) => {
+      this.config.onProgress?.(message);
+      this.logger.debug('payhip step', { externalId: draft.externalId, attempt, step: message });
+    };
 
     try {
+      step('launching the browser');
       ({ browser, context } = await openPayhipContext(this.config, session.storageState));
       page = await context.newPage();
       const dashboard = new PayhipProductPage(page, this.config.baseUrl);
 
+      step('opening the dashboard (checking the session is still valid)');
       await dashboard.openDashboard();
 
       // Recovery, not routine: our DB says no product exists, but a previous
@@ -148,6 +164,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       // we already have a logged-in dashboard, and only ever COSTS a listing
       // lookup — while the duplicate it prevents costs the seller a real
       // product on their storefront.
+      step(`checking whether "${draft.title}" is already listed`);
       const existing = await dashboard.findExistingByTitle(draft.title).catch(() => null);
       if (existing) {
         this.logger.warn('a Payhip product with this title already exists — adopting it', {
@@ -158,14 +175,28 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
         return { ...existing, createdAt: new Date() };
       }
 
+      step('opening the new digital product form');
       await dashboard.startDigitalProduct();
+
+      // Checked while the form is open and BEFORE anything is uploaded: Payhip
+      // sets currency per store, so a mismatch cannot be fixed from here, and
+      // finding out after a 48 MB upload wastes the seller's time as well.
+      step('checking the store currency matches the book');
+      await dashboard.assertCurrency(draft.currency);
+
+      step('filling in the title, description and price');
       await dashboard.fillDetails({
         title: draft.title,
         description: draft.description,
         priceText: formatPrice(draft.priceCents),
       });
+
+      // Named with its size because this is where the run spends most of its
+      // time, and a silent five-minute pause looks identical to a hang.
+      step(`uploading ${draft.pdf.filename} (${mb(draft.pdf.bytes.byteLength)}) — this is the slow part`);
       await dashboard.uploadPdf(staged.pdfPath, draft.pdf.filename);
       if (staged.coverPath) {
+        step('uploading the cover image');
         const ok = await dashboard.uploadCover(staged.coverPath);
         if (!ok) {
           this.logger.warn('cover image could not be attached — listing the product without one', {
@@ -174,7 +205,9 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
         }
       }
 
+      step('publishing and reading back the buy link');
       const link = await dashboard.publishAndReadLink();
+      step(`done — ${link.buyUrl}`);
 
       // Re-save the now-fresh cookies so Payhip's sliding session window resets.
       // Without this the session lapses between listings and the operator is
@@ -261,6 +294,11 @@ function asPayhipError(err: unknown): PayhipError {
   // Error, and those are exactly the class worth retrying.
   if (/timeout|net::|navigation|ERR_/i.test(message)) return new PayhipTransientError(message);
   return new PayhipRejected(message);
+}
+
+/** Byte count as megabytes, for a progress line a human can judge a wait against. */
+function mb(bytes: number): string {
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /** Cents → the major-unit string Payhip's price field expects ("1900" → "19.00"). */

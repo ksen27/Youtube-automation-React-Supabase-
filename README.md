@@ -97,6 +97,7 @@ Hard caps (configurable in `.env.local`):
 | `npm run worker`       | Start the BullMQ worker process                                |
 | `npm run check-system` | Verify ffmpeg / yt-dlp / Redis / env keys                      |
 | `npm run payhip:connect` | One-time headed login that stores the Payhip session (see below) |
+| `npm run payhip:debug-list` | Watch one book being listed on Payhip in a visible browser |
 | `npm run db:migrate`   | Prints instructions for applying the SQL migrations            |
 | `npm run typecheck`    | `tsc --noEmit`                                                 |
 | `npm run lint`         | ESLint                                                         |
@@ -153,6 +154,38 @@ All optional — the defaults are correct for a normal Payhip account.
 
 `SECRET_BOX_KEY` (already required for the HeyGen account pool) is what encrypts
 the stored session.
+
+### Watching it run
+
+The button hands the work to the queue, which means a failure surfaces as a job
+that simply didn't finish. To watch the real thing instead:
+
+```bash
+npm run payhip:debug-list <projectId>     # the UUID in /books/<projectId>
+```
+
+A visible browser opens and every step is printed with a running clock, so a
+long pause is attributable to a named step rather than to "it hung":
+
+```
+  [  0s] launching the browser
+  [  2s] opening the dashboard (checking the session is still valid)
+  [  5s] checking whether "The Mechanic Bible" is already listed
+  [  9s] opening the new digital product form
+  [ 11s] filling in the title, description and price
+  [ 12s] uploading The-Mechanic-Bible.pdf (38.4 MB) — this is the slow part
+  [ 94s] uploading the cover image
+  [ 97s] publishing and reading back the buy link
+  [103s] done — https://payhip.com/b/AbC12
+```
+
+It runs the same use case, page object and selectors the worker runs, so what
+you watch is the production flow. It needs no worker and no Redis.
+
+**It creates a real product on your live storefront** — it is not a dry run. The
+idempotency guard still applies, so a book that already has one prints the stored
+link and creates nothing; `--force` overrides that. `--headless` gives you the
+step log without a window taking over the screen.
 
 ### When it fails
 

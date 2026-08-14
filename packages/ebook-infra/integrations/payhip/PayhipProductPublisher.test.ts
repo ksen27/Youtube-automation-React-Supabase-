@@ -31,6 +31,9 @@ const pageBehaviour = {
   startDigitalProduct: vi.fn(async () => {
     calls.push('startDigitalProduct');
   }),
+  assertCurrency: vi.fn(async () => {
+    calls.push('assertCurrency');
+  }),
   fillDetails: vi.fn(async () => {
     calls.push('fillDetails');
   }),
@@ -55,6 +58,7 @@ vi.mock('./PayhipProductPage', async () => {
       openDashboard = pageBehaviour.openDashboard;
       findExistingByTitle = pageBehaviour.findExistingByTitle;
       startDigitalProduct = pageBehaviour.startDigitalProduct;
+      assertCurrency = pageBehaviour.assertCurrency;
       fillDetails = pageBehaviour.fillDetails;
       uploadPdf = pageBehaviour.uploadPdf;
       uploadCover = pageBehaviour.uploadCover;
@@ -156,7 +160,13 @@ beforeEach(() => {
     calls.push('publishAndReadLink');
     return { productKey: 'AbC12', buyUrl: 'https://payhip.com/b/AbC12' };
   });
-  for (const step of ['openDashboard', 'startDigitalProduct', 'fillDetails', 'uploadPdf'] as const) {
+  for (const step of [
+    'openDashboard',
+    'startDigitalProduct',
+    'assertCurrency',
+    'fillDetails',
+    'uploadPdf',
+  ] as const) {
     pageBehaviour[step].mockImplementation(async () => {
       calls.push(step);
     });
@@ -174,6 +184,9 @@ describe('the automation flow', () => {
       'openDashboard',
       'findExistingByTitle',
       'startDigitalProduct',
+      // Before the upload, deliberately: a currency mismatch cannot be fixed
+      // from here, so discovering it after a 48 MB upload only wastes time.
+      'assertCurrency',
       'fillDetails',
       'uploadPdf',
       'uploadCover',
@@ -268,6 +281,29 @@ describe('error mapping and retries', () => {
     expect(sessions.markNeedsReauth).toHaveBeenCalled();
     // And the message names the command that fixes it.
     expect(result.error.message).toMatch(/payhip:connect/);
+  });
+
+  /**
+   * Payhip sets currency per STORE, not per product. Listing a book the sales
+   * page advertises as "$10" into a store that charges €10 means the page and
+   * the checkout disagree about what the buyer pays, with nothing warning
+   * anyone — the first person to notice is a customer.
+   */
+  it('stops before uploading anything when the store currency disagrees', async () => {
+    pageBehaviour.assertCurrency.mockImplementation(async () => {
+      calls.push('assertCurrency');
+      throw new PayhipRejected('This book is priced in USD but the Payhip store sells in EUR.');
+    });
+    const { publisher } = build();
+
+    const result = await publisher.createProduct(makeDraft());
+
+    expect(result.isFail()).toBe(true);
+    if (result.isOk()) return;
+    expect(result.error.kind).toBe('rejected');
+    // The 48 MB upload never starts, and nothing is published.
+    expect(calls).not.toContain('uploadPdf');
+    expect(calls).not.toContain('publishAndReadLink');
   });
 
   it('never retries a rejection — Payhip would reject it identically', async () => {

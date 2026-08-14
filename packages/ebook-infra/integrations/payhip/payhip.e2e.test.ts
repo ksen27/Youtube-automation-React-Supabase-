@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { extractProductKey } from './PayhipProductPage';
-import { isLoginUrl, openPayhipContext } from './PayhipBrowser';
+import { isLoginUrl, loginUrl, openPayhipContext } from './PayhipBrowser';
 
 /**
  * The only test that touches a real browser and a real Payhip account.
@@ -51,6 +51,68 @@ describe('parsing a Payhip product link', () => {
     // positive here strands the seller on a re-connect they did not need.
     expect(isLoginUrl('https://payhip.com/b/login-course')).toBe(false);
     expect(isLoginUrl('https://payhip.com/login')).toBe(true);
+  });
+
+  /**
+   * Payhip serves the form at `/auth/login`; a bare `/login` 404s.
+   *
+   * Both directions of this shipped broken. The connect command sent people to
+   * the 404, and — the expensive half — `isLoginUrl` did not recognise the real
+   * path, so an expired session would have fallen through to a navigation
+   * timeout and told the operator the dashboard was slow rather than that they
+   * needed to log in again.
+   */
+  it('recognises the real login path, which is /auth/login', () => {
+    expect(isLoginUrl('https://payhip.com/auth/login')).toBe(true);
+    expect(isLoginUrl('https://payhip.com/auth/login?redirect=https%3A%2F%2Fpayhip.com%2Fdashboard')).toBe(true);
+    // Still not a login page, prefix or no prefix.
+    expect(isLoginUrl('https://payhip.com/b/auth-login-guide')).toBe(false);
+  });
+
+  it('sends the operator to a login URL that exists, landing on the dashboard', () => {
+    const url = loginUrl('https://payhip.com');
+    expect(url).toContain('/auth/login');
+    // The redirect is what makes a successful login land on the dashboard —
+    // which is the page the connect flow watches for to know it worked.
+    expect(url).toContain('redirect=https%3A%2F%2Fpayhip.com%2Fdashboard');
+  });
+});
+
+/**
+ * A guard against the mistake that took the whole ebook feature down in
+ * production once already.
+ *
+ * The web app reaches this module through
+ *   route handler → container() → @ebook/infra → PayhipProductPublisher → PayhipBrowser
+ * so a VALUE import of `playwright` anywhere in that chain gets bundled into
+ * every serverless function. It builds, it passes tests, it works in dev where
+ * node_modules is on disk — and then 500s every ebook route in production,
+ * with an error that says nothing about Payhip.
+ *
+ * Type imports are erased and therefore fine. Only a real runtime import is the
+ * hazard, and it belongs inside a function that is called exclusively by the
+ * worker and the connect CLI.
+ */
+describe('keeping the browser out of the web bundle', () => {
+  it('never imports playwright at the top level of any Payhip module', async () => {
+    const { readdir, readFile } = await import('node:fs/promises');
+    const { join, dirname } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const files = (await readdir(dir)).filter((f) => f.endsWith('.ts') && !f.includes('.test.'));
+    expect(files.length).toBeGreaterThan(0);
+
+    for (const file of files) {
+      const source = await readFile(join(dir, file), 'utf8');
+      // `import type { ... } from 'playwright'` is erased at compile time and
+      // is what every one of these modules should be using.
+      const valueImports = source
+        .split('\n')
+        .filter((line) => /^\s*import\s/.test(line) && /from\s+['"]playwright['"]/.test(line))
+        .filter((line) => !/^\s*import\s+type\s/.test(line));
+      expect(valueImports, `${file} must not import playwright as a value`).toEqual([]);
+    }
   });
 });
 
