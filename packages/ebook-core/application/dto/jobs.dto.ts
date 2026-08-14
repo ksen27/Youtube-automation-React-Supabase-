@@ -84,3 +84,22 @@ export const LandingTemplateJob = z.object({
   force: z.boolean().default(false),
 });
 export type LandingTemplateJob = z.infer<typeof LandingTemplateJob>;
+
+/**
+ * Listing a finished book on the store, so its landing page has a buy link.
+ *
+ * Queued rather than run in the request, because it drives a real browser
+ * against a third party: uploading a multi-megabyte PDF is minutes of work,
+ * well past any HTTP request's lifetime.
+ */
+export const CheckoutProductJob = z.object({
+  projectId: z.string().uuid(),
+  /**
+   * Create a new product even though one is already recorded for this book.
+   *
+   * The escape hatch for a product the seller deleted on the store, leaving our
+   * stored link dead. Never set by a retry — only by a human who has looked.
+   */
+  force: z.boolean().default(false),
+});
+export type CheckoutProductJob = z.infer<typeof CheckoutProductJob>;

@@ -21,6 +21,21 @@ const SIBLING_SLOTS = 2;
  */
 const STALE_RUN_MS = 10 * 60_000;
 
+/**
+ * What the store-listing endpoint reports for this book.
+ *
+ * `generated` is the field that matters: it is true only when WE created the
+ * product, which is what separates "press the button" from "a link is already
+ * here because you pasted one".
+ */
+interface ProductState {
+  configured: boolean;
+  productKey: string | null;
+  buyUrl: string | null;
+  generated: boolean;
+  blockers: string[];
+}
+
 interface SiblingSetting {
   projectId: string;
   priceCents: number | null;
@@ -152,6 +167,10 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [page, setPage] = useState<PageState | null>(null);
   const [publisherConfigured, setPublisherConfigured] = useState(false);
+  // The store product behind the checkout link, when we made it.
+  const [product, setProduct] = useState<ProductState | null>(null);
+  // A listing run is in flight. Drives the same 5s poll the page render uses.
+  const [listing, setListing] = useState(false);
   // See `working` below: a GENERATING/PUBLISHING row whose run never reported back.
   const [stalled, setStalled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -211,10 +230,11 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
 
   const load = useCallback(async (isCancelled?: () => boolean) => {
     try {
-      const [sRes, cRes, tRes] = await Promise.all([
+      const [sRes, cRes, tRes, pRes] = await Promise.all([
         fetch(`/api/books/projects/${projectId}/landing-page`, { cache: "no-store" }),
         fetch(`/api/books/projects/${projectId}/landing-page/candidates`, { cache: "no-store" }),
         fetch(`/api/books/landing-templates`, { cache: "no-store" }),
+        fetch(`/api/books/projects/${projectId}/checkout-product`, { cache: "no-store" }),
       ]);
       if (!sRes.ok || isCancelled?.()) return;
       const data = await sRes.json();
@@ -229,6 +249,16 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
         data.page ? Date.now() - new Date(data.page.updatedAt).getTime() > STALE_RUN_MS : false,
       );
       setPublisherConfigured(Boolean(data.publisherConfigured));
+      // No special handling for the buy link itself: the worker writes it to
+      // `landingCheckoutUrl`, so `setCheckoutUrl(s.checkoutUrl)` below already
+      // picks it up. That is the whole reason this integration is one file.
+      const pData: ProductState | null = pRes.ok ? await pRes.json() : null;
+      setProduct(pData);
+      // A listing run is over the moment the product exists. Cleared HERE, on
+      // the poll's own result, rather than from an effect watching `product` —
+      // that shape is a cascading render, and this is the callback the fetch
+      // already gives us.
+      if (pData?.generated) setListing(false);
       setCheckoutUrl(s.checkoutUrl ?? "");
       setPrice(centsToInput(s.priceCents));
       setCompareAt(centsToInput(s.compareAtCents));
@@ -286,7 +316,9 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     queueMicrotask(() => {
       if (!cancelled) void load(isCancelled);
     });
-    if (!working) return () => { cancelled = true; };
+    // `listing` joins `working` here so the checkout field fills itself in when
+    // the worker finishes, instead of the seller reloading to find out.
+    if (!working && !listing) return () => { cancelled = true; };
     const t = setInterval(() => {
       if (!cancelled) void load(isCancelled);
     }, 5000);
@@ -294,7 +326,37 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       cancelled = true;
       clearInterval(t);
     };
-  }, [load, working]);
+  }, [load, working, listing]);
+
+  /**
+   * List the book on Payhip and let the poll fill the checkout field in.
+   *
+   * Saves first, and refuses to continue if that fails: the worker reads the
+   * price from the SAVED project row, not from this form, so listing without
+   * saving would put the book on sale at the previous price.
+   */
+  async function createProduct() {
+    setErr(null);
+    if (!(await saveSettings())) return;
+    setListing(true);
+    try {
+      const res = await fetch(`/api/books/projects/${projectId}/checkout-product`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setErr(data.error ?? "Could not create the product");
+        setListing(false);
+        return;
+      }
+      // Already listed: nothing was queued, so there is nothing to wait for.
+      if (!data.queued) {
+        setListing(false);
+        await load();
+      }
+    } catch {
+      setErr("Could not reach the server");
+      setListing(false);
+    }
+  }
 
   function updateSibling(i: number, patch: Partial<SiblingDraft>) {
     setSiblings((prev) => prev.map((s, j) => (j === i ? { ...s, ...patch } : s)));
@@ -899,6 +961,37 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 onChange={(e) => setCheckoutUrl(e.target.value)}
                 placeholder="https://payhip.com/b/..."
               />
+              {/* The manual paste stays. Automation fills this field in; it does
+                  not take it over — a seller looking at a dead link needs to be
+                  able to fix it right here. */}
+              {product?.generated ? (
+                <p className="text-xs text-fg-subtle">Created on Payhip ({product.productKey}).</p>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={createProduct}
+                    disabled={
+                      busy || listing || !product?.configured || (product?.blockers.length ?? 0) > 0
+                    }
+                  >
+                    {listing ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                    {listing ? "Creating on Payhip…" : "Create product on Payhip"}
+                  </Button>
+                  {/* A disabled button that explains itself. Every reason here is
+                      real and fixable — no price set, book still generating, no
+                      store session connected. */}
+                  {!product?.configured ? (
+                    <span className="text-xs text-fg-subtle">
+                      Run <code>npm run payhip:connect</code> once to connect the store.
+                    </span>
+                  ) : product?.blockers[0] ? (
+                    <span className="text-xs text-fg-subtle">{product.blockers[0]}</span>
+                  ) : null}
+                </div>
+              )}
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="price">Price ({settings.currency})</Label>

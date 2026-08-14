@@ -35,6 +35,14 @@ export * from './landing/SupabaseTemplateArtifactStore';
 export * from './landing/AssetRehoster';
 export * from './landing/CssBundler';
 
+// ── Payhip (store listing via browser automation) ───────────────────────────
+export * from './integrations/payhip/PayhipSessionStore';
+export * from './integrations/payhip/PayhipProductPublisher';
+export * from './integrations/payhip/PayhipErrors';
+export * from './integrations/payhip/PayhipProductPage';
+export * from './integrations/payhip/PayhipBrowser';
+export * from './integrations/payhip/login';
+
 // ── YouTube ─────────────────────────────────────────────────────────────────
 export * from './youtube/YouTubeDataApiProvider';
 export * from './youtube/YouTubeTranscriptProvider';

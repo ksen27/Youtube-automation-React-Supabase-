@@ -142,6 +142,18 @@ interface GenerationOptionsProps {
    * uploaded — but a page cannot be PUBLISHED without it.
    */
   landingCheckoutUrl?: string | undefined;
+  /**
+   * The store's own id for the product `landingCheckoutUrl` points at, when we
+   * created that product ourselves rather than having it pasted in.
+   *
+   * Its ONLY job is idempotency: a second "create the product" click must
+   * return the existing link instead of listing the book twice on the store.
+   * Nothing renders it, and a manually pasted `landingCheckoutUrl` simply
+   * leaves it unset — which is why the two are separate fields rather than one
+   * composed URL. Set together with `landingCheckoutUrl`; see
+   * `Project.attachCheckoutProduct`.
+   */
+  landingCheckoutProductKey?: string | undefined;
   /** Sale price in minor units (cents). The user sets this per book. */
   landingPriceCents?: number | undefined;
   /** Optional "was" price, rendered struck-through beside the sale price. */
@@ -218,6 +230,9 @@ export class GenerationOptions extends ValueObject<GenerationOptionsProps> {
       // Blank strings arrive from empty form fields; treat them as "not set" so
       // `hasCheckoutUrl` stays a single honest check everywhere downstream.
       ...(props.landingCheckoutUrl?.trim() ? { landingCheckoutUrl: props.landingCheckoutUrl.trim() } : {}),
+      ...(props.landingCheckoutProductKey?.trim()
+        ? { landingCheckoutProductKey: props.landingCheckoutProductKey.trim() }
+        : {}),
       ...(typeof props.landingPriceCents === 'number' && Number.isFinite(props.landingPriceCents)
         ? { landingPriceCents: Math.max(0, Math.round(props.landingPriceCents)) }
         : {}),
@@ -293,6 +308,9 @@ export class GenerationOptions extends ValueObject<GenerationOptionsProps> {
   }
   get landingCheckoutUrl() {
     return this.props.landingCheckoutUrl;
+  }
+  get landingCheckoutProductKey() {
+    return this.props.landingCheckoutProductKey;
   }
   get landingPriceCents() {
     return this.props.landingPriceCents;

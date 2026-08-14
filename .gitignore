@@ -34,6 +34,19 @@ Thumbs.db
 # HeyGen automation runtime diagnostics (screenshots, HTML, json snapshots)
 /logs/heygen/
 
+# Payhip automation: browser session state and failure diagnostics.
+#
+# The session is a BEARER CREDENTIAL — anyone holding it is logged into the
+# seller's store — and it normally never touches the disk at all: it lives
+# encrypted in the database (see supabase/migrations/0034_payhip_session.sql).
+# These patterns exist for the local-debugging case, where a stray
+# storage_state.json or a debug screenshot of a logged-in dashboard would
+# otherwise be one `git add -A` away from being published.
+/logs/payhip/
+payhip-debug/
+**/payhip-storage-state*.json
+**/storage_state*.json
+
 # debug
 npm-debug.log*
 yarn-debug.log*

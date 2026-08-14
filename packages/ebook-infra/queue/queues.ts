@@ -19,6 +19,7 @@ export const QUEUE_NAMES: QueueName[] = [
   'export',
   'landing-page',
   'landing-template',
+  'checkout-product',
 ];
 
 /**
@@ -93,6 +94,19 @@ export const QUEUE_CONFIG: Record<QueueName, QueueConfig> = {
   // full-height screenshots in memory. Two attempts, because the common failure
   // is a slow template rather than an unusable one.
   'landing-template': { concurrency: 1, attempts: 2 },
+  // Serial, and ONE attempt only.
+  //
+  // Serial because every run drives a logged-in browser against a single Payhip
+  // account: two at once is a session two tabs are fighting over, and it looks
+  // exactly like the automated abuse the account would be flagged for.
+  //
+  // One attempt because this queue CREATES something, and BullMQ cannot tell a
+  // run that failed before publishing from one that failed after. A blind retry
+  // of the latter lists the book on the store twice, which costs the seller a
+  // duplicate product and a refund. The adapter retries internally where it can
+  // still see which side of the publish it is on; past that boundary a human
+  // decides.
+  'checkout-product': { concurrency: 1, attempts: 1 },
 };
 
 /**

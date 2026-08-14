@@ -1,6 +1,6 @@
 import type { Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
-import { ProjectJob, VideoJob, WhisperJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, ExportFormat, ProjectId } from '@ebook/core';
+import { ProjectJob, VideoJob, WhisperJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, CheckoutProductJob, ExportFormat, ProjectId } from '@ebook/core';
 import type { Container } from '@ebook/config';
 import { makeWorker } from './runtime/worker-factory';
 import { queueRuntimeConfig } from '@ebook/infra';
@@ -547,6 +547,46 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
     },
   });
 
+  /**
+   * Listing a finished book on the store, so its landing page has a real buy
+   * link instead of one pasted in by hand.
+   *
+   * Operator-triggered, never automatic: the seller decides when a book goes on
+   * sale, and at what price. Like the landing-page queue this is side-car work
+   * — the project is already COMPLETED — so it touches no pipeline state.
+   *
+   * Note the queue is configured with ONE attempt (see QUEUE_CONFIG): BullMQ
+   * cannot tell a run that failed before publishing from one that failed after,
+   * and a blind retry of the latter lists the book twice. The adapter retries
+   * internally, where it can still see which side of the publish it is on.
+   */
+  const checkoutProduct = makeWorker(connection, container, {
+    name: 'checkout-product',
+    ...queueRuntimeConfig('checkout-product'),
+    payloadSchema: CheckoutProductJob,
+    handler: async (p) => {
+      const r = await useCases.createCheckoutProduct.execute({ projectId: p.projectId, force: p.force });
+      if (r.isFail()) {
+        // The operator reads this in the job's failure, so it carries the fix
+        // (re-connect the session, set a price, export the book) and the paths
+        // to the screenshot of whatever the browser was looking at.
+        container.logger.error('🛒 could not list the book for sale', {
+          projectId: p.projectId,
+          kind: r.error.kind,
+          debugPaths: r.error.debugPaths,
+        });
+        throw new Error(r.error.message);
+      }
+      container.logger.info(r.value.reused ? '🛒 product already listed' : '🛒 book listed for sale', {
+        projectId: p.projectId,
+        productKey: r.value.productKey,
+        buyUrl: r.value.buyUrl,
+        reused: r.value.reused,
+      });
+      return r.value;
+    },
+  });
+
   return [
     channelIngest,
     videoData,
@@ -566,6 +606,7 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
     exportWorker,
     landingPage,
     landingTemplate,
+    checkoutProduct,
   ];
 }
 

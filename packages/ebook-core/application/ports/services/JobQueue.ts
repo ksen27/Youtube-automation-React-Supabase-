@@ -19,7 +19,12 @@ export type QueueName =
   // Cloning a template site. Once per template, not once per book — and its own
   // queue so a template that cannot be captured fails on its own row rather
   // than taking a book's page down with it.
-  | 'landing-template';
+  | 'landing-template'
+  // Listing a finished book on the store (Payhip) so its landing page has a buy
+  // link. Its own queue because it drives a real browser against a third party:
+  // it is slow, it is rate-sensitive, and a failure here must not take a page
+  // generation down with it.
+  | 'checkout-product';
 
 export interface EnqueueOptions {
   /** Deterministic id → BullMQ de-duplicates identical jobs. */

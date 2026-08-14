@@ -31,6 +31,7 @@ import {
   GenerateClonedLandingPageUseCase,
   ExtractTemplateUseCase,
   PublishLandingPageUseCase,
+  CreateCheckoutProductUseCase,
   type DocumentExporter,
 } from '@ebook/core';
 import {
@@ -78,6 +79,8 @@ import {
   SharpPageDiffer,
   TemplateBinder,
   SupabaseIdempotencyStore,
+  PayhipSessionStore,
+  PayhipProductPublisher,
 } from '@ebook/infra';
 import { loadEnv, type Env } from './env';
 
@@ -155,6 +158,28 @@ export function buildContainer(env: Env = loadEnv()) {
   // Proves nothing but the replaced content moved.
   const pageDiffer = new SharpPageDiffer();
   const sitePublisher = new NetlifyDeployer(env.NETLIFY_AUTH_TOKEN ?? '', env.NETLIFY_ACCOUNT_SLUG);
+  // Lists a finished book on Payhip so its landing page has a real buy link.
+  // Payhip publishes no product-creation API, so this drives their dashboard in
+  // a browser using a session a human connected once — see
+  // packages/ebook-infra/integrations/payhip/ and migration 0034.
+  const payhipSessions = new PayhipSessionStore(supabase);
+  const checkoutPublisher = new PayhipProductPublisher(
+    payhipSessions,
+    {
+      baseUrl: env.PAYHIP_BASE_URL,
+      timeoutMs: env.PAYHIP_TIMEOUT_MS,
+      debugDir: env.PAYHIP_DEBUG_DIR,
+      headed: env.PAYHIP_HEADED,
+      slowMoMs: env.PAYHIP_SLOWMO_MS,
+      tmpDir: env.PAYHIP_TMP_DIR,
+    },
+    logger.child({ adapter: 'payhip' }),
+  );
+  // `isConfigured()` is synchronous by the port's contract but the answer is a
+  // database row, so it is resolved once here rather than on every UI request.
+  // Fire-and-forget: a container must not block on it, and an unwarmed
+  // publisher fails with a precise message rather than a missing button.
+  void checkoutPublisher.warmUp().catch(() => {});
   const youtube = new YouTubeDataApiProvider(env.YOUTUBE_API_KEY);
   const transcripts = new YouTubeTranscriptProvider();
   const audio = new YtDlpAudioDownloader(storage);
@@ -279,6 +304,21 @@ export function buildContainer(env: Env = loadEnv()) {
       templateArtifacts,
       storage,
     ),
+    /**
+     * Lists the finished book on the store and writes the resulting buy link
+     * into the SAME `landingCheckoutUrl` the settings form writes — which is why
+     * neither page renderer nor the publish gate needed changing for it.
+     */
+    createCheckoutProduct: new CreateCheckoutProductUseCase(
+      projects,
+      books,
+      knowledge,
+      artifacts,
+      storage,
+      checkoutPublisher,
+      clock,
+      logger.child({ useCase: 'checkout-product' }),
+    ),
   };
 
   return {
@@ -293,6 +333,8 @@ export function buildContainer(env: Env = loadEnv()) {
     idempotency,
     orchestrator,
     sitePublisher,
+    checkoutPublisher,
+    payhipSessions,
     repositories: {
       projects,
       videos,

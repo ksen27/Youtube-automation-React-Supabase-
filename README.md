@@ -96,10 +96,91 @@ Hard caps (configurable in `.env.local`):
 | `npm run dev`          | Start Next.js                                                  |
 | `npm run worker`       | Start the BullMQ worker process                                |
 | `npm run check-system` | Verify ffmpeg / yt-dlp / Redis / env keys                      |
+| `npm run payhip:connect` | One-time headed login that stores the Payhip session (see below) |
 | `npm run db:migrate`   | Prints instructions for applying the SQL migrations            |
 | `npm run typecheck`    | `tsc --noEmit`                                                 |
 | `npm run lint`         | ESLint                                                         |
 | `npm run build`        | `next build` (production)                                      |
+
+## Listing a book for sale (Payhip)
+
+A finished ebook needs a buy link before its landing page can be published. That
+link used to be made by hand: create the product on Payhip, upload the PDF, copy
+the URL back into the settings form. The **Create product** button on the
+landing-page card does all of it and fills the checkout field in for you.
+
+Payhip publishes **no API for creating products** — their public API covers
+coupons and license keys only — so this drives their real dashboard in a
+headless browser (`packages/ebook-infra/integrations/payhip/`).
+
+### One-time setup
+
+```bash
+# 1) Apply the migration that stores the session
+#    supabase/migrations/0034_payhip_session.sql  (Supabase SQL editor)
+
+# 2) Log in once, by hand, on a machine WITH a display
+npm run payhip:connect
+```
+
+A visible browser opens. Log in to Payhip yourself — including any captcha, 2FA
+or email code — and the session is captured and stored **encrypted** in the
+database. Every headless worker then reuses it.
+
+**Workers never log in.** A headless login walks straight into 2FA/captcha, and
+giving a worker credentials means storing credentials on a worker. When the app
+reports the session has expired, re-run `npm run payhip:connect`. There are
+deliberately no Payhip username/password env vars.
+
+The session lives in the database rather than in a file because the workers run
+on Fly with ephemeral filesystems: a state file would not survive a deploy and
+would never reach the worker that needs it, since the connect runs on your
+laptop and the automation runs in a container. It also means there is no session
+file on disk to commit by accident.
+
+### Environment variables
+
+All optional — the defaults are correct for a normal Payhip account.
+
+| Variable             | Default                | Purpose                                                     |
+| -------------------- | ---------------------- | ----------------------------------------------------------- |
+| `PAYHIP_BASE_URL`    | `https://payhip.com`   | Override only to point at a staging host                     |
+| `PAYHIP_TIMEOUT_MS`  | `45000`                | Per-action budget; uploads get their own 10-minute allowance |
+| `PAYHIP_DEBUG_DIR`   | `/tmp/payhip-debug`    | Screenshots + HTML snapshots of failed runs land here        |
+| `PAYHIP_TMP_DIR`     | OS temp dir            | Where upload files are staged before Playwright reads them   |
+| `PAYHIP_HEADED`      | `false`                | Run the automation visibly. Local debugging only             |
+| `PAYHIP_SLOWMO_MS`   | `0`                    | Slows a headed run so a human can watch it                   |
+
+`SECRET_BOX_KEY` (already required for the HeyGen account pool) is what encrypts
+the stored session.
+
+### When it fails
+
+Every failure captures a screenshot and an HTML snapshot of the page the browser
+was looking at, into `PAYHIP_DEBUG_DIR`, and the paths are included in the error
+the operator sees. Start there — "it timed out" is unactionable; "it timed out,
+here is the page" is a bug report.
+
+Payhip ships UI changes without notice, and the first symptom is a button that
+times out. Every selector lives in one file (`PayhipProductPage.ts`) so the fix
+is confined to it, and the `@e2e` test is what confirms a fix:
+
+```bash
+PAYHIP_E2E=1 npx vitest run packages/ebook-infra/integrations/payhip
+```
+
+It needs a connected session and the Playwright browsers installed, and it stops
+short of publishing anything — creating a real listing on your live storefront
+as a side effect of a test run would be worse than the bug it looks for.
+
+### Docker / Playwright dependencies
+
+Nothing to add: `Dockerfile.worker` already runs
+`npx playwright install --with-deps chromium` for the HeyGen automation, and this
+module uses the same browser and the same OS libraries. On a **new** host,
+`--with-deps` is the part that matters — a bare `playwright install` leaves
+Chromium unable to start on Debian slim, which surfaces as a launch failure on
+the first listing rather than at build time.
 
 ## Layout
 

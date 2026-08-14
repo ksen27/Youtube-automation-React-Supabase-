@@ -149,7 +149,36 @@ export class Project extends AggregateRoot<ProjectProps, ProjectId> {
     now: Date,
   ): void {
     const defined = Object.fromEntries(Object.entries(changes).filter(([, v]) => v !== undefined));
-    this.props.options = GenerationOptions.create({ ...this.props.options.toJSON(), ...defined });
+    const current = this.props.options.toJSON();
+    // Pointing the buy button somewhere ELSE disowns the product we created for
+    // this book: the stored key no longer describes where the money goes, and
+    // leaving it behind would make a later "create the product" click hand back
+    // a link the seller had already replaced by hand. Compared rather than
+    // cleared on every write, because the settings form PATCHes the checkout
+    // field on every save — including saves that leave our own generated link
+    // exactly as it was.
+    const replacedByHand =
+      changes.landingCheckoutUrl !== undefined &&
+      changes.landingCheckoutUrl.trim() !== (current.landingCheckoutUrl ?? '');
+    if (replacedByHand) delete current.landingCheckoutProductKey;
+    this.props.options = GenerationOptions.create({ ...current, ...defined });
+    this.props.updatedAt = now;
+  }
+
+  /**
+   * Record the store product created for this book, and point the page's buy
+   * button at it.
+   *
+   * Both fields move together and only here: the URL is what every CTA renders,
+   * the key is what stops a second run from listing the book twice. Writing one
+   * without the other is the bug this method exists to make impossible.
+   */
+  attachCheckoutProduct(product: { productKey: string; buyUrl: string }, now: Date): void {
+    this.props.options = GenerationOptions.create({
+      ...this.props.options.toJSON(),
+      landingCheckoutUrl: product.buyUrl,
+      landingCheckoutProductKey: product.productKey,
+    });
     this.props.updatedAt = now;
   }
 

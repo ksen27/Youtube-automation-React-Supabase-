@@ -64,6 +64,24 @@ const EnvSchema = z.object({
   NETLIFY_AUTH_TOKEN: z.string().optional(),
   /** Team slug; only needed when the token has access to more than one team. */
   NETLIFY_ACCOUNT_SLUG: z.string().optional(),
+
+  // ── Payhip (the store a finished book is listed on) ───────────────────────
+  // Payhip has no product-creation API, so listing a book drives their real
+  // dashboard in a browser. There are deliberately NO credential variables
+  // here: a human logs in once via `npm run payhip:connect` and the resulting
+  // session is stored encrypted in the database (ebook.payhip_sessions). A
+  // worker that could read a password is a worker that could leak one.
+  PAYHIP_BASE_URL: z.string().url().default('https://payhip.com'),
+  /** Per-action budget. Uploads get their own, much longer allowance. */
+  PAYHIP_TIMEOUT_MS: z.coerce.number().int().positive().default(45_000),
+  /** Screenshots + HTML snapshots of failed runs land here. */
+  PAYHIP_DEBUG_DIR: z.string().default('/tmp/payhip-debug'),
+  /** Where upload files are staged before Playwright reads them off disk. */
+  PAYHIP_TMP_DIR: z.string().optional(),
+  /** Run the automation visibly. For local debugging only — never on a worker. */
+  PAYHIP_HEADED: z.coerce.boolean().default(false),
+  /** Slows a headed run down so a human can watch what it does. */
+  PAYHIP_SLOWMO_MS: z.coerce.number().int().nonnegative().default(0),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

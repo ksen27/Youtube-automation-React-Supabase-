@@ -31,6 +31,7 @@ interface ProjectRow {
     illustrationEveryPages?: number;
     landingPage?: boolean;
     landingCheckoutUrl?: string;
+    landingCheckoutProductKey?: string;
     landingPriceCents?: number;
     landingCompareAtCents?: number;
     landingCurrency?: string;
@@ -80,6 +81,12 @@ export class SupabaseProjectRepository implements ProjectRepository {
         // Omitted rather than written as null when unset, matching bookTitle —
         // GenerationOptions treats an absent key and an empty string alike.
         ...(project.options.landingCheckoutUrl ? { landingCheckoutUrl: project.options.landingCheckoutUrl } : {}),
+        // The store product behind that link, when we created it. Idempotency
+        // depends on this surviving the round-trip — without it a second run
+        // lists the same book on the store twice.
+        ...(project.options.landingCheckoutProductKey
+          ? { landingCheckoutProductKey: project.options.landingCheckoutProductKey }
+          : {}),
         ...(project.options.landingPriceCents !== undefined
           ? { landingPriceCents: project.options.landingPriceCents }
           : {}),

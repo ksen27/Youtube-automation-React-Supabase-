@@ -9,6 +9,7 @@
     "worker": "tsx worker/index.ts",
     "check-system": "tsx scripts/check-system.ts",
     "heygen:connect": "tsx scripts/heygen-connect.ts",
+    "payhip:connect": "tsx scripts/payhip-connect.ts",
     "heygen:reconnect": "tsx scripts/heygen-reconnect.ts",
     "heygen:keepalive": "tsx scripts/heygen-keepalive.ts",
     "heygen:reactivate": "tsx scripts/heygen-reactivate.ts",
