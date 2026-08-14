@@ -33,6 +33,15 @@ export const GET = handle(async (_req: Request, { params }: { params: Promise<{ 
       // page carries one creator's avatar and one author bio.
       sameChannel: candidate.channelUrl === project.channelUrl.raw,
       createdAt: candidate.createdAt,
+      // What this book already sells for, so choosing it fills the form in
+      // rather than asking the seller to remember. `hasProduct` is the one the
+      // UI acts on: it separates "ready to sell" from "still needs a Payhip
+      // product", which is the difference between showing a link and showing a
+      // Create button.
+      priceCents: candidate.priceCents,
+      compareAtCents: candidate.compareAtCents,
+      checkoutUrl: candidate.checkoutUrl,
+      hasProduct: Boolean(candidate.checkoutProductKey && candidate.checkoutUrl),
     })),
   });
 });

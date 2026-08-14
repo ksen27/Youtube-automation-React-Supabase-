@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Result } from '../../domain/shared/Result';
 import { ProjectId } from '../../domain/project/ProjectId';
+import { siblingCommerce } from '../landing/siblingCommerce';
 import {
   LandingPage,
   LandingPageId,
@@ -802,6 +803,7 @@ export class GenerateClonedLandingPageUseCase {
         return Result.fail(`Selected book ${sibling.projectId} is not finished yet`);
       }
       const siblingStrategy = await this.knowledge.getBookStrategy(siblingId);
+      const siblingCommerceValues = siblingCommerce(siblingProject.options, sibling);
 
       products.push({
         index: i + 1,
@@ -810,10 +812,13 @@ export class GenerateClonedLandingPageUseCase {
             siblingBook.title ?? siblingProject.options.bookTitle ?? siblingStrategy?.title ?? undefined,
           ) ?? 'Untitled',
         subtitle: siblingStrategy?.subtitle ?? '',
-        // Price and link come from THIS sibling's own entry, never from the
-        // project it points at — the seller sets them per page.
-        priceCents: sibling.priceCents ?? null,
-        checkoutUrl: sibling.checkoutUrl ?? null,
+        // Price and link follow THE BOOK, falling back to whatever this page
+        // recorded for it — see siblingCommerce. Resolved identically to the
+        // built-in renderer on purpose: the two engines disagreeing about what
+        // a book costs would be a bug nobody could reproduce, because which one
+        // runs depends on whether the project has a cloned template.
+        priceCents: siblingCommerceValues.priceCents,
+        checkoutUrl: siblingCommerceValues.checkoutUrl,
         coverPath: siblingBook.coverImagePath,
         coverSitePath: null,
         chapterTitles: siblingBook.chapterTitles,

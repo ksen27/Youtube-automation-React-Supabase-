@@ -22,6 +22,21 @@ export interface LandingCandidate {
   coverImagePath: string | null;
   channelUrl: string;
   createdAt: string;
+  /**
+   * The book's OWN commerce settings, so the picker can show what it already
+   * sells for the moment it is chosen — and so the seller can tell "this book
+   * is ready to sell" from "this book still needs a product" without leaving
+   * the form.
+   *
+   * These are the same values the renderers now resolve from (see
+   * `siblingCommerce`), which is what makes the preview honest rather than a
+   * second, hopeful copy of the truth.
+   */
+  priceCents: number | null;
+  compareAtCents: number | null;
+  checkoutUrl: string | null;
+  /** Set only when WE created the store product — see GenerationOptions. */
+  checkoutProductKey: string | null;
 }
 
 export interface ProjectRepository {

@@ -94,6 +94,7 @@ export * from './application/dto/jobs.dto';
 export * from './application/errors';
 export * from './application/pipeline/PipelineOrchestrator';
 export * from './application/landing/pageContract';
+export * from './application/landing/siblingCommerce';
 export * from './application/landing/templateContract';
 export * from './application/landing/bindTemplate';
 

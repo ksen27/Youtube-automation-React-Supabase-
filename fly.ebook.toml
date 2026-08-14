@@ -21,8 +21,22 @@
 #     REDIS_URL='redis://:<password>@video-automation-worker.fly.dev:6379' \
 #     NEXT_PUBLIC_SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
 #     ANTHROPIC_API_KEY=... YOUTUBE_API_KEY=... \
-#     SIXTYNINE_LABS_API_KEY=...
+#     SIXTYNINE_LABS_API_KEY=... \
+#     SECRET_BOX_KEY=...
 # (REDIS_URL must point at the celebrity worker's public Redis — the shared queue.)
+#
+# SECRET_BOX_KEY is what decrypts the stored Payhip browser session
+# (ebook.payhip_sessions, migration 0034) so the `checkout-product` queue can
+# list a finished book for sale. It must be the SAME value the web app and the
+# `payhip:connect` CLI use — the session is encrypted with it, so a different
+# key here does not fail loudly at boot, it fails on the first listing with a
+# decryption error. Without it that queue cannot run at all; every other queue
+# is unaffected.
+#
+# The Payhip automation needs no other configuration: PAYHIP_* all have working
+# defaults (see packages/ebook-config/env.ts), and there are deliberately no
+# Payhip credentials anywhere — a human connects the session once with
+# `npm run payhip:connect` and every worker reuses it.
 #
 # OPTIONAL secrets:
 #   OPENAI_API_KEY      — cover art (gpt-image-1) AND the Whisper transcript
