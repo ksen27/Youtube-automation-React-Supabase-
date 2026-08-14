@@ -206,7 +206,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       }
 
       step('publishing and reading back the buy link');
-      const link = await dashboard.publishAndReadLink();
+      const link = await dashboard.publishAndReadLink(draft.title);
       step(`done — ${link.buyUrl}`);
 
       // Re-save the now-fresh cookies so Payhip's sliding session window resets.
