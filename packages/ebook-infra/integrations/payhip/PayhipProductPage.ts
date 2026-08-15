@@ -549,18 +549,43 @@ export class PayhipProductPage {
     // nothing is created, which is indistinguishable from a submit that failed
     // for any other reason. If that modal appears, wait for it to clear and
     // press save once more rather than reporting a mystery.
-    const stillUploading = this.page.getByText(/still uploading|upload(ing)? in progress|wait.*upload/i).first();
+    const stillUploading = this.page
+      .getByText(/still being uploaded|still uploading|add at least one file/i)
+      .first();
     const blocked = await stillUploading
       .waitFor({ state: 'visible', timeout: 5_000 })
       .then(() => true)
       .catch(() => false);
+
     if (blocked) {
-      await stillUploading.waitFor({ state: 'hidden', timeout: UPLOAD_TIMEOUT_MS }).catch(() => {
-        throw new PayhipTransientError(
-          'Payhip refused to save because the file was still uploading, and it never finished',
-        );
-      });
-      await this.page.locator(SELECTORS.submit).first().click().catch(() => {});
+      // DISMISS IT. This is a modal with an OK button, not a transient notice:
+      // it sits there until someone clicks, and it covers the form while it
+      // does. Waiting for it to disappear on its own — which is what this used
+      // to do — meant the run stopped dead at the very last step, having done
+      // everything else correctly.
+      const ok = firstVisible(this.page, [
+        this.page.getByRole('button', { name: /^\s*ok\s*$/i }),
+        this.page.getByRole('link', { name: /^\s*ok\s*$/i }),
+        this.page.getByText(/^\s*ok\s*$/i),
+      ]);
+      await ok.click({ timeout: 10_000 }).catch(() => {});
+      await stillUploading.waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
+
+      // Now wait for the upload to actually finish — the row settles into a
+      // file with a size — and only then try saving again.
+      await this.page
+        .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileRow}`)
+        .filter({ hasText: /\(\s*[\d.]+\s*[kmg]b\s*\)/i })
+        .first()
+        .waitFor({ state: 'visible', timeout: UPLOAD_TIMEOUT_MS })
+        .catch(() => {
+          throw new PayhipTransientError(
+            'Payhip refused to save because the file was still uploading, and the upload never finished',
+          );
+        });
+
+      await this.page.locator(SELECTORS.submit).first().click();
+      await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
     }
 
     // Submitting posts the whole form, including the file it just accepted, so
