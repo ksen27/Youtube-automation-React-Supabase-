@@ -1,6 +1,28 @@
 import { z } from 'zod';
 
 /** Single source of truth for environment configuration — validated at startup. */
+/**
+ * An env var that can actually be switched OFF.
+ *
+ * `z.coerce.boolean()` calls `Boolean(value)`, and `Boolean("false")` is TRUE —
+ * so a flag declared that way cannot be turned off from the environment at all.
+ * Setting `PAYHIP_USE_STEALTH=false` as a Fly secret enabled stealth, which
+ * cost most of a day: the local CLI reads `process.env` directly and honoured
+ * the "false", so the same setting behaved one way on a laptop and the opposite
+ * way on the worker, and every log line insisted the flag was on while the
+ * operator could see they had set it off.
+ *
+ * The same trap is documented at lib/env.ts:948 for `SYNTHETIC_PLAN_ALIGN_FIRST`,
+ * where it was found the same way.
+ */
+const boolish = (fallback: boolean) =>
+  z
+    .preprocess(
+      (v) => (typeof v === 'string' ? !/^(0|false|no|off)$/i.test(v.trim()) : v),
+      z.boolean(),
+    )
+    .default(fallback);
+
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   APP_URL: z.string().url().default('http://localhost:3000'),
@@ -79,7 +101,7 @@ const EnvSchema = z.object({
   /** Where upload files are staged before Playwright reads them off disk. */
   PAYHIP_TMP_DIR: z.string().optional(),
   /** Run the automation visibly. For local debugging only — never on a worker. */
-  PAYHIP_HEADED: z.coerce.boolean().default(false),
+  PAYHIP_HEADED: boolish(false),
   /** Slows a headed run down so a human can watch what it does. */
   PAYHIP_SLOWMO_MS: z.coerce.number().int().nonnegative().default(0),
   /**
@@ -88,7 +110,7 @@ const EnvSchema = z.object({
    * "performing security verification" interstitial to browsers it reads as
    * bots, and a plain headless Chromium is read that way every time.
    */
-  PAYHIP_USE_STEALTH: z.coerce.boolean().default(true),
+  PAYHIP_USE_STEALTH: boolish(true),
   /**
    * Residential proxy for the Payhip browser — `ip:port` or `ip:port:user:pass`.
    *
@@ -106,7 +128,7 @@ const EnvSchema = z.object({
    * session created through the SAME exit IP the worker uses never shows Payhip
    * an IP jump between login and use, which is itself a reason to re-challenge.
    */
-  PAYHIP_CONNECT_USES_PROXY: z.coerce.boolean().default(false),
+  PAYHIP_CONNECT_USES_PROXY: boolish(false),
   /**
    * How often the worker visits Payhip to keep the stored session from lapsing.
    *
@@ -134,8 +156,15 @@ export type Env = z.infer<typeof EnvSchema>;
 
 let cached: Env | null = null;
 
-export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  if (cached) return cached;
+/**
+ * Validate an environment WITHOUT caching.
+ *
+ * `loadEnv` memoises for the life of the process, which is right for a
+ * container and useless for testing a parse — every call after the first
+ * returns the first answer regardless of input. This is the seam the flag tests
+ * use, and it is the whole of `loadEnv` minus the cache.
+ */
+export function parseEnv(source: NodeJS.ProcessEnv = process.env): Env {
   const parsed = EnvSchema.safeParse({
     ...source,
     // PORT NOTE: this app names the Supabase project URL
@@ -148,6 +177,11 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   if (!parsed.success) {
     throw new Error(`Invalid environment:\n${parsed.error.issues.map((i) => `  - ${i.path.join('.')}: ${i.message}`).join('\n')}`);
   }
-  cached = parsed.data;
+  return parsed.data;
+}
+
+export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
+  if (cached) return cached;
+  cached = parseEnv(source);
   return cached;
 }
