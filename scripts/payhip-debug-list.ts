@@ -89,6 +89,16 @@ async function main() {
       // the step log (and not a window taking over your screen).
       headed: !flag("headless"),
       slowMoMs: Number(process.env.PAYHIP_SLOWMO_MS || 400),
+      // Read from the environment exactly as the worker's container does.
+      //
+      // These were missing, and their absence made this script lie: it always
+      // ran with stealth on and no proxy regardless of .env.local, so a test of
+      // "does turning stealth off fix it?" silently tested nothing and reported
+      // `stealth: true` while doing so. A debug tool that does not reproduce
+      // the thing it is debugging is worse than no debug tool.
+      stealth: process.env.PAYHIP_USE_STEALTH !== "false",
+      ...(process.env.PAYHIP_PROXY ? { proxy: process.env.PAYHIP_PROXY } : {}),
+      ...(process.env.PAYHIP_USER_AGENT ? { userAgent: process.env.PAYHIP_USER_AGENT } : {}),
       // Each step, printed as it starts, with a running clock — so a long pause
       // is attributable to a specific step rather than to "it hung".
       onProgress: (step) => console.log(`  [${elapsed()}] ${step}`),
