@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     redis-server \
     fonts-dejavu-core \
+    xvfb \
  && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
       -o /usr/local/bin/yt-dlp \
  && chmod +x /usr/local/bin/yt-dlp \
@@ -74,6 +75,20 @@ ENV NODE_ENV=production \
 
 # Start Redis as a daemon, then exec the worker as PID 1 so SIGTERM from
 # Fly reaches the worker and triggers its graceful shutdown handler.
+#
+# WRAPPED IN XVFB so a browser can run HEADED on a machine with no screen.
+#
+# Payhip's uploader is the reason. Headless Chromium reaches the dashboard,
+# fills the form, opens the real file dialog and hands over the file — and
+# plupload then does nothing with it, every time, while the identical code
+# headed on a laptop uploads fine. Rather than keep hunting for which headless
+# difference it objects to, this gives it a real browser on a virtual display,
+# which is what it evidently wants.
+#
+# `-a` picks a free display number, so nothing breaks if one is already taken.
+# The screen size matches the viewport the automation asks for, so elements are
+# not scrolled out of view. Harmless for every other worker role: Puppeteer and
+# the video engines keep launching headless and simply ignore DISPLAY.
 # --bind 0.0.0.0 lets the Vercel app reach Redis over the public internet
 # (port exposed via fly.toml [[services]]). --requirepass enforces auth.
 # Password is read at runtime from REDIS_PASSWORD env (Fly secret).
@@ -100,4 +115,4 @@ CMD mkdir -p /data \
         --protected-mode no \
         --requirepass "$REDIS_PASSWORD"; \
     fi \
- && exec npx tsx worker/index.ts
+ && exec xvfb-run -a --server-args="-screen 0 1440x960x24" npx tsx worker/index.ts

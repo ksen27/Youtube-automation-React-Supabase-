@@ -34,6 +34,19 @@ import { isProductPrompt } from "@/lib/synthetic/constants";
 // public function catches its own errors (including "migration not applied
 // yet") and returns null / no-ops, so generation always proceeds.
 
+// Image providers that must NEVER be served from the reuse pool. These are the
+// dead fallback chain (69labs -> Gemini -> fal.ai FLUX) removed from
+// generateImage on 2026-08-15: their stills do not match the house look the
+// synthetic STYLE_PROMPT is tuned for, so recycling them spreads one outage's
+// output across every future video. Nothing new can be indexed with these
+// providers; this guards the ~19.8k rows already in the table (and is enforced
+// in SQL too — see migration 0035 for the semantic tier).
+//
+// Deliberately a DENY-LIST, not an allow-list of "sixtynine_image": the same
+// table holds ltx2 clips and heygen avatar frames, which are legitimate and
+// must stay reusable.
+export const FALLBACK_PROVIDERS = ["fal_flux_image", "gemini_image"] as const;
+
 export interface ReusableAsset {
   id: string;
   assetUrl: string;
@@ -166,12 +179,21 @@ export async function findReusableAsset(opts: {
     const exclude = state.usedUrls;
 
     // Tier 1: exact normalized-prompt hash.
+    // This tier does NOT go through match_generated_assets, so the fallback
+    // exclusion that migration 0035 added to the RPC has to be repeated here or
+    // an exact prompt match would still serve a FLUX/Gemini still. See
+    // FALLBACK_PROVIDERS.
     const { data: exact, error: exactErr } = await sb
       .from("generated_assets")
       .select("id, asset_url, source_image_url, provider, reuse_count, last_reused_at")
       .eq("asset_type", opts.assetType)
       .eq("is_product", isProduct)
       .eq("prompt_hash", promptHash(prompt))
+      // `or(is.null, not.in)` and not a bare `not.in`: PostgREST renders the
+      // latter as SQL `provider NOT IN (...)`, which evaluates to NULL — i.e.
+      // NOT MATCHED — for a null provider, silently dropping rows that pre-date
+      // provider tracking. Mirrors `is distinct from` in the 0035 RPC.
+      .or(`provider.is.null,provider.not.in.(${FALLBACK_PROVIDERS.join(",")})`)
       .limit(50);
     if (exactErr) throw new Error(exactErr.message);
     const exactFree = (exact ?? []).filter((r) => !exclude.includes(r.asset_url as string));

@@ -454,11 +454,19 @@ export class PayhipProductPage {
       .then(() => true)
       .catch(() => false);
     if (!started) {
+      // Name the path that was used. The two are completely different failures
+      // and the message used to blame the network for both: answering the file
+      // dialog is Payhip's own code path and should work, whereas writing to
+      // the input directly is known not to — so if the fallback ran, the
+      // question is why no dialog opened, not why the bytes did not move.
       throw new PayhipTransientError(
         `Payhip never accepted the ebook file (${filename}) — the upload did not start, ` +
-          'so no bytes were transferred. The form still reads "No product files added yet". ' +
-          'This is usually the connection to Payhip failing rather than the file itself; ' +
-          'a slow or unreliable proxy is the common cause.',
+          `so no bytes were transferred, and the form still reads "No product files added yet". ` +
+          (viaDialog
+            ? 'The file was handed to Payhip\'s own upload dialog, so its uploader received the file and did nothing with it.'
+            : 'NOTE: the upload button opened no file dialog, so this fell back to writing the file ' +
+              'straight to the input — which Payhip\'s uploader ignores. That fallback is the ' +
+              'likely cause, not the network.'),
       );
     }
     // Completion is the row settling into its FINISHED state — a Delete control

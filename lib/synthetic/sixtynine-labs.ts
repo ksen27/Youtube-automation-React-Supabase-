@@ -8,8 +8,6 @@ import {
 } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
-import { generateFalImage, isFalImageConfigured } from "@/lib/synthetic/falai";
-import { generateGeminiImage, isGeminiImageConfigured } from "@/lib/synthetic/gemini-image";
 
 // Stable per-account id for the Redis slot pool. The slot cap this feeds is
 // enforced by 69labs PER ACCOUNT, not per key — so this id must identify the
@@ -328,10 +326,12 @@ export async function generateVoice(input: GenerateVoiceInput): Promise<Generate
 export interface GenerateImageResult {
   image: Buffer;
   contentType: string;
-  // "sixtynine_image" for the primary nano-banana path; on 69labs-pool exhaustion
-  // the fallback is "gemini_image" (Gemini's own nano-banana, same look) when
-  // configured, else "fal_flux_image" (fal.ai FLUX). See generateImage.
-  provider: "sixtynine_image" | "gemini_image" | "fal_flux_image";
+  // Always "sixtynine_image". Narrowed from a 3-way union on 2026-08-15 when the
+  // Gemini/fal.ai fallback was removed (see generateImage) — a 69labs failure now
+  // throws instead of silently returning another provider's image. cost.ts still
+  // knows "gemini_image" / "fal_flux_image" because historical job rows recorded
+  // them; nothing NEW can produce those values.
+  provider: "sixtynine_image";
 }
 
 // Cross-attempt resume for 69labs image generation (the zombie-loop fix). When a
@@ -409,9 +409,10 @@ async function generateNanoBananaImage(
   // "concurrent limit reached" here means 69labs' own count is full of
   // generations WE CAN'T CONTROL (zombies from a prior overload that timed out on
   // our side but keep running on theirs). Retrying in place for ~80s (the old
-  // 5-attempt budget) just holds our slot doing nothing and delays the fal.ai
-  // fallback by minutes. Fail fast so generateImage falls over to fal.ai quickly
-  // instead of burning the retry budget on an account we can't unstick.
+  // 5-attempt budget) just holds our slot doing nothing. Fail fast so the key
+  // failover can try another account, instead of burning the retry budget on one
+  // we can't unstick. (Before 2026-08-15 the thing being hurried along was the
+  // fal.ai fallback; that is gone, but failing fast still matters for failover.)
   let jobId: string;
   if (opts.resumeJobId) {
     jobId = opts.resumeJobId;
@@ -516,9 +517,9 @@ async function generateNanoBananaImage(
       // with the reason only in userMessage (verified 2026-08-10 on gpt-image-2:
       // "This image request was blocked by the model's safety checks."). Without
       // this branch such a job looks like a transient failure, so the key-failover
-      // loop sweeps every account and the Gemini/fal fallback chain runs too —
-      // minutes of paid calls that CANNOT succeed, since every provider refuses
-      // the same content. Re-label it as CENSORED so isCensored() short-circuits.
+      // loop sweeps every account — minutes of paid calls that CANNOT succeed,
+      // since every account refuses the same content. Re-label it as CENSORED so
+      // isCensored() short-circuits the sweep.
       const userMessage = (st as { userMessage?: string }).userMessage ?? "";
       if (/safety check|blocked by|restricted content|content polic/i.test(userMessage)) {
         throw new Error(`69labs image: CENSORED (job ${jobId}) — ${userMessage}`);
@@ -580,10 +581,10 @@ async function generateNanoBananaImage(
  * re-run from the UI once 69labs recovers. The chosen provider is returned for
  * cost attribution (always "sixtynine_image").
  */
-// A 69labs CENSORED (content-policy) failure. This must NOT trigger the fal.ai
-// fallback: a content rejection would also be rejected by fal.ai, and the real
-// fix is to edit the prompt (see the de-naming rule), not switch provider. Match
-// the CENSORED reason text generateNanoBananaImage throws.
+// A 69labs CENSORED (content-policy) failure. This must NOT trigger the KEY
+// FAILOVER sweep: every account rejects the same content, so trying the next one
+// just spends money to fail again. The real fix is to edit the prompt (see the
+// de-naming rule). Match the CENSORED reason text generateNanoBananaImage throws.
 function isCensored(err: unknown): boolean {
   return /CENSORED/i.test((err as Error)?.message ?? "");
 }
@@ -599,8 +600,8 @@ export function isGenerationDeadline(err: unknown): boolean {
 
 // Run the 69labs (nano-banana) pool: round-robin across keys, each under the
 // GLOBAL per-account slot cap. Throws when every key is exhausted (all accounts
-// down/blocked, persistent rate-limit, poll timeout). This is the PRIMARY path;
-// generateImage wraps it with the fal.ai fallback.
+// down/blocked, persistent rate-limit, poll timeout). This is the ONLY path —
+// generateImage is a thin wrapper over it and no longer catches its errors.
 async function generate69labsImage(
   prompt: string,
   resume?: ImageResume,
@@ -751,12 +752,6 @@ export interface GenerateImageOptions {
   // Per-call model / resolution override (see generateNanoBananaImage opts).
   model?: string;
   resolution?: string;
-  // Skip the Gemini → fal.ai fallback chain. That chain exists because Gemini
-  // IS nano-banana and matches the synthetic look; for a celebrity still it is
-  // actively wrong — Gemini/FLUX refuse real public figures, so the fallback
-  // burns minutes to produce either a refusal or an off-model image. Callers
-  // that set this handle their own fallback (CelebForge: scraped photos).
-  noFallback?: boolean;
   // Wall clock for ONE generation (submit → poll → download), measured from the
   // moment the per-account slot is held — NOT from the call, so time spent
   // queueing for a slot is not charged to it. On expiry the poll is ABORTED and
@@ -791,82 +786,23 @@ export async function generateImage(
     apiKey: options.apiKey,
   };
 
-  try {
-    // The resume path re-polls a prior attempt's 69labs generation instead of
-    // resubmitting (zombie-loop fix). Only the 69labs path resumes — the fal.ai
-    // fallback below always submits fresh (it has no per-account concurrency wall).
-    return await generate69labsImage(prompt, resume, modelOpts);
-  } catch (err) {
-    // Caller owns its own fallback (see GenerateImageOptions.noFallback).
-    if (options.noFallback) throw err;
-    // FALLBACK: 69labs failed past its retry budget / all accounts are down or
-    // blocked. EXCEPT on CENSORED — a content rejection would fail on any provider
-    // too; the fix is to edit the prompt, not switch provider. Surface it.
-    if (isCensored(err)) throw err;
-    // Same for our own deadline: the caller asked to be back by a fixed time and
-    // that time has passed, so starting a fresh generation on another provider
-    // would blow the budget it was meant to enforce.
-    if (isGenerationDeadline(err)) throw err;
-
-    // PREFERRED fallback is Gemini's own image model: 69labs resells Google's
-    // nano-banana, so a Gemini still matches the 69labs look (fal.ai FLUX reads
-    // different) while sidestepping 69labs' credit/slot limits. Fall through to
-    // fal.ai only when Gemini is unconfigured or itself fails.
-    if (isGeminiImageConfigured()) {
-      console.warn(
-        JSON.stringify({
-          msg: "69labs.image.gemini_fallback",
-          note: "69labs image pool exhausted; falling back to Gemini (nano-banana)",
-          err: (err as Error).message?.slice(0, 200),
-        }),
-      );
-      try {
-        const out = await generateGeminiImage(prompt);
-        return { image: out.image, contentType: out.contentType, provider: out.provider };
-      } catch (geminiErr) {
-        // Gemini also failed. Try fal.ai as a last resort if configured;
-        // otherwise surface a combined 69labs+Gemini reason.
-        if (!isFalImageConfigured()) {
-          throw new Error(
-            `image generation failed :: 69labs: ${(err as Error).message?.slice(0, 120)} :: gemini: ${(geminiErr as Error).message?.slice(0, 120)}`,
-          );
-        }
-        console.warn(
-          JSON.stringify({
-            msg: "69labs.image.fal_fallback",
-            note: "69labs + Gemini failed; falling back to fal.ai FLUX",
-            err: (geminiErr as Error).message?.slice(0, 200),
-          }),
-        );
-        try {
-          const out = await generateFalImage(prompt);
-          return { image: out.image, contentType: out.contentType, provider: out.provider };
-        } catch (falErr) {
-          throw new Error(
-            `image generation failed on all providers :: 69labs: ${(err as Error).message?.slice(0, 100)} :: gemini: ${(geminiErr as Error).message?.slice(0, 100)} :: fal.ai: ${(falErr as Error).message?.slice(0, 100)}`,
-          );
-        }
-      }
-    }
-
-    // Gemini not configured — original fal.ai-only fallback path.
-    if (!isFalImageConfigured()) throw err;
-    console.warn(
-      JSON.stringify({
-        msg: "69labs.image.fal_fallback",
-        note: "69labs image pool exhausted; falling back to fal.ai FLUX",
-        err: (err as Error).message?.slice(0, 200),
-      }),
-    );
-    try {
-      const out = await generateFalImage(prompt);
-      return { image: out.image, contentType: out.contentType, provider: out.provider };
-    } catch (falErr) {
-      // Both providers failed. Surface a combined reason so the job log shows
-      // WHY each one failed, not just the last.
-      throw new Error(
-        `image generation failed on both providers :: 69labs: ${(err as Error).message?.slice(0, 150)} :: fal.ai: ${(falErr as Error).message?.slice(0, 150)}`,
-      );
-    }
-  }
+  // NO CROSS-PROVIDER FALLBACK (2026-08-15, product decision). 69labs is the
+  // only image provider: if it fails past its retry budget and key failover, the
+  // error propagates to the job and the USER SEES IT.
+  //
+  // The old chain silently retried on Gemini, then fal.ai FLUX. It was removed
+  // because it converted a provider outage into an invisible quality
+  // regression: on 2026-08-15 a bad `resolution` value made 69labs 503 EVERY
+  // submit for days, and because the chain kept returning images the queue
+  // looked perfectly healthy — the only symptom was that stills quietly stopped
+  // matching the house style. A failure that shows up as a failure is worth more
+  // than one that shows up as an off-model image nobody can explain.
+  //
+  // The resume path re-polls a prior attempt's 69labs generation instead of
+  // resubmitting (zombie-loop fix); it is unaffected by any of the above.
+  //
+  // If a fallback is ever wanted again, restore it HERE — every caller goes
+  // through this function, and generate69labsImage's own errors (CENSORED,
+  // deadline, auth) are already classified for that purpose.
+  return await generate69labsImage(prompt, resume, modelOpts);
 }

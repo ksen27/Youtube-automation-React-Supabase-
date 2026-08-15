@@ -543,13 +543,32 @@ const ServerEnvSchema = z.object({
   // require setting SIXTYNINE_LABS_IMAGE_MODEL to the Pro model name.
   // Verified valid values for nano-banana-2: "1k" | "2k" | "4k" (LOWERCASE —
   // the API 400s on "2K"). "" omits the field (provider default = 1k).
-  // "2k", not "4k": the export only has to BE 4K (client 2026-08-03), it does not
-  // need 4K source detail. But this was "1k" in production, which the 3840x2160
-  // canvas would upscale 4x on ~215 of ~277 blocks — visibly mushy for no saving,
-  // since 69labs bills per IMAGE, not per pixel. "2k" is the middle ground.
-  // Probed 2026-08-03: "4k" returns 5504×3072 (above the canvas) and each file is
-  // ~10MB, so 4k costs ~2GB of storage per project — the reason not to default to it.
-  SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("2k"),
+  //
+  // "1k", NOT "2k" — 2026-08-15. 69labs REJECTS above-1k resolutions ON THE
+  // NANO-BANANA FAMILY with a generic `503 {"code":"SERVICE_UNAVAILABLE"}` at
+  // submit, so a "2k" default made EVERY avatar image generation fail and
+  // silently fall through the Gemini/fal.ai fallback chain in generateImage().
+  // Measured that day, same request with only `resolution` varied:
+  //     2k -> 503 (x3)   4k -> 503   1k -> 201   omitted -> 201
+  // Confirmed on nano-banana-2, nano-banana-pro AND nano-banana-2-lite.
+  // NOT a blanket high-res outage: gpt-image-2 at 2k returns 201, which is why
+  // CelebForge (CELEB_IMAGE_RESOLUTION="2k" on gpt-image-2) is UNAFFECTED —
+  // do not "fix" that one to match this.
+  // Key was valid, model health "healthy/available", credits 0/2000 used — so
+  // the 503 is 69labs signalling "this resolution is not available for this
+  // model", NOT the transient outage its message claims.
+  // "4k" DID work on 2026-08-03 (probed: 5504×3072), so this is a change on
+  // their side. Re-test with scripts/diagnose-69labs-image.ts before raising
+  // this again; while it 503s, a higher value costs 100% of generations.
+  //
+  // The old comment justified "2k" as free quality "since 69labs bills per
+  // IMAGE, not per pixel". That is WRONG — /api/v1/images/models reports
+  // resolutionCosts {1k:1, 2k:3, 4k:4}, so 2k burned 3x the credits (~666
+  // images/day against the 2000/day budget, vs 2000 at 1k).
+  // Cost of 1k: the 3840x2160 canvas upscales these ~4x and they read soft.
+  // That is the known trade — but a soft nano-banana still beats the off-model
+  // fal.ai FLUX image the 503 was actually producing.
+  SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("1k"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
   // Max seconds to poll a TTS job to COMPLETED before giving up.
   SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),

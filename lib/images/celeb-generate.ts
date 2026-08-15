@@ -19,9 +19,12 @@
  *  2. NAMES. lib/synthetic/planner.ts forbids real names in image prompts because
  *     nano-banana/FLUX refuse real likenesses. Here the name is the POINT — it is
  *     what makes the still show the actual celebrity — so we deliberately keep it.
- *  3. FALLBACK. Synthetic falls 69labs → Gemini → fal.ai. For a named celebrity
- *     that chain is worthless (Gemini/FLUX refuse public figures), so we pass
- *     noFallback and fall back to the existing SCRAPED photo path instead.
+ *  3. FALLBACK. generateImage has NO cross-provider fallback (removed
+ *     2026-08-15 — see the note in its body): a 69labs failure throws. That is
+ *     what this path already wanted, since the old 69labs → Gemini → fal.ai
+ *     chain was worthless for a named celebrity (Gemini/FLUX refuse public
+ *     figures). The throw is caught below and we fall back to the existing
+ *     SCRAPED photo path, exactly as before.
  *
  * MODEL CHOICE (measured, scripts/celeb-image-spike.ts, 2026-08-10)
  * ----------------------------------------------------------------
@@ -201,8 +204,6 @@ export async function generateCelebImage(
       rawPrompt: true,
       model: env.CELEB_IMAGE_MODEL,
       resolution: env.CELEB_IMAGE_RESOLUTION,
-      // Gemini/FLUX refuse named public figures; scraped photos are our fallback.
-      noFallback: true,
       generationTimeoutMs: env.CELEB_IMAGE_TIMEOUT_MS,
       acquireTimeoutMs: env.CELEB_IMAGE_SLOT_WAIT_MS,
       // Pin the dedicated CelebForge key when configured. The shared pool's keys

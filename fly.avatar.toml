@@ -48,6 +48,15 @@ kill_timeout = "300s"
 [env]
   # Serve ONLY the synthetic queues (tts/planner/image/video/avatar).
   WORKER_ROLE = "synthetic"
+  # 69labs image resolution. PINNED HERE (not left to the env.ts default) because
+  # getting it wrong fails 100% of image generations in a way that LOOKS healthy:
+  # 69labs answers any resolution above 1k with a generic 503 SERVICE_UNAVAILABLE,
+  # and generateImage() catches that and quietly falls back to Gemini/fal.ai — so
+  # the queue keeps draining and only the image STYLE changes. See the long note
+  # on SIXTYNINE_LABS_IMAGE_RESOLUTION in lib/env.ts (2026-08-15). Not a secret,
+  # so [env] is the right home. Verify with scripts/diagnose-69labs-image.ts
+  # before changing.
+  SIXTYNINE_LABS_IMAGE_RESOLUTION = "1k"
   # Headless Chromium for HeyGen automation.
   HEYGEN_HEADLESS = "true"
   # How long the warm HeyGen session is trusted before the worker re-verifies it
