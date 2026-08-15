@@ -362,7 +362,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * price from the SAVED project row, not from this form, so listing without
    * saving would put the book on sale at the previous price.
    */
-  async function createProduct() {
+  async function createProduct(force = false) {
     if (parsePrice(price) === null) {
       setErr("Set a price before creating the Payhip link — the store needs one.");
       return;
@@ -372,7 +372,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
     // project row, not from this form, so listing without saving would put the
     // book on sale at whatever it was priced at before.
     if (!(await saveSettings())) return;
-    await listBook(projectId);
+    await listBook(projectId, force);
   }
 
   /**
@@ -384,7 +384,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
    * so skipping this step would list the book at whatever it was priced at
    * before, silently.
    */
-  async function createSiblingProduct(i: number) {
+  async function createSiblingProduct(i: number, force = false) {
     const sib = siblings[i];
     if (!sib?.projectId) {
       setErr("Choose a book before creating its Payhip link.");
@@ -413,14 +413,17 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
       return;
     }
 
-    await listBook(sib.projectId);
+    await listBook(sib.projectId, force);
   }
 
   /** Queue the Payhip listing for one book and start watching for its link. */
-  async function listBook(bookProjectId: string) {
+  async function listBook(bookProjectId: string, force = false) {
     setListingId(bookProjectId);
     try {
-      const res = await fetch(`/api/books/projects/${bookProjectId}/checkout-product`, { method: "POST" });
+      const res = await fetch(
+        `/api/books/projects/${bookProjectId}/checkout-product${force ? "?force=true" : ""}`,
+        { method: "POST" },
+      );
       const data = await res.json();
       if (!res.ok) {
         setErr(data.error ?? "Could not create the product");
@@ -1068,7 +1071,8 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                 blocker={product?.blockers[0] ?? null}
                 busy={busy}
                 listing={listingId === projectId}
-                onCreate={createProduct}
+                onCreate={() => createProduct(false)}
+                onRegenerate={() => createProduct(true)}
                 inputId="checkoutUrl"
                 // Read from the FORM, not from the server's saved copy. The
                 // button is what saves the price, so gating it on the saved
@@ -1218,6 +1222,7 @@ export function LandingPageCard({ projectId }: { projectId: string }) {
                     busy={busy}
                     listing={listingId === sib.projectId}
                     onCreate={() => createSiblingProduct(i)}
+                    onRegenerate={() => createSiblingProduct(i, true)}
                     inputId={`sib-url-${i}`}
                     disabledReason={
                       !sib.projectId
@@ -1357,6 +1362,8 @@ function CheckoutControl(props: {
   busy: boolean;
   listing: boolean;
   onCreate: () => void;
+  /** Create a NEW product, ignoring the one already recorded. */
+  onRegenerate: () => void;
   inputId: string;
   /** Shown instead of the Create button before a book has been chosen. */
   disabledReason?: string | undefined;
@@ -1377,6 +1384,30 @@ function CheckoutControl(props: {
         </a>
         <p className="text-xs text-fg-subtle">
           Created on Payhip{props.productKey ? ` (${props.productKey})` : ""}.{" "}
+          {/* Regenerating makes a SECOND product — Payhip keeps the old one, and
+              any page or email already carrying its link keeps selling it. So
+              this confirms rather than firing on one click, and says plainly
+              what it will leave behind. */}
+          <button
+            type="button"
+            disabled={props.busy || props.listing}
+            onClick={() => {
+              if (
+                window.confirm(
+                  "Create a new Payhip product for this book?\n\n" +
+                    "The existing product stays on Payhip — it is not deleted — and any link " +
+                    "already shared keeps working. This page will point at the new one.\n\n" +
+                    "Delete the old product in Payhip afterwards if you don't want two.",
+                )
+              ) {
+                props.onRegenerate();
+              }
+            }}
+            className="underline hover:text-fg disabled:opacity-50"
+          >
+            {props.listing ? "creating a new one…" : "create a new one"}
+          </button>{" "}
+          ·{" "}
           <button
             type="button"
             onClick={() => setManual(true)}

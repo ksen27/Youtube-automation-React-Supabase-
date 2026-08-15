@@ -106,6 +106,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
 
   async createProduct(
     draft: CheckoutProductDraft,
+    options: { force?: boolean | undefined } = {},
   ): Promise<Result<PublishedCheckoutProduct, CheckoutPublishError>> {
     let lastError: PayhipError | null = null;
     const backoff = this.config.backoffMs ?? DEFAULT_BACKOFF_MS;
@@ -140,7 +141,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
         await delay(wait);
       }
       try {
-        const product = await this.runFlow(draft, attempt);
+        const product = await this.runFlow(draft, attempt, options.force ?? false);
         return Result.ok(product);
       } catch (err) {
         const payhipError = asPayhipError(err);
@@ -160,7 +161,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
   }
 
   /** One full attempt: session → dashboard → form → upload → publish → link. */
-  private async runFlow(draft: CheckoutProductDraft, attempt: number): Promise<PublishedCheckoutProduct> {
+  private async runFlow(draft: CheckoutProductDraft, attempt: number, force: boolean): Promise<PublishedCheckoutProduct> {
     const session = await this.sessions.load();
     if (!session?.storageState) throw new PayhipNotConfigured();
     if (session.needsReauth) {
@@ -211,8 +212,17 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       // we already have a logged-in dashboard, and only ever COSTS a listing
       // lookup — while the duplicate it prevents costs the seller a real
       // product on their storefront.
-      step(`checking whether "${draft.title}" is already listed`);
-      const existing = await dashboard.findExistingByTitle(draft.title).catch(() => null);
+      // Skipped when the caller explicitly asked to create a new one. Adopting
+      // is the right default — it is what stops a run that published and then
+      // died from listing the same book twice — but it also makes regenerating
+      // impossible, since it would find the old listing and hand its link back
+      // as if a new product had been made.
+      step(
+        force
+          ? 'creating a NEW product (skipping the existing-listing check)'
+          : `checking whether "${draft.title}" is already listed`,
+      );
+      const existing = force ? null : await dashboard.findExistingByTitle(draft.title).catch(() => null);
       if (existing) {
         this.logger.warn('a Payhip product with this title already exists — adopting it', {
           externalId: draft.externalId,

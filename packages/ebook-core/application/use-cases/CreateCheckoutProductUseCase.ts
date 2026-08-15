@@ -164,7 +164,10 @@ export class CreateCheckoutProductUseCase {
       hasCover: Boolean(cover),
     });
 
-    const published = await this.publisher.createProduct(draft);
+    // `force` reaches the publisher too, not just the DB guard above. Otherwise
+    // "regenerate" would skip our own record, find the old listing on the store
+    // by title, and return that — doing nothing while appearing to work.
+    const published = await this.publisher.createProduct(draft, { force: input.force ?? false });
     if (published.isFail()) {
       this.logger.error('could not create the store product', {
         projectId: input.projectId,

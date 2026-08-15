@@ -70,8 +70,25 @@ export interface CheckoutPublishError {
   debugPaths?: string[] | undefined;
 }
 
+export interface CreateProductOptions {
+  /**
+   * Create a NEW product even if one with this title already exists on the
+   * store.
+   *
+   * Off by default, because adopting an existing listing is what stops a run
+   * that published and then died from listing the same book twice. But that
+   * same guard makes "create it again" impossible — it would find the old
+   * product and hand back its link — so a caller who has deliberately asked to
+   * regenerate must be able to switch it off.
+   */
+  force?: boolean | undefined;
+}
+
 export interface CheckoutProductPublisher {
   /** False when no session/credentials are set up, so the UI can say so up front. */
   isConfigured(): boolean;
-  createProduct(draft: CheckoutProductDraft): Promise<Result<PublishedCheckoutProduct, CheckoutPublishError>>;
+  createProduct(
+    draft: CheckoutProductDraft,
+    options?: CreateProductOptions,
+  ): Promise<Result<PublishedCheckoutProduct, CheckoutPublishError>>;
 }
