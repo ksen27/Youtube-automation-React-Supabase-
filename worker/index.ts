@@ -327,7 +327,27 @@ if (runEbook) {
       const { keepPayhipSessionAlive } = await import("@ebook/infra");
       const c = getContainer();
       const payhipKeepAlive = () => {
-        void keepPayhipSessionAlive(
+        void (async () => {
+          // ONE MACHINE AT A TIME, across the whole fleet.
+          //
+          // This app runs two machines (one is Fly's standby), and both boot
+          // the same worker — so both were opening a browser against the SAME
+          // Payhip account, minutes apart, from two different exits. That is
+          // not merely wasteful: two concurrent logged-in sessions for one
+          // account, from two addresses, is the pattern a bot-protected site
+          // invalidates sessions over. The keep-alive meant to preserve the
+          // session may well have been helping to kill it.
+          //
+          // A Redis SET NX with a TTL just under the interval is enough: the
+          // winner sweeps, the loser skips this tick, and a machine that dies
+          // holding the lock only delays the next sweep by one interval.
+          const ttlMs = Math.max(60_000, Math.max(10, c.env.PAYHIP_KEEPALIVE_MINUTES) * 60_000 - 60_000);
+          const won = await getRedisConnection()
+            .set('payhip:keepalive:lock', String(process.pid), 'PX', ttlMs, 'NX')
+            .catch(() => null);
+          if (won !== 'OK') return;
+
+          return keepPayhipSessionAlive(
           c.payhipSessions,
           {
             baseUrl: c.env.PAYHIP_BASE_URL,
@@ -340,8 +360,8 @@ if (runEbook) {
         )
           .then((verdict) => {
             console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "payhip.keepalive.done", verdict }));
-          })
-          .catch(() => {});
+          });
+        })().catch(() => {});
       };
       // Not immediately at boot: a deploy restarts the worker, and hitting a
       // Cloudflare-protected dashboard the instant every machine comes up is

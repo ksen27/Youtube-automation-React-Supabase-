@@ -109,7 +109,12 @@ export const POST = handle(async (req: Request, { params }: { params: Promise<{ 
   // this — a queue can be posted to directly — but a 422 now beats a failure then.
   const blockers = listBlockers(project);
   if (blockers.length > 0) return error(blockers[0] as string, 422);
-  if (!c.checkoutPublisher.isConfigured()) {
+  // Re-read rather than trusting the boot-time cache, exactly as GET does. The
+  // cached answer is set false the moment any run reports an expired session,
+  // and a server process outlives that by hours — so an operator who had
+  // already reconnected was still told to reconnect, by a value from before
+  // they did.
+  if (!(await c.checkoutPublisher.warmUp().catch(() => false))) {
     return error(
       'No Payhip session is connected. Run `npm run payhip:connect` on a machine with a display to log in once.',
       422,
