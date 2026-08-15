@@ -389,25 +389,52 @@ export class PayhipProductPage {
     // actually being listened to. `attached` rather than `visible` because
     // these inputs are deliberately invisible (opacity 0, behind the button).
     const shimInput = this.page.locator(`${SELECTORS.productFileZone} .moxie-shim input[type="file"]`).first();
-    const wired = await shimInput
-      .waitFor({ state: 'attached', timeout: 60_000 })
-      .then(() => true)
+    await shimInput.waitFor({ state: 'attached', timeout: 60_000 }).catch(() => {});
+
+    // CLICK THE BUTTON AND ANSWER THE FILE DIALOG, rather than writing to a
+    // hidden input.
+    //
+    // Setting `input.files` directly is the obvious approach and it does not
+    // work here, on any of the inputs in this zone — plupload's, the templates',
+    // or the first one in document order. All three accept the file and none of
+    // them start an upload, because plupload does not simply listen for a
+    // `change` event on an input it left lying around; it drives its own
+    // runtime from the click.
+    //
+    // So this does what a person does: click the visible "Upload product file"
+    // button, let Payhip open the native file dialog, and answer it. Playwright
+    // intercepts that dialog as a `filechooser` event, which means the whole
+    // path from click to upload is Payhip's own code — nothing here depends on
+    // guessing which element is secretly wired to what.
+    const uploadButton = firstVisible(this.page, [
+      this.page.locator(SELECTORS.productFileZone).getByText(/upload (another )?product file/i),
+      this.page.getByRole('button', { name: /upload (another )?product file/i }),
+      this.page.getByText(/upload product file/i),
+    ]);
+
+    const viaDialog = await Promise.all([
+      this.page.waitForEvent('filechooser', { timeout: 30_000 }),
+      uploadButton.click({ timeout: 30_000 }),
+    ])
+      .then(async ([chooser]) => {
+        await chooser.setFiles(pdfPath);
+        return true;
+      })
       .catch(() => false);
 
-    // Fall back to any file input in the zone if the shim never appears —
-    // better a doomed attempt with a clear failure than refusing to try.
-    const input = wired
-      ? shimInput
-      : this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
-    // Reported so a failed run says WHICH input received the file. The
-    // difference between the uploader's own input and some other one in the
-    // zone is the whole bug, and without this the two failures look identical.
-    onNote(
-      wired
-        ? "using the uploader's own file input (.moxie-shim)"
-        : 'moxie shim never appeared — falling back to the first file input in the zone',
-    );
-    await input.setInputFiles(pdfPath);
+    if (!viaDialog) {
+      // The dialog never opened — fall back to the old approach so a Payhip
+      // redesign degrades to the previous behaviour rather than refusing to try.
+      onNote('the upload button opened no file dialog — falling back to setting the input directly');
+      await shimInput.setInputFiles(pdfPath).catch(async () => {
+        await this.page
+          .locator(`${SELECTORS.productFileZone} input[type="file"]`)
+          .first()
+          .setInputFiles(pdfPath);
+      });
+    } else {
+      onNote('answered Payhip\'s own file dialog');
+    }
 
     // FIRST: did the upload even START?
     //
