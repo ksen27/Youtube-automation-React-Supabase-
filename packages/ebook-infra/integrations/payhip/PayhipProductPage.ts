@@ -480,9 +480,19 @@ export class PayhipProductPage {
     // just as wrong — it is present but hidden, so a perfectly successful 46 MB
     // upload sat there until the ten-minute budget expired, twice, with the
     // finished file visible on screen the whole time.
+    // The "uploaded" BADGE, not the file size.
+    //
+    // The size is known from the File object the instant it is chosen, so
+    // Payhip prints "name.pdf (5.9 mb)" before any bytes move — a check on it
+    // passed in one second and let the submit fire mid-transfer. The badge is
+    // the only marker here that means the server has the file.
+    //
+    // This was the original check, and it was replaced after a run where it
+    // timed out — but that run's upload never STARTED (the file was being set
+    // on an input plupload wasn't listening to). The badge was right; the
+    // upload was the problem.
     const settled = this.page
-      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileRow}`)
-      .filter({ hasText: /\(\s*[\d.]+\s*[kmg]b\s*\)/i })
+      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileBadge}`)
       .first();
 
     await settled
@@ -542,57 +552,55 @@ export class PayhipProductPage {
    * that 404s would be written into a live sales page's buy button.
    */
   async publishAndReadLink(title: string): Promise<{ productKey: string; buyUrl: string }> {
-    await this.page.locator(SELECTORS.submit).first().click();
+    // SAVE, AND KEEP SAVING UNTIL PAYHIP ACCEPTS IT.
+    //
+    // Every attempt to predict when the uploads have finished has been wrong —
+    // the rename input was invisible, the file size is printed before any bytes
+    // move, and the badge and the thumbnail strip each have their own timing.
+    // Guessing again would just be a fourth version of the same mistake.
+    //
+    // Payhip already knows the answer and says so plainly: it blocks a
+    // premature save with an "Oops — files are still being uploaded" modal and
+    // stays on the form. So ask it. Click save; if it objects, dismiss the
+    // modal, wait, and click again. The page leaving the add-product form is
+    // the only unambiguous evidence the save was taken.
+    const onForm = () => /\/product\/(add|create)/.test(this.page.url());
+    const deadline = Date.now() + UPLOAD_TIMEOUT_MS;
+    let blockedRounds = 0;
 
-    // Payhip answers a premature save with a modal — "your files are still
-    // uploading" — and stays on the form. The click looks like it worked and
-    // nothing is created, which is indistinguishable from a submit that failed
-    // for any other reason. If that modal appears, wait for it to clear and
-    // press save once more rather than reporting a mystery.
-    const stillUploading = this.page
-      .getByText(/still being uploaded|still uploading|add at least one file/i)
-      .first();
-    const blocked = await stillUploading
-      .waitFor({ state: 'visible', timeout: 5_000 })
-      .then(() => true)
-      .catch(() => false);
+    for (;;) {
+      await this.page.locator(SELECTORS.submit).first().click().catch(() => {});
+      await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
+      if (!onForm()) break; // accepted — Payhip moved us on
 
-    if (blocked) {
-      // DISMISS IT. This is a modal with an OK button, not a transient notice:
-      // it sits there until someone clicks, and it covers the form while it
-      // does. Waiting for it to disappear on its own — which is what this used
-      // to do — meant the run stopped dead at the very last step, having done
-      // everything else correctly.
+      const modal = this.page
+        .getByText(/still being uploaded|still uploading|add at least one file/i)
+        .first();
+      const objected = await modal
+        .waitFor({ state: 'visible', timeout: 5_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!objected) break; // stayed put for some other reason — handled below
+
+      blockedRounds++;
+      if (Date.now() >= deadline) {
+        throw new PayhipTransientError(
+          `Payhip kept refusing to save because the files were still uploading, ` +
+            `after ${Math.round(UPLOAD_TIMEOUT_MS / 60_000)} minutes and ${blockedRounds} attempts`,
+        );
+      }
+
+      // Dismiss it. This is a modal with an OK button — it covers the form and
+      // waits for a click, so waiting for it to vanish on its own hangs the run.
       const ok = firstVisible(this.page, [
         this.page.getByRole('button', { name: /^\s*ok\s*$/i }),
         this.page.getByRole('link', { name: /^\s*ok\s*$/i }),
         this.page.getByText(/^\s*ok\s*$/i),
       ]);
       await ok.click({ timeout: 10_000 }).catch(() => {});
-      await stillUploading.waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
-
-      // Now wait for the upload to actually finish — the row settles into a
-      // file with a size — and only then try saving again.
-      await this.page
-        .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileRow}`)
-        .filter({ hasText: /\(\s*[\d.]+\s*[kmg]b\s*\)/i })
-        .first()
-        .waitFor({ state: 'visible', timeout: UPLOAD_TIMEOUT_MS })
-        .catch(() => {
-          throw new PayhipTransientError(
-            'Payhip refused to save because the file was still uploading, and the upload never finished',
-          );
-        });
-
-      await this.page.locator(SELECTORS.submit).first().click();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
+      await modal.waitFor({ state: 'hidden', timeout: 30_000 }).catch(() => {});
+      await this.page.waitForTimeout(5_000);
     }
-
-    // Submitting posts the whole form, including the file it just accepted, so
-    // give the navigation room before concluding anything about the result.
-    // Not fatal on timeout: some flows update in place rather than navigating,
-    // and the checks below can still find the link.
-    await this.page.waitForLoadState('domcontentloaded', { timeout: 120_000 }).catch(() => {});
 
     // Payhip surfaces validation failures as inline messages and simply stays
     // on the form — the submit looks like it happened and nothing is created.
@@ -678,6 +686,29 @@ export class PayhipProductPage {
     // for every book — which quietly turned this duplicate guard into a no-op.
     await this.page.goto(`${this.baseUrl}${ROUTES.products}`, { waitUntil: 'domcontentloaded' }).catch(() => {});
     if (isLoginUrl(this.page.url())) throw new PayhipSessionExpired();
+
+    // Ask Payhip to find it, rather than hoping it is on screen.
+    //
+    // The list paginates and shows a handful at a time — this store already has
+    // fourteen products — so "is the title visible?" answers a different
+    // question from "does this product exist?". That mattered twice: the
+    // duplicate guard silently found nothing every run, and the post-save
+    // recovery reported a product missing while looking at page one.
+    const search = firstVisible(this.page, [
+      this.page.getByPlaceholder(/search/i),
+      this.page.getByRole('searchbox'),
+      this.page.locator('input[type="search"], input[name*="search" i]'),
+    ]);
+    const searched = await search
+      .fill(title, { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (searched) {
+      await search.press('Enter').catch(() => {});
+      // The list re-renders in place; give it a moment to settle before
+      // concluding anything from what is on screen.
+      await this.page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+    }
 
     const row = this.page.getByText(title, { exact: true }).first();
     const present = await row
