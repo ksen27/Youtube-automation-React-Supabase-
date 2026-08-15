@@ -7,3 +7,29 @@ tmp
 .vscode
 *.log
 README.md
+
+# Everything below is uploaded to the builder on EVERY deploy and used by
+# nothing inside the image. It is not the main cost of a slow build — the three
+# Chromium installs in Dockerfile.worker are — but it is the part that is pure
+# waste, and it also invalidates the `COPY . .` layer whenever a stray file
+# changes, forcing a rebuild of every step after it.
+
+# Sample media and debug captures (~18MB, none of it shipped)
+four-k-sample
+logs
+*.mp3
+*.mp4
+key-*.png
+key-results.json
+
+# Local build artefacts and tooling state
+tsconfig.tsbuildinfo
+coverage
+.claude
+scripts/.spike-out
+
+# Docs and infra configs the runtime never reads
+*.md
+fly*.toml
+docker-compose.yml
+supabase/migrations
