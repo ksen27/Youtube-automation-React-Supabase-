@@ -77,7 +77,12 @@ vi.mock('./PayhipBrowser', async () => {
       browser: { close: async () => {} },
       context: {
         close: async () => {},
-        newPage: async () => ({ url: () => 'https://payhip.com/dashboard' }),
+        newPage: async () => ({
+          url: () => 'https://payhip.com/dashboard',
+          // The publisher subscribes to network and page-error events for
+          // upload diagnostics; a fake page just needs to accept the handlers.
+          on: () => {},
+        }),
         storageState: async () => ({ cookies: ['refreshed'] }),
       },
     })),

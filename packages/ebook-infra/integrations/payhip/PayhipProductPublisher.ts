@@ -202,6 +202,57 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
         exitIp: await readExitIp(context),
       });
       page = await context.newPage();
+
+      // WATCH THE UPLOAD TRAFFIC ITSELF.
+      //
+      // "The upload did not start" has been diagnosed from screenshots for
+      // several rounds, and a screenshot cannot distinguish the three things
+      // that produce it: the uploader never fired a request, it fired one that
+      // failed to connect, or it fired one that was rejected. Those need
+      // completely different fixes, and the network layer states which outright.
+      //
+      // Payhip stores product files in S3 (its markup even has a
+      // `hide-when-s3-file-accidentally-deleted` class), so an upload shows up
+      // as a request to S3 or to a Payhip upload endpoint. Silence here means
+      // plupload never tried.
+      const isUpload = (url: string) =>
+        /amazonaws\.com|\/upload|\/s3|blob\.core|storage\.googleapis/i.test(url);
+      page.on('request', (req) => {
+        if (req.method() === 'POST' && isUpload(req.url())) {
+          this.logger.info('upload request sent', {
+            externalId: draft.externalId,
+            url: req.url().slice(0, 200),
+          });
+        }
+      });
+      page.on('response', (res) => {
+        if (isUpload(res.url())) {
+          this.logger.info('upload response', {
+            externalId: draft.externalId,
+            status: res.status(),
+            url: res.url().slice(0, 200),
+          });
+        }
+      });
+      page.on('requestfailed', (req) => {
+        if (isUpload(req.url())) {
+          this.logger.warn('upload request FAILED', {
+            externalId: draft.externalId,
+            reason: req.failure()?.errorText,
+            url: req.url().slice(0, 200),
+          });
+        }
+      });
+      // Payhip's own JS errors surface here — a runtime exception inside
+      // plupload would stop the upload dead and leave the page looking exactly
+      // as it does now.
+      page.on('pageerror', (err) => {
+        this.logger.warn('page JS error', {
+          externalId: draft.externalId,
+          err: String(err).slice(0, 300),
+        });
+      });
+
       const dashboard = new PayhipProductPage(page, this.config.baseUrl);
 
       step('opening the dashboard (checking the session is still valid)');
