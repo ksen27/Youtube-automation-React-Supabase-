@@ -388,8 +388,43 @@ export class PayhipProductPage {
     // once the uploader has initialised, and the input inside it is the one
     // actually being listened to. `attached` rather than `visible` because
     // these inputs are deliberately invisible (opacity 0, behind the button).
+    // WAIT FOR PLUPLOAD TO HAVE AN UPLOADER, not for markup to appear.
+    //
+    // This is the bug that survived every environment fix. Payhip loads the
+    // plupload library and then CONSTRUCTS an uploader a moment later; until
+    // that construction happens there is nothing listening, and a file handed
+    // over in the meantime is silently dropped — the page keeps saying "No
+    // product files added yet" and no request is ever made.
+    //
+    // It never reproduced locally because a laptop renders the form slowly
+    // enough to hide it: nine seconds from form-open to file there, two
+    // seconds on the worker. Faster hardware lost the race, which is why this
+    // looked like a production-only fault for days.
+    //
+    // `plupload.uploaders.length` is the library's own register of live
+    // instances — the one signal that means "there is something to receive a
+    // file". Waiting on markup (.moxie-shim, a file input) was wrong: both
+    // exist before the uploader does.
+    const uploaderReady = await this.page
+      .waitForFunction(
+        () => {
+          const pl = (window as unknown as { plupload?: { uploaders?: unknown[] } }).plupload;
+          return Boolean(pl?.uploaders?.length);
+        },
+        undefined,
+        { timeout: 60_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (!uploaderReady) {
+      throw new PayhipTransientError(
+        "Payhip's file uploader never initialised on the product form — plupload loaded but " +
+          'registered no uploader within 60s, so there was nothing to hand the file to.',
+      );
+    }
+
     const shimInput = this.page.locator(`${SELECTORS.productFileZone} .moxie-shim input[type="file"]`).first();
-    await shimInput.waitFor({ state: 'attached', timeout: 60_000 }).catch(() => {});
+    await shimInput.waitFor({ state: 'attached', timeout: 30_000 }).catch(() => {});
 
     // CLICK THE BUTTON AND ANSWER THE FILE DIALOG, rather than writing to a
     // hidden input.

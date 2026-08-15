@@ -23,12 +23,16 @@
 // than a fix — run it to shrink the table and make the library honest, not to
 // stop the bleeding.
 import { getServerSupabase } from "@/lib/supabase/server";
-import { FALLBACK_PROVIDERS } from "@/lib/synthetic/asset-library";
+import { REMOVED_FALLBACK_PROVIDERS } from "@/lib/synthetic/asset-library";
 
 async function main() {
   const apply = process.argv.includes("--apply");
   const sb = getServerSupabase();
-  const providers = [...FALLBACK_PROVIDERS];
+  // Only the provably off-style fallback stills. The ltx2/heygen-labelled images
+  // are ALSO barred from reuse (migration 0036) but are NOT deleted: they are
+  // most likely genuine 69labs output that the backfill mislabelled, and
+  // deletion cannot be undone.
+  const providers = [...REMOVED_FALLBACK_PROVIDERS];
 
   const { count, error: countErr } = await sb
     .from("generated_assets")

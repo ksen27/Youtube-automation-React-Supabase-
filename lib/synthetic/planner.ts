@@ -3178,6 +3178,26 @@ export async function buildSyntheticTimeline(input: {
 
   // Persist. Clear any prior plan first so retries don't accumulate.
   const sb = getServerSupabase();
+  // BOTH tables, and timeline_items FIRST. Deleting only synthetic_segments
+  // left the PREVIOUS plan's timeline_items behind as invisible orphans, and
+  // nothing downstream could see them:
+  //   - timeline_items.synthetic_segment_id is `on delete set null` (migration
+  //     0024), so dropping the segments NULLED the orphans' link;
+  //   - 0024's unique index is PARTIAL (where synthetic_segment_id is not null),
+  //     so a null-linked orphan can never conflict;
+  //   - maybeFinalizeSynthetic's already-materialized set is keyed on that same
+  //     id, so it re-materializes the new plan alongside them.
+  // The render gate, however, sums EVERY duration-bearing row — so a re-planned
+  // project failed with "Timeline duration must match voiceover" by almost
+  // exactly one whole voiceover. Observed 2026-08-15 on project 01bc9624
+  // ("10 Chinese Utes"): 288 live rows = 1814.0s (a perfect match) plus 315
+  // orphans = 1813.6s from a plan 8 hours earlier, summing to 3627.6s against a
+  // 1814s voiceover.
+  //
+  // Ordered timeline_items -> synthetic_segments so the rows are gone before the
+  // FK can null their link; if the second delete fails, the retry still sees a
+  // clean timeline rather than a fresh batch of unreachable orphans.
+  await sb.from("timeline_items").delete().eq("project_id", projectId);
   await sb.from("synthetic_segments").delete().eq("project_id", projectId);
   const rows = planned.map((p) => ({
     project_id: projectId,

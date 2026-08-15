@@ -34,18 +34,41 @@ import { isProductPrompt } from "@/lib/synthetic/constants";
 // public function catches its own errors (including "migration not applied
 // yet") and returns null / no-ops, so generation always proceeds.
 
-// Image providers that must NEVER be served from the reuse pool. These are the
-// dead fallback chain (69labs -> Gemini -> fal.ai FLUX) removed from
-// generateImage on 2026-08-15: their stills do not match the house look the
-// synthetic STYLE_PROMPT is tuned for, so recycling them spreads one outage's
-// output across every future video. Nothing new can be indexed with these
-// providers; this guards the ~19.8k rows already in the table (and is enforced
-// in SQL too — see migration 0035 for the semantic tier).
+// Providers whose stills may be served from the reuse pool. IMAGES ONLY — an
+// ALLOW-LIST of exactly one provider (tightened 2026-08-15, superseding the
+// earlier fal_flux_image/gemini_image deny-list; see migration 0036).
 //
-// Deliberately a DENY-LIST, not an allow-list of "sixtynine_image": the same
-// table holds ltx2 clips and heygen avatar frames, which are legitimate and
-// must stay reusable.
-export const FALLBACK_PROVIDERS = ["fal_flux_image", "gemini_image"] as const;
+// Only 69labs output matches the house look the synthetic STYLE_PROMPT is tuned
+// for, so only 69labs output may be recycled into a new video.
+//
+// The deny-list was not enough because of a BACKFILL MISLABEL. Every
+// indexGeneratedAsset CALL SITE passes the image's own provider correctly, but
+// scripts/asset-library-backfill.ts reads the SEGMENT's `provider` column — and
+// for an ai_clip segment imageToVideoProcessor overwrites that column with the
+// CLIP's provider once the animation lands (image provider at :118, clobbered
+// by clip.provider at :158). So an ai_clip's 69labs still got indexed as
+// "ltx2", and a split_2's right-half still as "heygen". Measured 2026-08-15:
+// 723 ltx2 + 249 heygen rows of asset_type='image', every one a .jpg under
+// /images/ — LTX-2 is image-to-video and HeyGen renders avatar video; NEITHER
+// can emit a standalone still, which is what proves these are mislabels.
+//
+// Those ~972 rows are therefore MOSTLY genuine 69labs stills — but the image's
+// true provider is not recoverable (the segment column was overwritten), so any
+// that were generated during the fallback era are indistinguishable FLUX/Gemini
+// stills. Excluded rather than relabelled: 972 rows is ~2% of the 43.7k clean
+// pool, a cheap price for certainty about what gets reused.
+//
+// SCOPED TO IMAGES. Clip reuse is untouched — the ~10.1k ltx2 clips are the only
+// clips there are, and an allow-list applied to them would disable clip reuse
+// entirely.
+export const REUSABLE_IMAGE_PROVIDERS = ["sixtynine_image"] as const;
+
+// Stills from the REMOVED fallback chain. Distinct from the allow-list above:
+// these are the rows we can PROVE are off-style, so they are the only ones
+// scripts/purge-fallback-assets.ts will delete. The mislabelled ltx2/heygen
+// stills are blocked from reuse by the allow-list but NOT deleted — they are
+// probably genuine 69labs output and deletion is irreversible.
+export const REMOVED_FALLBACK_PROVIDERS = ["fal_flux_image", "gemini_image"] as const;
 
 export interface ReusableAsset {
   id: string;
@@ -179,22 +202,21 @@ export async function findReusableAsset(opts: {
     const exclude = state.usedUrls;
 
     // Tier 1: exact normalized-prompt hash.
-    // This tier does NOT go through match_generated_assets, so the fallback
-    // exclusion that migration 0035 added to the RPC has to be repeated here or
-    // an exact prompt match would still serve a FLUX/Gemini still. See
-    // FALLBACK_PROVIDERS.
-    const { data: exact, error: exactErr } = await sb
+    // This tier does NOT go through match_generated_assets, so the provider rule
+    // migration 0036 added to the RPC has to be repeated here or an exact prompt
+    // match would still serve a non-69labs still. See REUSABLE_IMAGE_PROVIDERS.
+    let exactQ = sb
       .from("generated_assets")
       .select("id, asset_url, source_image_url, provider, reuse_count, last_reused_at")
       .eq("asset_type", opts.assetType)
       .eq("is_product", isProduct)
-      .eq("prompt_hash", promptHash(prompt))
-      // `or(is.null, not.in)` and not a bare `not.in`: PostgREST renders the
-      // latter as SQL `provider NOT IN (...)`, which evaluates to NULL — i.e.
-      // NOT MATCHED — for a null provider, silently dropping rows that pre-date
-      // provider tracking. Mirrors `is distinct from` in the 0035 RPC.
-      .or(`provider.is.null,provider.not.in.(${FALLBACK_PROVIDERS.join(",")})`)
-      .limit(50);
+      .eq("prompt_hash", promptHash(prompt));
+    // Images: 69labs only. Clips: unrestricted (ltx2 is the only clip provider,
+    // so a filter here would switch clip reuse off entirely).
+    if (opts.assetType === "image") {
+      exactQ = exactQ.in("provider", [...REUSABLE_IMAGE_PROVIDERS]);
+    }
+    const { data: exact, error: exactErr } = await exactQ.limit(50);
     if (exactErr) throw new Error(exactErr.message);
     const exactFree = (exact ?? []).filter((r) => !exclude.includes(r.asset_url as string));
     const exactPick = pickLeastRecentlyReused(
