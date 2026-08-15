@@ -461,7 +461,18 @@ export class PayhipProductPage {
           'a slow or unreliable proxy is the common cause.',
       );
     }
-    // Completion is the "uploaded" BADGE on the file row.
+    // Completion is the row settling into its FINISHED state — a Delete control
+    // beside a file whose size is shown.
+    //
+    // The "uploaded" badge alone is not enough, and believing it cost a run:
+    // the badge is part of the row, and the row is rendered when the file is
+    // ACCEPTED, not when its bytes have arrived. So the flow sailed on and
+    // clicked Add Product mid-transfer, and Payhip put up a "files are still
+    // uploading" modal and refused to save — reported here as the product
+    // simply not being created, which explained nothing.
+    //
+    // A row offering to Delete a file, with its size printed, is a file Payhip
+    // considers stored.
     //
     // Not the filename as page text: Payhip renders it inside a row whose
     // rename `<input>` lives in a collapsed dropdown, and an input's value is
@@ -469,14 +480,30 @@ export class PayhipProductPage {
     // just as wrong — it is present but hidden, so a perfectly successful 46 MB
     // upload sat there until the ten-minute budget expired, twice, with the
     // finished file visible on screen the whole time.
-    await this.page
-      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileBadge}`)
-      .first()
+    const settled = this.page
+      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileRow}`)
+      .filter({ hasText: /\(\s*[\d.]+\s*[kmg]b\s*\)/i })
+      .first();
+
+    await settled
       .waitFor({ state: 'visible', timeout: UPLOAD_TIMEOUT_MS })
       .catch(() => {
         throw new PayhipTransientError(
           `the ebook upload (${filename}) did not complete within ${Math.round(UPLOAD_TIMEOUT_MS / 60_000)} minutes`,
         );
+      });
+
+    // And confirm nothing is still in flight. A second file, a retry, or a
+    // progress bar that has not cleared all mean Payhip will refuse the save —
+    // and refuse it with a modal, which from the automation's side looks like
+    // the submit button simply not working.
+    await this.page
+      .locator(`${SELECTORS.productFileZone} .plupload_progress, ${SELECTORS.productFileZone} progress`)
+      .first()
+      .waitFor({ state: 'hidden', timeout: 60_000 })
+      .catch(() => {
+        // No progress element at all is the normal case once a file has
+        // settled; only its lingering VISIBLE presence would matter.
       });
   }
 
@@ -516,6 +543,25 @@ export class PayhipProductPage {
    */
   async publishAndReadLink(title: string): Promise<{ productKey: string; buyUrl: string }> {
     await this.page.locator(SELECTORS.submit).first().click();
+
+    // Payhip answers a premature save with a modal — "your files are still
+    // uploading" — and stays on the form. The click looks like it worked and
+    // nothing is created, which is indistinguishable from a submit that failed
+    // for any other reason. If that modal appears, wait for it to clear and
+    // press save once more rather than reporting a mystery.
+    const stillUploading = this.page.getByText(/still uploading|upload(ing)? in progress|wait.*upload/i).first();
+    const blocked = await stillUploading
+      .waitFor({ state: 'visible', timeout: 5_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (blocked) {
+      await stillUploading.waitFor({ state: 'hidden', timeout: UPLOAD_TIMEOUT_MS }).catch(() => {
+        throw new PayhipTransientError(
+          'Payhip refused to save because the file was still uploading, and it never finished',
+        );
+      });
+      await this.page.locator(SELECTORS.submit).first().click().catch(() => {});
+    }
 
     // Submitting posts the whole form, including the file it just accepted, so
     // give the navigation room before concluding anything about the result.
