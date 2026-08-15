@@ -41,8 +41,22 @@ import {
  * the runner.
  */
 
-/** How long a file upload may take, over and above the per-action timeout. */
-const UPLOAD_TIMEOUT_MS = 10 * 60_000;
+/**
+ * How long a file upload may take, over and above the per-action timeout.
+ *
+ * Ten minutes is generous on a direct connection and can be far too little
+ * through a residential proxy: those are optimised for looking like a home
+ * user, not for throughput, and one measured here took 26 seconds to fetch a
+ * 14-byte response. A book is several megabytes, so the same link can need half
+ * an hour — and timing out mid-upload wastes every minute already spent.
+ *
+ * Env-overridable because the right value depends entirely on the exit in use,
+ * which is an operational choice rather than something this file can know.
+ */
+const UPLOAD_TIMEOUT_MS = Math.max(
+  60_000,
+  Number(process.env.PAYHIP_UPLOAD_TIMEOUT_MS ?? 30 * 60_000),
+);
 
 /**
  * Payhip's real routes, read off a live dashboard.

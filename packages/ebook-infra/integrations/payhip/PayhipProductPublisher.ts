@@ -177,7 +177,12 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
     const label = `${draft.externalId}_attempt${attempt}`;
     const step = (message: string) => {
       this.config.onProgress?.(message);
-      this.logger.debug('payhip step', { externalId: draft.externalId, attempt, step: message });
+      // INFO, not debug. A run is minutes long and spends most of them inside a
+      // single upload, so at debug level production showed a start line and
+      // then nothing at all — leaving "still uploading a 6 MB PDF" and "hung on
+      // a selector" indistinguishable for anyone watching the logs. Ten lines
+      // per listing is a small price for being able to tell those apart.
+      this.logger.info('payhip step', { externalId: draft.externalId, attempt, step: message });
     };
 
     try {
