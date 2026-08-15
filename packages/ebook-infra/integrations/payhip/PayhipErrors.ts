@@ -13,6 +13,16 @@ export interface PayhipDebugArtifacts {
   screenshotPath?: string | undefined;
   htmlPath?: string | undefined;
   url?: string | undefined;
+  /**
+   * Links to the same artifacts in object storage.
+   *
+   * The local paths are useless on a worker: the container filesystem does not
+   * survive a restart, and reaching it needs an SSH tunnel that is itself
+   * sometimes unavailable — which is exactly when a production failure most
+   * needs looking at. A URL in the log costs one upload and can be opened from
+   * anywhere, by anyone reading the error.
+   */
+  urls?: string[] | undefined;
 }
 
 export abstract class PayhipError extends Error {
@@ -23,7 +33,10 @@ export abstract class PayhipError extends Error {
   }
   /** All captured artifact paths, for the error the operator finally reads. */
   get debugPaths(): string[] {
-    return [this.debug.screenshotPath, this.debug.htmlPath].filter((p): p is string => Boolean(p));
+    // URLs first: on a worker they are the only ones anybody can actually open.
+    return [...(this.debug.urls ?? []), this.debug.screenshotPath, this.debug.htmlPath].filter(
+      (p): p is string => Boolean(p),
+    );
   }
 }
 

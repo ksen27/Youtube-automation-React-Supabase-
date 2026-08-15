@@ -11,7 +11,7 @@ import {
   type CheckoutPublishError,
   type Logger,
 } from '@ebook/core';
-import { openPayhipContext, withDiagnostics, describeProxy, type PayhipBrowserConfig } from './PayhipBrowser';
+import { openPayhipContext, withDiagnostics, describeProxy, readExitIp, type PayhipBrowserConfig } from './PayhipBrowser';
 import { PayhipProductPage } from './PayhipProductPage';
 import { PayhipSessionStore } from './PayhipSessionStore';
 import {
@@ -64,6 +64,18 @@ export interface PayhipPublisherConfig extends PayhipBrowserConfig {
    * payhip:debug-list` prints these beside a visible browser.
    */
   onProgress?: ((step: string) => void) | undefined;
+  /**
+   * Publish a failure artifact somewhere readable and return a link to it.
+   *
+   * Wired to object storage in the container. Without it the screenshot lives
+   * only on the worker's disk, which dies with the container and needs an SSH
+   * tunnel to reach in the meantime — and a tunnel that is down is precisely
+   * the moment the screenshot matters. Optional: the CLI writes locally and has
+   * no need of it.
+   */
+  uploadDiagnostic?:
+    | ((name: string, bytes: Uint8Array, contentType: string) => Promise<string | null>)
+    | undefined;
 }
 
 export class PayhipProductPublisher implements CheckoutProductPublisher {
@@ -176,6 +188,13 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       // were.
       step(`launching the browser via ${describeProxy(this.config.proxy)}`);
       ({ browser, context } = await openPayhipContext(this.config, session.storageState));
+      // The address Payhip will actually see. Logged at info so it can be
+      // compared against the one the connect CLI printed — a proxy gateway can
+      // rotate its exit per connection, so matching config proves nothing.
+      this.logger.info('browser exit ip', {
+        externalId: draft.externalId,
+        exitIp: await readExitIp(context),
+      });
       page = await context.newPage();
       const dashboard = new PayhipProductPage(page, this.config.baseUrl);
 
@@ -242,7 +261,9 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       const payhipError = asPayhipError(err);
       // Diagnostics captured while the page is still open — after the finally
       // block closes the browser there is nothing left to photograph.
-      throw await withDiagnostics(payhipError, page, this.config.debugDir, label);
+      await withDiagnostics(payhipError, page, this.config.debugDir, label);
+      await this.publishDiagnostics(payhipError, label);
+      throw payhipError;
     } finally {
       await context?.close().catch(() => {});
       await browser?.close().catch(() => {});
@@ -259,6 +280,34 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
    * copies of a saleable product, and leaving them on a shared worker disk is
    * both a leak and, over enough runs, a full volume.
    */
+  /**
+   * Copy a failure's screenshot and HTML into object storage and attach the
+   * links to the error, so the operator can open them from the log line.
+   *
+   * Best-effort throughout: diagnostics must never be able to replace the
+   * failure they were meant to explain.
+   */
+  private async publishDiagnostics(error: PayhipError, label: string): Promise<void> {
+    const upload = this.config.uploadDiagnostic;
+    if (!upload) return;
+    const files: Array<[string | undefined, string]> = [
+      [error.debug.screenshotPath, 'image/png'],
+      [error.debug.htmlPath, 'text/html'],
+    ];
+    const urls: string[] = [];
+    for (const [filePath, contentType] of files) {
+      if (!filePath) continue;
+      try {
+        const bytes = await fs.readFile(filePath);
+        const url = await upload(`${label}${path.extname(filePath)}`, bytes, contentType);
+        if (url) urls.push(url);
+      } catch {
+        /* best-effort */
+      }
+    }
+    if (urls.length > 0) error.debug.urls = urls;
+  }
+
   private async stageFiles(draft: CheckoutProductDraft): Promise<{
     pdfPath: string;
     coverPath?: string | undefined;

@@ -1,4 +1,4 @@
-import { openPayhipContext, isLoginUrl, loginUrl, describeProxy, type PayhipBrowserConfig } from './PayhipBrowser';
+import { openPayhipContext, isLoginUrl, loginUrl, describeProxy, readExitIp, type PayhipBrowserConfig } from './PayhipBrowser';
 import { LOGGED_IN_MARKER } from './PayhipProductPage';
 import type { PayhipSessionStore } from './PayhipSessionStore';
 
@@ -74,6 +74,11 @@ export async function interactivePayhipLogin(
       );
     }
 
+    // Measured AFTER login, from the same context that holds the session, so it
+    // is the address Payhip associated with these cookies. Compare it against
+    // the worker's `browser exit ip` line: the proxy string matching is not
+    // enough, because a residential gateway can rotate its exit per connection.
+    log(`Session created from exit IP: ${await readExitIp(context)}`);
     log('Authenticated. Capturing the session…');
     await sessions.saveConnected(await context.storageState());
   } finally {

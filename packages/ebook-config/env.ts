@@ -117,6 +117,17 @@ const EnvSchema = z.object({
    * to keep a sliding window open.
    */
   PAYHIP_KEEPALIVE_MINUTES: z.coerce.number().int().positive().default(60),
+  /**
+   * Pin the browser's user agent for BOTH the connect CLI and the worker.
+   *
+   * Set the same value in `.env.local` and as a Fly secret. The point is that
+   * they match: the connect runs on Windows and the worker on Linux, and a
+   * session created by one browser and presented by an apparently different one
+   * can be dropped — reported as a redirect to login, which reads exactly like
+   * an ordinary expiry. A desktop Linux Chrome string is the honest pick, since
+   * that is what the worker really is.
+   */
+  PAYHIP_USER_AGENT: z.string().optional(),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

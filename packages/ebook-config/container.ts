@@ -174,6 +174,20 @@ export function buildContainer(env: Env = loadEnv()) {
       tmpDir: env.PAYHIP_TMP_DIR,
       stealth: env.PAYHIP_USE_STEALTH,
       proxy: env.PAYHIP_PROXY,
+      userAgent: env.PAYHIP_USER_AGENT,
+      // Failure screenshots go to object storage and come back as signed links
+      // in the error, because the worker's own disk is unreachable from
+      // anywhere useful — it dies with the container, and the SSH tunnel needed
+      // to read it is down exactly when production is misbehaving.
+      uploadDiagnostic: async (name, bytes, contentType) => {
+        const key = `payhip-diagnostics/${name}`;
+        const put = await storage.put('ebook-exports', key, bytes, contentType);
+        if (put.isFail()) return null;
+        // A week is long enough to investigate and short enough that a link
+        // leaking from a log does not expose the dashboard indefinitely.
+        const signed = await storage.signedUrl('ebook-exports', key, 7 * 24 * 60 * 60);
+        return signed.isOk() ? signed.value : null;
+      },
     },
     logger.child({ adapter: 'payhip' }),
   );

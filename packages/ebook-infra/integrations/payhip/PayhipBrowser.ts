@@ -48,6 +48,23 @@ export interface PayhipBrowserConfig {
    * jumps between login and use is itself a signal worth flagging.
    */
   proxy?: string | undefined;
+  /**
+   * Pin the browser's user agent, so the session is created and used by what
+   * looks like the SAME browser.
+   *
+   * The connect runs on an operator's laptop — Windows, headed — and the worker
+   * runs on Fly — Linux, headless. Left alone, those report two different user
+   * agents and two different platforms, and a session created by one is being
+   * presented by something that looks like another machine entirely. Sites
+   * routinely tie a session to that fingerprint, and reject the mismatch with a
+   * plain redirect to the login page: identical, from the outside, to the
+   * session simply having expired.
+   *
+   * Unset changes nothing. Set the SAME value for the connect CLI and the
+   * worker — a desktop Linux Chrome string is the honest choice, since that is
+   * what the worker actually is and it is the side that cannot be changed.
+   */
+  userAgent?: string | undefined;
   /** Per-action timeout. Uploads get their own, longer budget in the page object. */
   timeoutMs: number;
   /** Where screenshots + HTML snapshots of failed runs are written. */
@@ -185,6 +202,36 @@ function pickProxy(raw: string): { server: string; username?: string; password?:
   return { server: `http://${ip}:${port}` };
 }
 
+/**
+ * The public IP this browser actually leaves from.
+ *
+ * The proxy STRING is not this. Residential providers hand out a fixed gateway
+ * that rotates the real exit per connection, so two runs can print the same
+ * `ip:port` and still appear to Payhip as two different people in two different
+ * places — which is indistinguishable, from the log, from a session that simply
+ * expired. Measuring it is the only way to know whether the connect and the
+ * worker really share an address.
+ *
+ * Best-effort and short-timeout: this is diagnostics, and it must never be the
+ * reason a listing fails.
+ */
+export async function readExitIp(context: BrowserContext): Promise<string> {
+  const page = await context.newPage().catch(() => null);
+  if (!page) return 'unknown';
+  try {
+    const response = await page.goto('https://api.ipify.org', {
+      waitUntil: 'domcontentloaded',
+      timeout: 15_000,
+    });
+    const text = (await response?.text().catch(() => '')) ?? '';
+    return text.trim().slice(0, 45) || 'unknown';
+  } catch {
+    return 'unknown';
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
 /** Launch a browser and restore the stored session into a fresh context. */
 export async function openPayhipContext(
   config: PayhipBrowserConfig,
@@ -209,7 +256,13 @@ export async function openPayhipContext(
     ...(storageState
       ? { storageState: storageState as unknown as Awaited<ReturnType<BrowserContext['storageState']>> }
       : {}),
+    // Everything below is pinned so the connect and the worker present the same
+    // browser to Payhip. A session created at one viewport, locale and timezone
+    // and used at another is a fingerprint change on a live session, which is
+    // the kind of thing that gets it dropped.
     viewport: { width: 1440, height: 960 },
+    ...(config.userAgent ? { userAgent: config.userAgent } : {}),
+    timezoneId: 'UTC',
     locale: 'en-US',
   });
   context.setDefaultTimeout(config.timeoutMs);

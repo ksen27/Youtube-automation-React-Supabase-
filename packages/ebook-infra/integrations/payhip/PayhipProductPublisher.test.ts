@@ -83,6 +83,10 @@ vi.mock('./PayhipBrowser', async () => {
     })),
     // Diagnostics would try to screenshot a page that does not exist.
     withDiagnostics: vi.fn(async (error: Error) => error),
+    // Diagnostics too: the real one opens a page and calls out to an IP echo,
+    // neither of which a fake context supports and neither of which any
+    // behaviour here depends on.
+    readExitIp: vi.fn(async () => '203.0.113.7'),
   };
 });
 

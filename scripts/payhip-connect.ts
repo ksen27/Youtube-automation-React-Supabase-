@@ -39,6 +39,9 @@ function payhipConfig() {
     // Stealth here too, so the human sees the same site the worker will —
     // including whether Cloudflare lets it through.
     stealth: process.env.PAYHIP_USE_STEALTH !== "false",
+    // Must match the worker's PAYHIP_USER_AGENT, or the session is created by
+    // one browser and presented by what looks like another.
+    ...(process.env.PAYHIP_USER_AGENT ? { userAgent: process.env.PAYHIP_USER_AGENT } : {}),
     // Opt-in: connecting through the worker's own exit IP means Payhip never
     // sees the session's IP jump between login and use. Off by default because
     // a broken proxy on a laptop just blocks the login outright.
