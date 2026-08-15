@@ -526,8 +526,32 @@ export class PayhipProductPage {
    */
   async uploadCover(coverPath: string): Promise<boolean> {
     try {
-      const input = this.page.locator(`${SELECTORS.productImageZone} input[type="file"]`).first();
-      await input.setInputFiles(coverPath);
+      // Through the file dialog, exactly like the ebook.
+      //
+      // This zone is the same plupload widget, so writing to its hidden input
+      // has the same effect as it did for the PDF: none. The step "succeeded"
+      // in a second and every listing went up without its cover, which nothing
+      // reported because a missing cover is deliberately not fatal.
+      const button = firstVisible(this.page, [
+        this.page.locator(SELECTORS.productImageZone).getByText(/upload a product image/i),
+        this.page.getByRole('button', { name: /upload a product image/i }),
+        this.page.getByText(/upload a product image/i),
+      ]);
+
+      const viaDialog = await Promise.all([
+        this.page.waitForEvent('filechooser', { timeout: 30_000 }),
+        button.click({ timeout: 30_000 }),
+      ])
+        .then(async ([chooser]) => {
+          await chooser.setFiles(coverPath);
+          return true;
+        })
+        .catch(() => false);
+
+      if (!viaDialog) {
+        const input = this.page.locator(`${SELECTORS.productImageZone} input[type="file"]`).first();
+        await input.setInputFiles(coverPath);
+      }
       // A thumbnail is small and fast; give it a fraction of the ebook's budget
       // rather than letting a stuck image hold the whole run open for minutes.
       // The thumbnail strip carries `display: none` until an image is actually
