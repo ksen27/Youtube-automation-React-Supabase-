@@ -370,7 +370,7 @@ export class PayhipProductPage {
    * that has been accepted, not merely started, which for a multi-megabyte PDF
    * are minutes apart.
    */
-  async uploadPdf(pdfPath: string, filename: string): Promise<void> {
+  async uploadPdf(pdfPath: string, filename: string, onNote: (note: string) => void = () => {}): Promise<void> {
     // WAIT FOR PAYHIP'S UPLOADER TO WIRE ITSELF UP FIRST.
     //
     // The file input is not a plain control — it is created and adopted by
@@ -399,6 +399,14 @@ export class PayhipProductPage {
     const input = wired
       ? shimInput
       : this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
+    // Reported so a failed run says WHICH input received the file. The
+    // difference between the uploader's own input and some other one in the
+    // zone is the whole bug, and without this the two failures look identical.
+    onNote(
+      wired
+        ? "using the uploader's own file input (.moxie-shim)"
+        : 'moxie shim never appeared — falling back to the first file input in the zone',
+    );
     await input.setInputFiles(pdfPath);
 
     // FIRST: did the upload even START?

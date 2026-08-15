@@ -241,7 +241,7 @@ export class PayhipProductPublisher implements CheckoutProductPublisher {
       // Named with its size because this is where the run spends most of its
       // time, and a silent five-minute pause looks identical to a hang.
       step(`uploading ${draft.pdf.filename} (${mb(draft.pdf.bytes.byteLength)}) — this is the slow part`);
-      await dashboard.uploadPdf(staged.pdfPath, draft.pdf.filename);
+      await dashboard.uploadPdf(staged.pdfPath, draft.pdf.filename, step);
       if (staged.coverPath) {
         step('uploading the cover image');
         const ok = await dashboard.uploadCover(staged.coverPath);
