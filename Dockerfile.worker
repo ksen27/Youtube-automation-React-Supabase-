@@ -11,7 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     redis-server \
     fonts-dejavu-core \
-    xvfb \
  && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
       -o /usr/local/bin/yt-dlp \
  && chmod +x /usr/local/bin/yt-dlp \
@@ -76,19 +75,17 @@ ENV NODE_ENV=production \
 # Start Redis as a daemon, then exec the worker as PID 1 so SIGTERM from
 # Fly reaches the worker and triggers its graceful shutdown handler.
 #
-# WRAPPED IN XVFB so a browser can run HEADED on a machine with no screen.
+# NO XVFB HERE, deliberately — it was added and reverted within the hour.
 #
-# Payhip's uploader is the reason. Headless Chromium reaches the dashboard,
-# fills the form, opens the real file dialog and hands over the file — and
-# plupload then does nothing with it, every time, while the identical code
-# headed on a laptop uploads fine. Rather than keep hunting for which headless
-# difference it objects to, this gives it a real browser on a virtual display,
-# which is what it evidently wants.
+# The theory was that Payhip's uploader needs a real (headed) browser, so the
+# worker was wrapped in `xvfb-run` to give it a virtual display. Two things were
+# wrong with that. `xvfb-run` needs the `xauth` package, which was not installed,
+# so every machine crash-looped on "xauth command not found" — a change that
+# could not have worked at all, shipped without being run once. And the premise
+# was false: a headless run on a laptop lists a book end to end, uploads and all.
 #
-# `-a` picks a free display number, so nothing breaks if one is already taken.
-# The screen size matches the viewport the automation asks for, so elements are
-# not scrolled out of view. Harmless for every other worker role: Puppeteer and
-# the video engines keep launching headless and simply ignore DISPLAY.
+# If a headed browser is ever genuinely needed here, it needs BOTH `xvfb` and
+# `xauth`, and it needs testing in the image before deploying.
 # --bind 0.0.0.0 lets the Vercel app reach Redis over the public internet
 # (port exposed via fly.toml [[services]]). --requirepass enforces auth.
 # Password is read at runtime from REDIS_PASSWORD env (Fly secret).
@@ -115,4 +112,4 @@ CMD mkdir -p /data \
         --protected-mode no \
         --requirepass "$REDIS_PASSWORD"; \
     fi \
- && exec xvfb-run -a --server-args="-screen 0 1440x960x24" npx tsx worker/index.ts
+ && exec npx tsx worker/index.ts
