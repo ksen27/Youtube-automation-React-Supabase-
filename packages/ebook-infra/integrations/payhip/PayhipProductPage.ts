@@ -436,6 +436,38 @@ export class PayhipProductPage {
       onNote('answered Payhip\'s own file dialog');
     }
 
+    // What did the page actually receive?
+    //
+    // "The upload did not start" has three possible states underneath, and they
+    // need different fixes: the file never reached any input, it reached one but
+    // plupload does not know about it, or plupload knows and chose not to send.
+    // Reading them out of the page settles it — the alternative is another round
+    // of matching environments one variable at a time.
+    const probe = await this.page
+      .evaluate(() => {
+        const zone = document.querySelector('#ebook_files');
+        const inputs = Array.from(zone?.querySelectorAll('input[type="file"]') ?? []);
+        // plupload registers its instances globally; each carries the queue it
+        // believes it has.
+        const pl = (window as unknown as { plupload?: { uploaders?: unknown[] } }).plupload;
+        const uploaders = (pl?.uploaders ?? []) as Array<{
+          state?: number;
+          files?: unknown[];
+          runtime?: string;
+        }>;
+        return {
+          fileInputs: inputs.length,
+          filesOnInputs: inputs.map((i) => (i as HTMLInputElement).files?.length ?? 0),
+          pluploadPresent: Boolean(pl),
+          uploaderCount: uploaders.length,
+          queued: uploaders.map((u) => u.files?.length ?? 0),
+          states: uploaders.map((u) => u.state ?? null),
+          runtimes: uploaders.map((u) => u.runtime ?? null),
+        };
+      })
+      .catch(() => null);
+    onNote(`upload probe: ${JSON.stringify(probe)}`);
+
     // FIRST: did the upload even START?
     //
     // Payhip renders a row for the file the moment it is accepted, before any
