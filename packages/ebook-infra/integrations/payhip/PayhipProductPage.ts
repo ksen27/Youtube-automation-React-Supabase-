@@ -373,6 +373,32 @@ export class PayhipProductPage {
   async uploadPdf(pdfPath: string, filename: string): Promise<void> {
     const input = this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
     await input.setInputFiles(pdfPath);
+
+    // FIRST: did the upload even START?
+    //
+    // Payhip renders a row for the file the moment it is accepted, before any
+    // bytes have moved. Waiting only for the "uploaded" badge conflated two
+    // very different failures — a slow transfer, and one that never began — and
+    // spent the full upload budget on both. A worker sat for ten minutes on a
+    // form that said "No product files added yet" the entire time, and the
+    // error blamed the file's size.
+    //
+    // A row appearing is cheap and fast, so failing here is decisive: the file
+    // input was set and Payhip's uploader did not pick it up.
+    const started = await this.page
+      .locator(`${SELECTORS.productFileZone} ${SELECTORS.uploadedFileRow}`)
+      .first()
+      .waitFor({ state: 'visible', timeout: 60_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!started) {
+      throw new PayhipTransientError(
+        `Payhip never accepted the ebook file (${filename}) — the upload did not start, ` +
+          'so no bytes were transferred. The form still reads "No product files added yet". ' +
+          'This is usually the connection to Payhip failing rather than the file itself; ' +
+          'a slow or unreliable proxy is the common cause.',
+      );
+    }
     // Completion is the "uploaded" BADGE on the file row.
     //
     // Not the filename as page text: Payhip renders it inside a row whose
