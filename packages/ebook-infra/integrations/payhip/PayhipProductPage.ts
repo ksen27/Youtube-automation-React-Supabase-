@@ -371,7 +371,34 @@ export class PayhipProductPage {
    * are minutes apart.
    */
   async uploadPdf(pdfPath: string, filename: string): Promise<void> {
-    const input = this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
+    // WAIT FOR PAYHIP'S UPLOADER TO WIRE ITSELF UP FIRST.
+    //
+    // The file input is not a plain control — it is created and adopted by
+    // plupload/moxie, asynchronously, after the form's HTML has arrived. Setting
+    // files on it before that happens does nothing at all: the input holds the
+    // file, no change handler is listening, and the page goes on saying "No
+    // product files added yet" until the timeout.
+    //
+    // This never showed up locally because the debug run is headed with a
+    // 400ms slow-mo, which gave the shim all the time it needed. On the worker
+    // the form opened and the file was set within the same second, and the
+    // upload silently never began — a race that only exists at machine speed.
+    //
+    // The moxie shim's own container is the readiness signal: it exists only
+    // once the uploader has initialised, and the input inside it is the one
+    // actually being listened to. `attached` rather than `visible` because
+    // these inputs are deliberately invisible (opacity 0, behind the button).
+    const shimInput = this.page.locator(`${SELECTORS.productFileZone} .moxie-shim input[type="file"]`).first();
+    const wired = await shimInput
+      .waitFor({ state: 'attached', timeout: 60_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    // Fall back to any file input in the zone if the shim never appears —
+    // better a doomed attempt with a clear failure than refusing to try.
+    const input = wired
+      ? shimInput
+      : this.page.locator(`${SELECTORS.productFileZone} input[type="file"]`).first();
     await input.setInputFiles(pdfPath);
 
     // FIRST: did the upload even START?
