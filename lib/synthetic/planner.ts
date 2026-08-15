@@ -3197,6 +3197,13 @@ export async function buildSyntheticTimeline(input: {
   // Ordered timeline_items -> synthetic_segments so the rows are gone before the
   // FK can null their link; if the second delete fails, the retry still sees a
   // clean timeline rather than a fresh batch of unreachable orphans.
+  //
+  // The wipe is UNFILTERED on purpose — it takes the sales-pitch row too, which
+  // has no synthetic_segment_id. That row is rebuilt from projects.pitch_video_url
+  // by ensurePitchTimelineItem, which maybeFinalizeSynthetic calls unconditionally
+  // on every finalize (_shared.ts:258). Narrowing this delete to segment-linked
+  // rows would reintroduce the orphan bug for exactly the rows that are hardest
+  // to see.
   await sb.from("timeline_items").delete().eq("project_id", projectId);
   await sb.from("synthetic_segments").delete().eq("project_id", projectId);
   const rows = planned.map((p) => ({

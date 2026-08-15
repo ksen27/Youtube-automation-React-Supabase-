@@ -134,6 +134,21 @@ async function main() {
         .eq("id", absorber.id);
       if (upErr) throw new Error(upErr.message);
     }
+    // Drop the segment's timeline row FIRST. timeline_items.synthetic_segment_id
+    // is `on delete set null` (migration 0024), so deleting the segment on its
+    // own would NULL the link and strand the timeline row: invisible to the
+    // unique index and to maybeFinalizeSynthetic, but still counted by the
+    // render route's duration gate — i.e. "Timeline duration must match
+    // voiceover" with no visible cause. Same ordering the segment DELETE
+    // endpoint uses (app/api/projects/[id]/synthetic/segments/[segmentId]).
+    // Matched on metadata because the real column may already be null on rows
+    // materialized before 0024's backfill.
+    const { error: tlErr } = await sb
+      .from("timeline_items")
+      .delete()
+      .eq("project_id", seg.project_id)
+      .contains("metadata", { synthetic_segment_id: seg.id });
+    if (tlErr) throw new Error(tlErr.message);
     const { error: delErr } = await sb.from("synthetic_segments").delete().eq("id", seg.id);
     if (delErr) throw new Error(delErr.message);
     console.log(`  APPLIED: ${plan}`);
