@@ -11,6 +11,10 @@ import { logJob } from "@/lib/jobs/db";
 export type SyntheticProvider =
   | "sixtynine_tts"
   | "sixtynine_image"
+  // ai33.pro (OpenSpeaker) — PRIMARY image + TTS provider since 2026-08-16;
+  // 69labs is the backup. Both render gpt-image-2 / the same ElevenLabs voices.
+  | "ai33_image"
+  | "ai33_tts"
   | "gemini_image"
   | "flux_image"
   | "fal_flux_image"
@@ -26,6 +30,15 @@ export type SyntheticProvider =
 const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   sixtynine_tts:   { unit: "per_1k_chars", usd: 0.015 },
   sixtynine_image: { unit: "per_image",    usd: 0.04 },
+  // ai33 bills in CREDITS, not dollars, so these are converted from measured
+  // credit costs (2026-08-16): a gpt-image-2 still at 2K/high = 2,574 credits,
+  // and TTS = ~1.14 credits/char (58 credits for 51 chars). The USD figures
+  // below assume the same effective rate as 69labs until the client confirms
+  // what the credit pack cost — they exist for the coarse "this project cost
+  // ~$X" summary, not invoicing, so a wrong rate misprices a summary and
+  // nothing else.
+  ai33_image:      { unit: "per_image",    usd: 0.04 },
+  ai33_tts:        { unit: "per_1k_chars", usd: 0.015 },
   // Gemini's own nano-banana image model — the PREFERRED still fallback when the
   // 69labs pool is exhausted (same model 69labs resells, so matching look).
   // Google bills per image; tune if GEMINI_IMAGE_MODEL changes to a Pro tier.

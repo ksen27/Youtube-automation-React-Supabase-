@@ -48,8 +48,11 @@ async function generateVoiceQC(
       { text: args.text, voiceId: args.voiceId },
       attempt === 1 ? args.resume : { keyIdx: -1, onSubmit: args.resume.onSubmit },
     );
-    await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: "sixtynine_tts", phase: "response",
-      durationMs: Date.now() - t0, cost: { provider: "sixtynine_tts", chars: voice.chars } });
+    // Log the provider that ACTUALLY rendered it (ai33 primary, 69labs backup),
+    // not the one we asked first — otherwise a failover is invisible in the job
+    // log and the cost lands on the wrong vendor.
+    await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: voice.provider, phase: "response",
+      durationMs: Date.now() - t0, cost: { provider: voice.provider, chars: voice.chars } });
 
     // QC disabled → accept the first take unconditionally.
     if (maxRegen === 0) return { voice, attempts: attempt, clean: true, note: "qc_disabled" };

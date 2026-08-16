@@ -96,7 +96,7 @@ export async function processPitchGenJob(
     const pitchVoiceId = row.tts_voice_id ?? undefined;
     await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: "sixtynine_tts", phase: "request", extra: { chars: script.length, kind: "pitch", voiceId: pitchVoiceId ?? "default" } });
     const voice = await generateVoice({ text: script, voiceId: pitchVoiceId });
-    await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: "sixtynine_tts", phase: "response", durationMs: Date.now() - t0, cost: { provider: "sixtynine_tts", chars: voice.chars } });
+    await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: voice.provider, phase: "response", durationMs: Date.now() - t0, cost: { provider: voice.provider, chars: voice.chars } });
 
     const audioPath = path.join(tmp, `pitch_${ts}.mp3`);
     await fs.writeFile(audioPath, voice.audio);

@@ -61,7 +61,14 @@ import { isProductPrompt } from "@/lib/synthetic/constants";
 // SCOPED TO IMAGES. Clip reuse is untouched — the ~10.1k ltx2 clips are the only
 // clips there are, and an allow-list applied to them would disable clip reuse
 // entirely.
-export const REUSABLE_IMAGE_PROVIDERS = ["sixtynine_image"] as const;
+//
+// "ai33_image" joins the list on 2026-08-16, when ai33.pro became the primary
+// image provider. It belongs here for the same reason "sixtynine_image" does:
+// both render the house model (gpt-image-2) against the same style prompt, so
+// their stills are interchangeable for reuse. This is NOT the fallback-era
+// problem the allow-list was built to solve — that was about FLUX/Gemini stills
+// from a DIFFERENT model quietly entering the pool.
+export const REUSABLE_IMAGE_PROVIDERS = ["sixtynine_image", "ai33_image"] as const;
 
 // Stills from the REMOVED fallback chain. Distinct from the allow-list above:
 // these are the rows we can PROVE are off-style, so they are the only ones

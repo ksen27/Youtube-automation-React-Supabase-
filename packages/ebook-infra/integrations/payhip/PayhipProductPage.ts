@@ -1,3 +1,4 @@
+import { promises as fs } from 'node:fs';
 import type { Locator, Page } from 'playwright';
 import { isLoginUrl } from './PayhipBrowser';
 import {
@@ -402,6 +403,9 @@ export class PayhipProductPage {
           uploaderState: uploader?.state ?? null,
           queued: uploader?.files?.length ?? null,
           initMessageRendered: Boolean(document.querySelector('#filelist .no_ebook_file_added_yet')),
+          // plupload's own account of what it was handed, in order. Empty means
+          // it was never told about the file at all.
+          uploaderEvents: (window as unknown as { __payhipUploadEvents?: unknown[] }).__payhipUploadEvents ?? [],
           scriptsLoaded: Array.from(document.querySelectorAll('script[src]'))
             .map((s) => (s as HTMLScriptElement).src)
             .filter((src) => /plupload|uploader|jquery/i.test(src)),
@@ -500,40 +504,125 @@ export class PayhipProductPage {
     const shimInput = this.page.locator(`${SELECTORS.productFileZone} .moxie-shim input[type="file"]`).first();
     await shimInput.waitFor({ state: 'attached', timeout: 30_000 }).catch(() => {});
 
-    // CLICK THE BUTTON AND ANSWER THE FILE DIALOG, rather than writing to a
-    // hidden input.
+    // RECORD WHAT PLUPLOAD ITSELF SAYS, before handing it anything.
     //
-    // Setting `input.files` directly is the obvious approach and it does not
-    // work here, on any of the inputs in this zone — plupload's, the templates',
-    // or the first one in document order. All three accept the file and none of
-    // them start an upload, because plupload does not simply listen for a
-    // `change` event on an input it left lying around; it drives its own
-    // runtime from the click.
+    // Every failure so far has been read off the DOM afterwards, which cannot
+    // tell "the file was never offered" from "the file was offered and
+    // rejected". plupload announces both — FilesAdded, FileFiltered, Error with
+    // a code — so binding first means the next failure names the reason instead
+    // of leaving it to be inferred from an empty file list.
+    await this.page
+      .evaluate(() => {
+        const w = window as unknown as {
+          __payhipUploadEvents?: unknown[];
+          payhipDigitalFileUploader?: { opts?: { uploader?: { bind(ev: string, cb: (...a: never[]) => void): void } } };
+        };
+        if (w.__payhipUploadEvents) return;
+        const events: unknown[] = [];
+        w.__payhipUploadEvents = events;
+        const uploader = w.payhipDigitalFileUploader?.opts?.uploader;
+        if (!uploader) return;
+        for (const name of ['FilesAdded', 'FileFiltered', 'QueueChanged', 'BeforeUpload', 'Error'] as const) {
+          uploader.bind(name, ((...args: unknown[]) => {
+            const detail = args[1] as { message?: string; code?: number; name?: string; length?: number } | undefined;
+            events.push({
+              event: name,
+              detail:
+                detail && typeof detail === 'object'
+                  ? { message: detail.message, code: detail.code, name: detail.name, count: detail.length }
+                  : null,
+            });
+          }) as (...a: never[]) => void);
+        }
+      })
+      .catch(() => {});
+
+    // HAND THE FILE TO PLUPLOAD DIRECTLY — do not rely on the native dialog.
     //
-    // So this does what a person does: click the visible "Upload product file"
-    // button, let Payhip open the native file dialog, and answer it. Playwright
-    // intercepts that dialog as a `filechooser` event, which means the whole
-    // path from click to upload is Payhip's own code — nothing here depends on
-    // guessing which element is secretly wired to what.
+    // The dialog path (below, now the fallback) is what a person does and it
+    // looked like the safest possible choice, but production disproved it: the
+    // click landed, Chromium raised a `filechooser`, `setFiles` resolved, and
+    // plupload's queue stayed empty — `queued: 0`, `uploaderState: 1`
+    // (STOPPED), no row, no request. Playwright intercepts the chooser, which
+    // CANCELS Chromium's own dialog and writes the files onto the input out of
+    // band; moxie's html5 FileInput never saw the interaction it was waiting
+    // for, so nothing reached the uploader.
+    //
+    // `Uploader.addFile` is plupload's own public entry point and the same one
+    // its drag-and-drop path uses. Reading 2.1.8's implementation, it accepts a
+    // native `File` (`typeOf` "file" → wrapped in `mOxie.File`), runs the
+    // configured filters, fires FilesAdded, and from there it is entirely
+    // Payhip's code: their handler renders the row and calls `up.start()`.
+    //
+    // The bytes cross into the page as base64 because there is no other way to
+    // build a real `File` in a page from a path on the worker's disk. It costs
+    // roughly 4/3 of the file size in transfer for a file that is about to be
+    // uploaded to S3 anyway, so the overhead is not the expensive part of this
+    // step.
+    const bytes = await fs.readFile(pdfPath);
+    const viaAddFile = await this.page
+      .evaluate(
+        ({ base64, name }) => {
+          const w = window as unknown as {
+            payhipDigitalFileUploader?: {
+              opts?: { uploader?: { addFile(file: unknown, name?: string): void; files?: unknown[] } };
+            };
+          };
+          const uploader = w.payhipDigitalFileUploader?.opts?.uploader;
+          if (!uploader) return { ok: false, reason: 'no uploader on window.payhipDigitalFileUploader' };
+
+          const binary = atob(base64);
+          const buffer = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) buffer[i] = binary.charCodeAt(i);
+          const file = new File([buffer], name, { type: 'application/pdf' });
+
+          try {
+            uploader.addFile(file, name);
+          } catch (error) {
+            return { ok: false, reason: `addFile threw: ${String(error)}` };
+          }
+          // addFile runs its filters asynchronously, so an empty queue here is
+          // not yet a failure — the row wait below is the real verdict.
+          return { ok: true, queued: uploader.files?.length ?? 0 };
+        },
+        { base64: bytes.toString('base64'), name: filename },
+      )
+      .catch((error: unknown) => ({ ok: false, reason: `evaluate failed: ${String(error)}` }));
+
+    if (viaAddFile.ok) {
+      onNote(`handed the file to Payhip's own uploader via addFile (queued=${'queued' in viaAddFile ? viaAddFile.queued : '?'})`);
+    } else {
+      onNote(`addFile did not take the file (${'reason' in viaAddFile ? viaAddFile.reason : 'unknown'}) — falling back to the file dialog`);
+    }
+
+    // FALLBACK: click the button and answer the native dialog.
+    //
+    // Kept because it is the path that depends on nothing but Payhip's own
+    // markup, so it still works if a plupload upgrade changes `addFile` or
+    // Payhip stops exposing the uploader on `window`. It is no longer the
+    // primary path for the reason recorded above.
     const uploadButton = firstVisible(this.page, [
       this.page.locator(SELECTORS.productFileZone).getByText(/upload (another )?product file/i),
       this.page.getByRole('button', { name: /upload (another )?product file/i }),
       this.page.getByText(/upload product file/i),
     ]);
 
-    const viaDialog = await Promise.all([
-      this.page.waitForEvent('filechooser', { timeout: 30_000 }),
-      uploadButton.click({ timeout: 30_000 }),
-    ])
-      .then(async ([chooser]) => {
-        await chooser.setFiles(pdfPath);
-        return true;
-      })
-      .catch(() => false);
+    const viaDialog =
+      viaAddFile.ok ||
+      (await Promise.all([
+        this.page.waitForEvent('filechooser', { timeout: 30_000 }),
+        uploadButton.click({ timeout: 30_000 }),
+      ])
+        .then(async ([chooser]) => {
+          await chooser.setFiles(pdfPath);
+          return true;
+        })
+        .catch(() => false));
 
     if (!viaDialog) {
-      // The dialog never opened — fall back to the old approach so a Payhip
-      // redesign degrades to the previous behaviour rather than refusing to try.
+      // Neither addFile nor the dialog took it — fall back to the old approach
+      // so a Payhip redesign degrades to the previous behaviour rather than
+      // refusing to try.
       onNote('the upload button opened no file dialog — falling back to setting the input directly');
       await shimInput.setInputFiles(pdfPath).catch(async () => {
         await this.page
@@ -541,7 +630,7 @@ export class PayhipProductPage {
           .first()
           .setInputFiles(pdfPath);
       });
-    } else {
+    } else if (!viaAddFile.ok) {
       onNote('answered Payhip\'s own file dialog');
     }
 
@@ -565,19 +654,23 @@ export class PayhipProductPage {
       .then(() => true)
       .catch(() => false);
     if (!started) {
-      // Name the path that was used. The two are completely different failures
-      // and the message used to blame the network for both: answering the file
-      // dialog is Payhip's own code path and should work, whereas writing to
-      // the input directly is known not to — so if the fallback ran, the
-      // question is why no dialog opened, not why the bytes did not move.
+      // Name the path that was used, and quote plupload's own account of it.
+      //
+      // These are completely different failures and the message used to blame
+      // the network for all of them. The recorded events are what separates
+      // "plupload never heard about the file" from "plupload took it and a
+      // filter threw it out" — the distinction that cost two production runs
+      // to establish by elimination.
       throw new PayhipTransientError(
         `Payhip never accepted the ebook file (${filename}) — the upload did not start, ` +
           `so no bytes were transferred, and the form still reads "No product files added yet". ` +
-          (viaDialog
-            ? 'The file was handed to Payhip\'s own upload dialog, so its uploader received the file and did nothing with it.'
-            : 'NOTE: the upload button opened no file dialog, so this fell back to writing the file ' +
-              'straight to the input — which Payhip\'s uploader ignores. That fallback is the ' +
-              'likely cause, not the network.'),
+          (viaAddFile.ok
+            ? "The file was passed to plupload's own addFile and its queue produced no row."
+            : viaDialog
+              ? 'The file was handed to Payhip\'s own upload dialog, so its uploader received the file and did nothing with it.'
+              : 'NOTE: the upload button opened no file dialog, so this fell back to writing the file ' +
+                'straight to the input — which Payhip\'s uploader ignores. That fallback is the ' +
+                'likely cause, not the network.'),
       );
     }
     // Completion is the row settling into its FINISHED state — a Delete control

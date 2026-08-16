@@ -71,7 +71,16 @@ a 1280×720 MP4 through the **existing** render pipeline.
 ```
 
 ### Failure recovery / fallback chains
-- **69labs image → Flux** (inside `generateImage`).
+- **ai33.pro image → 69labs image** (inside `generateImage`). ai33 is the PRIMARY
+  image provider since 2026-08-16; 69labs is the backup. Both render
+  **gpt-image-2**, so a failover changes the vendor and nothing the viewer sees —
+  the condition that makes this chain safe, unlike the removed Gemini/fal.ai one
+  which silently substituted a different-looking model.
+- **ai33.pro TTS → 69labs TTS** (inside `generateVoice`). Same voice either way:
+  project rows store bare ElevenLabs voice ids and ai33 serves that catalogue
+  under `elevenlabs_<id>`.
+- Resume pointers are provider-tagged (`ai33:` prefix), so a retry re-polls the
+  render its own provider started instead of paying for a duplicate.
 - **fal.ai Veo 3 Fast → Kling** (inside `generateClipWithFallback`).
 - **ai_clip video fails → hold the generated still** (degrade, not fail).
 - **HeyGen account fails → rotate to next account** (cooldown / disable past threshold).
@@ -140,9 +149,9 @@ scripts/test-synthetic.ts            # tsx unit tests (crypto/cost/proxy/style)
 
 | Queue                       | media_job type    | concurrency (env)              | provider |
 |-----------------------------|-------------------|--------------------------------|----------|
-| `tts`                       | `tts`             | `TTS_CONCURRENCY` (2)          | 69labs TTS + Deepgram |
+| `tts`                       | `tts`             | `TTS_CONCURRENCY` (2)          | ai33 TTS → 69labs TTS + Deepgram |
 | `syntheticPlanner`          | `plan_synthetic`  | `SYNTHETIC_PLANNER_CONCURRENCY` (2) | Gemini |
-| `imageGeneration`           | `image_gen`       | `IMAGE_GEN_CONCURRENCY` (3)    | 69labs nano-banana / Flux |
+| `imageGeneration`           | `image_gen`       | `IMAGE_GEN_CONCURRENCY` (3)    | ai33 gpt-image-2 → 69labs gpt-image-2 |
 | `imageToVideo`              | `image_to_video`  | `IMAGE_TO_VIDEO_CONCURRENCY` (2) | fal.ai Veo3 / Kling |
 | `avatar`                    | `avatar`          | `AVATAR_CONCURRENCY` (1)       | HeyGen (Playwright) |
 

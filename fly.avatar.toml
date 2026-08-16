@@ -57,6 +57,27 @@ kill_timeout = "300s"
   # so [env] is the right home. Verify with scripts/diagnose-69labs-image.ts
   # before changing.
   SIXTYNINE_LABS_IMAGE_RESOLUTION = "1k"
+  # gpt-image-2 on BOTH providers (client direction 2026-08-16). The backup must
+  # render the SAME model as the primary, or a failover changes how the video
+  # looks. Pinned here for the same reason the resolution above is.
+  #
+  # Note this model keeps the 1k pin above but for a NEW reason: gpt-image-2 @2k
+  # is accepted at submit on 69labs and then FAILS ~4 min into the render
+  # (measured twice, 2026-08-16). 2K comes from ai33 instead — see below.
+  SIXTYNINE_LABS_IMAGE_MODEL = "gpt-image-2"
+  # ai33.pro (OpenSpeaker) — PRIMARY image + voiceover provider; 69labs is the
+  # backup. AI33_API_KEY is a SECRET (flyctl secrets set), never [env]. These
+  # three are just tuning:
+  #   - ai33 resolutions are UPPERCASE ("2K"); the lowercase 69labs spelling is
+  #     rejected, which is why the providers keep separate settings.
+  #   - "1K" per client direction 2026-08-16. Measured: 1K = 1280x720, 1,902
+  #     credits, ~113s; 2K = 2048x1152, 2,574 credits, ~130s. So 1K saves 26% of
+  #     credits and ~13% of time for 2.6x fewer pixels, and the synthetic engine
+  #     renders on a 3840x2160 canvas — 1K upscales 3x into the frame vs 1.9x
+  #     for 2K. Set "2K" here to reverse it; no code change needed.
+  AI33_IMAGE_MODEL = "gpt-image-2"
+  AI33_IMAGE_RESOLUTION = "1K"
+  AI33_IMAGE_QUALITY = "high"
   # Headless Chromium for HeyGen automation.
   HEYGEN_HEADLESS = "true"
   # How long the warm HeyGen session is trusted before the worker re-verifies it

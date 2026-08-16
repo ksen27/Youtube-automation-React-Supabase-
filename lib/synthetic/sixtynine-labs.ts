@@ -9,6 +9,15 @@ import {
 } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
+import {
+  isAi33Configured,
+  generateAi33Image,
+  generateAi33Voice,
+  isAi33Pointer,
+  toAi33Pointer,
+  fromAi33Pointer,
+  AI33_STALE_RESUME,
+} from "@/lib/synthetic/ai33";
 
 // Stable per-account id for the Redis slot pool. The slot cap this feeds is
 // enforced by 69labs PER ACCOUNT, not per key — so this id must identify the
@@ -178,6 +187,9 @@ export interface GenerateVoiceResult {
   audio: Buffer;
   contentType: string;
   chars: number;        // billing dimension for cost tracking
+  // Which provider rendered the audio (ai33 is primary, 69labs the backup) —
+  // used for cost attribution and so a failover is visible in the job log.
+  provider: "sixtynine_tts" | "ai33_tts";
 }
 
 // 69labs TTS is an ASYNC JOB API (not a synchronous audio endpoint):
@@ -368,6 +380,7 @@ async function generateVoiceWithKey(
     audio: Buffer.from(arrayBuf),
     contentType: dl.headers.get("content-type") || "audio/mpeg",
     chars: text.length,
+    provider: "sixtynine_tts",
   };
 }
 
@@ -383,7 +396,7 @@ async function generateVoiceWithKey(
  * key warrants hopping. When ALL keys are down past the retry budget, the call
  * throws and the job processor retries.
  */
-export async function generateVoice(
+async function generate69labsVoice(
   input: GenerateVoiceInput,
   resume?: VoiceResume,
 ): Promise<GenerateVoiceResult> {
@@ -448,6 +461,99 @@ export async function generateVoice(
   throw lastErr ?? new Error("generateVoice: no 69labs key configured");
 }
 
+/**
+ * Generate a voiceover MP3 — ai33.pro PRIMARY, 69labs BACKUP (client direction
+ * 2026-08-16).
+ *
+ * The stored voice id needs no migration: project rows hold BARE ElevenLabs ids
+ * (what 69labs takes), and ai33 serves the same ElevenLabs catalogue under
+ * `elevenlabs_<id>`, which normalizeAi33VoiceId adds on the way out. So the two
+ * providers render the SAME voice and a failover is inaudible.
+ *
+ * Resume pointers are provider-tagged (see AI33_KEY_IDX / isAi33Pointer), so a
+ * retry re-polls the render its own provider actually started instead of
+ * submitting a duplicate — the 409 DUPLICATE_TTS_IN_PROGRESS lockout that the
+ * 69labs resume path exists to prevent.
+ */
+export async function generateVoice(
+  input: GenerateVoiceInput,
+  resume?: VoiceResume,
+): Promise<GenerateVoiceResult> {
+  const resumeIsAi33 = isAi33Pointer(resume?.jobId);
+  const resumeIsSixtyNine = Boolean(resume?.jobId) && !resumeIsAi33;
+
+  const providers: Array<"ai33" | "sixtynine"> = [];
+  if (isAi33Configured()) providers.push("ai33");
+  if (isSixtyNineConfigured()) providers.push("sixtynine");
+  // An in-flight 69labs render is already paid for and may be nearly done — go
+  // back to it before starting a fresh one anywhere else.
+  if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
+  if (providers.length === 0) {
+    throw new Error("SIXTYNINE_LABS_API_KEY not configured (synthetic engine)");
+  }
+
+  let lastErr: unknown;
+  for (let i = 0; i < providers.length; i++) {
+    const provider = providers[i];
+    try {
+      if (provider === "ai33") {
+        const onSubmit = resume?.onSubmit
+          ? (taskId: string) => resume.onSubmit!(toAi33Pointer(taskId), AI33_KEY_IDX)
+          : undefined;
+        const resumeTaskId = fromAi33Pointer(resume?.jobId);
+        try {
+          const out = await generateAi33Voice(input, {
+            resumeTaskId: resumeTaskId || undefined,
+            onSubmit,
+          });
+          return { ...out, provider: "ai33_tts" };
+        } catch (err) {
+          // A dead pointer must not fail the voiceover forever — drop it and
+          // render fresh (same contract as the 69labs stale-resume path).
+          if (resumeTaskId && new RegExp(AI33_STALE_RESUME, "i").test((err as Error)?.message ?? "")) {
+            console.warn(
+              JSON.stringify({
+                msg: "ai33.tts.resume_stale",
+                note: "recorded ai33 task no longer exists; submitting a fresh render",
+                err: (err as Error).message?.slice(0, 200),
+              }),
+            );
+            const out = await generateAi33Voice(input, { onSubmit });
+            return { ...out, provider: "ai33_tts" };
+          }
+          throw err;
+        }
+      }
+      // 69labs only understands its own resume pointers.
+      return await generate69labsVoice(
+        input,
+        resumeIsAi33 ? { ...resume!, jobId: undefined, keyIdx: -1 } : resume,
+      );
+    } catch (err) {
+      lastErr = err;
+      // A moderation refusal is about the SCRIPT, not the vendor — every
+      // provider blocks the same text, so re-rendering elsewhere just spends
+      // money to fail again. The script has to be edited.
+      if (/CENSORED|moderation|content polic/i.test((err as Error)?.message ?? "")) throw err;
+      const hasNext = i < providers.length - 1;
+      if (hasNext) {
+        console.warn(
+          JSON.stringify({
+            msg: "tts.provider_failover",
+            note: `${provider} tts failed; falling over to ${providers[i + 1]}`,
+            from: provider,
+            to: providers[i + 1],
+            err: (err as Error).message?.slice(0, 300),
+          }),
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr ?? new Error("generateVoice: no tts provider configured");
+}
+
 // NOTE: 69labs has no documented voice-catalog endpoint — a voice is referenced
 // by a specific voiceId the user supplies (e.g. Gr7mLjPA3HhuWxZidxPW), so there
 // is no listVoices() here. The intake screen takes the voiceId as text input.
@@ -455,12 +561,20 @@ export async function generateVoice(
 export interface GenerateImageResult {
   image: Buffer;
   contentType: string;
-  // Always "sixtynine_image". Narrowed from a 3-way union on 2026-08-15 when the
-  // Gemini/fal.ai fallback was removed (see generateImage) — a 69labs failure now
-  // throws instead of silently returning another provider's image. cost.ts still
-  // knows "gemini_image" / "fal_flux_image" because historical job rows recorded
-  // them; nothing NEW can produce those values.
-  provider: "sixtynine_image";
+  // Which provider actually produced the image, for cost attribution and so the
+  // logs show a failover plainly.
+  //
+  // "ai33_image" was added 2026-08-16 when ai33.pro became the PRIMARY provider
+  // and 69labs the backup. This is NOT a return to the old silent Gemini/fal.ai
+  // fallback chain that was removed on 2026-08-15: that chain swapped in a
+  // DIFFERENT MODEL (FLUX) whose output looked nothing like the house style, so
+  // an outage showed up as an unexplained quality regression instead of a
+  // failure. Both providers here run gpt-image-2, so a failover changes the
+  // vendor and nothing the viewer can see.
+  //
+  // cost.ts still knows "gemini_image" / "fal_flux_image" because historical job
+  // rows recorded them; nothing NEW can produce those values.
+  provider: "sixtynine_image" | "ai33_image";
 }
 
 // Cross-attempt resume for 69labs image generation (the zombie-loop fix). When a
@@ -715,7 +829,13 @@ async function generateNanoBananaImage(
 // just spends money to fail again. The real fix is to edit the prompt (see the
 // de-naming rule). Match the CENSORED reason text generateNanoBananaImage throws.
 function isCensored(err: unknown): boolean {
-  return /CENSORED/i.test((err as Error)?.message ?? "");
+  const text = (err as Error)?.message ?? "";
+  // 69labs labels it CENSORED (or reports a moderation refusal as FAILED with a
+  // safety userMessage, which generateNanoBananaImage re-labels). ai33 surfaces
+  // the same class of refusal as a task `error` whose error_message carries the
+  // model's safety text — match that too, so a refusal doesn't send the image
+  // round the provider list to be refused again by the same model.
+  return /CENSORED|safety check|blocked by the model|content polic|moderation/i.test(text);
 }
 
 // The caller's own per-image generation deadline expired (generationTimeoutMs).
@@ -900,12 +1020,56 @@ export interface GenerateImageOptions {
   apiKey?: string;
 }
 
+// Sentinel keyIdx persisted alongside an ai33 resume pointer. The pointer's
+// "ai33:" prefix is what actually identifies the provider (see isAi33Pointer);
+// this value only has to stay OUT of the 69labs key-pool index range so the
+// 69labs resume guards (`keyIdx >= 0 && < pool.length`) reject it on sight.
+const AI33_KEY_IDX = -2;
+
+/**
+ * Run ONE ai33 generation, transparently recovering from a dead resume pointer.
+ * A recorded task that ai33 no longer knows about must not fail the image
+ * forever, so a STALE pointer falls through to a fresh submit — the same
+ * contract the 69labs resume path has.
+ */
+async function generateAi33ImageWithResume(
+  prompt: string,
+  resume: ImageResume | undefined,
+  modelOpts: { model?: string; generationTimeoutMs?: number; acquireTimeoutMs?: number },
+): Promise<GenerateImageResult> {
+  // NOTE: the caller's `resolution` is deliberately NOT forwarded. It is spelled
+  // for 69labs (lowercase "1k"); ai33 wants "2K" and 422s on the other form, so
+  // ai33 always uses its own AI33_IMAGE_RESOLUTION / AI33_IMAGE_QUALITY.
+  const onSubmit = resume?.onSubmit
+    ? (taskId: string) => resume.onSubmit!(toAi33Pointer(taskId), AI33_KEY_IDX)
+    : undefined;
+  const opts = { ...modelOpts, onSubmit };
+
+  const resumeTaskId = fromAi33Pointer(resume?.jobId);
+  try {
+    const out = await generateAi33Image(prompt, { ...opts, resumeTaskId: resumeTaskId || undefined });
+    return { ...out, provider: "ai33_image" };
+  } catch (err) {
+    if (resumeTaskId && new RegExp(AI33_STALE_RESUME, "i").test((err as Error)?.message ?? "")) {
+      console.warn(
+        JSON.stringify({
+          msg: "ai33.image.resume_stale",
+          note: "recorded ai33 task no longer exists; submitting a fresh generation",
+          err: (err as Error).message?.slice(0, 200),
+        }),
+      );
+      const out = await generateAi33Image(prompt, opts);
+      return { ...out, provider: "ai33_image" };
+    }
+    throw err;
+  }
+}
+
 export async function generateImage(
   basePrompt: string,
   resume?: ImageResume,
   options: GenerateImageOptions = {},
 ): Promise<GenerateImageResult> {
-  cfg(); // validates SIXTYNINE_LABS_API_KEY is configured (throws if not)
   const prompt = options.rawPrompt ? basePrompt : withStylePrompt(basePrompt);
   const modelOpts = {
     model: options.model,
@@ -915,23 +1079,73 @@ export async function generateImage(
     apiKey: options.apiKey,
   };
 
-  // NO CROSS-PROVIDER FALLBACK (2026-08-15, product decision). 69labs is the
-  // only image provider: if it fails past its retry budget and key failover, the
-  // error propagates to the job and the USER SEES IT.
+  // ---------------------------------------------------------------------
+  // PROVIDER ORDER (client direction 2026-08-16): ai33.pro PRIMARY, 69labs
+  // BACKUP. Both run gpt-image-2, so a failover changes the vendor and nothing
+  // the viewer can see — which is the condition that makes a fallback chain
+  // safe here at all (the 2026-08-15 removal of the Gemini/fal.ai chain was
+  // about a fallback that silently swapped in a DIFFERENT-LOOKING model; see
+  // GenerateImageResult.provider).
   //
-  // The old chain silently retried on Gemini, then fal.ai FLUX. It was removed
-  // because it converted a provider outage into an invisible quality
-  // regression: on 2026-08-15 a bad `resolution` value made 69labs 503 EVERY
-  // submit for days, and because the chain kept returning images the queue
-  // looked perfectly healthy — the only symptom was that stills quietly stopped
-  // matching the house style. A failure that shows up as a failure is worth more
-  // than one that shows up as an off-model image nobody can explain.
-  //
-  // The resume path re-polls a prior attempt's 69labs generation instead of
-  // resubmitting (zombie-loop fix); it is unaffected by any of the above.
-  //
-  // If a fallback is ever wanted again, restore it HERE — every caller goes
-  // through this function, and generate69labsImage's own errors (CENSORED,
-  // deadline, auth) are already classified for that purpose.
-  return await generate69labsImage(prompt, resume, modelOpts);
+  // Two cases deliberately do NOT lead with ai33:
+  //   - A PINNED 69labs key (CelebForge). Pinning exists because that key is
+  //     provisioned differently from the pool; sending its stills elsewhere
+  //     would ignore the caller's whole reason for pinning.
+  //   - A 69labs RESUME pointer. That generation is already paid for and may
+  //     be seconds from finishing, so re-polling it beats starting fresh
+  //     elsewhere. ai33 stays available behind it if the resume fails.
+  // ---------------------------------------------------------------------
+  const pinnedSixtyNine = Boolean(options.apiKey?.trim());
+  const resumeIsAi33 = isAi33Pointer(resume?.jobId);
+  const resumeIsSixtyNine = Boolean(resume?.jobId) && !resumeIsAi33;
+
+  const providers: Array<"ai33" | "sixtynine"> = [];
+  if (isAi33Configured() && !pinnedSixtyNine) providers.push("ai33");
+  if (isSixtyNineConfigured()) providers.push("sixtynine");
+  // A 69labs resume pointer jumps 69labs to the front (see above).
+  if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
+  if (providers.length === 0) {
+    // Preserves the old error text for an unconfigured engine.
+    throw new Error("SIXTYNINE_LABS_API_KEY not configured (synthetic engine)");
+  }
+
+  let lastErr: unknown;
+  for (let i = 0; i < providers.length; i++) {
+    const provider = providers[i];
+    try {
+      if (provider === "ai33") {
+        return await generateAi33ImageWithResume(prompt, resume, modelOpts);
+      }
+      // 69labs only understands its OWN resume pointers; an ai33 one would be
+      // submitted as a job id it has never seen.
+      return await generate69labsImage(
+        prompt,
+        resumeIsAi33 ? { ...resume!, jobId: "", keyIdx: -1 } : resume,
+        modelOpts,
+      );
+    } catch (err) {
+      lastErr = err;
+      // A content refusal is decided by the MODEL, and both providers serve the
+      // same one — trying the other just pays to be refused again. Terminal.
+      if (isCensored(err)) throw err;
+      // Our own generation deadline is already spent; a second provider would
+      // only multiply the stall.
+      if (isGenerationDeadline(err)) throw err;
+      const hasNext = i < providers.length - 1;
+      if (hasNext) {
+        console.warn(
+          JSON.stringify({
+            msg: "image.provider_failover",
+            note: `${provider} image generation failed; falling over to ${providers[i + 1]}`,
+            from: provider,
+            to: providers[i + 1],
+            err: (err as Error).message?.slice(0, 300),
+          }),
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr ?? new Error("generateImage: no image provider configured");
 }

@@ -443,7 +443,16 @@ const ServerEnvSchema = z.object({
   SIXTYNINE_LABS_TTS_PROVIDER: z.string().default("elevenlabs"),
   // modelId default depends on provider (eleven_multilingual_v2 for elevenlabs).
   SIXTYNINE_LABS_TTS_MODEL: z.string().default("eleven_multilingual_v2"),
-  SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("nano-banana-2"),
+  // gpt-image-2, NOT nano-banana — client direction 2026-08-16 ("switch our nano
+  // banana to GPT image 2 … both providers"), to match the reference channel's
+  // image quality. Keep this in step with AI33_IMAGE_MODEL: the two providers
+  // must render the same model, or a mid-project failover changes the look of
+  // the video.
+  //
+  // Pair it with SIXTYNINE_LABS_IMAGE_RESOLUTION="1k" — see the note there:
+  // gpt-image-2 @2k currently FAILS on 69labs (accepted at submit, then dies
+  // ~4 min in). 2K on this model is served by ai33 instead, which is primary.
+  SIXTYNINE_LABS_IMAGE_MODEL: z.string().default("gpt-image-2"),
   // --- CelebForge (sourced engine) AI still images -------------------------
   // Client request 2026-08-10: "add ai images for the still images … you can use
   // GROK IMAGE or GPT Image model. They can generate celebrity images."
@@ -568,6 +577,14 @@ const ServerEnvSchema = z.object({
   // Cost of 1k: the 3840x2160 canvas upscales these ~4x and they read soft.
   // That is the known trade — but a soft nano-banana still beats the off-model
   // fal.ai FLUX image the 503 was actually producing.
+  //
+  // STILL "1k" after the 2026-08-16 move to gpt-image-2, for a DIFFERENT reason:
+  // gpt-image-2 @2k is accepted at submit on 69labs (201) but then FAILS ~4 min
+  // into generation ("This job failed to complete", measured twice that day);
+  // @1k COMPLETED. So this stays 1k on 69labs, and 2K comes from ai33
+  // (AI33_IMAGE_RESOLUTION), which is the primary provider. Note this makes the
+  // 69labs fallback the SOFTER of the two — acceptable, since it only runs when
+  // ai33 is down.
   SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("1k"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
   // Max seconds to poll a TTS job to COMPLETED before giving up. Raised from 600
@@ -579,6 +596,86 @@ const ServerEnvSchema = z.object({
   SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1800),
   // Max seconds to poll an image job to COMPLETED before giving up.
   SIXTYNINE_LABS_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
+  // =======================================================================
+  // ai33.pro (OpenSpeaker) — PRIMARY image + voiceover provider.
+  //
+  // Added 2026-08-16 on client direction: ai33.pro is primary, 69labs is the
+  // backup. Both now run gpt-image-2 (see AI33_IMAGE_MODEL /
+  // SIXTYNINE_LABS_IMAGE_MODEL) so a failover cannot change the look of a video
+  // mid-project — the failure mode that made the old Gemini/fal.ai chain a
+  // liability.
+  //
+  // WHY the switch: on 2026-08-16 69labs was degraded across the board —
+  // nano-banana-2 @2k returned 503 SERVICE_UNAVAILABLE at submit (i.e. EVERY
+  // production image failed, which is why uploads stopped), and gpt-image-2 @2k
+  // accepted the submit then died ~4 min in with "This job failed to complete".
+  // ai33 served the same prompts at 2K in ~90s.
+  //
+  // Wire contract (verified live 2026-08-16 — their docs page 403s to scrapers,
+  // so this is the ground truth):
+  //   auth   : `xi-api-key: <key>` header (NOT `Authorization: Bearer`)
+  //   images : POST /v1i/task/generate-image (multipart) -> { task_id }
+  //   tts    : POST /v3/text-to-speech      (multipart) -> { task_id }
+  //   poll   : GET  /v1/task/:task_id       -> status doing|done|error
+  //   result : images -> metadata.result_images[0].imageUrl
+  //            tts    -> metadata.audio_url
+  // Failed tasks are refunded automatically by the provider.
+  AI33_API_KEY: z.string().optional(),
+  // Master switch. Off (or unkeyed) = the engine runs 69labs-only, exactly as
+  // before this provider existed. On with a key = ai33 is tried FIRST and 69labs
+  // becomes the fallback.
+  AI33_ENABLED: z.coerce.boolean().default(true),
+  AI33_BASE_URL: z.string().url().default("https://api.ai33.pro"),
+  // Client direction 2026-08-16: gpt-image-2 on BOTH providers, matching the
+  // reference channel's look. Model ids come from GET /v1i/models.
+  AI33_IMAGE_MODEL: z.string().default("gpt-image-2"),
+  // ai33 resolutions are UPPERCASE ("1K"|"2K"|"4K") — the lowercase form 69labs
+  // wants is rejected here, which is why the two providers keep SEPARATE
+  // resolution settings rather than sharing the caller's value.
+  // "1K" per client direction 2026-08-16. MEASURED trade (gpt-image-2, 16:9,
+  // quality=high) — the saving is smaller and the quality cost larger than the
+  // "half price, half time" estimate that prompted the switch:
+  //
+  //            pixels       credits   generation
+  //     1K     1280x720      1,902      ~113s
+  //     2K     2048x1152     2,574      ~130s
+  //
+  // i.e. 1K saves 26% of credits and ~13% of wall-clock, and costs 2.6x the
+  // pixels. It matters because the SYNTHETIC engine renders on a 3840x2160
+  // canvas (lib/media/ffmpeg.ts): a 1K still is upscaled 3x into the frame,
+  // where 2K is upscaled 1.9x. Set "2K" here or in fly.avatar.toml [env] to
+  // reverse — no code change needed.
+  AI33_IMAGE_RESOLUTION: z.string().default("1K"),
+  // gpt-image-2 exposes qualities low|medium|high (default medium). "" omits the
+  // field for models that don't expose it.
+  AI33_IMAGE_QUALITY: z.string().default("high"),
+  AI33_IMAGE_ASPECT_RATIO: z.string().default("16:9"),
+  // gpt-image-2 caps the prompt at 10,000 chars (GET /v1i/models
+  // max_prompt_length). Longer prompts are truncated with a warning rather than
+  // 400-ing the generation.
+  AI33_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(10_000),
+  // A 2K/high gpt-image-2 still measured ~85-90s; 300s leaves headroom for a
+  // queued task without stranding a lane on a dead one.
+  AI33_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
+  // Matches SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS — a 30k-char narration is a
+  // long render on any provider.
+  AI33_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1800),
+  // ai33 voice ids carry a provider prefix (elevenlabs_ | minimax_ | clone_ |
+  // edge_ | kokoro_ | vbee_ | fishaudio_). Our project rows store BARE
+  // ElevenLabs ids (the form 69labs takes), so an unprefixed id is prefixed with
+  // this before submitting — which is what lets the same voice id serve both
+  // providers with no per-project migration.
+  AI33_TTS_VOICE_PROVIDER: z.string().default("elevenlabs"),
+  // Voice used when a project has none. Empty = fall back to
+  // SIXTYNINE_LABS_DEFAULT_VOICE (normalised with the prefix above).
+  AI33_DEFAULT_VOICE: z.string().default(""),
+  // Cluster-wide concurrent ai33 generations (Redis-coordinated, same mechanism
+  // as the 69labs account cap). ai33 rate-limits per USER — every key on the
+  // account shares one quota — so this is a single global ceiling.
+  AI33_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  // How long a generation may WAIT for a free ai33 slot before giving up (and,
+  // for images, falling over to 69labs).
+  AI33_SLOT_WAIT_MS: z.coerce.number().int().positive().default(120_000),
   // Flux image fallback when nano-banana fails (Black Forest Labs or a proxy).
   FLUX_API_KEY: z.string().optional(),
   FLUX_BASE_URL: z.string().url().default("https://api.bfl.ai/v1"),
