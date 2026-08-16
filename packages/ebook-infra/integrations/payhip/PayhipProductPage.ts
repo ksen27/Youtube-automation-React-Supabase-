@@ -361,6 +361,56 @@ export class PayhipProductPage {
   }
 
   /**
+   * What the upload zone actually looks like from inside the page.
+   *
+   * "The upload did not start" has several states underneath and they need
+   * different fixes: Payhip's uploader script never ran, it ran but plupload
+   * picked no runtime, the file never reached an input, or plupload holds the
+   * file and chose not to send. Reading them out of the page settles it — the
+   * alternative is another round of matching environments one variable at a
+   * time.
+   *
+   * Called from BOTH upload failure paths (never became ready, never started),
+   * because the readiness failure is the one that fired in production and it
+   * used to print nothing.
+   *
+   * `scriptsLoaded` is here for the case this was written for: a form whose
+   * `digital-file-uploader.js` never arrived — through a proxy, from a bad
+   * cache, or behind a challenge — looks identical from the DOM to one whose
+   * uploader is merely slow.
+   */
+  private async probeUploadState(): Promise<unknown> {
+    return this.page
+      .evaluate(() => {
+        const zone = document.querySelector('#ebook_files');
+        const inputs = Array.from(zone?.querySelectorAll('input[type="file"]') ?? []);
+        const w = window as unknown as {
+          plupload?: { VERSION?: string };
+          jQuery?: unknown;
+          payhipDigitalFileUploader?: {
+            opts?: { uploader?: { state?: number; runtime?: string | null; files?: unknown[] } };
+          };
+        };
+        const uploader = w.payhipDigitalFileUploader?.opts?.uploader;
+        return {
+          fileInputs: inputs.length,
+          filesOnInputs: inputs.map((i) => (i as HTMLInputElement).files?.length ?? 0),
+          jqueryPresent: Boolean(w.jQuery),
+          pluploadVersion: w.plupload?.VERSION ?? null,
+          payhipUploaderPresent: Boolean(w.payhipDigitalFileUploader),
+          uploaderRuntime: uploader?.runtime ?? null,
+          uploaderState: uploader?.state ?? null,
+          queued: uploader?.files?.length ?? null,
+          initMessageRendered: Boolean(document.querySelector('#filelist .no_ebook_file_added_yet')),
+          scriptsLoaded: Array.from(document.querySelectorAll('script[src]'))
+            .map((s) => (s as HTMLScriptElement).src)
+            .filter((src) => /plupload|uploader|jquery/i.test(src)),
+        };
+      })
+      .catch(() => null);
+  }
+
+  /**
    * Upload the ebook itself.
    *
    * `setInputFiles` targets the file input directly rather than clicking the
@@ -388,28 +438,43 @@ export class PayhipProductPage {
     // once the uploader has initialised, and the input inside it is the one
     // actually being listened to. `attached` rather than `visible` because
     // these inputs are deliberately invisible (opacity 0, behind the button).
-    // WAIT FOR PLUPLOAD TO HAVE AN UPLOADER, not for markup to appear.
+    // WAIT FOR PAYHIP'S OWN UPLOADER OBJECT, not for markup and not for a
+    // plupload global that does not exist.
     //
-    // This is the bug that survived every environment fix. Payhip loads the
-    // plupload library and then CONSTRUCTS an uploader a moment later; until
-    // that construction happens there is nothing listening, and a file handed
-    // over in the meantime is silently dropped — the page keeps saying "No
-    // product files added yet" and no request is ever made.
+    // `plupload.uploaders` was the previous gate and it is not a thing. Payhip
+    // serves plupload 2.1.8, whose bundle contains the string "uploaders" zero
+    // times — a global register of live instances is a plupload 3 / jQuery
+    // widget idea. So the predicate was false forever, the wait always ran its
+    // full 60s, and EVERY listing failed with "plupload loaded but registered
+    // no uploader". Nothing about the worker, the proxy or headless mode was
+    // involved; a local run that still worked was running an older build.
     //
-    // It never reproduced locally because a laptop renders the form slowly
-    // enough to hide it: nine seconds from form-open to file there, two
-    // seconds on the worker. Faster hardware lost the race, which is why this
-    // looked like a production-only fault for days.
+    // What Payhip actually does, in js/product/digital-file-uploader.js, all
+    // synchronously inside jQuery's DOM-ready:
     //
-    // `plupload.uploaders.length` is the library's own register of live
-    // instances — the one signal that means "there is something to receive a
-    // file". Waiting on markup (.moxie-shim, a file input) was wrong: both
-    // exist before the uploader does.
+    //   $(function(){ window.payhipDigitalFileUploader = new DigitalFileUploader(); });
+    //     → setUploader():  opts.uploader = new plupload.Uploader({ container: 'ebook_files', ... })
+    //     → attachEvents(): binds 'Init', then opts.uploader.init()
+    //
+    // `Uploader.runtime` is null until `init()` has finished detecting a
+    // runtime, so a non-null runtime is exactly "there is something listening,
+    // and it knows how it will send". The instance existing is not enough —
+    // that is true one tick before it can accept anything.
+    //
+    // The DOM fallback is Payhip's own Init handler: on the add page it
+    // renders "No product files added yet" into #filelist, which therefore
+    // cannot appear until the uploader has initialised. It covers a rename of
+    // the window global without re-opening the original race, since waiting on
+    // .moxie-shim or a file input does — both exist before the uploader does.
     const uploaderReady = await this.page
       .waitForFunction(
         () => {
-          const pl = (window as unknown as { plupload?: { uploaders?: unknown[] } }).plupload;
-          return Boolean(pl?.uploaders?.length);
+          const w = window as unknown as {
+            payhipDigitalFileUploader?: { opts?: { uploader?: { runtime?: string | null } } };
+          };
+          const uploader = w.payhipDigitalFileUploader?.opts?.uploader;
+          if (uploader?.runtime) return true;
+          return Boolean(document.querySelector('#filelist .no_ebook_file_added_yet'));
         },
         undefined,
         { timeout: 60_000 },
@@ -417,9 +482,18 @@ export class PayhipProductPage {
       .then(() => true)
       .catch(() => false);
     if (!uploaderReady) {
+      // Say what the page HAD, not just what it lacked.
+      //
+      // The probe below used to run only after the file had been handed over,
+      // which meant this failure path — the one that actually fired in
+      // production — printed nothing at all about the page and left the
+      // diagnosis to a screenshot. Reading it here is what turns "the uploader
+      // never initialised" into a fact about which script did not run.
+      onNote(`upload probe (uploader never became ready): ${JSON.stringify(await this.probeUploadState())}`);
       throw new PayhipTransientError(
-        "Payhip's file uploader never initialised on the product form — plupload loaded but " +
-          'registered no uploader within 60s, so there was nothing to hand the file to.',
+        "Payhip's file uploader never initialised on the product form — window." +
+          'payhipDigitalFileUploader had no initialised plupload uploader within 60s, so there ' +
+          'was nothing to hand the file to. See the upload probe above for which scripts loaded.',
       );
     }
 
@@ -471,37 +545,7 @@ export class PayhipProductPage {
       onNote('answered Payhip\'s own file dialog');
     }
 
-    // What did the page actually receive?
-    //
-    // "The upload did not start" has three possible states underneath, and they
-    // need different fixes: the file never reached any input, it reached one but
-    // plupload does not know about it, or plupload knows and chose not to send.
-    // Reading them out of the page settles it — the alternative is another round
-    // of matching environments one variable at a time.
-    const probe = await this.page
-      .evaluate(() => {
-        const zone = document.querySelector('#ebook_files');
-        const inputs = Array.from(zone?.querySelectorAll('input[type="file"]') ?? []);
-        // plupload registers its instances globally; each carries the queue it
-        // believes it has.
-        const pl = (window as unknown as { plupload?: { uploaders?: unknown[] } }).plupload;
-        const uploaders = (pl?.uploaders ?? []) as Array<{
-          state?: number;
-          files?: unknown[];
-          runtime?: string;
-        }>;
-        return {
-          fileInputs: inputs.length,
-          filesOnInputs: inputs.map((i) => (i as HTMLInputElement).files?.length ?? 0),
-          pluploadPresent: Boolean(pl),
-          uploaderCount: uploaders.length,
-          queued: uploaders.map((u) => u.files?.length ?? 0),
-          states: uploaders.map((u) => u.state ?? null),
-          runtimes: uploaders.map((u) => u.runtime ?? null),
-        };
-      })
-      .catch(() => null);
-    onNote(`upload probe: ${JSON.stringify(probe)}`);
+    onNote(`upload probe: ${JSON.stringify(await this.probeUploadState())}`);
 
     // FIRST: did the upload even START?
     //

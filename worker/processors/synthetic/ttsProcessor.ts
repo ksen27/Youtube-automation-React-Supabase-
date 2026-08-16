@@ -3,7 +3,12 @@ import { setMediaJob, setProjectStatus, createMediaJob, logJob } from "@/lib/job
 import { enqueueSyntheticPlanner, type TtsJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
 import { transcribeAudioFromUrl } from "@/lib/ai/deepgram";
-import { generateVoice, type GenerateVoiceResult } from "@/lib/synthetic/sixtynine-labs";
+import {
+  generateVoice,
+  isDuplicateTtsInProgress,
+  type GenerateVoiceResult,
+  type VoiceResume,
+} from "@/lib/synthetic/sixtynine-labs";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { detectLoudnessDropout } from "@/lib/media/ffmpeg";
@@ -21,7 +26,7 @@ import type { JobAttemptInfo } from "@/worker/index";
 // re-generate — up to SYNTHETIC_VOICEOVER_QC_MAX_REGEN times — keeping the
 // cleanest take. Returns the chosen audio plus the QC verdict for logging.
 async function generateVoiceQC(
-  args: { projectId: string; mediaJobId: string; text: string; voiceId?: string },
+  args: { projectId: string; mediaJobId: string; text: string; voiceId?: string; resume: VoiceResume },
 ): Promise<{ voice: GenerateVoiceResult; attempts: number; clean: boolean; note: string }> {
   const env = getEnv();
   const dropDb = env.SYNTHETIC_VOICEOVER_QC_DROP_DB;
@@ -35,7 +40,14 @@ async function generateVoiceQC(
     const t0 = Date.now();
     await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: "sixtynine_tts", phase: "request",
       extra: { chars: args.text.length, voiceId: args.voiceId ?? "default", attempt } });
-    const voice = await generateVoice({ text: args.text, voiceId: args.voiceId });
+    // Only the FIRST take may resume a prior BullMQ attempt's render. A QC
+    // regen (attempt >= 2) deliberately wants a NEW take of the same text, so
+    // resuming there would just re-download the defective audio we're retrying
+    // away from — pass the pointer-writer alone, with no jobId to resume.
+    const voice = await generateVoice(
+      { text: args.text, voiceId: args.voiceId },
+      attempt === 1 ? args.resume : { keyIdx: -1, onSubmit: args.resume.onSubmit },
+    );
     await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: "sixtynine_tts", phase: "response",
       durationMs: Date.now() - t0, cost: { provider: "sixtynine_tts", chars: voice.chars } });
 
@@ -98,8 +110,52 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
   const { projectId, mediaJobId, voiceoverOnly } = data;
   const sb = getServerSupabase();
 
+  // SUPERSEDED-JOB GUARD. The retry route marks any in-flight tts row 'failed'
+  // ("superseded by retry") and creates a fresh one, but the OLD BullMQ job is
+  // still in Redis and will keep running. Two live jobs for one project submit
+  // IDENTICAL text+voice to 69labs, and the loser earns a 409
+  // DUPLICATE_TTS_IN_PROGRESS that kills it. Bail out here so a superseded job
+  // never reaches the provider.
+  // NOTE: we must NOT simply skip on status='failed'. markJobFailedIfExhausted
+  // marks the row failed on the LAST attempt's failed event, which fires BEFORE
+  // BullMQ runs that attempt — so a plain status check would abort legitimate
+  // final retries. Supersession is identified by a NEWER tts row for the same
+  // project (what both the retry route and a second Generate click create).
+  const { data: ownRow } = await sb
+    .from("media_jobs")
+    .select("created_at, metadata")
+    .eq("id", mediaJobId)
+    .single();
+  if (ownRow) {
+    const { data: newer } = await sb
+      .from("media_jobs")
+      .select("id")
+      .eq("project_id", projectId)
+      .eq("type", "tts")
+      .gt("created_at", ownRow.created_at as string)
+      .limit(1);
+    if ((newer ?? []).length > 0) {
+      await logJob({ projectId, jobId: mediaJobId }, "synthetic.tts.superseded", {
+        note: "a newer tts job exists for this project — skipping to avoid a duplicate 69labs submit",
+        supersededBy: (newer ?? [])[0]?.id ?? null,
+      });
+      return;
+    }
+  }
+
   await setMediaJob(mediaJobId, { status: "running", progress: 5 });
   await setProjectStatus(projectId, "voiceover");
+
+  // Resume pointer for THIS media job (see VoiceResume). setMediaJob merges
+  // metadata, so writing the pair here never clobbers voiceoverSource/retry.
+  const jobMeta = (ownRow?.metadata as { sixtynineTtsJobId?: string; sixtynineTtsKeyIdx?: number } | null) ?? {};
+  const resume: VoiceResume = {
+    jobId: jobMeta.sixtynineTtsJobId,
+    keyIdx: typeof jobMeta.sixtynineTtsKeyIdx === "number" ? jobMeta.sixtynineTtsKeyIdx : -1,
+    onSubmit: async (jobId: string, keyIdx: number) => {
+      await setMediaJob(mediaJobId, { metadata: { sixtynineTtsJobId: jobId, sixtynineTtsKeyIdx: keyIdx } });
+    },
+  };
 
   const { data: project, error } = await sb
     .from("projects")
@@ -115,14 +171,41 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
     const transcript = (project.transcript ?? "").trim();
     if (!transcript) throw new Error("tts: transcript required for tts voiceover_source");
 
-    const { voice, attempts, clean, note } = await generateVoiceQC({
-      projectId, mediaJobId, text: transcript, voiceId: project.tts_voice_id ?? undefined,
-    });
+    let voice: GenerateVoiceResult, attempts: number, clean: boolean, note: string;
+    try {
+      ({ voice, attempts, clean, note } = await generateVoiceQC({
+        projectId, mediaJobId, text: transcript, voiceId: project.tts_voice_id ?? undefined, resume,
+      }));
+    } catch (err) {
+      // 409 DUPLICATE_TTS_IN_PROGRESS with no resume pointer to fall back on:
+      // another submission of this exact text+voice is rendering on the account
+      // and we have no id for it. Retrying the submit just collides again, so
+      // relabel it into something actionable instead of burning the remaining
+      // BullMQ attempts on identical 300ms failures.
+      if (isDuplicateTtsInProgress(err)) {
+        await logJob({ projectId, jobId: mediaJobId }, "synthetic.tts.duplicate_in_progress", {
+          hadResumePointer: Boolean(resume.jobId),
+        });
+        throw new Error(
+          "69labs tts: an identical voiceover (same text + voice) is already rendering on this account. " +
+            "Wait for it to finish — or cancel it on 69labs — before retrying this project.",
+        );
+      }
+      throw err;
+    }
 
     const up = await uploadBuffer(voice.audio, r2Keys.masterVoiceover(projectId), voice.contentType);
     voiceoverUrl = up.publicUrl;
     await sb.from("projects").update({ voiceover_url: voiceoverUrl }).eq("id", projectId);
-    await setMediaJob(mediaJobId, { progress: 50, metadata: { ttsChars: voice.chars, qcAttempts: attempts, qcClean: clean, qcNote: note } });
+    // Clear the resume pointer on success: the render is downloaded and stored,
+    // so a later regenerate of this project must submit a fresh one.
+    await setMediaJob(mediaJobId, {
+      progress: 50,
+      metadata: {
+        ttsChars: voice.chars, qcAttempts: attempts, qcClean: clean, qcNote: note,
+        sixtynineTtsJobId: null, sixtynineTtsKeyIdx: null,
+      },
+    });
   } else {
     if (!voiceoverUrl) throw new Error("tts: voiceover_source='uploaded' but no voiceover_url");
     await setMediaJob(mediaJobId, { progress: 50 });

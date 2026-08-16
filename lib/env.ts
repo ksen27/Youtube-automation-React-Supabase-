@@ -570,8 +570,13 @@ const ServerEnvSchema = z.object({
   // fal.ai FLUX image the 503 was actually producing.
   SIXTYNINE_LABS_IMAGE_RESOLUTION: z.string().default("1k"),
   SIXTYNINE_LABS_DEFAULT_VOICE: z.string().default("narrator"),
-  // Max seconds to poll a TTS job to COMPLETED before giving up.
-  SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
+  // Max seconds to poll a TTS job to COMPLETED before giving up. Raised from 600
+  // to 1800 on 2026-08-16: a 30,599-char voiceover consistently ran past the
+  // 10-minute ceiling, and every timeout used to strand a still-rendering job on
+  // 69labs that then 409'd (DUPLICATE_TTS_IN_PROGRESS) every retry. The resume
+  // pointer now recovers from that, but a full-length narration should not be
+  // hitting the timeout at all — 30 min covers the longest scripts we render.
+  SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1800),
   // Max seconds to poll an image job to COMPLETED before giving up.
   SIXTYNINE_LABS_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
   // Flux image fallback when nano-banana fails (Black Forest Labs or a proxy).

@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { checkProjectEngine, createMediaJob, setProjectStatus } from "@/lib/jobs/db";
-import { enqueueTts, enqueueSyntheticPlanner } from "@/lib/jobs/queue";
+import { enqueueTts, enqueueSyntheticPlanner, removeQueuedJob } from "@/lib/jobs/queue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,12 +47,22 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   // stuck/orphaned job (e.g. left queued from earlier debugging) can't block a
   // legitimate retry with a 409. This makes Re-plan/Retry always actionable.
   const jobType = body.data.step === "planner" ? "plan_synthetic" : "tts";
-  await sb
+  const { data: superseded } = await sb
     .from("media_jobs")
     .update({ status: "failed", error: "superseded by retry" })
     .eq("project_id", id)
     .eq("type", jobType)
-    .in("status", ["queued", "running"]);
+    .in("status", ["queued", "running"])
+    .select("id");
+
+  // Marking the ROW failed does not stop the BullMQ job — it stays in Redis and
+  // keeps retrying. For TTS that means the old job re-submits the SAME text +
+  // voice to 69labs alongside the new one, and 69labs 409s the loser
+  // (DUPLICATE_TTS_IN_PROGRESS), so hitting Retry repeatedly used to make the
+  // project progressively harder to generate. Evict the superseded jobs too.
+  for (const row of superseded ?? []) {
+    await removeQueuedJob(jobType === "plan_synthetic" ? "syntheticPlanner" : "tts", row.id as string);
+  }
 
   if (body.data.step === "voiceover" || body.data.step === "voiceover_only") {
     const voiceoverOnly = body.data.step === "voiceover_only";

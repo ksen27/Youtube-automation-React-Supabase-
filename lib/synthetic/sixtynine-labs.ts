@@ -5,6 +5,7 @@ import {
   isAuthForbidden,
   isAbortError,
   sleepUnlessAborted,
+  HttpError,
 } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
@@ -198,6 +199,43 @@ interface TtsStatusResponse {
   blockedChunks?: Array<{ index: number; text: string }>;
 }
 
+// Cross-attempt resume for 69labs TTS — the same zombie-loop fix images already
+// have (see ImageResume), added 2026-08-16 after a 30k-char voiceover blew the
+// poll timeout at 603s while the provider job kept rendering. Without a resume
+// pointer, BullMQ attempt N+1 POSTs /tts/generate again with IDENTICAL text +
+// voice, and 69labs rejects it:
+//   409 {"error":"A matching TTS job is already in progress.",
+//        "code":"DUPLICATE_TTS_IN_PROGRESS"}
+// Every remaining attempt then 409s in ~300ms, the job dies, and the project is
+// LOCKED OUT until the provider-side render ages out — even though the audio was
+// rendering fine the whole time. Recording (jobId, keyIdx) on submit lets the
+// retry RE-POLL that exact render instead of colliding with it.
+export interface VoiceResume {
+  // The 69labs job id recorded by a PRIOR attempt, if any.
+  jobId?: string;
+  // Index into keyPool() of the key that job was submitted on (0 = primary).
+  // -1 when unknown; resume only happens when this still addresses a live key,
+  // since a TTS job is only visible to the account that created it.
+  keyIdx: number;
+  // Called with a freshly-submitted (jobId, keyIdx) BEFORE polling begins so the
+  // caller can persist it and resume this exact render on the next attempt.
+  onSubmit?: (jobId: string, keyIdx: number) => Promise<void> | void;
+}
+
+// True for 69labs' duplicate-submit rejection. Terminal for the attempt: the
+// text is ALREADY rendering on that account, so retrying the submit collides
+// again. The cure is to resume the in-flight job (VoiceResume), not to retry.
+export function isDuplicateTtsInProgress(err: unknown): boolean {
+  const text = err instanceof HttpError ? (err.body ?? err.message) : ((err as Error)?.message ?? "");
+  return /DUPLICATE_TTS_IN_PROGRESS|matching TTS job is already in progress/i.test(text);
+}
+
+// A recorded resume pointer that 69labs no longer knows about (job expired or
+// was swept). Internal: generateVoiceWithKey raises it so the caller can drop
+// the stale pointer and fall through to a normal fresh submit, rather than
+// failing the job forever on an id that will never resolve.
+const STALE_RESUME = "69labs tts: recorded job no longer exists";
+
 // Internal: one TTS run (submit→poll→download) with a SPECIFIC api key. The key
 // is passed in (not read from cfg) so generateVoice can re-run this on the backup
 // key when the primary hits a permanent auth 403 — mirroring generateImage.
@@ -206,26 +244,58 @@ async function generateVoiceWithKey(
   text: string,
   voiceId: string | undefined,
   key: string,
+  opts: { resumeJobId?: string; onSubmit?: (jobId: string) => Promise<void> | void } = {},
 ): Promise<GenerateVoiceResult> {
   const authJson = { Authorization: `Bearer ${key}`, "Content-Type": "application/json" };
   const authOnly = { Authorization: `Bearer ${key}` };
 
-  // 1) Submit the job.
-  const submit = await withHttpRetry("69labs.tts.submit", () =>
-    fetchOrThrow(`${c.base}/api/v1/tts/generate`, {
-      method: "POST",
-      headers: authJson,
-      body: JSON.stringify({
-        text,
-        voiceId: voiceId || c.defaultVoice,
-        voiceProvider: c.ttsProvider,
-        modelId: c.ttsModel,
+  // 1) Submit the job — UNLESS a prior attempt already submitted this exact
+  // render on this account (opts.resumeJobId), in which case we skip straight to
+  // polling it. Resubmitting is what earns the 409 DUPLICATE_TTS_IN_PROGRESS.
+  let jobId: string;
+  if (opts.resumeJobId) {
+    jobId = opts.resumeJobId;
+    // Probe the recorded job before committing to the poll loop. A 404/410 means
+    // the pointer is stale (job expired or swept), so we drop it and submit
+    // fresh instead of polling an id that will never resolve.
+    try {
+      await withHttpRetry("69labs.tts.resume_probe", () =>
+        fetchOrThrow(`${c.base}/api/v1/tts/status/${jobId}`, { headers: authOnly, timeoutMs: 30_000 }),
+      );
+      console.log(
+        JSON.stringify({
+          msg: "69labs.tts.resume",
+          note: "re-polling the TTS job submitted by a prior attempt instead of resubmitting",
+          jobId,
+        }),
+      );
+    } catch (e) {
+      if (e instanceof HttpError && (e.status === 404 || e.status === 410)) {
+        throw new Error(`${STALE_RESUME} (job ${jobId})`);
+      }
+      throw e;
+    }
+  } else {
+    const submit = await withHttpRetry("69labs.tts.submit", () =>
+      fetchOrThrow(`${c.base}/api/v1/tts/generate`, {
+        method: "POST",
+        headers: authJson,
+        body: JSON.stringify({
+          text,
+          voiceId: voiceId || c.defaultVoice,
+          voiceProvider: c.ttsProvider,
+          modelId: c.ttsModel,
+        }),
+        timeoutMs: 60_000,
       }),
-      timeoutMs: 60_000,
-    }),
-  );
-  const { id: jobId } = (await submit.json()) as { id: string; status: TtsStatus };
-  if (!jobId) throw new Error("69labs tts: submit returned no job id");
+    );
+    const parsed = (await submit.json()) as { id: string; status: TtsStatus };
+    if (!parsed.id) throw new Error("69labs tts: submit returned no job id");
+    jobId = parsed.id;
+    // Persist BEFORE polling so a poll-timeout retry resumes THIS render rather
+    // than colliding with it.
+    if (opts.onSubmit) await opts.onSubmit(jobId);
+  }
 
   // 2) Poll status until COMPLETED (or a terminal failure / timeout).
   const deadline = Date.now() + c.ttsPollTimeoutMs;
@@ -281,25 +351,52 @@ async function generateVoiceWithKey(
  * key warrants hopping. When ALL keys are down past the retry budget, the call
  * throws and the job processor retries.
  */
-export async function generateVoice(input: GenerateVoiceInput): Promise<GenerateVoiceResult> {
+export async function generateVoice(
+  input: GenerateVoiceInput,
+  resume?: VoiceResume,
+): Promise<GenerateVoiceResult> {
   const c = cfg();
   const text = input.text.trim();
   if (!text) throw new Error("generateVoice: empty text");
   const limit = getEnv().SIXTYNINE_IMAGE_CONCURRENCY;
 
-  // Round-robin across the key pool with per-key concurrency, mirroring
-  // generateImage: the first key is the load-balanced choice, the rest are
-  // permanent-auth-403 failover targets. With two separate-account keys this runs
-  // voiceover jobs on both accounts in parallel.
-  const order = nextKeyOrder(keyPool());
+  // RESUME PATH: a prior attempt already submitted this render on a specific
+  // account. Re-poll THAT job on THAT key — a fresh round-robin submit would
+  // either collide with it (409 DUPLICATE_TTS_IN_PROGRESS on the same account)
+  // or pay a second time for identical audio on another one. Falls through to a
+  // normal round-robin submit when the recorded key is no longer in the pool.
+  const pool = keyPool();
+  const canResume = !!resume?.jobId && resume.keyIdx >= 0 && resume.keyIdx < pool.length;
+  const order = canResume ? [pool[resume!.keyIdx]] : nextKeyOrder(pool);
   let lastErr: unknown;
   for (let i = 0; i < order.length; i++) {
     const key = order[i];
+    const keyIdx = pool.indexOf(key);
+    const resumeJobId = canResume && keyIdx === resume!.keyIdx ? resume!.jobId : undefined;
     await ttsSemaphoreFor(key).acquire(limit);
     try {
-      return await generateVoiceWithKey(c, text, input.voiceId, key);
+      return await generateVoiceWithKey(c, text, input.voiceId, key, {
+        resumeJobId,
+        onSubmit: resume?.onSubmit ? (jobId) => resume.onSubmit!(jobId, keyIdx) : undefined,
+      });
     } catch (err) {
       lastErr = err;
+      // The recorded resume pointer is dead (job expired/swept on 69labs' side).
+      // Drop it and retry this same key with a FRESH submit — the duplicate
+      // guard has nothing to collide with once the old render is gone.
+      if (new RegExp(STALE_RESUME, "i").test((err as Error)?.message ?? "")) {
+        console.warn(
+          JSON.stringify({
+            msg: "69labs.tts.resume_stale",
+            note: "recorded tts job no longer exists; submitting a fresh render",
+            err: (err as Error).message?.slice(0, 200),
+          }),
+        );
+        // Reuse the slot we already hold — the outer `finally` releases it once.
+        return await generateVoiceWithKey(c, text, input.voiceId, key, {
+          onSubmit: resume?.onSubmit ? (jobId) => resume.onSubmit!(jobId, keyIdx) : undefined,
+        });
+      }
       const hasNext = i < order.length - 1;
       if (hasNext && isAuthForbidden(err)) {
         console.warn(

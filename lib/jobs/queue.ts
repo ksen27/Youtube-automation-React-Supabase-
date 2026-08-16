@@ -207,6 +207,25 @@ export async function enqueueScriptClip(data: ScriptClipJobData) {
 export async function enqueueTts(data: TtsJobData) {
   return getQueue<TtsJobData>(QUEUE_NAMES.tts).add("tts", data, { jobId: data.mediaJobId });
 }
+
+// Drop a job from Redis given its media_job id (jobId === mediaJobId). Marking
+// the Postgres row 'failed' does NOT stop the queued/retrying BullMQ job — it
+// keeps running and, for TTS, submits the same text+voice to 69labs as the
+// replacement job, so one of the two dies on a 409 DUPLICATE_TTS_IN_PROGRESS.
+// Callers that supersede a job must remove it here as well. Best-effort: a job
+// that is already gone, or currently ACTIVE (BullMQ refuses to remove a locked
+// job), is not an error — the processor's superseded-row guard catches that
+// case on its next attempt.
+export async function removeQueuedJob(queue: keyof typeof QUEUE_NAMES, mediaJobId: string): Promise<boolean> {
+  try {
+    const job = await getQueue(QUEUE_NAMES[queue]).getJob(mediaJobId);
+    if (!job) return false;
+    await job.remove();
+    return true;
+  } catch {
+    return false;
+  }
+}
 export async function enqueueSyntheticPlanner(data: SyntheticPlannerJobData) {
   return getQueue<SyntheticPlannerJobData>(QUEUE_NAMES.syntheticPlanner).add("plan_synthetic", data, { jobId: data.mediaJobId });
 }
