@@ -197,6 +197,17 @@ interface TtsStatusResponse {
   chunksTotal?: number;
   chunksCompleted?: number;
   blockedChunks?: Array<{ index: number; text: string }>;
+  // Provider-side reason on a FAILED job. 69labs is inconsistent about which
+  // field carries it (images use userMessage), so read all three — a bare
+  // "job FAILED (job <uuid>)" with the reason thrown away is undebuggable.
+  userMessage?: string;
+  error?: string;
+  message?: string;
+}
+
+// The reason text off a status payload, if 69labs supplied one.
+function ttsFailureReason(st: TtsStatusResponse): string {
+  return (st.userMessage || st.error || st.message || "").trim();
 }
 
 // Cross-attempt resume for 69labs TTS — the same zombie-loop fix images already
@@ -255,18 +266,35 @@ async function generateVoiceWithKey(
   let jobId: string;
   if (opts.resumeJobId) {
     jobId = opts.resumeJobId;
-    // Probe the recorded job before committing to the poll loop. A 404/410 means
-    // the pointer is stale (job expired or swept), so we drop it and submit
-    // fresh instead of polling an id that will never resolve.
+    // Probe the recorded job before committing to the poll loop. Two ways a
+    // pointer can be dead, and BOTH must fall through to a fresh submit:
+    //   - 404/410: the job expired or was swept.
+    //   - 200 with a TERMINAL status: the render already FAILED/CANCELLED. This
+    //     is the common one — 69labs fails a render, we record the id, and every
+    //     later attempt would re-poll that corpse and re-throw "job FAILED"
+    //     instantly, never resubmitting. That turns a one-off provider failure
+    //     into a permanent dead project, which is the same class of lockout the
+    //     resume pointer exists to prevent.
+    // CENSORED is the exception: a resubmit of the same text is censored again,
+    // so surface it rather than paying for a guaranteed second refusal.
     try {
-      await withHttpRetry("69labs.tts.resume_probe", () =>
+      const probe = await withHttpRetry("69labs.tts.resume_probe", () =>
         fetchOrThrow(`${c.base}/api/v1/tts/status/${jobId}`, { headers: authOnly, timeoutMs: 30_000 }),
       );
+      const st = (await probe.json()) as TtsStatusResponse;
+      if (st.status === "CENSORED") {
+        const blocked = (st.blockedChunks ?? []).map((b) => b.index).join(",");
+        throw new Error(`69labs tts: CENSORED (blocked chunks: ${blocked || "?"}) — edit the script and retry`);
+      }
+      if (st.status === "FAILED" || st.status === "CANCELLED") {
+        throw new Error(`${STALE_RESUME} (job ${jobId} is ${st.status})`);
+      }
       console.log(
         JSON.stringify({
           msg: "69labs.tts.resume",
           note: "re-polling the TTS job submitted by a prior attempt instead of resubmitting",
           jobId,
+          status: st.status,
         }),
       );
     } catch (e) {
@@ -312,7 +340,11 @@ async function generateVoiceWithKey(
     const st = (await statusRes.json()) as TtsStatusResponse;
     if (st.status === "COMPLETED") break;
     if (st.status === "FAILED" || st.status === "CANCELLED") {
-      throw new Error(`69labs tts: job ${st.status} (job ${jobId})`);
+      const reason = ttsFailureReason(st);
+      throw new Error(
+        `69labs tts: job ${st.status} (job ${jobId})${reason ? ` — ${reason}` : ""}` +
+          `${st.chunksTotal ? ` [chunks ${st.chunksCompleted ?? 0}/${st.chunksTotal}]` : ""}`,
+      );
     }
     if (st.status === "CENSORED") {
       // Content moderation blocked one or more chunks. We surface this as a
