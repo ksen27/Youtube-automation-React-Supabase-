@@ -123,6 +123,12 @@ export interface PlannedSegment {
   // Shot type for the SECOND visual (paired with imagePrompt2).
   shotType2?: string | null;
   animationPrompt: string | null;
+  // WHICH CLIP ENGINE renders this block, set by assignClipDurationQuota.
+  // Meaningful only on ai_clip blocks; null everywhere else. "ltx" is the
+  // workhorse (~25% of a video) and "veo" the 69labs Veo 3.1 Lite lane (~5%).
+  // Persisted into synthetic_segments.metadata.clip_engine so the processor can
+  // route without re-deriving the plan.
+  clipEngine?: "ltx" | "veo" | null;
   // Exact char range in the transcript this block covers. Set by the
   // align-first path from the sentence offsets it groups. Undefined on the
   // legacy path, which has no reliable offsets (Gemini's script text is a
@@ -581,15 +587,23 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "they read as one continuous shot. Only change the visual world when the",
     "narration genuinely moves to a new scene.",
     "",
-    "For ai_clip blocks also write an `animationPrompt`. The client wants the",
-    "motion to be BARELY PERCEPTIBLE — an extremely slow, very slight camera",
-    "push-in over an otherwise completely STILL, frozen scene. This is the",
-    "reference channel's look. Do NOT describe panning, dramatic action, fast or",
-    "sudden motion, camera shake, motion blur, or eventful 'something happening'",
-    "in the scene — those make the footage look blurry and jumpy, which the client",
-    "rejected. Default to an extremely slow, steady, minimal push-in (e.g.",
-    "'extremely slow, very slight push-in, scene completely static, no shake, no",
-    "motion blur'). avatar blocks need no prompts.",
+    "For ai_clip blocks also write an `animationPrompt` describing a REAL HUMAN",
+    "ACTION (client requirement 2026-08-17). An ai_clip must show a PERSON DOING",
+    "the thing the narration is talking about — pouring the milk, stirring the",
+    "pot, planting the seedling, wiping the surface — NOT a still photo with a",
+    "camera move over it. Write the specific action THIS block's narration",
+    "describes, as one continuous everyday motion with a beginning and an end",
+    "(e.g. 'she pours the milk from the bottle into the bowl of oats and tilts",
+    "the bottle back upright').",
+    "",
+    "CRITICAL — the CAMERA MUST NOT MOVE. Only the PERSON moves. Never describe",
+    "a push-in, zoom, pan, tilt, tracking shot, orbit, or camera shake: the",
+    "camera is locked off on a tripod and the framing never changes. Camera",
+    "movement is what made earlier footage look blurry and jumpy, which the",
+    "client rejected — the motion must come from the SUBJECT, not the lens.",
+    "Also avoid slow motion, dramatic/cinematic movement, and scene changes",
+    "mid-clip. If a block's narration genuinely has no human action in it, that",
+    "block should be an `image`, not an `ai_clip`. avatar blocks need no prompts.",
     "",
     responseShape,
     "",
@@ -682,7 +696,7 @@ function buildSingleSegmentPrompt(
     amateurLookRule(EMPTY_TOPIC),
     "",
     wantsAnimation
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = BARELY PERCEPTIBLE motion: an extremely slow, very slight push-in over a completely still, frozen scene. NO panning, NO sudden motion, NO camera shake, NO motion blur, NO eventful action.).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = a REAL HUMAN ACTION the person performs, carried through the whole shot, matching this block\'s narration. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; ONLY the person moves. No slow motion, no cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
@@ -1488,6 +1502,201 @@ export function balanceVisualTypesByPosition(
     return { ...seg, blockType: "image" as SyntheticBlockType, animationPrompt: null };
   });
   return { segments: out, toClip, toImage };
+}
+
+// van der Corput (radix-2) sequence. The point of it here: ANY PREFIX of the
+// resulting order is evenly spread over 0..n-1 — vdc gives 0, .5, .25, .75,
+// .125 … so taking the first k items lands them across the whole timeline for
+// every k, not just a k chosen up front.
+//
+// That property is what the quota pass needs and a plain stride cannot give:
+// how many blocks fit in a SECONDS budget isn't known until we're partway
+// through adding them up (blocks differ in length), so the selection order has
+// to stay evenly spread no matter where we stop.
+function vanDerCorput(i: number): number {
+  let n = i;
+  let base = 0.5;
+  let q = 0;
+  while (n > 0) {
+    q += (n % 2) * base;
+    n = Math.floor(n / 2);
+    base /= 2;
+  }
+  return q;
+}
+
+/** Indices 0..n-1 ordered so that every prefix is evenly spread across them. */
+function spreadOrder(n: number): number[] {
+  return Array.from({ length: n }, (_, i) => i)
+    .map((i) => ({ i, key: vanDerCorput(i) }))
+    .sort((a, b) => a.key - b.key || a.i - b.i)
+    .map((x) => x.i);
+}
+
+// Does this scene contain a person who could plausibly PERFORM an action? An
+// ai_clip is now defined by human movement (ACTION_CLIP_RULE), so promoting a
+// still-life — a jar on a shelf, an empty field — into one produces either the
+// "random zoom" the client rejected or a hallucinated person appearing from
+// nowhere. Blocks whose prompt names a person or a hands-on action are
+// therefore preferred when filling the clip budget.
+//
+// Deliberately a loose keyword test on the prompt text, not a model call: it
+// only has to ORDER candidates (a wrong guess costs one mediocre clip, never a
+// failure), and the pass has to stay pure and instant.
+const ACTION_SCENE_RE =
+  /\b(she|he|her|his|their|they|woman|man|person|people|hand|hands|holding|hold|pour|pours|pouring|stir|stirs|stirring|mix|mixes|mixing|cut|cuts|cutting|chop|slice|lift|lifts|lifting|wipe|wipes|plant|plants|planting|water|watering|spray|sprays|clean|cleans|cooking|cooks|adds|adding|placing|places|picking|picks|carry|carries|open|opens|opening|pressing|presses|scoop|scoops|spread|spreads|rub|rubs|kneading|knead)\b/i;
+
+function canCarryAction(seg: PlannedSegment): boolean {
+  return ACTION_SCENE_RE.test(`${seg.imagePrompt ?? ""} ${seg.script ?? ""}`);
+}
+
+export interface ClipQuotaResult {
+  segments: PlannedSegment[];
+  totalSeconds: number;
+  targetClipSeconds: number;   // LTX + veo combined
+  targetVeoSeconds: number;
+  clipSeconds: number;         // achieved, LTX + veo
+  veoSeconds: number;          // achieved
+  promoted: number;            // image -> ai_clip
+  demoted: number;             // ai_clip -> image
+  veoBlocks: number;
+  ltxBlocks: number;
+  // Seconds by which the clip budget could NOT be met, because there were not
+  // enough eligible visual blocks (see the avatar-marking note below). 0 when
+  // the target was reached.
+  shortfallSeconds: number;
+}
+
+/**
+ * Enforce the client's CLIP BUDGET BY DURATION (2026-08-17): ~25% of the video
+ * is LTX footage and ~5% is Veo footage, the other ~70% being image / avatar /
+ * split_2.
+ *
+ * This is deliberately a DURATION pass, not a count pass. The older
+ * balanceVisualTypesByPosition works on block COUNT and POSITION, and a count
+ * share does not yield a duration share when blocks differ in length — a plan
+ * can be 30% clips by count and 12% by screen time. This runs after it and is
+ * authoritative for the final mix.
+ *
+ * WHAT IT WILL NOT TOUCH: 'avatar' and 'split_2' blocks. Avatar blocks are not
+ * ours to reassign — they come from the red/orange highlights in the client's
+ * Google Doc (see doc-marks.ts), so the avatar share of a video is fixed by the
+ * source document. The clip budget is therefore drawn only from the visual
+ * (image/ai_clip) remainder, and on a heavily-highlighted doc the 30% target
+ * can be genuinely unreachable. That case reports `shortfallSeconds` rather
+ * than failing: silently missing the target is what makes it undiagnosable.
+ *
+ * Percentages are of TOTAL video duration (every block, avatar included),
+ * matching how the client states them.
+ */
+export function assignClipDurationQuota(
+  segs: PlannedSegment[],
+  opts: {
+    clipFraction: number;   // LTX share of total duration
+    veoFraction: number;    // veo share of total duration
+    veoEnabled: boolean;
+    // Restrict the budget to blocks starting before this many seconds (the
+    // "no LTX after 15 minutes" cost guard). 0 = the whole video is eligible.
+    cutoffSeconds: number;
+  },
+): ClipQuotaResult {
+  const dur = (s: PlannedSegment) => Math.max(0, Number(s.duration) || 0);
+  const totalSeconds = segs.reduce((a, s) => a + dur(s), 0);
+  const veoFraction = opts.veoEnabled ? Math.max(0, opts.veoFraction) : 0;
+  const targetVeoSeconds = totalSeconds * veoFraction;
+  const targetClipSeconds = totalSeconds * (Math.max(0, opts.clipFraction) + veoFraction);
+
+  // Eligible = visual blocks inside the window. Everything else keeps its type.
+  const eligible: number[] = [];
+  segs.forEach((s, i) => {
+    if (s.blockType !== "image" && s.blockType !== "ai_clip") return;
+    if (opts.cutoffSeconds > 0 && s.startTime >= opts.cutoffSeconds) return;
+    eligible.push(i);
+  });
+
+  // Fill the seconds budget, preferring blocks that make a GOOD clip, and
+  // spreading evenly WITHIN each preference tier so the chosen clips still land
+  // across the whole video rather than clumping.
+  //
+  // Tiers, best first:
+  //   3  already ai_clip AND the scene has a person/action  (Gemini picked it
+  //      as a dynamic scene and it can carry the movement)
+  //   2  already ai_clip                                    (chosen as dynamic)
+  //   1  a still whose scene has a person/action            (promotes cleanly)
+  //   0  any other still                                    (last resort — an
+  //      action prompt over a still-life is the weakest clip we can make)
+  const tierOf = (i: number) =>
+    (segs[i].blockType === "ai_clip" ? 2 : 0) + (canCarryAction(segs[i]) ? 1 : 0);
+  const byTier = new Map<number, number[]>();
+  for (const i of eligible) {
+    const t = tierOf(i);
+    if (!byTier.has(t)) byTier.set(t, []);
+    byTier.get(t)!.push(i);
+  }
+  const order: number[] = [];
+  for (const t of [3, 2, 1, 0]) {
+    const tier = byTier.get(t) ?? [];
+    for (const oi of spreadOrder(tier.length)) order.push(tier[oi]);
+  }
+
+  const wantClip = new Set<number>();
+  let clipSeconds = 0;
+  for (const idx of order) {
+    if (clipSeconds >= targetClipSeconds) break;
+    wantClip.add(idx);
+    clipSeconds += dur(segs[idx]);
+  }
+  const shortfallSeconds = Math.max(0, targetClipSeconds - clipSeconds);
+
+  // Of the chosen clips, the evenly-spread prefix that fills the VEO budget
+  // renders on veo; the rest on LTX. Floor of one veo block whenever the lane
+  // is on and any clip exists — on a short video 5% can round to less than a
+  // single clip, and "5% veo" plainly means at least one.
+  const clipIdxInTimelineOrder = [...wantClip].sort((a, b) => a - b);
+  const veoOrder = spreadOrder(clipIdxInTimelineOrder.length);
+  const wantVeo = new Set<number>();
+  let veoSeconds = 0;
+  if (veoFraction > 0) {
+    for (const oi of veoOrder) {
+      if (veoSeconds >= targetVeoSeconds && wantVeo.size > 0) break;
+      const idx = clipIdxInTimelineOrder[oi];
+      wantVeo.add(idx);
+      veoSeconds += dur(segs[idx]);
+    }
+  }
+
+  let promoted = 0;
+  let demoted = 0;
+  const segments = segs.map((seg, i) => {
+    if (seg.blockType !== "image" && seg.blockType !== "ai_clip") {
+      return seg.clipEngine ? { ...seg, clipEngine: null } : seg;
+    }
+    if (!wantClip.has(i)) {
+      // Not in the budget: this block is a still.
+      if (seg.blockType === "ai_clip") {
+        demoted++;
+        return { ...seg, blockType: "image" as SyntheticBlockType, animationPrompt: null, clipEngine: null };
+      }
+      return seg.clipEngine ? { ...seg, clipEngine: null } : seg;
+    }
+    const clipEngine: "ltx" | "veo" = wantVeo.has(i) ? "veo" : "ltx";
+    if (seg.blockType === "image") promoted++;
+    return { ...seg, blockType: "ai_clip" as SyntheticBlockType, clipEngine };
+  });
+
+  return {
+    segments,
+    totalSeconds,
+    targetClipSeconds,
+    targetVeoSeconds,
+    clipSeconds,
+    veoSeconds,
+    promoted,
+    demoted,
+    veoBlocks: wantVeo.size,
+    ltxBlocks: wantClip.size - wantVeo.size,
+    shortfallSeconds,
+  };
 }
 
 // Guarantee a MINIMUM number of split_2 blocks (client 2026-06-30: "why is
@@ -2942,6 +3151,61 @@ export async function buildSyntheticTimeline(input: {
     }
   }
 
+  // CLIP BUDGET BY DURATION (client 2026-08-17: "25% LTX, 5% veo" of the
+  // video). Runs LAST of the type passes so nothing downstream can undo it —
+  // the split_2 floor above promotes images, which would otherwise eat into the
+  // clip budget after it was measured.
+  {
+    const env = getEnv();
+    const clipFraction = env.SYNTHETIC_CLIP_DURATION_FRACTION;
+    const veoFraction = env.SYNTHETIC_VEO_DURATION_FRACTION;
+    const veoEnabled = env.SYNTHETIC_VEO_ENABLED;
+    const cutoff = env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF
+      ? env.SYNTHETIC_CLIP_HEAVY_SECONDS
+      : 0;
+    if (clipFraction > 0 || veoFraction > 0) {
+      const q = assignClipDurationQuota(planned, {
+        clipFraction,
+        veoFraction,
+        veoEnabled,
+        cutoffSeconds: cutoff,
+      });
+      planned = q.segments;
+      const pct = (s: number) => (q.totalSeconds > 0 ? Number(((s / q.totalSeconds) * 100).toFixed(1)) : 0);
+      await logJob({ projectId, jobId }, "synthetic.plan.clip_duration_quota", {
+        clipFraction,
+        veoFraction,
+        veoEnabled,
+        cutoffSeconds: cutoff,
+        totalSeconds: Math.round(q.totalSeconds),
+        targetClipSeconds: Math.round(q.targetClipSeconds),
+        clipSeconds: Math.round(q.clipSeconds),
+        clipPercent: pct(q.clipSeconds),
+        targetVeoSeconds: Math.round(q.targetVeoSeconds),
+        veoSeconds: Math.round(q.veoSeconds),
+        veoPercent: pct(q.veoSeconds),
+        ltxBlocks: q.ltxBlocks,
+        veoBlocks: q.veoBlocks,
+        promotedToClip: q.promoted,
+        demotedToImage: q.demoted,
+        // Non-zero means there were not enough non-avatar blocks to hold the
+        // budget — the doc is highlighted too heavily for the requested clip
+        // share. Surfaced rather than silently missed.
+        shortfallSeconds: Math.round(q.shortfallSeconds),
+      });
+      if (q.shortfallSeconds > 0) {
+        await logJob({ projectId, jobId }, "synthetic.plan.clip_quota_shortfall", {
+          note:
+            "not enough non-avatar blocks to reach the clip duration target — " +
+            "avatar blocks come from doc highlights and cannot be reassigned",
+          shortfallSeconds: Math.round(q.shortfallSeconds),
+          achievedPercent: pct(q.clipSeconds),
+          targetPercent: Number(((clipFraction + (veoEnabled ? veoFraction : 0)) * 100).toFixed(1)),
+        });
+      }
+    }
+  }
+
   // DISTINCT-SCENE pass for the EXTRA visuals of one sentence (client 2026-06-30:
   // "if several images are generated in the same sentence, the image is the same
   // now"). When a sentence is shown with MULTIPLE visuals, every slot after the
@@ -3233,7 +3497,14 @@ export async function buildSyntheticTimeline(input: {
     // narration. A visual block should always carry a composed image_prompt
     // above, but if Gemini ever returns an empty scene AND there's no base, the
     // processor falls back to this instead of drawing the script verbatim.
-    metadata: { base_prompt: basePrompt || null },
+    metadata: {
+      base_prompt: basePrompt || null,
+      // Which clip engine this block renders on (assignClipDurationQuota).
+      // Only meaningful on ai_clip; null elsewhere. The processor reads this
+      // rather than re-deriving the split, so a re-run of a single segment
+      // keeps the engine the plan chose for it.
+      clip_engine: p.blockType === "ai_clip" ? (p.clipEngine ?? "ltx") : null,
+    },
     status: "pending" as const,
   }));
   const { error } = await sb.from("synthetic_segments").insert(rows);

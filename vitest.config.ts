@@ -20,6 +20,8 @@ export default defineConfig({
     ],
   },
   test: {
-    include: ["packages/**/*.test.ts"],
+    // packages/** is the ebook monorepo; lib/** covers the video engine (the
+    // synthetic planner's pure passes are unit-tested there).
+    include: ["packages/**/*.test.ts", "lib/**/*.test.ts"],
   },
 });

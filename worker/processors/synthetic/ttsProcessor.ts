@@ -5,6 +5,7 @@ import { uploadBuffer } from "@/lib/storage";
 import { transcribeAudioFromUrl } from "@/lib/ai/deepgram";
 import {
   generateVoice,
+  plannedTtsProvider,
   isDuplicateTtsInProgress,
   type GenerateVoiceResult,
   type VoiceResume,
@@ -38,7 +39,10 @@ async function generateVoiceQC(
 
   for (let attempt = 1; attempt <= total; attempt++) {
     const t0 = Date.now();
-    await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: "sixtynine_tts", phase: "request",
+    // The provider we're about to TRY (ai33 primary, 69labs backup). The
+    // matching `response` line names the one that actually served it — when the
+    // two differ, a failover happened.
+    await logProviderCall({ projectId: args.projectId, jobId: args.mediaJobId, provider: plannedTtsProvider(), phase: "request",
       extra: { chars: args.text.length, voiceId: args.voiceId ?? "default", attempt } });
     // Only the FIRST take may resume a prior BullMQ attempt's render. A QC
     // regen (attempt >= 2) deliberately wants a NEW take of the same text, so

@@ -622,9 +622,29 @@ const ServerEnvSchema = z.object({
   // Failed tasks are refunded automatically by the provider.
   AI33_API_KEY: z.string().optional(),
   // Master switch. Off (or unkeyed) = the engine runs 69labs-only, exactly as
-  // before this provider existed. On with a key = ai33 is tried FIRST and 69labs
-  // becomes the fallback.
+  // before this provider existed. On with a key = ai33 participates in the
+  // provider chain; WHICH END it sits at is set by SYNTHETIC_*_PROVIDER_PRIMARY
+  // below (it is no longer implicitly first — see that note).
   AI33_ENABLED: z.coerce.boolean().default(true),
+
+  // WHICH PROVIDER LEADS the image / TTS chain. The other one becomes the
+  // fallback; both still participate, so an outage on either is ridden out.
+  //
+  // Client direction 2026-08-17: 69labs PRIMARY, ai33 FALLBACK — a reversal of
+  // the 2026-08-16 direction recorded above (which made ai33 primary after a
+  // 69labs outage). The order has now changed twice in two days, so it is a
+  // SETTING rather than the hardcoded array it used to be: flipping it back is
+  // an env change, not a deploy.
+  //
+  // NOTE the operational trade when 69labs leads: its per-account generation
+  // ceiling (SIXTYNINE_ACCOUNT_CONCURRENCY, the 7-slot "Concurrent image
+  // generation limit reached" 403) is the binding constraint again, and the
+  // Redis slot limiter / key-pool failover / zombie-resume machinery is back on
+  // the hot path. ai33 has no such ceiling. If image throughput falls off a
+  // cliff under load, this setting is the first thing to check.
+  SYNTHETIC_IMAGE_PROVIDER_PRIMARY: z.enum(["sixtynine", "ai33"]).default("sixtynine"),
+  SYNTHETIC_TTS_PROVIDER_PRIMARY: z.enum(["sixtynine", "ai33"]).default("sixtynine"),
+
   AI33_BASE_URL: z.string().url().default("https://api.ai33.pro"),
   // Client direction 2026-08-16: gpt-image-2 on BOTH providers, matching the
   // reference channel's look. Model ids come from GET /v1i/models.
@@ -654,9 +674,13 @@ const ServerEnvSchema = z.object({
   // max_prompt_length). Longer prompts are truncated with a warning rather than
   // 400-ing the generation.
   AI33_MAX_PROMPT_CHARS: z.coerce.number().int().positive().default(10_000),
-  // A 2K/high gpt-image-2 still measured ~85-90s; 300s leaves headroom for a
-  // queued task without stranding a lane on a dead one.
-  AI33_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(300),
+  // 600s. A gpt-image-2 still returns in ~90-115s when ai33 is unloaded, but
+  // under real concurrency the tail stretches: at 16 in flight the slowest took
+  // 363s and one exceeded a 300s budget (measured 2026-08-16). A 300s ceiling
+  // therefore ABANDONED healthy-but-slow generations and failed them over to
+  // 69labs — observed in production as "ai33 image: poll timed out". 600s covers
+  // the loaded tail while still bounding a genuinely dead task.
+  AI33_IMAGE_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
   // Matches SIXTYNINE_LABS_TTS_POLL_TIMEOUT_SECONDS — a 30k-char narration is a
   // long render on any provider.
   AI33_TTS_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(1800),
@@ -672,10 +696,27 @@ const ServerEnvSchema = z.object({
   // Cluster-wide concurrent ai33 generations (Redis-coordinated, same mechanism
   // as the 69labs account cap). ai33 rate-limits per USER — every key on the
   // account shares one quota — so this is a single global ceiling.
-  AI33_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  //
+  // 8, MEASURED (2026-08-16), not guessed. Firing N gpt-image-2 generations at
+  // once and timing each:
+  //     8  -> 8/8 completed, slowest 110s (same as ONE image alone: 113s)
+  //     16 -> 15/16 completed, slowest 363s, one exceeded the 300s poll budget
+  // So 8 is free parallelism and 16 is past their capacity. The first value
+  // shipped was 4, which was a placeholder — with IMAGE_GEN_CONCURRENCY=5 plus
+  // the image_to_video and avatar lanes all drawing on the same pool, demand sat
+  // well above 4, so images queued past AI33_SLOT_WAIT_MS and failed OVER to a
+  // degraded 69labs instead of simply waiting. Raising this is what keeps work
+  // on the healthy provider.
+  AI33_CONCURRENCY: z.coerce.number().int().positive().default(8),
   // How long a generation may WAIT for a free ai33 slot before giving up (and,
   // for images, falling over to 69labs).
-  AI33_SLOT_WAIT_MS: z.coerce.number().int().positive().default(120_000),
+  //
+  // 5 min, up from 2. A queue is NOT a provider failure: falling over because
+  // our own cap is full sends the image to the slower, 429-storming provider for
+  // no reason. Waiting is nearly always the better trade while ai33 is the
+  // healthy one. Observed in production 2026-08-16 as a flood of
+  // "slot acquire timed out for account ai33" failovers.
+  AI33_SLOT_WAIT_MS: z.coerce.number().int().positive().default(300_000),
   // Flux image fallback when nano-banana fails (Black Forest Labs or a proxy).
   FLUX_API_KEY: z.string().optional(),
   FLUX_BASE_URL: z.string().url().default("https://api.bfl.ai/v1"),
@@ -1140,6 +1181,46 @@ const ServerEnvSchema = z.object({
   // CLIP_RUN ai_clips then IMAGE_RUN images. IMAGE_RUN 0 = all-clip intro.
   SYNTHETIC_INTRO_CLIP_RUN: z.coerce.number().int().positive().default(2),
   SYNTHETIC_INTRO_IMAGE_RUN: z.coerce.number().int().nonnegative().default(2),
+
+  // ---------------------------------------------------------------------
+  // CLIP BUDGET BY DURATION (client direction 2026-08-17): "in a video, 25%
+  // has to be LTX and 5% has to be VEO3" — i.e. 30% of the video is moving
+  // footage and the remaining 70% is image / avatar / split_2.
+  //
+  // These are shares of TOTAL VIDEO DURATION (seconds of screen time), NOT of
+  // block count. That distinction is the whole point: the older
+  // SYNTHETIC_*_CLIP_FRACTION knobs above balance by COUNT and by POSITION, and
+  // a count share does not produce a duration share when blocks differ in
+  // length. The duration pass (assignClipDurationQuota) runs AFTER those and is
+  // authoritative for the final mix.
+  //
+  // COST NOTE: LTX-2 bills per second (~$0.04/s), so this fraction sets the
+  // per-video LTX bill directly — 25% of a 60-minute video is ~15 min of LTX
+  // (~$36). The pre-existing SYNTHETIC_CLIP_HEAVY_SECONDS window exists for
+  // exactly that reason ("no more LTX after 15 minutes"). Set
+  // SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF to keep the budget inside that window
+  // instead of spreading it across a long video.
+  SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.25),
+  // Veo's share, on top of the LTX share above (25% + 5% = 30% total clips).
+  // Veo bills per GENERATION (1 credit), not per second, so this fraction
+  // controls clip COUNT rather than spend. Set to 0 to disable the veo lane
+  // without touching SYNTHETIC_VEO_ENABLED.
+  SYNTHETIC_VEO_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.05),
+  // When true, the clip budget is drawn only from blocks starting before
+  // SYNTHETIC_CLIP_HEAVY_SECONDS (preserving the "no LTX after 15 min" cost
+  // guard); the percentages are then met within that window rather than across
+  // the whole video. False (default) applies the client's percentages to the
+  // WHOLE video as literally stated.
+  SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF: z.coerce.boolean().default(false),
+  // Master switch for the veo clip lane. Off = every clip renders on LTX and
+  // the veo quota is ignored (useful to fall back instantly if Veo output is
+  // judged unusable, which the client has flagged as a risk).
+  SYNTHETIC_VEO_ENABLED: z.coerce.boolean().default(true),
+  // 69labs video lane (lib/synthetic/sixtynine-video.ts). Model ids come from
+  // GET /api/v1/videos/models — "veo-video" is Veo 3.1 Lite (1 credit),
+  // "veo-3.1-fast" is Veo Fast BETA (2 credits).
+  SIXTYNINE_LABS_VIDEO_MODEL: z.string().default("veo-video"),
+  SIXTYNINE_LABS_VIDEO_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(900),
   // split_2 cap (client feedback 2026-06: "too many split_2 parts, I don't want
   // many split_2 part video"). split_2 (a talking presenter beside an
   // illustrative still) is chosen freely by Gemini and routinely overruns — one

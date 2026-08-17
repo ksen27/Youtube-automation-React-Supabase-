@@ -142,7 +142,10 @@ export async function withAccountSlot<T>(
     waitMs = Math.min(waitMs * 1.5, 4000);
   }
   if (!acquired) {
-    throw new Error(`69labs slot acquire timed out for account ${accountId} (all slots busy)`);
+    // Provider-neutral wording: this helper now gates ai33 as well as 69labs,
+    // and the old hardcoded "69labs" made an ai33 queue read as a 69labs fault
+    // in the logs ("69labs slot acquire timed out for account ai33").
+    throw new Error(`provider slot acquire timed out for account ${accountId} (all slots busy)`);
   }
 
   // --- heartbeat the lease while the work runs ---

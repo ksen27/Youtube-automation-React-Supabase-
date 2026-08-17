@@ -19,6 +19,8 @@ export type SyntheticProvider =
   | "flux_image"
   | "fal_flux_image"
   | "ltx2"
+  // 69labs Veo 3.1 Lite — the secondary clip engine (~5% of a video).
+  | "sixtynine_veo"
   | "fal_veo3_fast"
   | "fal_kling"
   | "heygen_avatar"
@@ -52,6 +54,12 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   // If LTX_RESOLUTION is ever moved to 4K, raise this ~4x (LTX's published ratio
   // is 10s: $0.60 at 1080p -> $2.40 at 4K).
   ltx2:            { unit: "per_second",   usd: 0.04 },
+  // 69labs Veo 3.1 Lite bills 1 CREDIT PER GENERATION regardless of length, not
+  // per second — so it is priced per_clip here. The daily/monthly credit
+  // allowance (300/day, 24k/month as of 2026-08-17) is the real constraint; the
+  // USD figure is a nominal per-credit rate for the coarse project summary, and
+  // should be retuned when the client confirms what a credit pack costs.
+  sixtynine_veo:   { unit: "per_clip",     usd: 0.04 },
   fal_veo3_fast:   { unit: "per_second",   usd: 0.10 },
   fal_kling:       { unit: "per_second",   usd: 0.06 },
   heygen_avatar:   { unit: "per_second",   usd: 0.02 },
@@ -68,6 +76,7 @@ export interface CostInput {
   chars?: number;     // TTS
   images?: number;    // image gen
   seconds?: number;   // video / avatar (output duration)
+  clips?: number;     // per-generation video billing (69labs veo credits)
 }
 
 /** Coarse USD estimate for a single provider call. Never throws. */
@@ -81,6 +90,9 @@ export function estimateCost(input: CostInput): number {
       return (input.images ?? 1) * price.usd;
     case "per_second":
       return (input.seconds ?? 0) * price.usd;
+    case "per_clip":
+      // Billed per generation, so LENGTH is irrelevant — one clip, one charge.
+      return (input.clips ?? 1) * price.usd;
     default:
       return 0;
   }
@@ -107,12 +119,15 @@ export function estimateSegmentCost(seg: {
       // One generated still.
       return estimateCost({ provider: "sixtynine_image", images: 1 });
     case "ai_clip":
-      // A nano-banana still + an LTX-2 clip (the clip bills at its tier, but the
-      // segment only stores the played duration; tier-snap is close enough for a
-      // coarse summary).
+      // A nano-banana still + the animated clip. WHICH clip engine ran is read
+      // off the stored provider: the veo lane bills per generation (a flat
+      // credit) while LTX bills per second, so charging a veo clip at LTX's
+      // per-second rate would overstate a long block by several times.
       return (
         estimateCost({ provider: "sixtynine_image", images: 1 }) +
-        estimateCost({ provider: "ltx2", seconds: secs })
+        (seg.provider === "sixtynine_veo"
+          ? estimateCost({ provider: "sixtynine_veo", clips: 1 })
+          : estimateCost({ provider: "ltx2", seconds: secs }))
       );
     case "avatar":
       // A HeyGen talking-head render, billed per second of avatar video.

@@ -37,7 +37,9 @@ export interface GenerateClipInput {
 export interface GenerateClipResult {
   video: Buffer;
   contentType: string;
-  provider: "ltx2" | "fal_veo3_fast" | "fal_kling";
+  // "sixtynine_veo" is the 69labs Veo 3.1 Lite lane (lib/synthetic/sixtynine-
+  // video.ts) — the secondary clip engine alongside LTX-2.
+  provider: "ltx2" | "fal_veo3_fast" | "fal_kling" | "sixtynine_veo";
   seconds: number;             // billing dimension
 }
 

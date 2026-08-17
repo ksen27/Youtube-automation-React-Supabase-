@@ -78,6 +78,18 @@ kill_timeout = "300s"
   AI33_IMAGE_MODEL = "gpt-image-2"
   AI33_IMAGE_RESOLUTION = "1K"
   AI33_IMAGE_QUALITY = "high"
+  # Cluster-wide concurrent ai33 generations. 8 is MEASURED (2026-08-16): 8 at
+  # once all finished in 110s, the same as one alone; 16 degraded badly (slowest
+  # 363s, one timed out). The initial 4 was a placeholder and was too low —
+  # IMAGE_GEN_CONCURRENCY=5 plus the video/avatar lanes pushed demand past it, so
+  # images queued out and failed OVER to a degraded 69labs.
+  AI33_CONCURRENCY = "8"
+  # Wait for a free ai33 slot rather than dumping the image on the slower
+  # provider: a full queue is our own cap, not an ai33 failure.
+  AI33_SLOT_WAIT_MS = "300000"
+  # Covers the loaded tail (363s measured at high concurrency); 300s was
+  # abandoning healthy generations mid-render.
+  AI33_IMAGE_POLL_TIMEOUT_SECONDS = "600"
   # Headless Chromium for HeyGen automation.
   HEYGEN_HEADLESS = "true"
   # How long the warm HeyGen session is trusted before the worker re-verifies it
@@ -160,9 +172,35 @@ kill_timeout = "300s"
   # 15 min): fraction 0 = every visual is a still. split_2/avatar blocks are
   # untouched by this pass. These now match the lib/env.ts defaults; kept
   # explicit here so a defaults change can't silently alter the client's mix.
+  #
+  # SUPERSEDED for the FINAL mix (2026-08-17): these three balance by BLOCK
+  # COUNT and POSITION. The clip budget below balances by DURATION and runs
+  # AFTER them, so it decides what actually ships. They still shape WHERE clips
+  # fall before the duration pass trims/fills, so they are kept rather than
+  # removed — but do not tune these expecting the clip percentage to move.
   SYNTHETIC_CLIP_HEAVY_SECONDS = "900"
   SYNTHETIC_INTRO_CLIP_FRACTION = "0.3"
   SYNTHETIC_POST_INTRO_CLIP_FRACTION = "0"
+  # CLIP BUDGET BY DURATION (client 2026-08-17 via Joey: "25% of the video has
+  # to be LTX and 5% has to be veo3", the other ~70% image/avatar/split_2).
+  # Shares of TOTAL VIDEO DURATION, not block count. These match the lib/env.ts
+  # defaults; kept explicit so a defaults change can't silently alter the mix.
+  SYNTHETIC_CLIP_DURATION_FRACTION = "0.25"
+  SYNTHETIC_VEO_DURATION_FRACTION = "0.05"
+  SYNTHETIC_VEO_ENABLED = "true"
+  # LTX bills ~$0.04/sec, so 25% of a LONG video is a real bill (~$36 for 60
+  # min). Set this to "true" to confine the clip budget inside the 15-minute
+  # SYNTHETIC_CLIP_HEAVY_SECONDS window instead of spreading it across the whole
+  # video — restoring the July "no more LTX after 15 minutes" cost guard.
+  SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF = "false"
+  # 69labs video lane (Veo 3.1 Lite, 1 credit/clip). Model ids: GET
+  # /api/v1/videos/models.
+  SIXTYNINE_LABS_VIDEO_MODEL = "veo-video"
+  # PROVIDER ORDER (client 2026-08-17): 69labs primary, ai33 fallback — a
+  # reversal of the 2026-08-16 direction. Split per lane so the voiceover can be
+  # moved independently of images. Flipping back is an env change, not a deploy.
+  SYNTHETIC_IMAGE_PROVIDER_PRIMARY = "sixtynine"
+  SYNTHETIC_TTS_PROVIDER_PRIMARY = "sixtynine"
   # Local scratch for downloads/screenshots (ephemeral is fine for HeyGen
   # automation artifacts).
   TMP_DIR = "/tmp/work"

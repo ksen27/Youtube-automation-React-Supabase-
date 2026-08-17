@@ -7,7 +7,7 @@ import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadFile, ensureTmp, safeUnlink, publicUrlForKey } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
 import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
-import { generateVoice } from "@/lib/synthetic/sixtynine-labs";
+import { generateVoice, plannedTtsProvider } from "@/lib/synthetic/sixtynine-labs";
 import { recordWebsiteScroll } from "@/lib/synthetic/website-recorder";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { SYNTHETIC_WIDTH, SYNTHETIC_HEIGHT, SYNTHETIC_FPS } from "@/lib/synthetic/constants";
@@ -94,7 +94,7 @@ export async function processPitchGenJob(
     // --- 1) TTS the pitch script (69labs), stage as a local mp3 for HeyGen ---
     const t0 = Date.now();
     const pitchVoiceId = row.tts_voice_id ?? undefined;
-    await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: "sixtynine_tts", phase: "request", extra: { chars: script.length, kind: "pitch", voiceId: pitchVoiceId ?? "default" } });
+    await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: plannedTtsProvider(), phase: "request", extra: { chars: script.length, kind: "pitch", voiceId: pitchVoiceId ?? "default" } });
     const voice = await generateVoice({ text: script, voiceId: pitchVoiceId });
     await logProviderCall({ projectId: pitchVideoId, jobId: pitchVideoId, provider: voice.provider, phase: "response", durationMs: Date.now() - t0, cost: { provider: voice.provider, chars: voice.chars } });
 

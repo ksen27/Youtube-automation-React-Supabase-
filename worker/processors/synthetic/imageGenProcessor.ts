@@ -2,7 +2,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageGenerationJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
-import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { generateImage, plannedImageProvider } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
@@ -106,7 +106,7 @@ export async function processImageGenJob(
 
   try {
     const t0 = Date.now();
-    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
+    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: plannedImageProvider(), phase: "request" });
     const out = await generateImage(prompt, resume);
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId,

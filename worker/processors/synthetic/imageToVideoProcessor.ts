@@ -2,12 +2,13 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageToVideoJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
-import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { generateImage, plannedImageProvider } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure, ltxModel, ltxPoolSize } from "@/lib/synthetic/ltx";
+import { generateVeoClip, isVeoConfigured, isVeoPermanentFailure, veoModel } from "@/lib/synthetic/sixtynine-video";
 import { logProviderCall } from "@/lib/synthetic/cost";
-import { r2Keys } from "@/lib/synthetic/constants";
+import { r2Keys, DEFAULT_ACTION_ANIMATION_PROMPT } from "@/lib/synthetic/constants";
 import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
@@ -44,21 +45,25 @@ export async function processImageToVideoJob(
   // spoken narration) — that produced literal, off-topic frames. When the
   // per-block prompt is missing, use the video's recurring world (base_prompt,
   // stashed by the planner) so the still is on-topic.
-  const basePrompt = ((seg.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+  const meta = seg.metadata as { base_prompt?: string; clip_engine?: string | null } | null;
+  const basePrompt = (meta?.base_prompt ?? "").trim();
+  // Which clip engine the PLAN chose for this block (assignClipDurationQuota).
+  // Falls back to LTX when absent — segments planned before the veo lane existed
+  // carry no clip_engine, and LTX is the workhorse.
+  const wantVeo = meta?.clip_engine === "veo" && isVeoConfigured();
   const imagePrompt = (seg.image_prompt?.trim() || basePrompt).trim();
-  // Default to the client's preferred look. Client feedback (2026-06-28): the
-  // earlier pan-across-scene with "shake / motion blur" cues read as a SUDDEN
-  // movement that BLURRED the footage — they want motion so subtle it is barely
-  // perceptible, like the reference channels. So: an extremely slow, very slight
-  // push-in over an otherwise frozen scene, no panning, and NO blur/shake cues
-  // (those were literally producing the blur they objected to). Keep the low-fi
-  // grain so the clip still matches the source still's texture.
-  const animationPrompt = (
-    seg.animation_prompt ??
-    "Extremely slow, very slight camera push-in over an otherwise completely still, frozen scene. " +
-      "The movement is minimal and barely perceptible — no panning, no sudden motion, no shake, no motion blur. " +
-      "Steady and locked-off. Slightly low quality and grainy like real phone footage, not smooth or cinematic."
-  ).trim();
+  // The per-block action the planner wrote, else the generic action fallback.
+  // Both describe a PERSON PERFORMING AN ACTION with the camera locked off —
+  // see ACTION_CLIP_RULE for why that specific combination satisfies both the
+  // 2026-08-17 "human movement, not random zoom" ask and the 2026-06-28
+  // no-blur rule it appears to contradict.
+  //
+  // A block planned BEFORE this change may still carry an old frozen-scene
+  // animation_prompt. Those are left alone rather than rewritten: the stored
+  // prompt is editable on the review screen, and silently overriding a prompt
+  // an operator can see would make the screen lie about what will render. A
+  // re-plan (or a per-segment prompt regenerate) refreshes them.
+  const animationPrompt = (seg.animation_prompt ?? DEFAULT_ACTION_ANIMATION_PROMPT).trim();
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
   // ASSET LIBRARY (migration 0030): a matching PRIOR clip skips BOTH paid
@@ -97,7 +102,7 @@ export async function processImageToVideoJob(
   let imageUrl = seg.image_url as string | null;
   if (!imageUrl) {
     const t0 = Date.now();
-    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
+    await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: plannedImageProvider(), phase: "request" });
     // imagePrompt already resolves to the per-block scene, else the video's
     // recurring world (base_prompt). It is intentionally NOT the spoken script.
     if (!imagePrompt) throw new Error(`image_to_video: segment ${segmentId} has no usable image prompt`);
@@ -137,22 +142,36 @@ export async function processImageToVideoJob(
     // The actual provider isn't known until the fallback chain resolves
     // (reported on the response line via clip.provider); the request line logs
     // the configured primary so the two lines line up when LTX succeeds.
-    const primaryProvider = isLtxConfigured() ? "ltx2" : "fal_veo3_fast";
+    const primaryProvider = wantVeo ? "sixtynine_veo" : isLtxConfigured() ? "ltx2" : "fal_veo3_fast";
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: primaryProvider, phase: "request",
-      // Log the actual LTX model + pool size so the request line proves which
-      // model ran (the "ltx2" provider label alone can't distinguish
-      // ltx-2-fast from ltx-2-3-fast) and how many accounts are balancing.
-      extra: isLtxConfigured()
-        ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize() }
-        : { durationSeconds: duration } });
-    // Heartbeat the segment's updated_at across the ~60-95s LTX-2 render so the
-    // stall sweeper can't false-fail a segment that is alive and rendering.
+      // Log the actual model so the request line proves which engine ran (the
+      // "ltx2" provider label alone can't distinguish ltx-2-fast from
+      // ltx-2-3-fast) and how many accounts are balancing.
+      extra: wantVeo
+        ? { durationSeconds: duration, model: veoModel(), clipEngine: "veo" }
+        : isLtxConfigured()
+          ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize(), clipEngine: "ltx" }
+          : { durationSeconds: duration } });
+    // Heartbeat the segment's updated_at across the ~60-95s render so the stall
+    // sweeper can't false-fail a segment that is alive and rendering.
+    //
+    // The engine is NOT a fallback chain: a block planned as veo renders on veo
+    // or fails. Quietly re-rendering it on LTX would silently dissolve the 5%
+    // veo share the plan exists to enforce, and the shortfall would be
+    // invisible — the failure has to be visible and retryable instead.
     const clip = await withSegmentHeartbeat(segmentId, () =>
-      generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration }),
+      wantVeo
+        ? generateVeoClip({ imageUrl, prompt: animationPrompt, durationSeconds: duration })
+        : generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration }),
     );
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId, provider: clip.provider, phase: "response",
-      durationMs: Date.now() - t0, cost: { provider: clip.provider, seconds: clip.seconds },
+      durationMs: Date.now() - t0,
+      // veo bills per GENERATION (a flat credit), LTX per second — charging veo
+      // by seconds would overstate a long block several times over.
+      cost: clip.provider === "sixtynine_veo"
+        ? { provider: clip.provider, clips: 1 }
+        : { provider: clip.provider, seconds: clip.seconds },
     });
 
     const up = await uploadBuffer(clip.video, r2Keys.segmentVideo(projectId, segmentId, Date.now()), "video/mp4");
@@ -176,7 +195,7 @@ export async function processImageToVideoJob(
     // A billing/quota failure (LTX out of funds) can NEVER succeed on retry, and
     // each retry re-generates the nano-banana still (~4¢) for nothing. Fail it
     // immediately instead of burning the whole retry budget + image cost.
-    const permanent = isLtxPermanentFailure(err);
+    const permanent = wantVeo ? isVeoPermanentFailure(err) : isLtxPermanentFailure(err);
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.failed", {
       err: (err as Error).message?.slice(0, 200),
       isFinalAttempt,

@@ -83,6 +83,50 @@ export function withStylePrompt(basePrompt: string): string {
   return `${base}. ${STYLE_PROMPT} ${textRule}`;
 }
 
+// ---------------------------------------------------------------------------
+// ACTION CLIPS (client direction 2026-08-17, Loom + chat).
+// ---------------------------------------------------------------------------
+// The client's ask: a clip must show a PERSON PERFORMING THE ACTION the
+// voiceover is describing (stirring, pouring milk into a bowl) — "human
+// movement, actions in the clips, not just random zoom".
+//
+// This REVERSES the 2026-06-28 direction, which forbade motion outright, and
+// the reversal is only safe because the two complaints are about DIFFERENT
+// THINGS MOVING:
+//   - June 2026: the CAMERA moved (pans, push-ins with shake/blur cues) and the
+//     footage read as blurry and jumpy. That is still rejected.
+//   - August 2026: the SUBJECT doesn't move, so every clip is a zoom on a
+//     photo. That is what we are fixing now.
+// So the rule is: LOCK THE CAMERA OFF COMPLETELY, and let ONLY THE PERSON move.
+// A static frame of someone pouring milk satisfies both — it is unmistakably an
+// action, with zero camera motion to blur. Confirmed 2026-08-17 against test
+// renders on both clip engines (LTX-2 and 69labs Veo 3.1 Lite).
+//
+// Keep the low-fi cues: an action clip still has to match the surrounding
+// footage's amateur-phone texture, or the moving shots stand out as the
+// polished ones.
+export const ACTION_CLIP_RULE =
+  "Show the PERSON PERFORMING THE ACTION — a single, clearly readable everyday " +
+  "human action carried through the whole shot (hands doing the thing the " +
+  "narration describes: pouring, stirring, lifting, wiping, planting). " +
+  "The CAMERA IS COMPLETELY STILL AND LOCKED OFF on a tripod — absolutely NO " +
+  "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
+  "tracking, no orbit, no camera shake. ONLY THE PERSON AND THE OBJECTS THEY " +
+  "TOUCH MOVE; the framing never changes. " +
+  "Natural real-time speed — NOT slow motion, NOT sped up, no dramatic or " +
+  "cinematic movement, no motion blur on the camera. " +
+  "Handheld phone video look, slightly low quality and grainy like a real home " +
+  "vlog clip — not smooth, not cinematic, no colour grading, no on-screen text.";
+
+// The animation prompt used when a block has no per-block one of its own (the
+// planner failed to write one, or the block was promoted to ai_clip by a later
+// balance/quota pass). Generic on purpose: it must read as an action on ANY
+// scene, since we don't know what the still shows here.
+export const DEFAULT_ACTION_ANIMATION_PROMPT =
+  "The person in the frame continues the everyday action they are already doing, " +
+  "carrying it through naturally from start to finish. " +
+  ACTION_CLIP_RULE;
+
 // Output canvas for the synthetic engine (matches the sourced render).
 export const SYNTHETIC_WIDTH = 1280;
 export const SYNTHETIC_HEIGHT = 720;

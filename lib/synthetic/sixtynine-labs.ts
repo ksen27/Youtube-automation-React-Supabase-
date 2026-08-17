@@ -177,6 +177,30 @@ export function isSixtyNineConfigured(): boolean {
   return Boolean(getEnv().SIXTYNINE_LABS_API_KEY);
 }
 
+/**
+ * The provider chain, ordered so `primary` leads and the other configured
+ * provider follows as fallback. Unconfigured providers are dropped, so a
+ * single-provider deployment yields a 1-element chain (no failover) exactly as
+ * before this was configurable.
+ *
+ * Both the image and TTS lanes read this; they differ only in WHICH env setting
+ * they pass (SYNTHETIC_IMAGE_PROVIDER_PRIMARY / SYNTHETIC_TTS_PROVIDER_PRIMARY),
+ * so the two lanes can be pointed at different vendors — the voiceover lane is
+ * the riskier one to move, and this keeps that a separate decision.
+ */
+export function providerOrder(
+  primary: "sixtynine" | "ai33",
+): Array<"ai33" | "sixtynine"> {
+  const available: Array<"ai33" | "sixtynine"> = [];
+  if (isSixtyNineConfigured()) available.push("sixtynine");
+  if (isAi33Configured()) available.push("ai33");
+  // Primary first, everything else after in its natural order.
+  return [
+    ...available.filter((p) => p === primary),
+    ...available.filter((p) => p !== primary),
+  ];
+}
+
 export interface GenerateVoiceInput {
   text: string;
   voiceId?: string;     // 69labs voiceId; falls back to SIXTYNINE_LABS_DEFAULT_VOICE
@@ -462,8 +486,9 @@ async function generate69labsVoice(
 }
 
 /**
- * Generate a voiceover MP3 — ai33.pro PRIMARY, 69labs BACKUP (client direction
- * 2026-08-16).
+ * Generate a voiceover MP3. Which vendor leads is SYNTHETIC_TTS_PROVIDER_PRIMARY
+ * ("sixtynine" by default per client direction 2026-08-17); the other follows as
+ * fallback.
  *
  * The stored voice id needs no migration: project rows hold BARE ElevenLabs ids
  * (what 69labs takes), and ai33 serves the same ElevenLabs catalogue under
@@ -482,9 +507,7 @@ export async function generateVoice(
   const resumeIsAi33 = isAi33Pointer(resume?.jobId);
   const resumeIsSixtyNine = Boolean(resume?.jobId) && !resumeIsAi33;
 
-  const providers: Array<"ai33" | "sixtynine"> = [];
-  if (isAi33Configured()) providers.push("ai33");
-  if (isSixtyNineConfigured()) providers.push("sixtynine");
+  const providers = providerOrder(getEnv().SYNTHETIC_TTS_PROVIDER_PRIMARY);
   // An in-flight 69labs render is already paid for and may be nearly done — go
   // back to it before starting a fresh one anywhere else.
   if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
@@ -1020,6 +1043,31 @@ export interface GenerateImageOptions {
   apiKey?: string;
 }
 
+/**
+ * Which provider generateImage / generateVoice will TRY FIRST, for the
+ * `request`-phase log line callers emit before the call.
+ *
+ * These exist because that line used to hardcode "sixtynine_*", which after the
+ * 2026-08-16 provider switch read as "69labs served this" on every single job —
+ * including the ones ai33 actually served. A log that names the wrong vendor is
+ * worse than one that names none, because it gets believed.
+ *
+ * This is the INTENDED provider, not the settled one: a failover can still move
+ * the work. The `response` line reports what actually ran, and the two differing
+ * is exactly how a failover becomes visible.
+ */
+export function plannedImageProvider(pinnedKey?: string): "ai33_image" | "sixtynine_image" {
+  // A pinned key means the caller demanded 69labs (CelebForge) — see generateImage.
+  if (pinnedKey?.trim()) return "sixtynine_image";
+  const first = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY)[0];
+  return first === "ai33" ? "ai33_image" : "sixtynine_image";
+}
+
+export function plannedTtsProvider(): "ai33_tts" | "sixtynine_tts" {
+  const first = providerOrder(getEnv().SYNTHETIC_TTS_PROVIDER_PRIMARY)[0];
+  return first === "ai33" ? "ai33_tts" : "sixtynine_tts";
+}
+
 // Sentinel keyIdx persisted alongside an ai33 resume pointer. The pointer's
 // "ai33:" prefix is what actually identifies the provider (see isAi33Pointer);
 // this value only has to stay OUT of the 69labs key-pool index range so the
@@ -1080,14 +1128,15 @@ export async function generateImage(
   };
 
   // ---------------------------------------------------------------------
-  // PROVIDER ORDER (client direction 2026-08-16): ai33.pro PRIMARY, 69labs
-  // BACKUP. Both run gpt-image-2, so a failover changes the vendor and nothing
-  // the viewer can see — which is the condition that makes a fallback chain
-  // safe here at all (the 2026-08-15 removal of the Gemini/fal.ai chain was
-  // about a fallback that silently swapped in a DIFFERENT-LOOKING model; see
-  // GenerateImageResult.provider).
+  // PROVIDER ORDER is a SETTING: SYNTHETIC_IMAGE_PROVIDER_PRIMARY, which is
+  // "sixtynine" by default (client direction 2026-08-17 — a reversal of the
+  // 2026-08-16 ai33-primary direction). Both run gpt-image-2, so a failover
+  // changes the vendor and nothing the viewer can see — which is the condition
+  // that makes a fallback chain safe here at all (the 2026-08-15 removal of the
+  // Gemini/fal.ai chain was about a fallback that silently swapped in a
+  // DIFFERENT-LOOKING model; see GenerateImageResult.provider).
   //
-  // Two cases deliberately do NOT lead with ai33:
+  // Two cases deliberately override the configured order:
   //   - A PINNED 69labs key (CelebForge). Pinning exists because that key is
   //     provisioned differently from the pool; sending its stills elsewhere
   //     would ignore the caller's whole reason for pinning.
@@ -1099,9 +1148,11 @@ export async function generateImage(
   const resumeIsAi33 = isAi33Pointer(resume?.jobId);
   const resumeIsSixtyNine = Boolean(resume?.jobId) && !resumeIsAi33;
 
-  const providers: Array<"ai33" | "sixtynine"> = [];
-  if (isAi33Configured() && !pinnedSixtyNine) providers.push("ai33");
-  if (isSixtyNineConfigured()) providers.push("sixtynine");
+  // A PINNED 69labs key (CelebForge) means the caller demanded that vendor, so
+  // ai33 is dropped from the chain entirely rather than merely demoted.
+  const providers = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY).filter(
+    (p) => !(pinnedSixtyNine && p === "ai33"),
+  );
   // A 69labs resume pointer jumps 69labs to the front (see above).
   if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
   if (providers.length === 0) {

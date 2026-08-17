@@ -6,7 +6,7 @@ import type { AvatarJobData } from "@/lib/jobs/queue";
 import { fetchOrThrow, withHttpRetry } from "@/lib/synthetic/http";
 import { uploadBuffer, uploadFile, downloadToFile, headObject, ensureTmp, safeUnlink, publicUrlForKey } from "@/lib/storage";
 import { generateAvatar } from "@/lib/synthetic/heygen";
-import { generateImage } from "@/lib/synthetic/sixtynine-labs";
+import { generateImage, plannedImageProvider } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
@@ -133,7 +133,7 @@ async function generateSplitRightImage(
     await finishSegment(segmentId, { right_image_url: reuse.assetUrl }, { via: reuse.via, similarity: reuse.similarity, assetId: reuse.id });
     return;
   }
-  await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: "sixtynine_image", phase: "request" });
+  await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: plannedImageProvider(), phase: "request" });
   const img = await generateImage(prompt);
   await logProviderCall({
     projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
