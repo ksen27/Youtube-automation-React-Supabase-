@@ -112,6 +112,11 @@ export interface Project {
   aspect_ratio: AspectRatio;
   voiceover_source: VoiceoverSource | null;
   tts_voice_id: string | null;
+  // --- narration language (migration 0038) ---
+  // lib/i18n/locale.ts LanguageCode. Typed as string because the DB has no
+  // CHECK constraint: getLocale() falls back to English on anything it doesn't
+  // recognise, so a new language never needs a migration or a type change.
+  language: string;
   // --- sales-pitch video insertion (migration 0025; synthetic-only) ---
   pitch_video_url: string | null;
   pitch_video_duration_seconds: number | null;

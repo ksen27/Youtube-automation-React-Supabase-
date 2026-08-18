@@ -94,9 +94,13 @@ export function buildTimedSentences(input: {
   transcript: string;
   words: WordTiming[] | null;
   voiceoverDuration: number;
+  // Narration language (projects.language). Only the SPLIT depends on it —
+  // German abbreviations and ordinal dates end in '.' without ending a
+  // sentence, and each false break would become its own visual block.
+  language?: string | null;
 }): TimedSentenceResult {
-  const { transcript, words, voiceoverDuration } = input;
-  const raw = splitTranscriptIntoSentences(transcript);
+  const { transcript, words, voiceoverDuration, language } = input;
+  const raw = splitTranscriptIntoSentences(transcript, undefined, language);
   if (raw.length === 0) {
     return { sentences: [], anchored: 0, interpolated: 0, anchoredFraction: 0 };
   }

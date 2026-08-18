@@ -13,6 +13,7 @@ import {
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { detectLoudnessDropout } from "@/lib/media/ffmpeg";
+import { getLocale, type LocaleConfig } from "@/lib/i18n/locale";
 import { getEnv } from "@/lib/env";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -103,6 +104,23 @@ async function generateVoiceQC(
   return { voice: best!.voice, attempts: total, clean: false, note: "qc_exhausted_best_effort" };
 }
 
+// Pick the voice to narrate with.
+//
+// The TTS providers have NO language parameter — both ai33 and 69labs are
+// voice-id driven, so "generate this in German" means "generate this with a
+// German voice". The project's own tts_voice_id always wins (the user picked
+// it at intake); otherwise a non-English project falls back to its language's
+// configured default rather than the English one. Returning undefined lets the
+// provider apply its own default, which is correct for English.
+function resolveVoiceId(projectVoiceId: string | null, locale: LocaleConfig): string | undefined {
+  if (projectVoiceId?.trim()) return projectVoiceId.trim();
+  if (locale.code === "de") {
+    const german = getEnv().TTS_DEFAULT_VOICE_DE.trim();
+    if (german) return german;
+  }
+  return undefined;
+}
+
 // STEP 2 + 3 of the synthetic pipeline (voiceover resolution + alignment).
 //
 //  voiceover_source = 'tts'      -> generate master_voiceover.mp3 via 69labs
@@ -166,10 +184,14 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
 
   const { data: project, error } = await sb
     .from("projects")
-    .select("id, transcript, voiceover_url, voiceover_source, tts_voice_id")
+    .select("id, transcript, voiceover_url, voiceover_source, tts_voice_id, language")
     .eq("id", projectId)
     .single();
   if (error || !project) throw new Error(`tts: project ${projectId} not found`);
+
+  // Narration language. Drives BOTH halves of this processor: which voice
+  // speaks the script, and which language Deepgram aligns it as.
+  const locale = getLocale(project.language as string | null);
 
   let voiceoverUrl = project.voiceover_url as string | null;
 
@@ -178,10 +200,20 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
     const transcript = (project.transcript ?? "").trim();
     if (!transcript) throw new Error("tts: transcript required for tts voiceover_source");
 
+    const voiceId = resolveVoiceId(project.tts_voice_id as string | null, locale);
+    // Surface the voice/language pairing BEFORE spending the generation. A
+    // German project narrated by the English default voice is the failure this
+    // line makes greppable.
+    await logJob({ projectId, jobId: mediaJobId }, "synthetic.tts.voice_resolved", {
+      language: locale.code,
+      voiceId: voiceId ?? "(provider default)",
+      fromProject: Boolean(project.tts_voice_id),
+    });
+
     let voice: GenerateVoiceResult, attempts: number, clean: boolean, note: string;
     try {
       ({ voice, attempts, clean, note } = await generateVoiceQC({
-        projectId, mediaJobId, text: transcript, voiceId: project.tts_voice_id ?? undefined, resume,
+        projectId, mediaJobId, text: transcript, voiceId, resume,
       }));
     } catch (err) {
       // 409 DUPLICATE_TTS_IN_PROGRESS with no resume pointer to fall back on:
@@ -220,7 +252,9 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
 
   // --- alignment (STEP 3) — reuse the existing Deepgram URL transcription ---
   await setProjectStatus(projectId, "aligning");
-  const result = await transcribeAudioFromUrl(voiceoverUrl!);
+  // Name the language explicitly — auto-detect silently mis-times a non-English
+  // voiceover instead of failing (see buildListenUrl in lib/ai/deepgram.ts).
+  const result = await transcribeAudioFromUrl(voiceoverUrl!, locale.deepgramLanguage);
   const durationSeconds =
     result.durationSeconds && result.durationSeconds > 0 ? Math.round(result.durationSeconds) : null;
 
@@ -240,6 +274,7 @@ export async function processTtsJob(data: TtsJobData, _attempt?: JobAttemptInfo)
     durationSeconds,
     words: result.words?.length ?? 0,
     source: project.voiceover_source,
+    language: locale.code,
   });
   await setMediaJob(mediaJobId, { status: "completed", progress: 100 });
 

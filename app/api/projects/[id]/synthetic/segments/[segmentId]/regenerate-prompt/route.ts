@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { checkProjectEngine } from "@/lib/jobs/db";
 import { regenerateSegmentPrompt } from "@/lib/synthetic/planner";
+import { toLanguageCode } from "@/lib/i18n/locale";
 import type { SyntheticBlockType } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -59,6 +60,10 @@ export async function POST(
     basePrompt = ((siblings?.[0]?.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
   }
 
+  // Narration language. Without it a regenerated block silently reverts to the
+  // English/American default world while its neighbours stay German.
+  const { data: proj } = await sb.from("projects").select("language").eq("id", id).single();
+
   let result;
   try {
     result = await regenerateSegmentPrompt({
@@ -66,6 +71,7 @@ export async function POST(
       script: (seg.script as string) ?? "",
       basePrompt,
       blockType,
+      language: toLanguageCode(proj?.language as string | null),
     });
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message }, { status: 502 });

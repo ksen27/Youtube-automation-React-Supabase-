@@ -1,0 +1,12 @@
+LTX-2 image-to-video smoke test
+  imageUrl : https://media.celebforge.org/samples/action-clip/1786958603040-still.jpg
+  requested: 8s -> snapped: 8s
+  prompt   : The woman pours the milk steadily from the bottle into the bowl of oats; the milk streams down and soaks into the oats, and she tilts the bottle back upright as she finishes. The CAMERA stays completely still and locked-off on a kitchen counter - no push-in, no pan, no zoom, no camera movement at all. Only the PERSON moves. Handheld phone video, slightly low quality and grainy like a real home vlog, not smooth or cinematic.
+  submitting (this polls until completed; may take a minute)...
+  ✓ success
+    provider   : ltx2
+    billed secs: 8
+    contentType: video/mp4
+    bytes      : 3,812,761
+    elapsed    : 42.2s
+    saved      : ltx-test-output.mp4

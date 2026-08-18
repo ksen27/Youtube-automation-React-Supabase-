@@ -5,6 +5,7 @@ import { admitProjectIfSlotFree } from "./_shared";
 import type { SyntheticPlannerJobData } from "@/lib/jobs/queue";
 import type { WordTiming } from "@/lib/ai/deepgram";
 import { buildSyntheticTimeline } from "@/lib/synthetic/planner";
+import { toLanguageCode } from "@/lib/i18n/locale";
 import type { AvatarMarkRange } from "@/lib/synthetic/doc-marks";
 import type { JobAttemptInfo } from "@/worker/index";
 
@@ -32,7 +33,7 @@ export async function processSyntheticPlannerJob(
 
   const { data: project, error } = await sb
     .from("projects")
-    .select("title, transcript, transcript_words, voiceover_duration_seconds, avatar_mark_ranges")
+    .select("title, transcript, transcript_words, voiceover_duration_seconds, avatar_mark_ranges, language")
     .eq("id", projectId)
     .single();
   if (error || !project) throw new Error(`planner: project ${projectId} not found`);
@@ -52,6 +53,9 @@ export async function processSyntheticPlannerJob(
     words,
     voiceoverDuration,
     avatarRanges,
+    // Narration language: sets the visual region (a German script gets a
+    // European world) and keeps the machine-facing prompts in English.
+    language: toLanguageCode(project.language as string | null),
   });
 
   await setMediaJob(mediaJobId, {

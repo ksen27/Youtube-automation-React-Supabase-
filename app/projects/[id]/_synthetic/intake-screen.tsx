@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { uploadVoiceoverDirect } from "@/lib/client/upload-voiceover";
 import { uploadPitchVideoDirect } from "@/lib/client/upload-pitch-video";
+import { ALL_LOCALES, toLanguageCode, type LanguageCode } from "@/lib/i18n/locale";
 import type { SyntheticResp } from "./types";
 
 
@@ -30,6 +31,10 @@ export function SyntheticIntakeScreen({
   const p = resp.project;
   const [docUrl, setDocUrl] = useState(p.script_doc_url ?? "");
   const [voiceId, setVoiceId] = useState(p.tts_voice_id ?? "");
+  // Narration language of the Google Doc script. Set here rather than inferred
+  // from the text: detection would have to be right every time, and getting it
+  // wrong mis-times the whole video (see lib/ai/deepgram.ts buildListenUrl).
+  const [language, setLanguage] = useState<LanguageCode>(toLanguageCode(p.language));
   const [error, setError] = useState<string | null>(null);
   const [voPct, setVoPct] = useState<number | null>(null);
   const [pitchPct, setPitchPct] = useState<number | null>(null);
@@ -113,7 +118,7 @@ export function SyntheticIntakeScreen({
       const r = await fetch(`/api/projects/${projectId}/generate-synthetic`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ttsVoiceId: voiceId || undefined }),
+        body: JSON.stringify({ ttsVoiceId: voiceId || undefined, language }),
       });
       if (!r.ok) throw new Error((await r.json()).error ?? `build plan failed (${r.status})`);
     },
@@ -168,6 +173,31 @@ export function SyntheticIntakeScreen({
             </div>
           )}
 
+          {/* Applies whether the voiceover is generated or uploaded: it also
+              selects the alignment language and the region the generated
+              images/clips are set in. */}
+          <div className="space-y-1.5">
+            <Label htmlFor="language">Script language</Label>
+            <select
+              id="language"
+              value={language}
+              onChange={(e) => setLanguage(e.target.value as LanguageCode)}
+              className="rounded-md border border-border bg-surface px-2 h-9 text-sm text-fg"
+            >
+              {ALL_LOCALES.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.label}
+                  {l.nativeLabel !== l.label ? ` (${l.nativeLabel})` : ""}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-fg-subtle">
+              The language your Google Doc script is written in. Sets the narration voice,
+              the transcript alignment, and the region the generated visuals are set in — a
+              German script renders European streets, homes and cars.
+            </p>
+          </div>
+
           <div className="flex items-center gap-3">
             <input
               ref={voInput}
@@ -195,7 +225,9 @@ export function SyntheticIntakeScreen({
                 placeholder="e.g. Gr7mLjPA3HhuWxZidxPW"
               />
               <p className="text-[11px] text-fg-subtle">
-                Paste the 69labs voice ID to narrate the script. Leave blank to use the default voice.
+                Paste the 69labs voice ID to narrate the script. Leave blank to use the
+                default voice for the selected language.
+                {language !== "en" && " Make sure the voice is a native speaker of that language."}
               </p>
             </div>
           )}

@@ -4,6 +4,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { createMediaJob, setProjectStatus } from "@/lib/jobs/db";
 import { enqueueTts } from "@/lib/jobs/queue";
 import { isSixtyNineConfigured } from "@/lib/synthetic/sixtynine-labs";
+import { LANGUAGES } from "@/lib/i18n/locale";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,6 +17,10 @@ export const dynamic = "force-dynamic";
 const Body = z.object({
   voiceoverSource: z.enum(["tts", "uploaded"]).optional(),
   ttsVoiceId: z.string().min(1).max(120).optional(),
+  // Narration language of the script (lib/i18n/locale.ts). Persisted before the
+  // pipeline starts because all three consumers — TTS voice, Deepgram
+  // alignment, and the planner's visual region — read it off the project row.
+  language: z.enum(LANGUAGES).optional(),
 });
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -66,10 +71,17 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "generation already in progress" }, { status: 409 });
   }
 
-  // Persist the resolved source + voice so the TTS processor reads them.
+  // Persist the resolved source + voice + language so the TTS processor and the
+  // planner read them. Language is omitted-means-unchanged (not
+  // omitted-means-English) so a re-run that doesn't resend it can't silently
+  // demote a German project back to English mid-pipeline.
   await sb
     .from("projects")
-    .update({ voiceover_source: source, tts_voice_id: body.data.ttsVoiceId ?? project.tts_voice_id ?? null })
+    .update({
+      voiceover_source: source,
+      tts_voice_id: body.data.ttsVoiceId ?? project.tts_voice_id ?? null,
+      language: body.data.language ?? project.language ?? "en",
+    })
     .eq("id", id);
 
   const mediaJobId = await createMediaJob({ projectId: id, type: "tts", metadata: { voiceoverSource: source } });

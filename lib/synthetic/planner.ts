@@ -13,6 +13,14 @@ import {
 } from "@/lib/synthetic/sentence-windows";
 import type { SyntheticBlockType } from "@/lib/types";
 import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
+import {
+  DEFAULT_LANGUAGE,
+  getLocale,
+  onImageTextRule,
+  promptLanguageRule,
+  visualCultureRule,
+  type LanguageCode,
+} from "@/lib/i18n/locale";
 
 // Synthetic timeline planner. Gemini reads the transcript and segments it into
 // ordered visual blocks, choosing a block_type per the spec rules:
@@ -220,10 +228,24 @@ export interface VideoTopic {
   // visuals aren't ONLY literal close-ups of the narrated object (client
   // feedback 2026-07: an engine video should also show cars driving as B-roll).
   environmentExamples: string;
+  // Narration language (projects.language). Carried on the topic rather than
+  // passed as a second argument because `topic` is ALREADY threaded through
+  // every prompt builder and chunk planner — so the language reaches all of
+  // them with no signature churn, and it cannot be forgotten on one path.
+  //
+  // It belongs here conceptually too: the language decides WHERE the video's
+  // world is (a German script gets European streets, homes, and cars), which is
+  // exactly what the rest of VideoTopic describes.
+  language: LanguageCode;
 }
 
-const EMPTY_TOPIC: VideoTopic = { niche: "", setting: "", subjectExamples: "", environmentExamples: "" };
+const EMPTY_TOPIC: VideoTopic = {
+  niche: "", setting: "", subjectExamples: "", environmentExamples: "",
+  language: DEFAULT_LANGUAGE,
+};
 
+// Topic emptiness is about the NICHE only — `language` always has a value and
+// must not make an otherwise-empty topic look derived.
 function hasTopic(t: VideoTopic): boolean {
   return Boolean(t.niche.trim() || t.setting.trim() || t.subjectExamples.trim() || t.environmentExamples.trim());
 }
@@ -406,6 +428,11 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
     "when the line is specifically about gardening or being outdoors.",
     "",
   );
+  // REGIONAL LOOK. Placed AFTER the niche so it constrains the derived world
+  // rather than replacing it: a German car video is still a car video, filmed
+  // in Europe. Empty for English, so English videos are byte-identical to
+  // before this block existed.
+  topicBlock.push(...visualCultureRule(getLocale(topic.language)));
   return topicBlock;
 }
 
@@ -428,6 +455,7 @@ type PlannerPayload =
 
 function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): string {
   const topicBlock = buildTopicBlock(topic);
+  const locale = getLocale(topic.language);
 
   const segmentationIntro =
     payload.mode === "text"
@@ -492,7 +520,24 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
           payload.numbered,
         ];
 
+  // Foreign-language narration: prompts go to English-trained image/video
+  // models, so they must come back in English. `script` is the ONE exception —
+  // in text mode it is a verbatim slice of the transcript that the caller then
+  // searches for in the word stream, so translating it would break alignment
+  // outright. Empty for English.
+  const languageRule = promptLanguageRule(locale);
+  const scriptExemption =
+    languageRule.length > 0 && payload.mode === "text"
+      ? [
+          "EXCEPTION: each block's `script` is a VERBATIM slice of the transcript and",
+          `MUST stay in ${locale.promptName}, copied exactly. Only the prompt fields are English.`,
+          "",
+        ]
+      : [];
+
   return [
+    ...languageRule,
+    ...scriptExemption,
     ...topicBlock,
     ...segmentationIntro,
     "",
@@ -580,6 +625,11 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "",
     productBrandRule(topic),
     "",
+    // Product/brand blocks are the one place text IS allowed on screen. On a
+    // German video that packaging must not read as English, or the single
+    // exception to the no-text rule becomes the thing that gives the
+    // localisation away. Empty for English.
+    ...onImageTextRule(locale),
     amateurLookRule(topic),
     "",
     "CONTINUITY (critical): when consecutive blocks describe one continuous",
@@ -646,10 +696,20 @@ function buildSingleSegmentPrompt(
   // subject / moment / detail) instead of a near-clone — the whole point of
   // having multiple visuals on a sentence is variety, not the same frame N times.
   avoidScenes: string[] = [],
+  // Narration language. The `script` below is in it; the prompt we ask for is
+  // not (see promptLanguageRule).
+  language: LanguageCode = DEFAULT_LANGUAGE,
 ): string {
   const wantsAnimation = blockType === "ai_clip";
   const hasAvoid = avoidScenes.filter((s) => s.trim()).length > 0;
+  const locale = getLocale(language);
   return [
+    ...promptLanguageRule(locale),
+    // The regional look. Unlike the full planner this path has no derived
+    // topic — the world comes from the stored basePrompt printed at the end —
+    // but the REGION still has to be restated, or a regenerated block quietly
+    // reverts to an American-looking scene beside its German neighbours.
+    ...visualCultureRule(locale),
     "You are a video director writing the visual for ONE block of an",
     "AI-generated narrated video. Below is the block's spoken narration",
     "(`script`) and the video's shared visual world (`basePrompt`).",
@@ -693,6 +753,7 @@ function buildSingleSegmentPrompt(
     "",
     productBrandRule(EMPTY_TOPIC),
     "",
+    ...onImageTextRule(locale),
     amateurLookRule(EMPTY_TOPIC),
     "",
     wantsAnimation
@@ -734,8 +795,11 @@ export async function regenerateSegmentPrompt(input: {
   // Optional scenes that OTHER visuals of this same sentence already show, so the
   // regenerated prompt is a genuinely different picture (see buildSingleSegmentPrompt).
   avoidScenes?: string[];
+  // Narration language (projects.language). Omitted = English, so callers that
+  // predate multi-language support are unaffected.
+  language?: LanguageCode;
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType, avoidScenes } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -751,7 +815,7 @@ export async function regenerateSegmentPrompt(input: {
     "regenerateSegmentPrompt",
     async (model) => {
       const res = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? []) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? [], language ?? DEFAULT_LANGUAGE) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.4,
@@ -2178,11 +2242,22 @@ async function deriveVideoTopic(input: {
   jobId?: string;
   title: string;
   transcript: string;
+  language: LanguageCode;
 }): Promise<VideoTopic> {
-  const { projectId, jobId, title, transcript } = input;
+  const { projectId, jobId, title, transcript, language } = input;
+  const locale = getLocale(language);
+  // Every early return and failure path must PRESERVE the language — the topic
+  // may be underivable, but the video is still German, and buildTopicBlock
+  // reads the region off this object.
+  const emptyTopic: VideoTopic = { ...EMPTY_TOPIC, language };
   const sample = transcript.trim().slice(0, 1500);
-  if (!title.trim() && !sample) return EMPTY_TOPIC;
+  if (!title.trim() && !sample) return emptyTopic;
   const prompt = [
+    // The title and sample below are in the narration language; the four fields
+    // we get back feed image prompts, so they must come back in English — and
+    // describe a place in the audience's own region.
+    ...promptLanguageRule(locale),
+    ...visualCultureRule(locale),
     "You are setting up the visual world for a short narrated video. From the",
     "TITLE and the transcript SAMPLE below, infer the video's subject/niche so a",
     "downstream image generator keeps every shot on-theme.",
@@ -2256,12 +2331,13 @@ async function deriveVideoTopic(input: {
       { attempts: 3, baseMs: 800 },
     );
     const parsed = VideoTopicSchema.safeParse(JSON.parse(res.response.text()));
-    if (!parsed.success) return EMPTY_TOPIC;
+    if (!parsed.success) return emptyTopic;
     const topic: VideoTopic = {
       niche: parsed.data.niche.trim(),
       setting: parsed.data.setting.trim(),
       subjectExamples: parsed.data.subjectExamples.trim(),
       environmentExamples: parsed.data.environmentExamples.trim(),
+      language,
     };
     await logJob({ projectId, jobId }, "synthetic.plan.topic_derived", {
       niche: topic.niche,
@@ -2273,7 +2349,7 @@ async function deriveVideoTopic(input: {
     await logJob({ projectId, jobId }, "synthetic.plan.topic_failed", {
       err: (e as Error).message?.slice(0, 200),
     });
-    return EMPTY_TOPIC;
+    return emptyTopic;
   }
 }
 
@@ -2505,18 +2581,27 @@ export async function buildSyntheticTimeline(input: {
   // Any planned segment overlapping one of these is FORCED to block_type
   // 'avatar', overriding Gemini's choice. Empty when no doc marks (pasted text).
   avatarRanges?: AvatarMarkRange[];
+  // Narration language (projects.language). Decides three things: that the
+  // sentence splitter applies this language's false-break rules, that Gemini
+  // answers in English while reading a foreign script, and that the generated
+  // world is set in the audience's own region. Defaults to English.
+  language?: LanguageCode;
 }): Promise<PlannedSegment[]> {
   const { projectId, jobId, projectTitle, transcript, words, voiceoverDuration } = input;
+  const language = input.language ?? DEFAULT_LANGUAGE;
   let avatarRanges = input.avatarRanges ?? [];
   if (!transcript.trim()) throw new Error("buildSyntheticTimeline: empty transcript");
 
   // Derive the video's niche ONCE so every chunk's basePrompt + imagePrompts
   // stay on-theme (the off-topic-visuals fix). Cheap, fault-tolerant call.
+  // Carries `language` out on the topic, which is how the region and the
+  // answer-in-English rule reach every downstream prompt builder.
   const topic = await deriveVideoTopic({
     projectId,
     jobId,
     title: projectTitle ?? "",
     transcript,
+    language,
   });
 
   // A long transcript makes Gemini emit a segments array that overflows its
@@ -2542,7 +2627,7 @@ export async function buildSyntheticTimeline(input: {
     // Time the transcript's own sentences, THEN ask Gemini only to group them.
     // Nothing downstream searches the audio for Gemini's text, so the desync
     // that stranded a whole plan behind its voiceover cannot occur.
-    const timed = buildTimedSentences({ transcript, words, voiceoverDuration });
+    const timed = buildTimedSentences({ transcript, words, voiceoverDuration, language });
     if (timed.sentences.length === 0) {
       throw new Error("buildSyntheticTimeline: transcript produced no sentences");
     }
@@ -2912,6 +2997,7 @@ export async function buildSyntheticTimeline(input: {
               script: p.script,
               basePrompt,
               blockType: p.blockType,
+              language,
             });
             // Composed WITH the base in front (like the merge pass), so clear
             // shotType — persist's composePrompt sees the base already present
@@ -3046,6 +3132,7 @@ export async function buildSyntheticTimeline(input: {
                     script: p.script,
                     basePrompt,
                     blockType: p.blockType,
+                    language,
                   });
                   // regenerateSegmentPrompt returns a prompt already composed WITH
                   // the base in front and the shot folded in, so clear shotType and
@@ -3266,6 +3353,7 @@ export async function buildSyntheticTimeline(input: {
                 script: slot.script,
                 basePrompt,
                 blockType: slot.blockType,
+                language,
                 avoidScenes: avoid,
               });
               // regenerateSegmentPrompt returns a prompt already composed WITH the

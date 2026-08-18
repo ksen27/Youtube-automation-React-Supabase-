@@ -14,6 +14,9 @@ export interface SyntheticProject {
   heygen_avatar_name: string | null;
   voiceover_source: "tts" | "uploaded" | null;
   tts_voice_id: string | null;
+  // Narration language (lib/i18n/locale.ts). Picked at intake; drives the TTS
+  // voice, Deepgram's alignment language, and the region the visuals are set in.
+  language: string | null;
   transcript: string | null;
   script_doc_url: string | null;
   avatar_mark_ranges: Array<{ start: number; end: number; model?: "avatar_iv" | "avatar_iii" }> | null;

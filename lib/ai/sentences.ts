@@ -25,6 +25,8 @@
 //                                the marker matcher when it needs to
 //                                correlate a script_phrase across passes.
 
+import { getLocale, type LocaleConfig } from "@/lib/i18n/locale";
+
 export interface Sentence {
   text: string;
   paragraph_index: number;
@@ -39,9 +41,77 @@ export interface Sentence {
 // that don't end with .!? (e.g. a paragraph cut off mid-thought).
 const SENTENCE_REGEX = /[^.!?]+[.!?]+(\s|$)|[^.!?]+$/g;
 
+// PROTECTING NON-TERMINAL PERIODS
+// -------------------------------
+// SENTENCE_REGEX breaks on EVERY '.', which is right for English but wrong for
+// languages that use periods inside a sentence. German hits this constantly,
+// and each false break becomes a phantom sentence — which the synthetic planner
+// turns into a phantom VISUAL BLOCK, so a fragment like "am 1." gets its own
+// generated image and its own sub-second slice of the voiceover.
+//
+// We MASK those periods before splitting rather than re-joining fragments
+// afterwards. Post-merging cannot work for abbreviations that contain internal
+// periods: "z.B." is already shredded into "z." + "B." by the time any merge
+// pass runs, so there is no intact token left to recognise.
+//
+// The mask is a single private-use character, so masking is LENGTH-PRESERVING.
+// That matters: char_offset is computed by indexing into the transcript, and
+// every offset stays valid as long as the masked and original strings line up
+// character for character. Sentences are unmasked at the very end.
+const PERIOD_MASK = "";
+
+// Escape a literal for use inside a RegExp.
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Build the mask patterns for a locale. Null when the locale has no rules
+// (English), which short-circuits masking entirely.
+function buildMaskPatterns(locale: LocaleConfig): RegExp[] | null {
+  const patterns: RegExp[] = [];
+
+  // Abbreviations: "z.B.", "d.h.", "Dr." — matched whole, case-sensitively, and
+  // only when followed by whitespace or end-of-input so "Dr." inside a longer
+  // token is left alone. The list holds only tokens that are effectively never
+  // sentence-final (it deliberately omits "usw." / "etc.", which routinely DO
+  // end a sentence), so masking them is unconditional.
+  if (locale.abbreviations.length > 0) {
+    const alt = locale.abbreviations.map(escapeRegExp).join("|");
+    patterns.push(new RegExp(`(?<![\\p{L}\\d])(?:${alt})(?=\\s|$)`, "gu"));
+  }
+
+  // Ordinals: "am 1. Januar", "vom 3. bis". A bare digits-then-period is
+  // genuinely ambiguous — "Es waren 15." is a real sentence end — so we mask
+  // only when what FOLLOWS continues the phrase: a month name, or a lowercase
+  // word (German capitalises nouns, so lowercase means mid-sentence).
+  if (locale.ordinalMonths.length > 0) {
+    const months = locale.ordinalMonths.map(escapeRegExp).join("|");
+    patterns.push(new RegExp(`\\d{1,2}\\.(?=\\s+(?:${months})\\b)`, "gu"));
+    patterns.push(new RegExp(`\\d{1,2}\\.(?=\\s+\\p{Ll})`, "gu"));
+  }
+
+  return patterns.length > 0 ? patterns : null;
+}
+
+// Replace sentence-internal periods with PERIOD_MASK. Length-preserving.
+function maskPeriods(text: string, patterns: RegExp[]): string {
+  let out = text;
+  for (const re of patterns) {
+    out = out.replace(re, (match) => match.replace(/\./g, PERIOD_MASK));
+  }
+  return out;
+}
+
+function unmaskPeriods(text: string): string {
+  return text.split(PERIOD_MASK).join(".");
+}
+
 // Split a single paragraph of text into its sentences. Trims each match
 // and drops the trailing-space the regex captures via its lookbehind-ish
 // `(\s|$)` group. Empty paragraphs produce an empty array.
+//
+// Operates on ALREADY-MASKED text (see maskPeriods), so a masked period is
+// invisible to SENTENCE_REGEX and simply cannot end a sentence.
 function splitParagraphIntoSentences(paragraph: string): string[] {
   const matches = paragraph.match(SENTENCE_REGEX);
   if (!matches) return [];
@@ -76,11 +146,25 @@ function splitParagraphIntoSentences(paragraph: string): string[] {
 export function splitTranscriptIntoSentences(
   transcript: string,
   titleCardParagraphIndices: ReadonlySet<number> = new Set(),
+  // Narration language (projects.language). Controls the false-break rules
+  // above; defaults to English, which contributes none — so every existing
+  // caller keeps its exact current behaviour.
+  language?: string | null,
 ): Sentence[] {
   if (!transcript || !transcript.trim()) return [];
 
+  const locale: LocaleConfig = getLocale(language);
+
+  // Hide sentence-internal periods before ANY splitting or offset arithmetic
+  // happens. Masking is length-preserving, so `masked` and `transcript` are
+  // positionally identical and every char_offset computed below indexes the
+  // original transcript correctly. English yields no patterns, so `masked` is
+  // the transcript itself and this whole feature is a no-op there.
+  const maskPatterns = buildMaskPatterns(locale);
+  const masked = maskPatterns ? maskPeriods(transcript, maskPatterns) : transcript;
+
   const sentences: Sentence[] = [];
-  const paragraphs = transcript.split(/\n+/);
+  const paragraphs = masked.split(/\n+/);
 
   // Walking offset in the original transcript. We track this so each
   // sentence carries its char_offset for downstream code that wants to
@@ -101,22 +185,27 @@ export function splitTranscriptIntoSentences(
     const isSectionParagraph = titleCardParagraphIndices.has(paragraphIndex);
     const sentenceTexts = splitParagraphIntoSentences(para);
 
-    // Track where each sentence's first character lives in the original
-    // transcript. We scan forward from the paragraph's start offset so
-    // a sentence that contains whitespace at its head doesn't end up with
-    // a char_offset pointing into the previous sentence.
-    let cursor = transcript.indexOf(para, offset);
+    // Track where each sentence's first character lives in the transcript. We
+    // scan forward from the paragraph's start offset so a sentence that
+    // contains whitespace at its head doesn't end up with a char_offset
+    // pointing into the previous sentence.
+    //
+    // These searches run against `masked` because `para` / `text` are masked —
+    // but masking is length-preserving, so the offsets they yield are equally
+    // valid in the ORIGINAL transcript, which is what callers slice.
+    let cursor = masked.indexOf(para, offset);
     if (cursor < 0) cursor = offset;
 
     for (let i = 0; i < sentenceTexts.length; i++) {
       const text = sentenceTexts[i];
-      // Find this sentence's exact start in the original transcript.
-      // indexOf from `cursor` keeps narration order even when a sentence
-      // happens to appear verbatim earlier in the doc.
-      const found = transcript.indexOf(text, cursor);
+      // Find this sentence's exact start. indexOf from `cursor` keeps narration
+      // order even when a sentence happens to appear verbatim earlier in the doc.
+      const found = masked.indexOf(text, cursor);
       const sentenceOffset = found >= 0 ? found : cursor;
       sentences.push({
-        text,
+        // Restore the real periods — the mask is an internal splitting device
+        // and must never reach a caller, a prompt, or the review screen.
+        text: unmaskPeriods(text),
         paragraph_index: paragraphIndex,
         sentence_index_in_paragraph: i,
         // Only the FIRST sentence of a blue-bold paragraph carries the

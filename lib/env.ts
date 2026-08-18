@@ -693,6 +693,17 @@ const ServerEnvSchema = z.object({
   // Voice used when a project has none. Empty = fall back to
   // SIXTYNINE_LABS_DEFAULT_VOICE (normalised with the prefix above).
   AI33_DEFAULT_VOICE: z.string().default(""),
+  // Per-language default voice, used when a non-English project does not name
+  // its own tts_voice_id. Without this a German project would silently fall
+  // back to the English default voice and render German text in an
+  // English-accented voice — the one failure mode of this feature that is
+  // obvious to the client but invisible in the logs.
+  //
+  // Same id format as AI33_DEFAULT_VOICE / tts_voice_id (a bare ElevenLabs id
+  // is prefixed with AI33_TTS_VOICE_PROVIDER before submit), so one value
+  // serves both the ai33 primary and the 69labs backup. Empty = no German
+  // default; a German project must then set its voice at intake.
+  TTS_DEFAULT_VOICE_DE: z.string().default(""),
   // Cluster-wide concurrent ai33 generations (Redis-coordinated, same mechanism
   // as the 69labs account cap). ai33 rate-limits per USER — every key on the
   // account shares one quota — so this is a single global ceiling.

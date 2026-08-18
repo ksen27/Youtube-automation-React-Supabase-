@@ -51,14 +51,32 @@ export interface TranscribeResult {
   words: WordTiming[] | null;
 }
 
-function buildListenUrl(): string {
+// Build the /v1/listen query.
+//
+// LANGUAGE HANDLING (multi-language support). When the caller knows the
+// narration language we NAME it (`language=de`) and turn detection OFF.
+// This is not a micro-optimisation — it is a correctness requirement:
+//
+//   * `detect_language` on nova-3 is English-oriented, and a wrong guess does
+//     not fail. It returns a full, plausible-looking word list with wrong
+//     timings, which the planner then trusts to place every visual block. The
+//     failure surfaces as a finished video whose pictures drift out of sync
+//     with the voiceover — expensive to produce and hard to diagnose.
+//   * A German voiceover transcribed as English also produces phonetic
+//     nonsense text, which for voiceover_source='uploaded' becomes the
+//     project's transcript.
+//
+// With no language given we keep the previous auto-detect behaviour so every
+// existing caller is unchanged.
+function buildListenUrl(language?: string): string {
   const env = getEnv();
   const params = new URLSearchParams({
     model: env.DEEPGRAM_MODEL,
     smart_format: "true",     // adds punctuation, capitalization, paragraphing
     punctuate: "true",
-    detect_language: "true",  // auto-detect; pass language=xx to force
   });
+  if (language) params.set("language", language);
+  else params.set("detect_language", "true");
   return `https://api.deepgram.com/v1/listen?${params}`;
 }
 
@@ -82,11 +100,17 @@ function parseListenResponse(json: DeepgramListenResponse): TranscribeResult {
   return { transcript, durationSeconds: dur, words };
 }
 
-export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<TranscribeResult> {
+export async function transcribeAudio(
+  buf: Buffer,
+  mimeType: string,
+  // Deepgram language code (lib/i18n/locale.ts -> deepgramLanguage). Omit to
+  // auto-detect, which is only safe when the language is genuinely unknown.
+  language?: string,
+): Promise<TranscribeResult> {
   const env = getEnv();
   if (!env.DEEPGRAM_API_KEY) throw new Error("DEEPGRAM_API_KEY not configured");
 
-  const res = await fetch(buildListenUrl(), {
+  const res = await fetch(buildListenUrl(language), {
     method: "POST",
     headers: {
       Authorization: `Token ${env.DEEPGRAM_API_KEY}`,
@@ -108,11 +132,17 @@ export async function transcribeAudio(buf: Buffer, mimeType: string): Promise<Tr
 // that would blow past Vercel's memory/timeout limits if we re-downloaded
 // from R2 just to forward to Deepgram. The URL must be publicly fetchable
 // (no auth headers can be passed through).
-export async function transcribeAudioFromUrl(audioUrl: string): Promise<TranscribeResult> {
+export async function transcribeAudioFromUrl(
+  audioUrl: string,
+  // Deepgram language code (lib/i18n/locale.ts -> deepgramLanguage). The
+  // synthetic pipeline always passes this from projects.language; see
+  // buildListenUrl for why auto-detect is unsafe once non-English scripts exist.
+  language?: string,
+): Promise<TranscribeResult> {
   const env = getEnv();
   if (!env.DEEPGRAM_API_KEY) throw new Error("DEEPGRAM_API_KEY not configured");
 
-  const res = await fetch(buildListenUrl(), {
+  const res = await fetch(buildListenUrl(language), {
     method: "POST",
     headers: {
       Authorization: `Token ${env.DEEPGRAM_API_KEY}`,
