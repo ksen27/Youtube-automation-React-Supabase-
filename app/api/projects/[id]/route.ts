@@ -140,9 +140,44 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   if (!UuidSchema.safeParse(id).success) return NextResponse.json({ error: "invalid id" }, { status: 400 });
 
   const sb = getServerSupabase();
-  // Child tables (project_entities, youtube_search_results, video_clips,
-  // timeline_items, render_jobs, media_jobs) all cascade on project_id.
-  // video_sources is set null by FK because rows are deduped across projects.
+
+  // Delete the children EXPLICITLY, in dependency order, instead of leaning on
+  // ON DELETE CASCADE from the parent row alone.
+  //
+  // Why: one `delete from projects` runs every child cleanup inside a SINGLE
+  // statement, and each referential-integrity trigger fires once per child row
+  // keyed on the REFERENCING column (timeline_items.synthetic_segment_id,
+  // timeline_items.clip_id, timeline_items.source_job_id). For a synthetic
+  // project that is thousands of tiny queries inside one statement, and the
+  // whole thing dies on PostgREST's 8s statement_timeout — "canceling statement
+  // due to statement timeout". Migration 0039 indexes those columns, which is
+  // the actual fix; deleting bottom-up here additionally makes each statement a
+  // single indexed project_id range delete with almost no cascade work left,
+  // and gives each one its own timeout budget instead of sharing one.
+  //
+  // Order matters: rows that POINT AT other rows of this project go first.
+  const childTables = [
+    "timeline_items",        // -> video_clips, synthetic_segments, media_jobs
+    "synthetic_segments",
+    "video_clips",           // -> video_sources.id, projects.intro_clip_id
+    "media_jobs",
+    "render_jobs",
+    "project_script_markers",
+    "face_references",
+    "youtube_search_results",
+    "project_entities",
+  ];
+  for (const table of childTables) {
+    const { error } = await sb.from(table).delete().eq("project_id", id);
+    // Schema drift between environments (table absent) must not block the
+    // delete — the parent cascade still covers whatever we could not reach.
+    if (error && error.code !== "42P01") {
+      return NextResponse.json({ error: `${table}: ${error.message}` }, { status: 500 });
+    }
+  }
+
+  // video_sources is ON DELETE SET NULL (rows are deduped across projects), so
+  // it is deliberately left to the FK.
   const { error } = await sb.from("projects").delete().eq("id", id);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   return NextResponse.json({ ok: true });
