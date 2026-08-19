@@ -181,13 +181,57 @@ kill_timeout = "300s"
   SYNTHETIC_CLIP_HEAVY_SECONDS = "900"
   SYNTHETIC_INTRO_CLIP_FRACTION = "0.3"
   SYNTHETIC_POST_INTRO_CLIP_FRACTION = "0"
-  # CLIP BUDGET BY DURATION (client 2026-08-17 via Joey: "25% of the video has
-  # to be LTX and 5% has to be veo3", the other ~70% image/avatar/split_2).
-  # Shares of TOTAL VIDEO DURATION, not block count. These match the lib/env.ts
-  # defaults; kept explicit so a defaults change can't silently alter the mix.
-  SYNTHETIC_CLIP_DURATION_FRACTION = "0.25"
-  SYNTHETIC_VEO_DURATION_FRACTION = "0.05"
+  # CLIP BUDGET BY DURATION, IN TWO PHASES (client 2026-08-18 via Joey: "The
+  # first 4 minutes of the ai avatar video i want 80% clips and 20% images.
+  # After the first 4 mins, change to 70% images and 20% ltx clips and 10% VEO").
+  # Supersedes the flat 2026-08-17 25%/5% direction, which is now just phase 2
+  # with the numbers moved to 20/10.
+  #
+  # These match the lib/env.ts defaults; kept explicit so a defaults change can't
+  # silently alter the mix. (That is not hypothetical — this block still held the
+  # 2026-08-17 values when the two-phase code landed, and would have overridden
+  # the new defaults and shipped phase 2 at 25/5.)
+  #
+  # Shares are of the ASSIGNABLE VISUAL time (image + ai_clip) in each phase, not
+  # of total screen time — see SYNTHETIC_CLIP_FRACTION_BASIS in lib/env.ts for
+  # why. Set the basis to "total" for the pre-2026-08-18 reading.
+  SYNTHETIC_CLIP_PHASE1_SECONDS = "240"
+  SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION = "0.80"
+  SYNTHETIC_CLIP_PHASE1_VEO_FRACTION = "0"
+  SYNTHETIC_CLIP_DURATION_FRACTION = "0.20"
+  SYNTHETIC_VEO_DURATION_FRACTION = "0.10"
+  SYNTHETIC_CLIP_FRACTION_BASIS = "visual"
   SYNTHETIC_VEO_ENABLED = "true"
+  # COST: LTX bills ~$0.04/s, so the 80% opening window is ~3.2 min of LTX
+  # (~$7.70) on EVERY video, on top of phase 2. Shorten PHASE1_SECONDS or drop
+  # PHASE1_CLIP_FRACTION to pull that back without a code change.
+
+  # SPLIT_2 PLACEMENT (client 2026-08-18: "i want more split screens in the 12
+  # min of the video. Put 80% of the splitscreens in the first 12 min and the 20%
+  # to the rest"). Redistribution only — the 5-8% band still decides HOW MANY.
+  #
+  # FRONT_MIN_GAP is the spacing rule inside the front window and is what makes
+  # the 80% reachable at all: at the whole-video MIN_GAP of 5 blocks, 12 minutes
+  # physically cannot hold that share. 3 still means 3 other blocks between two
+  # split_2 (~20-25s), so the client's actual objection — CONSECUTIVE split_2 —
+  # still holds. Where spacing and share conflict, spacing wins and the share
+  # falls short; check `frontPercent` in synthetic.plan.split2_front_rebalance.
+  SYNTHETIC_SPLIT2_FRONT_SECONDS = "720"
+  SYNTHETIC_SPLIT2_FRONT_SHARE = "0.80"
+  SYNTHETIC_SPLIT2_FRONT_MIN_GAP = "3"
+
+  # IMAGE REPETITION (client 2026-08-19: "the images are quite repetitive […] can
+  # you hardcode it in that its not too repetitive and it matches the script
+  # better"). Two independent causes, two knobs:
+  #   - cross-video: the library reuse ceiling, 0.5 -> 0.15. At 0.5 half a video
+  #     could be assets recycled from earlier projects.
+  #   - within-video: the scene-dedupe pass, which regenerates prompts that
+  #     repeat an earlier scene in the SAME script (the "spoons" complaint).
+  ASSET_LIBRARY_MAX_REUSE_FRACTION = "0.15"
+  SYNTHETIC_SCENE_DEDUPE_ENABLED = "true"
+  SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.5"
+  SYNTHETIC_SCENE_DEDUPE_WINDOW = "40"
+  SYNTHETIC_SCENE_DEDUPE_MAX_REGEN = "80"
   # LTX bills ~$0.04/sec, so 25% of a LONG video is a real bill (~$36 for 60
   # min). Set this to "true" to confine the clip budget inside the 15-minute
   # SYNTHETIC_CLIP_HEAVY_SECONDS window instead of spreading it across the whole

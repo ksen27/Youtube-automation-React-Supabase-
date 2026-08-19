@@ -2,6 +2,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { headObject, publicUrlForKey } from "@/lib/storage";
+import { logJob } from "@/lib/jobs/db";
+import { ensurePitchTimelineItem } from "@/lib/synthetic/pitch-timeline";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -75,6 +77,30 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     .single();
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
+  // Place the pitch on the timeline NOW if the project already has one.
+  //
+  // ensurePitchTimelineItem otherwise only ever runs from maybeFinalizeSynthetic,
+  // which fires on asset-job completion during generation and never again (no
+  // reconcile sweep calls it). That is fine for the intended order — upload at
+  // intake, then build — but the standalone generator (/sales-pitch, migration
+  // 0029) produces a pitch mp4 the user uploads to a project that is typically
+  // ALREADY generated and sitting at review. In that order nothing ever created
+  // the timeline row, so the pitch silently never appeared in the render.
+  //
+  // Safe to call unconditionally: it is idempotent, and it no-ops when the
+  // project has no segments materialised yet (the pre-generation case, where
+  // finalize will place it later as before).
+  try {
+    await ensurePitchTimelineItem(id);
+  } catch (e) {
+    // Placement failure must not fail the upload — the file is stored and
+    // recorded, and the next finalize (or a re-upload) will place it. Reported
+    // so a pitch that never shows up in the render is diagnosable.
+    await logJob({ projectId: id }, "synthetic.pitch_video.place_on_upload_failed", {
+      err: e instanceof Error ? e.message : String(e),
+    });
+  }
+
   return NextResponse.json({ project: data, pitch_video_url: pitchUrl }, { status: 200 });
 }
 
@@ -90,5 +116,19 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
     .update({ pitch_video_url: null, pitch_video_duration_seconds: null })
     .eq("id", id);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  // Drop the timeline row too. Clearing only the project columns left the
+  // pitch_video row behind, and the renderer reads the ROW (it renders any
+  // pitch_video row carrying a video_url) — so a "removed" pitch still played in
+  // the finished video. ensurePitchTimelineItem cannot clean this up either: it
+  // returns early when pitch_video_url is null, which is exactly the state
+  // Remove leaves behind.
+  const { error: rowErr } = await sb
+    .from("timeline_items")
+    .delete()
+    .eq("project_id", id)
+    .eq("type", "pitch_video");
+  if (rowErr) return NextResponse.json({ error: rowErr.message }, { status: 500 });
+
   return NextResponse.json({ ok: true }, { status: 200 });
 }

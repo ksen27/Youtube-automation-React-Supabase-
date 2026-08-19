@@ -1194,29 +1194,68 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_INTRO_IMAGE_RUN: z.coerce.number().int().nonnegative().default(2),
 
   // ---------------------------------------------------------------------
-  // CLIP BUDGET BY DURATION (client direction 2026-08-17): "in a video, 25%
-  // has to be LTX and 5% has to be VEO3" — i.e. 30% of the video is moving
-  // footage and the remaining 70% is image / avatar / split_2.
+  // CLIP BUDGET BY DURATION, IN TWO PHASES (client direction 2026-08-18 via
+  // Joey): "The first 4 minutes of the ai avatar video i want 80% clips and 20%
+  // images. After the first 4 mins, change to 70% images and 20% ltx clips and
+  // 10% VEO."
   //
-  // These are shares of TOTAL VIDEO DURATION (seconds of screen time), NOT of
-  // block count. That distinction is the whole point: the older
-  // SYNTHETIC_*_CLIP_FRACTION knobs above balance by COUNT and by POSITION, and
-  // a count share does not produce a duration share when blocks differ in
-  // length. The duration pass (assignClipDurationQuota) runs AFTER those and is
-  // authoritative for the final mix.
+  // Supersedes the flat 2026-08-17 direction ("25% LTX / 5% VEO across the
+  // video"), which is now just the PHASE 2 setting with the numbers moved to
+  // 20/10. The opening window is deliberately clip-heavy: the reference channel
+  // Joey linked opens on motion, and a still-heavy first minute is where his
+  // videos lose retention.
   //
-  // COST NOTE: LTX-2 bills per second (~$0.04/s), so this fraction sets the
-  // per-video LTX bill directly — 25% of a 60-minute video is ~15 min of LTX
-  // (~$36). The pre-existing SYNTHETIC_CLIP_HEAVY_SECONDS window exists for
-  // exactly that reason ("no more LTX after 15 minutes"). Set
-  // SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF to keep the budget inside that window
-  // instead of spreading it across a long video.
-  SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.25),
-  // Veo's share, on top of the LTX share above (25% + 5% = 30% total clips).
-  // Veo bills per GENERATION (1 credit), not per second, so this fraction
-  // controls clip COUNT rather than spend. Set to 0 to disable the veo lane
-  // without touching SYNTHETIC_VEO_ENABLED.
-  SYNTHETIC_VEO_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.05),
+  // BASIS — read the percentages the way the client states them. Both phases
+  // quote clips-vs-images and both sum to 100 (80+20, 70+20+10), so they are
+  // shares of the ASSIGNABLE VISUAL time (image + ai_clip blocks) in that
+  // phase, NOT of total screen time. Avatar and split_2 blocks come from the
+  // Google Doc highlights and cannot be reassigned (see assignClipDurationQuota),
+  // so measuring against total time would make "80%" unreachable on any
+  // normally-highlighted doc and silently under-deliver the whole window. Set
+  // SYNTHETIC_CLIP_FRACTION_BASIS=total for the pre-2026-08-18 behaviour, where
+  // the fractions are shares of total video duration.
+  //
+  // These are shares of DURATION (seconds of screen time), NOT of block count.
+  // That distinction is the whole point: the older SYNTHETIC_*_CLIP_FRACTION
+  // knobs above balance by COUNT and by POSITION, and a count share does not
+  // produce a duration share when blocks differ in length. The duration pass
+  // (assignClipDurationQuota) runs AFTER those and is authoritative for the
+  // final mix.
+  //
+  // COST NOTE: LTX-2 bills per second (~$0.04/s). The phase-1 window is the
+  // expensive one — 80% of 4 minutes is ~3.2 min of LTX (~$7.70) on EVERY video,
+  // on top of phase 2. Shorten SYNTHETIC_CLIP_PHASE1_SECONDS or drop
+  // SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION to pull that back. The pre-existing
+  // SYNTHETIC_CLIP_HEAVY_SECONDS window exists for the same reason ("no more LTX
+  // after 15 minutes"); set SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF to keep the
+  // whole budget inside it.
+
+  // End of the clip-heavy OPENING window, in seconds of video time. Blocks whose
+  // spoken window STARTS before this use the PHASE1 fractions below; everything
+  // at or after it uses the phase-2 fractions. 0 disables phasing entirely (the
+  // phase-2 fractions then apply to the whole video, i.e. pre-2026-08-18
+  // behaviour).
+  SYNTHETIC_CLIP_PHASE1_SECONDS: z.coerce.number().nonnegative().default(240),
+  // PHASE 1 (first SYNTHETIC_CLIP_PHASE1_SECONDS): LTX share. Client: 80% clips
+  // / 20% images, with no VEO called for in the opening window.
+  SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.80),
+  // PHASE 1 VEO share, on top of the LTX share above. 0 = the opening window is
+  // all-LTX (the client specified only "clips" for the first 4 minutes, and VEO
+  // bills per generation, so spending it here buys less than in the long tail).
+  SYNTHETIC_CLIP_PHASE1_VEO_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
+  // PHASE 2 (after the window): LTX share. Client 2026-08-18: 20% LTX.
+  SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.20),
+  // PHASE 2 VEO share, on top of the LTX share above (20% + 10% = 30% clips,
+  // leaving the client's 70% images). Veo bills per GENERATION (1 credit), not
+  // per second, so this fraction controls clip COUNT rather than spend. Set to 0
+  // to disable the veo lane without touching SYNTHETIC_VEO_ENABLED.
+  SYNTHETIC_VEO_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.10),
+  // What the fractions above are a share OF. "visual" (default, 2026-08-18) =
+  // the image + ai_clip seconds in that phase — the pool the pass can actually
+  // reassign, and the reading that makes 80/20 and 70/20/10 sum to 100. "total"
+  // = total screen time in that phase including avatar / split_2 (the
+  // 2026-08-17 behaviour).
+  SYNTHETIC_CLIP_FRACTION_BASIS: z.enum(["visual", "total"]).default("visual"),
   // When true, the clip budget is drawn only from blocks starting before
   // SYNTHETIC_CLIP_HEAVY_SECONDS (preserving the "no LTX after 15 min" cost
   // guard); the percentages are then met within that window rather than across
@@ -1267,6 +1306,39 @@ const ServerEnvSchema = z.object({
   // Raised 3 → 5 with the 2026-07-22 band reduction so the fewer kept split_2
   // also spread further apart instead of pairing up in one section.
   SYNTHETIC_SPLIT2_MIN_GAP: z.coerce.number().int().nonnegative().default(5),
+  // SPLIT_2 FRONT-LOADING (client 2026-08-18 via Joey: "i want more split
+  // screens in the 12 min of the video. Put 80% of the splitscreens in the
+  // first 12 min and the 20% to the rest").
+  //
+  // The band knobs above set HOW MANY split_2 a video gets; these set WHERE they
+  // sit. The allowed count is divided into two zones by video time — the first
+  // SYNTHETIC_SPLIT2_FRONT_SECONDS gets SYNTHETIC_SPLIT2_FRONT_SHARE of the
+  // allowance and the tail gets the remainder — and both the cap pass (which
+  // demotes excess) and the floor pass (which promotes images) work to those
+  // per-zone quotas. Without this the passes only balance across the whole
+  // timeline, which is how a 40-minute video ended up with its split_2 spread
+  // thin and almost none in the opening stretch the client cares about.
+  //
+  // NOTE: front-loading is a REDISTRIBUTION, not an increase — the total still
+  // obeys SYNTHETIC_SPLIT2_MAX_FRACTION / MIN_FRACTION. Raise the band if the
+  // client wants more split_2 overall, not this share.
+  // 0 disables zoning (single whole-video quota, pre-2026-08-18 behaviour).
+  SYNTHETIC_SPLIT2_FRONT_SECONDS: z.coerce.number().nonnegative().default(720),
+  // Share of the total split_2 allowance placed inside the front window.
+  SYNTHETIC_SPLIT2_FRONT_SHARE: z.coerce.number().min(0).max(1).default(0.80),
+  // Spacing rule INSIDE the front window, in blocks — the SYNTHETIC_SPLIT2_MIN_GAP
+  // equivalent for the front zone, applied when both neighbours are in it.
+  //
+  // Why it has to differ: MIN_GAP (5) was tuned for split_2 spread across a whole
+  // video. Concentrating 80% of them into 12 minutes is a much higher density by
+  // construction, and at gap 5 the window simply cannot hold the requested share
+  // — the front target then silently under-delivers no matter what the share is
+  // set to. 3 keeps the client's actual objection intact (they rejected
+  // CONSECUTIVE split_2, and 3 still means 3 other blocks in between, ~20-25s of
+  // other footage) while roughly doubling what the window can hold. Raise it
+  // toward 5 if the front stretch starts to feel split_2-heavy; the front share
+  // will then fall short and log it rather than pack them tighter.
+  SYNTHETIC_SPLIT2_FRONT_MIN_GAP: z.coerce.number().int().nonnegative().default(3),
   // Maximum DURATION for a single split_2 block (client 2026-07-03: a 38s
   // split_2 — Gemini lumped 5 sentences into one block and, unlike image /
   // ai_clip, nothing carves a split_2, so the same still held beside the
@@ -1514,12 +1586,51 @@ const ServerEnvSchema = z.object({
   // widen rotation, lower to cut query cost.
   ASSET_LIBRARY_MATCH_LIMIT: z.coerce.number().int().positive().default(8),
   // Per-project reuse ceiling, as a fraction of the project's segment count.
-  // Client requirement: at most half of a video may be assets pulled from the
-  // library — beyond that the video stops reading as freshly produced. Once
-  // floor(total_segments * this) segments carry a reused marker, lookups return
-  // null and every remaining segment generates fresh. Set to 1 to lift the cap,
-  // 0 to disable reuse entirely without touching ASSET_LIBRARY_ENABLED.
-  ASSET_LIBRARY_MAX_REUSE_FRACTION: z.coerce.number().min(0).max(1).default(0.5),
+  // Once floor(total_segments * this) segments carry a reused marker, lookups
+  // return null and every remaining segment generates fresh. Set to 1 to lift
+  // the cap, 0 to disable reuse entirely without touching ASSET_LIBRARY_ENABLED.
+  //
+  // LOWERED 0.5 → 0.15 (client 2026-08-19 via Joey: "the images are quite
+  // repetitive […] can you hardcode it in that its not too repetitive and it
+  // matches the script better. Because it negatively influences the performance
+  // if the video is too repetitive"). At 0.5 half of a video could be assets
+  // recycled from earlier projects, which is what made a spoon script come back
+  // as the same handful of spoon shots over and over. 0.15 keeps the cost win of
+  // reuse on genuinely repeated subject matter while forcing the bulk of a video
+  // to be generated for ITS script.
+  //
+  // This is the CROSS-VIDEO half of the repetition fix. The WITHIN-video half —
+  // near-identical prompts inside one script — is the planner's scene-dedupe
+  // pass (SYNTHETIC_SCENE_DEDUPE_* below); both were needed.
+  ASSET_LIBRARY_MAX_REUSE_FRACTION: z.coerce.number().min(0).max(1).default(0.15),
+
+  // ---------------------------------------------------------------------
+  // WITHIN-VIDEO SCENE DEDUPE (client 2026-08-19 via Joey: "for example the
+  // german video, it is showing spoons a lot, very similar images and similar
+  // footages. I want more variation").
+  //
+  // The planner already de-duplicates the EXTRA visuals of a SINGLE sentence
+  // (the distinct-second-visual pass). It did nothing across sentences — so a
+  // script that says "spoon" in forty places got forty near-identical spoon
+  // prompts, each individually reasonable. This pass compares every visual
+  // block's prompt against the ones already accepted and regenerates the ones
+  // that are too close, telling Gemini which scenes are already taken.
+  SYNTHETIC_SCENE_DEDUPE_ENABLED: z.coerce.boolean().default(true),
+  // Jaccard similarity over content words, above which two prompts count as the
+  // same scene. 0.5 is deliberately loose — "close-up of a wooden spoon on a
+  // marble counter" vs "a wooden spoon resting on a marble countertop" scores
+  // well under a strict threshold yet renders as the same picture.
+  SYNTHETIC_SCENE_DEDUPE_SIMILARITY: z.coerce.number().min(0).max(1).default(0.5),
+  // How far back to compare. Repetition reads as repetition when the viewer can
+  // still remember the earlier shot, and comparing every block against every
+  // other on a 300-block plan is both quadratic and over-strict (a callback to a
+  // subject 20 minutes later is fine). 0 = compare against the whole video.
+  SYNTHETIC_SCENE_DEDUPE_WINDOW: z.coerce.number().int().nonnegative().default(40),
+  // Hard ceiling on regenerations per plan. Each one is a Gemini call, so an
+  // extremely repetitive script must not turn planning into hundreds of extra
+  // round-trips. Blocks past the cap keep their original prompt and the overflow
+  // is logged (synthetic.plan.scene_dedupe.capped) rather than silently dropped.
+  SYNTHETIC_SCENE_DEDUPE_MAX_REGEN: z.coerce.number().int().nonnegative().default(80),
 });
 
 export type ServerEnv = z.infer<typeof ServerEnvSchema>;

@@ -1614,6 +1614,140 @@ function canCarryAction(seg: PlannedSegment): boolean {
   return ACTION_SCENE_RE.test(`${seg.imagePrompt ?? ""} ${seg.script ?? ""}`);
 }
 
+// ---------------------------------------------------------------------------
+// WITHIN-VIDEO SCENE REPETITION (client 2026-08-19 via Joey: "for example the
+// german video, it is showing spoons a lot, very similar images and similar
+// footages. I want more variation").
+//
+// The existing distinct-second-visual pass only compares the extra visuals of
+// ONE sentence. Repetition across the whole script was invisible to it: a script
+// that keeps returning to its subject produced dozens of individually-reasonable
+// prompts that all render as the same picture. These helpers find those runs so
+// the planner can regenerate the later ones against the earlier ones.
+//
+// The measure is a Jaccard overlap of CONTENT WORDS, not an embedding: it has to
+// stay pure and instant (it runs over every block of a 300-block plan), and the
+// failure it catches is lexical almost by construction — near-identical prompts
+// come from near-identical sentences.
+
+// Words that carry no scene identity. Overlap on these is what made a naive
+// comparison call every prompt similar to every other.
+const SCENE_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with",
+  "from", "by", "as", "is", "are", "was", "were", "be", "being", "been", "it",
+  "its", "this", "that", "these", "those", "there", "here", "into", "onto",
+  "over", "under", "up", "down", "out", "off", "near", "next", "beside",
+  // Prompt/craft boilerplate — present in nearly every prompt we emit, so it
+  // must not count as shared subject matter.
+  "shot", "close", "closeup", "wide", "macro", "angle", "view", "scene",
+  "photo", "photograph", "image", "footage", "clip", "frame", "framing",
+  "composition", "lighting", "light", "soft", "natural", "realistic", "real",
+  "detailed", "detail", "quality", "background", "foreground", "setting",
+  "style", "camera", "focus", "slight", "slightly", "very", "showing", "shows",
+  "show", "shown", "seen", "visible", "looks", "looking",
+]);
+
+/**
+ * Content words of a prompt, lowercased and de-duplicated.
+ *
+ * `exclude` removes the shared base-prompt vocabulary. That matters: during
+ * planning a block's `imagePrompt` is the scene alone, but a prompt that came
+ * back from regenerateSegmentPrompt already has the base folded in (and persist
+ * folds it into the rest), so without this the two shapes would score as far
+ * more similar than the scenes actually are.
+ */
+export function sceneWords(text: string, exclude?: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  for (const raw of (text ?? "").toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    // Length 3 keeps "jar"/"pan"/"oil" while dropping inflectional noise.
+    if (raw.length < 3) continue;
+    if (SCENE_STOPWORDS.has(raw)) continue;
+    if (exclude?.has(raw)) continue;
+    out.add(raw);
+  }
+  return out;
+}
+
+/** Jaccard overlap of two word sets. 1 = identical vocabulary, 0 = disjoint. */
+export function sceneSimilarity(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const w of small) if (large.has(w)) shared++;
+  return shared / (a.size + b.size - shared);
+}
+
+/** One block flagged as a repeat, with the earlier scenes it must differ from. */
+export interface RepeatedScene {
+  index: number;      // index into the array passed in
+  avoid: string[];    // earlier prompt(s) this block duplicates
+  anchor: number;     // index of the closest earlier match — chains group on it
+  similarity: number;
+}
+
+/**
+ * Flag blocks whose scene repeats an earlier one.
+ *
+ * Walks the plan in order keeping a list of ACCEPTED scenes. A block similar
+ * enough to an accepted scene is flagged (and deliberately NOT accepted — its
+ * prompt is about to be replaced, so admitting it would let later blocks
+ * de-duplicate against a scene that is going away). Everything else is accepted
+ * and becomes a reference for later blocks.
+ *
+ * `window` bounds the comparison to the last N visual blocks: repetition reads
+ * as repetition when the viewer can still remember the earlier shot, and a
+ * callback to a subject twenty minutes later is fine. 0 compares against the
+ * whole video.
+ *
+ * `maxRegen` caps how many are flagged — each one costs a Gemini call. The
+ * caller reports the overflow rather than silently truncating.
+ */
+export function findRepeatedScenes(
+  scenes: ReadonlyArray<string | null>,
+  opts: { basePrompt?: string; similarity: number; window: number; maxRegen: number },
+): { repeats: RepeatedScene[]; flaggedTotal: number } {
+  const exclude = opts.basePrompt ? sceneWords(opts.basePrompt) : undefined;
+  const accepted: { index: number; words: Set<string>; text: string }[] = [];
+  const repeats: RepeatedScene[] = [];
+  let flaggedTotal = 0;
+
+  for (let i = 0; i < scenes.length; i++) {
+    const text = (scenes[i] ?? "").trim();
+    if (!text) continue;
+    const words = sceneWords(text, exclude);
+    // A prompt with almost no distinctive vocabulary left can't be judged.
+    if (words.size < 3) { accepted.push({ index: i, words, text }); continue; }
+
+    let bestSim = 0;
+    let bestAt = -1;
+    const matches: string[] = [];
+    for (let k = accepted.length - 1; k >= 0; k--) {
+      const cand = accepted[k];
+      // `window` counts ACCEPTED scenes back, not raw block distance, so an
+      // avatar-heavy stretch doesn't push the comparison window past the
+      // visuals the viewer actually saw.
+      if (opts.window > 0 && accepted.length - k > opts.window) break;
+      const sim = sceneSimilarity(words, cand.words);
+      if (sim >= opts.similarity) {
+        matches.push(cand.text);
+        if (sim > bestSim) { bestSim = sim; bestAt = cand.index; }
+      }
+    }
+
+    if (bestAt >= 0) {
+      flaggedTotal++;
+      // Cap the avoid list: Gemini needs the shape of what's taken, not every
+      // instance, and a long list crowds out the script in the prompt budget.
+      if (repeats.length < opts.maxRegen) {
+        repeats.push({ index: i, avoid: matches.slice(0, 3), anchor: bestAt, similarity: bestSim });
+      }
+      continue;
+    }
+    accepted.push({ index: i, words, text });
+  }
+  return { repeats, flaggedTotal };
+}
+
 export interface ClipQuotaResult {
   segments: PlannedSegment[];
   totalSeconds: number;
@@ -1629,12 +1763,48 @@ export interface ClipQuotaResult {
   // enough eligible visual blocks (see the avatar-marking note below). 0 when
   // the target was reached.
   shortfallSeconds: number;
+  // Per-phase breakdown (client 2026-08-18 two-phase mix). One entry per phase
+  // in the order given; a single-phase call reports one entry. Logged so a
+  // mix complaint can be traced to the phase that missed rather than to the
+  // video-wide average, which hides a starved opening window.
+  phases: ClipQuotaPhaseResult[];
+}
+
+/** One phase of the duration budget — a time window with its own clip shares. */
+export interface ClipPhase {
+  // Video-time window this phase governs, by block START time: [start, end).
+  startSeconds: number;
+  endSeconds: number;     // Infinity for the final phase
+  clipFraction: number;   // LTX share of the phase's basis seconds
+  veoFraction: number;    // veo share of the phase's basis seconds
+  label: string;          // for logs, e.g. "phase1"
+}
+
+export interface ClipQuotaPhaseResult {
+  label: string;
+  startSeconds: number;
+  endSeconds: number;
+  // Seconds the fractions were measured against — total block seconds in the
+  // window under basis "total", or just the image/ai_clip seconds under "visual".
+  basisSeconds: number;
+  targetClipSeconds: number;
+  targetVeoSeconds: number;
+  clipSeconds: number;
+  veoSeconds: number;
+  shortfallSeconds: number;
+  ltxBlocks: number;
+  veoBlocks: number;
 }
 
 /**
- * Enforce the client's CLIP BUDGET BY DURATION (2026-08-17): ~25% of the video
- * is LTX footage and ~5% is Veo footage, the other ~70% being image / avatar /
- * split_2.
+ * Enforce the client's CLIP BUDGET BY DURATION, IN TIME PHASES.
+ *
+ * Client 2026-08-18 (Joey): "The first 4 minutes of the ai avatar video i want
+ * 80% clips and 20% images. After the first 4 mins, change to 70% images and 20%
+ * ltx clips and 10% VEO." Each phase is a video-time window with its own LTX and
+ * veo shares, filled INDEPENDENTLY from that window's own blocks — a single
+ * whole-video budget cannot express this, because an evenly-spread 30% budget
+ * puts ~30% in the opening window, not 80%.
  *
  * This is deliberately a DURATION pass, not a count pass. The older
  * balanceVisualTypesByPosition works on block COUNT and POSITION, and a count
@@ -1646,43 +1816,61 @@ export interface ClipQuotaResult {
  * ours to reassign — they come from the red/orange highlights in the client's
  * Google Doc (see doc-marks.ts), so the avatar share of a video is fixed by the
  * source document. The clip budget is therefore drawn only from the visual
- * (image/ai_clip) remainder, and on a heavily-highlighted doc the 30% target
- * can be genuinely unreachable. That case reports `shortfallSeconds` rather
- * than failing: silently missing the target is what makes it undiagnosable.
+ * (image/ai_clip) remainder, and on a heavily-highlighted doc the target can be
+ * genuinely unreachable. That case reports `shortfallSeconds` rather than
+ * failing: silently missing the target is what makes it undiagnosable.
  *
- * Percentages are of TOTAL video duration (every block, avatar included),
- * matching how the client states them.
+ * BASIS (see SYNTHETIC_CLIP_FRACTION_BASIS): "visual" measures the percentages
+ * against the image + ai_clip seconds in the phase — the pool this pass can
+ * actually reassign, and the reading under which the client's numbers sum to 100
+ * (80+20, 70+20+10). "total" measures against every block in the phase including
+ * avatar / split_2, the pre-2026-08-18 behaviour.
+ *
+ * Back-compat: the single-fraction opts shape ({clipFraction, veoFraction, …})
+ * is still accepted and is treated as one whole-video phase on the "total"
+ * basis, which is exactly what it used to mean.
  */
 export function assignClipDurationQuota(
   segs: PlannedSegment[],
   opts: {
-    clipFraction: number;   // LTX share of total duration
-    veoFraction: number;    // veo share of total duration
     veoEnabled: boolean;
     // Restrict the budget to blocks starting before this many seconds (the
     // "no LTX after 15 minutes" cost guard). 0 = the whole video is eligible.
     cutoffSeconds: number;
+    // Two-phase (or n-phase) form. Takes precedence over clipFraction below.
+    phases?: ClipPhase[];
+    basis?: "visual" | "total";
+    // Legacy single-phase form — a whole-video budget on the "total" basis.
+    clipFraction?: number;
+    veoFraction?: number;
   },
 ): ClipQuotaResult {
   const dur = (s: PlannedSegment) => Math.max(0, Number(s.duration) || 0);
   const totalSeconds = segs.reduce((a, s) => a + dur(s), 0);
-  const veoFraction = opts.veoEnabled ? Math.max(0, opts.veoFraction) : 0;
-  const targetVeoSeconds = totalSeconds * veoFraction;
-  const targetClipSeconds = totalSeconds * (Math.max(0, opts.clipFraction) + veoFraction);
+  const veoOn = opts.veoEnabled;
 
-  // Eligible = visual blocks inside the window. Everything else keeps its type.
-  const eligible: number[] = [];
-  segs.forEach((s, i) => {
-    if (s.blockType !== "image" && s.blockType !== "ai_clip") return;
-    if (opts.cutoffSeconds > 0 && s.startTime >= opts.cutoffSeconds) return;
-    eligible.push(i);
-  });
+  // Normalize both call shapes to a phase list. The legacy shape keeps the
+  // "total" basis regardless of the basis option, so an old caller's numbers
+  // never silently change meaning.
+  const legacy = !opts.phases || opts.phases.length === 0;
+  const phases: ClipPhase[] = legacy
+    ? [{
+        startSeconds: 0,
+        endSeconds: Infinity,
+        clipFraction: Math.max(0, opts.clipFraction ?? 0),
+        veoFraction: Math.max(0, opts.veoFraction ?? 0),
+        label: "all",
+      }]
+    : opts.phases!;
+  const basis: "visual" | "total" = legacy ? "total" : (opts.basis ?? "visual");
 
-  // Fill the seconds budget, preferring blocks that make a GOOD clip, and
-  // spreading evenly WITHIN each preference tier so the chosen clips still land
-  // across the whole video rather than clumping.
+  // Which blocks this pass may reassign at all: image / ai_clip inside the
+  // cost-guard cutoff. Everything else keeps its type no matter the phase.
+  const isVisual = (s: PlannedSegment) => s.blockType === "image" || s.blockType === "ai_clip";
+  const inCutoff = (s: PlannedSegment) => !(opts.cutoffSeconds > 0 && s.startTime >= opts.cutoffSeconds);
+
+  // Preference tiers for filling a budget — best clip candidates first.
   //
-  // Tiers, best first:
   //   3  already ai_clip AND the scene has a person/action  (Gemini picked it
   //      as a dynamic scene and it can carry the movement)
   //   2  already ai_clip                                    (chosen as dynamic)
@@ -1691,43 +1879,102 @@ export function assignClipDurationQuota(
   //      action prompt over a still-life is the weakest clip we can make)
   const tierOf = (i: number) =>
     (segs[i].blockType === "ai_clip" ? 2 : 0) + (canCarryAction(segs[i]) ? 1 : 0);
-  const byTier = new Map<number, number[]>();
-  for (const i of eligible) {
-    const t = tierOf(i);
-    if (!byTier.has(t)) byTier.set(t, []);
-    byTier.get(t)!.push(i);
-  }
-  const order: number[] = [];
-  for (const t of [3, 2, 1, 0]) {
-    const tier = byTier.get(t) ?? [];
-    for (const oi of spreadOrder(tier.length)) order.push(tier[oi]);
-  }
 
   const wantClip = new Set<number>();
-  let clipSeconds = 0;
-  for (const idx of order) {
-    if (clipSeconds >= targetClipSeconds) break;
-    wantClip.add(idx);
-    clipSeconds += dur(segs[idx]);
-  }
-  const shortfallSeconds = Math.max(0, targetClipSeconds - clipSeconds);
-
-  // Of the chosen clips, the evenly-spread prefix that fills the VEO budget
-  // renders on veo; the rest on LTX. Floor of one veo block whenever the lane
-  // is on and any clip exists — on a short video 5% can round to less than a
-  // single clip, and "5% veo" plainly means at least one.
-  const clipIdxInTimelineOrder = [...wantClip].sort((a, b) => a - b);
-  const veoOrder = spreadOrder(clipIdxInTimelineOrder.length);
   const wantVeo = new Set<number>();
+  const phaseResults: ClipQuotaPhaseResult[] = [];
+  let clipSeconds = 0;
   let veoSeconds = 0;
-  if (veoFraction > 0) {
-    for (const oi of veoOrder) {
-      if (veoSeconds >= targetVeoSeconds && wantVeo.size > 0) break;
-      const idx = clipIdxInTimelineOrder[oi];
-      wantVeo.add(idx);
-      veoSeconds += dur(segs[idx]);
+  let shortfallSeconds = 0;
+
+  for (const phase of phases) {
+    // Blocks whose spoken window STARTS inside this phase. Start time (not
+    // overlap) so a block belongs to exactly one phase and the phases partition
+    // the timeline — a block straddling the 4-minute mark counts as phase 1.
+    const inPhase = (s: PlannedSegment) =>
+      s.startTime >= phase.startSeconds && s.startTime < phase.endSeconds;
+
+    const eligible: number[] = [];
+    let visualSeconds = 0;
+    let phaseTotalSeconds = 0;
+    segs.forEach((s, i) => {
+      if (!inPhase(s)) return;
+      phaseTotalSeconds += dur(s);
+      if (!isVisual(s)) return;
+      visualSeconds += dur(s);
+      if (!inCutoff(s)) return;
+      eligible.push(i);
+    });
+
+    const phaseVeoFraction = veoOn ? Math.max(0, phase.veoFraction) : 0;
+    const basisSeconds = basis === "visual" ? visualSeconds : phaseTotalSeconds;
+    const targetVeo = basisSeconds * phaseVeoFraction;
+    const targetClip = basisSeconds * (Math.max(0, phase.clipFraction) + phaseVeoFraction);
+
+    // Fill the phase's seconds budget, spreading evenly WITHIN each preference
+    // tier so the chosen clips land across the whole PHASE rather than clumping
+    // at its start.
+    const byTier = new Map<number, number[]>();
+    for (const i of eligible) {
+      const t = tierOf(i);
+      if (!byTier.has(t)) byTier.set(t, []);
+      byTier.get(t)!.push(i);
     }
+    const order: number[] = [];
+    for (const t of [3, 2, 1, 0]) {
+      const tier = byTier.get(t) ?? [];
+      for (const oi of spreadOrder(tier.length)) order.push(tier[oi]);
+    }
+
+    const phaseClips: number[] = [];
+    let phaseClipSeconds = 0;
+    for (const idx of order) {
+      if (phaseClipSeconds >= targetClip) break;
+      wantClip.add(idx);
+      phaseClips.push(idx);
+      phaseClipSeconds += dur(segs[idx]);
+    }
+    const phaseShortfall = Math.max(0, targetClip - phaseClipSeconds);
+
+    // Of this phase's chosen clips, the evenly-spread prefix that fills the VEO
+    // budget renders on veo; the rest on LTX. Floor of one veo block whenever
+    // the lane is on for this phase and any clip exists — on a short window 10%
+    // can round to less than a single block, and "10% veo" plainly means at
+    // least one. A phase with veoFraction 0 (the client's opening window) gets
+    // NO veo at all, floor included.
+    const clipIdxInTimelineOrder = [...phaseClips].sort((a, b) => a - b);
+    let phaseVeoSeconds = 0;
+    let phaseVeoBlocks = 0;
+    if (phaseVeoFraction > 0) {
+      for (const oi of spreadOrder(clipIdxInTimelineOrder.length)) {
+        if (phaseVeoSeconds >= targetVeo && phaseVeoBlocks > 0) break;
+        const idx = clipIdxInTimelineOrder[oi];
+        wantVeo.add(idx);
+        phaseVeoBlocks++;
+        phaseVeoSeconds += dur(segs[idx]);
+      }
+    }
+
+    clipSeconds += phaseClipSeconds;
+    veoSeconds += phaseVeoSeconds;
+    shortfallSeconds += phaseShortfall;
+    phaseResults.push({
+      label: phase.label,
+      startSeconds: phase.startSeconds,
+      endSeconds: phase.endSeconds,
+      basisSeconds,
+      targetClipSeconds: targetClip,
+      targetVeoSeconds: targetVeo,
+      clipSeconds: phaseClipSeconds,
+      veoSeconds: phaseVeoSeconds,
+      shortfallSeconds: phaseShortfall,
+      ltxBlocks: phaseClips.length - phaseVeoBlocks,
+      veoBlocks: phaseVeoBlocks,
+    });
   }
+
+  const targetClipSeconds = phaseResults.reduce((a, p) => a + p.targetClipSeconds, 0);
+  const targetVeoSeconds = phaseResults.reduce((a, p) => a + p.targetVeoSeconds, 0);
 
   let promoted = 0;
   let demoted = 0;
@@ -1760,6 +2007,7 @@ export function assignClipDurationQuota(
     veoBlocks: wantVeo.size,
     ltxBlocks: wantClip.size - wantVeo.size,
     shortfallSeconds,
+    phases: phaseResults,
   };
 }
 
@@ -1771,34 +2019,61 @@ export function assignClipDurationQuota(
 // A promoted split_2 is fully renderable: the avatar processor generates the
 // talking-head LEFT half (from the project avatar image) and the still RIGHT
 // half (from the block's existing image_prompt), so an 'image' with a usable
-// prompt is a safe source. We promote only AFTER the clip-heavy intro cutoff
+// prompt is a safe source. We promote only AFTER the opening clip-heavy window
 // (split_2 is a presenter-beside-still explanatory layout, not an opening-action
 // shot) and space the promotions evenly across eligible blocks so they don't
 // clump. avatar / ai_clip / existing split_2 are never touched. Runs LAST (after
 // the visual-balance pass) so balance can't flip a promotion back to image.
+//
+// FRONT-LOADING (client 2026-08-18: "Put 80% of the splitscreens in the first 12
+// min and the 20% to the rest"). Promotions are targeted at the front zone until
+// its share of the total is met, then at the tail. The two client instructions
+// from that day pull against each other — the first 4 minutes are to be 80%
+// clips, and split_2 is not a clip — so `introCutoffSeconds` is now the PHASE-1
+// clip window (4 min), not the old 15-minute clip-heavy cutoff: promotions start
+// once the clip-heavy opening ends, which still leaves 4-12 min to carry the
+// bulk of the front share.
 export function ensureMinSplit2(
   segs: PlannedSegment[],
   minKeep: number,
-  clipHeavyCutoffSeconds: number,
-): { segments: PlannedSegment[]; promoted: number } {
-  if (minKeep <= 0) return { segments: segs, promoted: 0 };
+  introCutoffSeconds: number,
+  // Front zone for the client's 80/20 placement split. 0 disables zoning, in
+  // which case this behaves exactly as it did before (spread over everything
+  // past the intro cutoff).
+  frontSeconds: number = 0,
+  frontShare: number = 0,
+): { segments: PlannedSegment[]; promoted: number; promotedFront: number } {
+  if (minKeep <= 0) return { segments: segs, promoted: 0, promotedFront: 0 };
   const have = segs.filter((s) => s.blockType === "split_2").length;
   const need = minKeep - have;
-  if (need <= 0) return { segments: segs, promoted: 0 };
+  if (need <= 0) return { segments: segs, promoted: 0, promotedFront: 0 };
 
+  const zoned = frontSeconds > 0 && frontShare > 0;
   // Eligible: a plain 'image' AFTER the intro cutoff with a non-empty prompt.
   const eligibleIdx: number[] = [];
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i];
     if (
       s.blockType === "image" &&
-      s.startTime >= clipHeavyCutoffSeconds &&
+      s.startTime >= introCutoffSeconds &&
       (s.imagePrompt ?? "").trim().length > 0
     ) {
       eligibleIdx.push(i);
     }
   }
-  if (eligibleIdx.length === 0) return { segments: segs, promoted: 0 };
+  if (eligibleIdx.length === 0) return { segments: segs, promoted: 0, promotedFront: 0 };
+
+  // How many of the FINAL split_2 set should sit in the front zone, and how many
+  // already do. Promotions are steered to close that gap first; whatever is left
+  // over is spread across the tail. Measured against minKeep (the target total),
+  // not against `need`, so an existing front cluster correctly reduces the front
+  // promotions rather than doubling up on them.
+  const inFront = (i: number) => segs[i].startTime < frontSeconds;
+  const frontTarget = zoned ? Math.round(minKeep * frontShare) : 0;
+  const frontHave = zoned
+    ? segs.filter((s) => s.blockType === "split_2" && s.startTime < frontSeconds).length
+    : 0;
+  let frontWanted = zoned ? Math.max(0, frontTarget - frontHave) : 0;
 
   // Where do EXISTING split_2 already sit? Gemini routinely CLUMPS them at the
   // start or end of a video, so an even-stride pass that ignores them would pile
@@ -1812,18 +2087,15 @@ export function ensureMinSplit2(
   for (let i = 0; i < segs.length; i++) if (segs[i].blockType === "split_2") anchors.push(i);
   const take = Math.min(need, eligibleIdx.length);
   const chosen = new Set<number>();
-  // If Gemini produced NO split_2 at all, seed with the eligible midpoint so the
-  // first pick isn't pinned to an edge, then let the farthest-point fill spread
-  // the rest around it.
-  if (anchors.length === 0 && take > 0) {
-    const mid = eligibleIdx[Math.floor(eligibleIdx.length / 2)];
-    chosen.add(mid);
-    anchors.push(mid);
-  }
-  while (chosen.size < take) {
+  let promotedFront = 0;
+
+  // One greedy farthest-point pick from `pool`. Returns the chosen index, or -1
+  // when the pool is exhausted. Spreading is measured against ALL anchors (both
+  // zones) so a front-zone pick still avoids landing on top of a tail cluster.
+  const pickFarthest = (pool: number[]): number => {
     let bestIdx = -1;
     let bestDist = -1;
-    for (const idx of eligibleIdx) {
+    for (const idx of pool) {
       if (chosen.has(idx)) continue;
       // Distance to the nearest anchor (existing or already-chosen split_2).
       let nearest = Infinity;
@@ -1833,10 +2105,41 @@ export function ensureMinSplit2(
         bestIdx = idx;
       }
     }
-    if (bestIdx < 0) break;
+    if (bestIdx < 0) return -1;
     chosen.add(bestIdx);
     anchors.push(bestIdx);
+    if (zoned && inFront(bestIdx)) promotedFront++;
+    return bestIdx;
+  };
+
+  // FRONT ZONE FIRST — fill the client's 80% share out of the front-window
+  // eligibles before touching the tail. Runs before the seeding below so a plan
+  // with no existing split_2 still front-loads instead of seeding at the
+  // timeline midpoint.
+  if (zoned && frontWanted > 0) {
+    const frontPool = eligibleIdx.filter(inFront);
+    while (frontWanted > 0 && chosen.size < take) {
+      if (pickFarthest(frontPool) < 0) break; // front window is out of eligibles
+      frontWanted--;
+    }
   }
+
+  // If Gemini produced NO split_2 at all, seed with the eligible midpoint so the
+  // first pick isn't pinned to an edge, then let the farthest-point fill spread
+  // the rest around it.
+  if (anchors.length === 0 && take > 0) {
+    const mid = eligibleIdx[Math.floor(eligibleIdx.length / 2)];
+    chosen.add(mid);
+    anchors.push(mid);
+    if (zoned && inFront(mid)) promotedFront++;
+  }
+  // Remaining promotions spread across everything eligible. When the front zone
+  // ran out of eligibles above, this is also what spills its unfilled share into
+  // the tail rather than shipping fewer split_2 than the band calls for.
+  while (chosen.size < take) {
+    if (pickFarthest(eligibleIdx) < 0) break;
+  }
+
   let promoted = 0;
   const out = segs.map((s, i) => {
     if (!chosen.has(i)) return s;
@@ -1845,7 +2148,136 @@ export function ensureMinSplit2(
     // still); a split_2 has no motion, so drop any animationPrompt.
     return { ...s, blockType: "split_2" as SyntheticBlockType, animationPrompt: null };
   });
-  return { segments: out, promoted };
+  return { segments: out, promoted, promotedFront };
+}
+
+/**
+ * MOVE split_2 into the front window without changing how many there are
+ * (client 2026-08-18: "Put 80% of the splitscreens in the first 12 min and the
+ * 20% to the rest").
+ *
+ * Why this exists as a third pass. The cap pass front-loads only what Gemini
+ * ALREADY put in the front window, and the floor pass only promotes when the
+ * total is below the band floor. So a plan that is comfortably inside the band
+ * but whose split_2 all sit past 12 minutes satisfies both passes and still
+ * misses the client's placement rule entirely — the common case, since Gemini
+ * clusters split_2 wherever the script turns explanatory.
+ *
+ * This closes that gap by TRADING: promote an eligible 'image' inside the front
+ * window and demote a split_2 from the tail, one for one, until the front share
+ * is met or it runs out of either side. Total split_2 count is unchanged, so the
+ * band the client tuned separately still holds exactly.
+ *
+ * Tail blocks are given up CLOSEST-PAIR FIRST — thinning a tail clump both
+ * serves the trade and improves tail spacing, whereas taking them in timeline
+ * order would strip the tail from one end and leave a gap.
+ */
+export function rebalanceSplit2ToFront(
+  segs: PlannedSegment[],
+  opts: {
+    frontSeconds: number;
+    frontShare: number;
+    // Blocks before this are off-limits for promotion (the clip-heavy opening).
+    introCutoffSeconds: number;
+    minGap: number;
+    // Spacing between two split_2 both inside the front window. Unset falls
+    // back to minGap. See SYNTHETIC_SPLIT2_FRONT_MIN_GAP.
+    frontMinGap?: number;
+  },
+): { segments: PlannedSegment[]; moved: number; frontBefore: number; frontAfter: number; total: number } {
+  const total = segs.filter((s) => s.blockType === "split_2").length;
+  const inFront = (i: number) => segs[i].startTime < opts.frontSeconds;
+  const frontBefore = segs.filter(
+    (s) => s.blockType === "split_2" && s.startTime < opts.frontSeconds,
+  ).length;
+  const noop = { segments: segs, moved: 0, frontBefore, frontAfter: frontBefore, total };
+  if (total === 0 || opts.frontSeconds <= 0 || opts.frontShare <= 0) return noop;
+
+  const want = Math.round(total * opts.frontShare) - frontBefore;
+  if (want <= 0) return noop;
+
+  // Tail split_2, ordered by how tightly packed each is against its tail
+  // neighbours — the tightest goes first.
+  const tailIdx: number[] = [];
+  segs.forEach((s, i) => { if (s.blockType === "split_2" && !inFront(i)) tailIdx.push(i); });
+  const nearestTailNeighbour = (i: number) => {
+    let best = Infinity;
+    for (const k of tailIdx) if (k !== i) best = Math.min(best, Math.abs(k - i));
+    return best;
+  };
+  const giveUp = [...tailIdx].sort(
+    (a, b) => nearestTailNeighbour(a) - nearestTailNeighbour(b) || b - a,
+  );
+
+  // Front-window images we may promote. Same eligibility as the floor pass: a
+  // plain image, past the clip-heavy opening, with a prompt to render.
+  const frontPool: number[] = [];
+  segs.forEach((s, i) => {
+    if (
+      s.blockType === "image" &&
+      inFront(i) &&
+      s.startTime >= opts.introCutoffSeconds &&
+      (s.imagePrompt ?? "").trim().length > 0
+    ) {
+      frontPool.push(i);
+    }
+  });
+
+  const moves = Math.min(want, giveUp.length, frontPool.length);
+  if (moves <= 0) return noop;
+
+  // Spread the promotions across the front window, away from split_2 already
+  // there — same farthest-point fill the floor pass uses.
+  const anchors: number[] = [];
+  segs.forEach((s, i) => { if (s.blockType === "split_2") anchors.push(i); });
+  // A promotion lands in the front window, so its spacing against another front
+  // split_2 uses the front rule; against a tail one, the wider rule.
+  const gapFront = opts.frontMinGap != null && opts.frontMinGap >= 0 ? opts.frontMinGap : opts.minGap;
+  const promote = new Set<number>();
+  while (promote.size < moves) {
+    let bestIdx = -1;
+    let bestDist = -1;
+    for (const idx of frontPool) {
+      if (promote.has(idx)) continue;
+      // Honour the spacing rule the client asked for — a promotion that lands
+      // next to an existing split_2 recreates the back-to-back pairs they
+      // rejected, so skip it rather than take the trade.
+      let nearest = Infinity;
+      let blocked = false;
+      for (const a of anchors) {
+        const d = Math.abs(idx - a);
+        nearest = Math.min(nearest, d);
+        const limit = inFront(a) ? gapFront : opts.minGap;
+        if (limit > 0 && d <= limit) { blocked = true; break; }
+      }
+      if (blocked) continue;
+      if (nearest > bestDist) { bestDist = nearest; bestIdx = idx; }
+    }
+    if (bestIdx < 0) break;
+    promote.add(bestIdx);
+    anchors.push(bestIdx);
+  }
+  if (promote.size === 0) return noop;
+
+  // Demote exactly as many as we promoted, so the total never moves.
+  const demote = new Set(giveUp.slice(0, promote.size));
+
+  const out = segs.map((s, i) => {
+    if (promote.has(i)) {
+      return { ...s, blockType: "split_2" as SyntheticBlockType, animationPrompt: null };
+    }
+    if (demote.has(i)) {
+      return { ...s, blockType: "image" as SyntheticBlockType, animationPrompt: null };
+    }
+    return s;
+  });
+  return {
+    segments: out,
+    moved: promote.size,
+    frontBefore,
+    frontAfter: frontBefore + promote.size,
+    total,
+  };
 }
 
 // Coalesce CONTIGUOUS avatar segments into one atomic avatar "part".
@@ -2054,36 +2486,100 @@ export function capSplit2Blocks(
   maxFraction: number,
   minKeep: number = 0,
   minGap: number = 0,
-): { segments: PlannedSegment[]; demoted: number } {
-  if (maxFraction >= 1 && minGap <= 0) return { segments: segs, demoted: 0 };
-  const split2Count = segs.filter((s) => s.blockType === "split_2").length;
-  if (split2Count === 0) return { segments: segs, demoted: 0 };
+  // FRONT-LOADING (client 2026-08-18: "Put 80% of the splitscreens in the first
+  // 12 min and the 20% to the rest"). The allowance is divided into a front zone
+  // (blocks starting before frontSeconds) and the tail; each zone keeps its own
+  // quota, so the cap no longer just thins split_2 uniformly across the video.
+  // frontSeconds 0 disables zoning (single whole-video quota).
+  frontSeconds: number = 0,
+  frontShare: number = 0,
+  // Spacing rule between two split_2 that are BOTH in the front window.
+  // Concentrating the client's 80% into 12 minutes is a higher density than
+  // minGap was tuned for, so the front zone gets its own (tighter) rule; a
+  // negative or unset value falls back to minGap. See
+  // SYNTHETIC_SPLIT2_FRONT_MIN_GAP.
+  frontMinGap: number = -1,
+): { segments: PlannedSegment[]; demoted: number; keptFront: number; keptRest: number } {
+  const zoned = frontSeconds > 0 && frontShare > 0;
+  if (maxFraction >= 1 && minGap <= 0 && !zoned) {
+    return { segments: segs, demoted: 0, keptFront: 0, keptRest: 0 };
+  }
+  const split2Idx: number[] = [];
+  segs.forEach((s, i) => { if (s.blockType === "split_2") split2Idx.push(i); });
+  const split2Count = split2Idx.length;
+  if (split2Count === 0) return { segments: segs, demoted: 0, keptFront: 0, keptRest: 0 };
   // Allowed count: floor(total * fraction), floored at minKeep (client: ensure a
   // few split_2 survive so the layout still appears) but never above what Gemini
   // actually produced, and at least 1 when the fraction is non-zero. When the
   // fraction is 0 we still honor minKeep so an explicit floor wins over the cap.
   const fracAllowed = maxFraction <= 0 ? 0 : Math.max(1, Math.floor(segs.length * maxFraction));
   const allowed = maxFraction >= 1 ? split2Count : Math.min(split2Count, Math.max(fracAllowed, minKeep));
-  if (split2Count <= allowed && minGap <= 0) return { segments: segs, demoted: 0 };
+  if (split2Count <= allowed && minGap <= 0 && !zoned) {
+    return { segments: segs, demoted: 0, keptFront: 0, keptRest: 0 };
+  }
 
-  let kept = 0;
+  const isFront = (i: number) => zoned && segs[i].startTime < frontSeconds;
+  // Per-zone quotas. Rounding goes to the FRONT (the zone the client asked to
+  // fill) so an allowance of 5 at 80% is 4 front / 1 rest, not 4/1 by luck of
+  // the rounding mode.
+  const quotaFront = zoned ? Math.min(allowed, Math.round(allowed * frontShare)) : allowed;
+  const quotaRest = allowed - quotaFront;
+
+  // Spacing is measured in block positions, so "minGap 5" means at least 5
+  // blocks (of any type) between two kept split_2. Checked against the whole
+  // kept set rather than a running "last kept" cursor, because the spill pass
+  // below revisits earlier indices and a cursor would miss a backward conflict.
+  //
+  // A pair inside the front window uses the tighter front rule; any pair that
+  // straddles the boundary falls back to the wider one, so the tail never
+  // inherits front density.
+  const gapFront = zoned && frontMinGap >= 0 ? frontMinGap : minGap;
+  const kept = new Set<number>();
+  const gapOk = (idx: number) => {
+    if (minGap <= 0 && gapFront <= 0) return true;
+    for (const k of kept) {
+      const limit = isFront(idx) && isFront(k) ? gapFront : minGap;
+      if (limit > 0 && Math.abs(idx - k) <= limit) return false;
+    }
+    return true;
+  };
+
+  // Pass 1 — fill each zone against its own quota, in timeline order.
+  let keptFront = 0;
+  let keptRest = 0;
+  for (const i of split2Idx) {
+    const front = isFront(i);
+    const quota = front ? quotaFront : quotaRest;
+    const have = front ? keptFront : keptRest;
+    if (have >= quota || !gapOk(i)) continue;
+    kept.add(i);
+    if (front) keptFront++; else keptRest++;
+  }
+
+  // Pass 2 — SPILL. A zone that had fewer split_2 than its quota (Gemini put
+  // none in the first 12 minutes, say) leaves allowance unused; rather than
+  // silently shipping fewer split_2 than the band calls for, hand the remainder
+  // to the other zone. Front-loading is a preference about placement, not a
+  // reason to lose blocks the client's band already approved.
+  if (kept.size < allowed) {
+    for (const i of split2Idx) {
+      if (kept.size >= allowed) break;
+      if (kept.has(i) || !gapOk(i)) continue;
+      kept.add(i);
+      if (isFront(i)) keptFront++; else keptRest++;
+    }
+  }
+
   let demoted = 0;
-  // Index of the last KEPT split_2 — spacing is measured in block positions, so
-  // "minGap 3" means at least 3 other blocks (of any type) between two split_2.
-  let lastKeptIdx = -Infinity;
   const out = segs.map((s, i) => {
     if (s.blockType !== "split_2") return s;
-    if (kept < allowed && i - lastKeptIdx > minGap) {
-      kept++;
-      lastKeptIdx = i;
-      return s;
-    }
+    if (kept.has(i)) return s;
     demoted++;
     // Demote to a single-subject still. imagePrompt/shotType already describe the
     // illustrative half — reuse them verbatim. No motion on an image.
     return { ...s, blockType: "image" as SyntheticBlockType, animationPrompt: null };
   });
-  return { segments: out, demoted };
+  return { segments: out, demoted, keptFront, keptRest };
 }
 
 // Char index just past the FIRST sentence terminator (. ? !, optionally followed
@@ -2946,7 +3442,14 @@ export async function buildSyntheticTimeline(input: {
     const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
     const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
     const before = planned.filter((p) => p.blockType === "split_2").length;
-    const { segments, demoted } = capSplit2Blocks(planned, maxFraction, minKeep, minGap);
+    // FRONT-LOADING (client 2026-08-18): 80% of the allowance goes to the first
+    // 12 minutes. This only redistributes WHERE the kept split_2 sit; the band
+    // above still decides how many there are.
+    const frontSeconds = getEnv().SYNTHETIC_SPLIT2_FRONT_SECONDS;
+    const frontShare = getEnv().SYNTHETIC_SPLIT2_FRONT_SHARE;
+    const { segments, demoted, keptFront, keptRest } =
+      capSplit2Blocks(planned, maxFraction, minKeep, minGap, frontSeconds, frontShare,
+        getEnv().SYNTHETIC_SPLIT2_FRONT_MIN_GAP);
     if (demoted > 0) {
       segments.forEach((p, i) => { p.position = i; });
       planned = segments;
@@ -2955,9 +3458,19 @@ export async function buildSyntheticTimeline(input: {
         minFraction,
         minKeep,
         minGap,
+        frontSeconds,
+        frontShare,
         split2Before: before,
         split2After: before - demoted,
         demotedToImage: demoted,
+        keptFront,
+        keptRest,
+        // Achieved front share vs the requested one. Below target means the
+        // front window did not contain enough split_2 to fill its quota and the
+        // remainder spilled to the tail (see capSplit2Blocks pass 2).
+        keptFrontPercent: keptFront + keptRest > 0
+          ? Number(((keptFront / (keptFront + keptRest)) * 100).toFixed(1))
+          : 0,
         totalBlocks: planned.length,
       });
     }
@@ -3221,47 +3734,132 @@ export async function buildSyntheticTimeline(input: {
     const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
     const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
     const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
-    const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
+    // The no-promotions window is the PHASE-1 clip window (4 min), not the old
+    // 15-minute clip-heavy cutoff. The client's two 2026-08-18 asks conflict
+    // there — "first 4 minutes 80% clips" and "80% of splitscreens in the first
+    // 12 min" — and a split_2 is not a clip, so promoting inside the opening
+    // window would eat the very blocks the 80% clip target needs. Keeping the
+    // opening clear leaves 4-12 min to carry the front share. Falls back to the
+    // clip-heavy cutoff when phase 1 is disabled.
+    const cutoff = getEnv().SYNTHETIC_CLIP_PHASE1_SECONDS > 0
+      ? getEnv().SYNTHETIC_CLIP_PHASE1_SECONDS
+      : getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
+    const frontSeconds = getEnv().SYNTHETIC_SPLIT2_FRONT_SECONDS;
+    const frontShare = getEnv().SYNTHETIC_SPLIT2_FRONT_SHARE;
     const haveBefore = planned.filter((p) => p.blockType === "split_2").length;
-    const { segments, promoted } = ensureMinSplit2(planned, minKeep, cutoff);
+    const { segments, promoted, promotedFront } =
+      ensureMinSplit2(planned, minKeep, cutoff, frontSeconds, frontShare);
     if (promoted > 0) {
       planned = segments;
+      const finalFront = planned.filter(
+        (p) => p.blockType === "split_2" && p.startTime < frontSeconds,
+      ).length;
+      const finalTotal = haveBefore + promoted;
       await logJob({ projectId, jobId }, "synthetic.plan.split2_floor", {
         minKeep,
         minFraction,
         fracFloor,
+        introCutoffSeconds: cutoff,
+        frontSeconds,
+        frontShare,
         totalBlocks: planned.length,
         split2Before: haveBefore,
         promotedFromImage: promoted,
-        split2After: haveBefore + promoted,
+        promotedIntoFrontWindow: promotedFront,
+        split2After: finalTotal,
+        // FINAL placement across the whole plan — the number to check against
+        // the client's 80/20 ask. Short of target means the front window ran out
+        // of eligible 'image' blocks (heavily avatar-marked, or already clips).
+        split2InFrontWindow: finalFront,
+        split2FrontPercent: finalTotal > 0
+          ? Number(((finalFront / finalTotal) * 100).toFixed(1))
+          : 0,
       });
+    }
+
+    // FRONT-SHARE REBALANCE (client 2026-08-18: 80% of split_2 in the first 12
+    // min). The cap pass front-loads only what Gemini already put in the front
+    // window and the floor pass only fires below the band floor, so a plan that
+    // is inside the band but back-loaded satisfies both and still misses the
+    // placement rule. This trades tail split_2 for front ones at a fixed total.
+    // Runs last of the split_2 type passes; the DURATION cap below still gets to
+    // carve anything it promotes.
+    if (frontSeconds > 0 && frontShare > 0) {
+      const r = rebalanceSplit2ToFront(planned, {
+        frontSeconds,
+        frontShare,
+        introCutoffSeconds: cutoff,
+        minGap: getEnv().SYNTHETIC_SPLIT2_MIN_GAP,
+        frontMinGap: getEnv().SYNTHETIC_SPLIT2_FRONT_MIN_GAP,
+      });
+      if (r.moved > 0) {
+        planned = r.segments;
+        await logJob({ projectId, jobId }, "synthetic.plan.split2_front_rebalance", {
+          frontSeconds,
+          frontShare,
+          totalSplit2: r.total,
+          frontBefore: r.frontBefore,
+          frontAfter: r.frontAfter,
+          movedFromTailToFront: r.moved,
+          frontPercent: r.total > 0 ? Number(((r.frontAfter / r.total) * 100).toFixed(1)) : 0,
+          // Short of the requested share means the front window ran out of
+          // promotable images (heavily avatar-marked or already clips) or the
+          // spacing rule blocked the remaining slots.
+          targetFront: Math.round(r.total * frontShare),
+        });
+      }
     }
   }
 
-  // CLIP BUDGET BY DURATION (client 2026-08-17: "25% LTX, 5% veo" of the
-  // video). Runs LAST of the type passes so nothing downstream can undo it —
-  // the split_2 floor above promotes images, which would otherwise eat into the
-  // clip budget after it was measured.
+  // CLIP BUDGET BY DURATION, TWO PHASES (client 2026-08-18: "the first 4 minutes
+  // […] 80% clips and 20% images. After the first 4 mins, 70% images and 20% ltx
+  // clips and 10% VEO"). Runs LAST of the type passes so nothing downstream can
+  // undo it — the split_2 floor above promotes images, which would otherwise eat
+  // into the clip budget after it was measured.
   {
     const env = getEnv();
-    const clipFraction = env.SYNTHETIC_CLIP_DURATION_FRACTION;
-    const veoFraction = env.SYNTHETIC_VEO_DURATION_FRACTION;
+    const phase1Seconds = env.SYNTHETIC_CLIP_PHASE1_SECONDS;
     const veoEnabled = env.SYNTHETIC_VEO_ENABLED;
+    const basis = env.SYNTHETIC_CLIP_FRACTION_BASIS;
     const cutoff = env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF
       ? env.SYNTHETIC_CLIP_HEAVY_SECONDS
       : 0;
-    if (clipFraction > 0 || veoFraction > 0) {
+    // phase1Seconds 0 collapses to the single tail phase over the whole video,
+    // which is the pre-2026-08-18 flat budget.
+    const phases: ClipPhase[] = [];
+    if (phase1Seconds > 0) {
+      phases.push({
+        startSeconds: 0,
+        endSeconds: phase1Seconds,
+        clipFraction: env.SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION,
+        veoFraction: env.SYNTHETIC_CLIP_PHASE1_VEO_FRACTION,
+        label: "phase1_opening",
+      });
+    }
+    phases.push({
+      startSeconds: phase1Seconds > 0 ? phase1Seconds : 0,
+      endSeconds: Infinity,
+      clipFraction: env.SYNTHETIC_CLIP_DURATION_FRACTION,
+      veoFraction: env.SYNTHETIC_VEO_DURATION_FRACTION,
+      label: "phase2_body",
+    });
+    if (phases.some((p) => p.clipFraction > 0 || p.veoFraction > 0)) {
       const q = assignClipDurationQuota(planned, {
-        clipFraction,
-        veoFraction,
+        phases,
+        basis,
         veoEnabled,
         cutoffSeconds: cutoff,
       });
       planned = q.segments;
       const pct = (s: number) => (q.totalSeconds > 0 ? Number(((s / q.totalSeconds) * 100).toFixed(1)) : 0);
+      // Per-phase achieved share, measured against the SAME basis the target
+      // used — a video-wide percentage cannot show whether the opening window
+      // hit its 80%, which is the number the client is actually watching for.
+      const phaseShare = (p: ClipQuotaPhaseResult, s: number) =>
+        p.basisSeconds > 0 ? Number(((s / p.basisSeconds) * 100).toFixed(1)) : 0;
       await logJob({ projectId, jobId }, "synthetic.plan.clip_duration_quota", {
-        clipFraction,
-        veoFraction,
+        basis,
+        phase1Seconds,
         veoEnabled,
         cutoffSeconds: cutoff,
         totalSeconds: Math.round(q.totalSeconds),
@@ -3279,6 +3877,18 @@ export async function buildSyntheticTimeline(input: {
         // budget — the doc is highlighted too heavily for the requested clip
         // share. Surfaced rather than silently missed.
         shortfallSeconds: Math.round(q.shortfallSeconds),
+        phases: q.phases.map((p) => ({
+          label: p.label,
+          window: `${Math.round(p.startSeconds)}-${p.endSeconds === Infinity ? "end" : Math.round(p.endSeconds)}s`,
+          basisSeconds: Math.round(p.basisSeconds),
+          clipSeconds: Math.round(p.clipSeconds),
+          clipPercent: phaseShare(p, p.clipSeconds),
+          veoSeconds: Math.round(p.veoSeconds),
+          veoPercent: phaseShare(p, p.veoSeconds),
+          ltxBlocks: p.ltxBlocks,
+          veoBlocks: p.veoBlocks,
+          shortfallSeconds: Math.round(p.shortfallSeconds),
+        })),
       });
       if (q.shortfallSeconds > 0) {
         await logJob({ projectId, jobId }, "synthetic.plan.clip_quota_shortfall", {
@@ -3287,7 +3897,20 @@ export async function buildSyntheticTimeline(input: {
             "avatar blocks come from doc highlights and cannot be reassigned",
           shortfallSeconds: Math.round(q.shortfallSeconds),
           achievedPercent: pct(q.clipSeconds),
-          targetPercent: Number(((clipFraction + (veoEnabled ? veoFraction : 0)) * 100).toFixed(1)),
+          // Which phase(s) actually missed. On the client's 2026-08-18 mix the
+          // opening window is the one that can realistically starve: 80% of a
+          // 4-minute window is a lot of clip seconds to find when the doc marks
+          // much of it as avatar.
+          missedPhases: q.phases
+            .filter((p) => p.shortfallSeconds > 0)
+            .map((p) => ({
+              label: p.label,
+              shortfallSeconds: Math.round(p.shortfallSeconds),
+              achievedPercent: phaseShare(p, p.clipSeconds),
+              targetPercent: p.basisSeconds > 0
+                ? Number(((p.targetClipSeconds / p.basisSeconds) * 100).toFixed(1))
+                : 0,
+            })),
         });
       }
     }
@@ -3380,6 +4003,115 @@ export async function buildSyntheticTimeline(input: {
         regenerated: distinctRegenerated,
         regenFailed: distinctRegenFailed,
       });
+    }
+  }
+
+  // WITHIN-VIDEO SCENE DEDUPE (client 2026-08-19 via Joey: "for example the
+  // german video, it is showing spoons a lot, very similar images and similar
+  // footages. I want more variation" / "can you hardcode it in that its not too
+  // repetitive and it matches the script better").
+  //
+  // The pass above only de-duplicates the extra visuals of ONE sentence. This
+  // one runs across the WHOLE plan: any block whose scene repeats an earlier
+  // block's is regenerated against it, so a script that keeps returning to its
+  // subject stops rendering the same picture every time. Runs AFTER the
+  // second-visual pass (whose regenerations are themselves candidates here) and
+  // after every block-type pass, so it sees the final scene list.
+  //
+  // Deliberately the SECOND half of the repetition fix — the first is the
+  // cross-video reuse ceiling (ASSET_LIBRARY_MAX_REUSE_FRACTION, lowered to
+  // 0.15 the same day). Reuse recycles assets between projects; this is about
+  // one script talking about spoons forty times.
+  //
+  // A regen failure is non-fatal: that block keeps its original prompt.
+  if (getEnv().SYNTHETIC_SCENE_DEDUPE_ENABLED) {
+    const env = getEnv();
+    // Only visual blocks carry a scene. Avatar blocks have no image prompt, and
+    // split_2's right half does — it is just as capable of repeating.
+    const scenes = planned.map((p) =>
+      p.blockType === "avatar" ? null : (p.imagePrompt ?? null),
+    );
+    const { repeats, flaggedTotal } = findRepeatedScenes(scenes, {
+      basePrompt,
+      similarity: env.SYNTHETIC_SCENE_DEDUPE_SIMILARITY,
+      window: env.SYNTHETIC_SCENE_DEDUPE_WINDOW,
+      maxRegen: env.SYNTHETIC_SCENE_DEDUPE_MAX_REGEN,
+    });
+
+    if (repeats.length > 0) {
+      // Blocks that duplicate the SAME earlier scene must also differ from each
+      // OTHER, so each anchor's repeats form a chain processed sequentially with
+      // an accumulating avoid list — otherwise five spoon blocks would each be
+      // told "not that spoon shot" and could all land on the same new one.
+      // Different anchors are independent, so chains run in parallel (same
+      // shape as the second-visual pass above).
+      const chains = new Map<number, RepeatedScene[]>();
+      for (const r of repeats) {
+        if (!chains.has(r.anchor)) chains.set(r.anchor, []);
+        chains.get(r.anchor)!.push(r);
+      }
+
+      let dedupeRegenerated = 0;
+      let dedupeFailed = 0;
+      const dedupeLimit = makeLimit(5);
+      await Promise.all(
+        [...chains.values()].map((chain) =>
+          dedupeLimit(async () => {
+            const avoid = [...chain[0].avoid];
+            for (const r of chain) {
+              const seg = planned[r.index];
+              try {
+                const g = await regenerateSegmentPrompt({
+                  projectId,
+                  jobId,
+                  script: seg.script,
+                  basePrompt,
+                  blockType: seg.blockType,
+                  language,
+                  avoidScenes: avoid,
+                });
+                // Returns a prompt already composed WITH the base in front and
+                // the shot folded in — clear shotType so persist's composePrompt
+                // passes it through rather than prefixing a second shot.
+                seg.imagePrompt = g.imagePrompt;
+                seg.shotType = null;
+                if (seg.blockType === "ai_clip") seg.animationPrompt = g.animationPrompt;
+                avoid.push(g.imagePrompt);
+                dedupeRegenerated++;
+              } catch {
+                dedupeFailed++;
+                // Keep the old scene in avoid so the next link still differs
+                // from what this block will actually show.
+                if (seg.imagePrompt?.trim()) avoid.push(seg.imagePrompt.trim());
+              }
+            }
+          }),
+        ),
+      );
+
+      await logJob({ projectId, jobId }, "synthetic.plan.scene_dedupe", {
+        similarity: env.SYNTHETIC_SCENE_DEDUPE_SIMILARITY,
+        window: env.SYNTHETIC_SCENE_DEDUPE_WINDOW,
+        visualBlocks: scenes.filter((s) => !!s).length,
+        // How repetitive the plan was BEFORE this pass — the number to watch if
+        // the client reports repetition again. A high count here with a low
+        // regenerated count means the cap bound.
+        repeatsDetected: flaggedTotal,
+        regenerated: dedupeRegenerated,
+        regenFailed: dedupeFailed,
+        chains: chains.size,
+      });
+      if (flaggedTotal > repeats.length) {
+        await logJob({ projectId, jobId }, "synthetic.plan.scene_dedupe.capped", {
+          note:
+            "more repeated scenes than SYNTHETIC_SCENE_DEDUPE_MAX_REGEN allows — " +
+            "the overflow keeps its original prompt",
+          detected: flaggedTotal,
+          regenerated: repeats.length,
+          skipped: flaggedTotal - repeats.length,
+          maxRegen: env.SYNTHETIC_SCENE_DEDUPE_MAX_REGEN,
+        });
+      }
     }
   }
 
