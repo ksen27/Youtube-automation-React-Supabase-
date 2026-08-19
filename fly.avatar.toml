@@ -232,10 +232,24 @@ kill_timeout = "300s"
   SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.5"
   SYNTHETIC_SCENE_DEDUPE_WINDOW = "40"
   SYNTHETIC_SCENE_DEDUPE_MAX_REGEN = "80"
-  # LTX bills ~$0.04/sec, so 25% of a LONG video is a real bill (~$36 for 60
-  # min). Set this to "true" to confine the clip budget inside the 15-minute
-  # SYNTHETIC_CLIP_HEAVY_SECONDS window instead of spreading it across the whole
-  # video — restoring the July "no more LTX after 15 minutes" cost guard.
+  # Confine the clip budget inside the 15-minute SYNTHETIC_CLIP_HEAVY_SECONDS
+  # window instead of spreading it across the whole video — the July "no more LTX
+  # after 15 minutes" cost guard. "false" spreads clips across the whole video,
+  # which is what the client's 2026-08-18 percentage-based mix asks for.
+  #
+  # THIS LINE DID NOTHING UNTIL 2026-08-19. lib/env.ts parsed booleans with
+  # z.coerce.boolean(), i.e. Boolean("false") === true, so the guard was ON in
+  # production the whole time. Effect on project 36a374a5 (31 min): the entire
+  # clip budget landed before 15:00 — roughly three quarters of minutes 4-15 were
+  # clips and minutes 15-31 had NO moving footage at all — while the summary log
+  # reported a perfectly correct 30.3% clip share. lib/env.ts now uses boolish(),
+  # so "false" finally means false (see lib/env-boolish.test.ts).
+  #
+  # NOTE the standing conflict: the client's July direction was "no more LTX after
+  # 15 minutes" (cost), and the 2026-08-18 direction is a percentage mix across
+  # the whole video. They cannot both hold. This is set to honour the NEWER one.
+  # Flip to "true" to restore the cost guard — clips then compress into the first
+  # 15 minutes and the back half of a long video is all stills.
   SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF = "false"
   # 69labs video lane (Veo 3.1 Lite, 1 credit/clip). Model ids: GET
   # /api/v1/videos/models.

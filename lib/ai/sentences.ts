@@ -65,10 +65,27 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Build the mask patterns for a locale. Null when the locale has no rules
-// (English), which short-circuits masking entirely.
+// A period BETWEEN DIGITS is never a sentence end: "1.500 Euro", "1.5 euros",
+// "23.7%". This one is language-INDEPENDENT and applies even to English.
+//
+// It fixes silent TEXT LOSS, not just a bad split. SENTENCE_REGEX's first
+// branch requires whitespace-or-end after the terminator, so on "Das kostet
+// 1.500 Euro." it fails mid-number, resumes past the period, and the leading
+// "Das kostet 1" is dropped from the output entirely — the sentence list no
+// longer reproduces the transcript, and the block's generated visual describes
+// a sentence that was never spoken.
+//
+// English uses ',' for thousands so it only hit decimals there; German and
+// Spanish both use '.' in ordinary prose ("1.500 Euro"), which turns a rare
+// edge case into a routine one. Requires a digit IMMEDIATELY after the period,
+// so a genuine sentence break before a number ("Ich habe 5. 3 bleiben.") is
+// untouched.
+const NUMERIC_PERIOD = /\d\.(?=\d)/gu;
+
+// Build the mask patterns for a locale. Always returns at least the
+// language-independent numeric rule.
 function buildMaskPatterns(locale: LocaleConfig): RegExp[] | null {
-  const patterns: RegExp[] = [];
+  const patterns: RegExp[] = [NUMERIC_PERIOD];
 
   // Abbreviations: "z.B.", "d.h.", "Dr." — matched whole, case-sensitively, and
   // only when followed by whitespace or end-of-input so "Dr." inside a longer
@@ -83,14 +100,16 @@ function buildMaskPatterns(locale: LocaleConfig): RegExp[] | null {
   // Ordinals: "am 1. Januar", "vom 3. bis". A bare digits-then-period is
   // genuinely ambiguous — "Es waren 15." is a real sentence end — so we mask
   // only when what FOLLOWS continues the phrase: a month name, or a lowercase
-  // word (German capitalises nouns, so lowercase means mid-sentence).
+  // word. The lowercase test holds in every language here: a new sentence is
+  // capitalised, so a lowercase continuation means we are mid-sentence. (It
+  // also covers Spanish months, which are written lowercase.)
   if (locale.ordinalMonths.length > 0) {
     const months = locale.ordinalMonths.map(escapeRegExp).join("|");
-    patterns.push(new RegExp(`\\d{1,2}\\.(?=\\s+(?:${months})\\b)`, "gu"));
+    patterns.push(new RegExp(`\\d{1,2}\\.(?=\\s+(?:${months})\\b)`, "giu"));
     patterns.push(new RegExp(`\\d{1,2}\\.(?=\\s+\\p{Ll})`, "gu"));
   }
 
-  return patterns.length > 0 ? patterns : null;
+  return patterns;
 }
 
 // Replace sentence-internal periods with PERIOD_MASK. Length-preserving.
@@ -158,10 +177,9 @@ export function splitTranscriptIntoSentences(
   // Hide sentence-internal periods before ANY splitting or offset arithmetic
   // happens. Masking is length-preserving, so `masked` and `transcript` are
   // positionally identical and every char_offset computed below indexes the
-  // original transcript correctly. English yields no patterns, so `masked` is
-  // the transcript itself and this whole feature is a no-op there.
-  const maskPatterns = buildMaskPatterns(locale);
-  const masked = maskPatterns ? maskPeriods(transcript, maskPatterns) : transcript;
+  // original transcript correctly. English gets only the numeric rule, which
+  // is a bug fix rather than a behaviour change (see NUMERIC_PERIOD).
+  const masked = maskPeriods(transcript, buildMaskPatterns(locale));
 
   const sentences: Sentence[] = [];
   const paragraphs = masked.split(/\n+/);

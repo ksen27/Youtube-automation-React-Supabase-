@@ -147,11 +147,7 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   // Why: one `delete from projects` runs every child cleanup inside a SINGLE
   // statement, and each referential-integrity trigger fires once per child row
   // keyed on the REFERENCING column (timeline_items.synthetic_segment_id,
-<<<<<<< HEAD
-  // timeline_items.clip_id, synthetic_segments.source_job_id). For a synthetic
-=======
   // timeline_items.clip_id, timeline_items.source_job_id). For a synthetic
->>>>>>> 822a0fd90aca7ea1340a9aa60b54b90ea4ed28ff
   // project that is thousands of tiny queries inside one statement, and the
   // whole thing dies on PostgREST's 8s statement_timeout — "canceling statement
   // due to statement timeout". Migration 0039 indexes those columns, which is
@@ -161,13 +157,10 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   //
   // Order matters: rows that POINT AT other rows of this project go first.
   const childTables = [
-<<<<<<< HEAD
-    "timeline_items",        // -> video_clips.clip_id, synthetic_segments.synthetic_segment_id
-    "synthetic_segments",    // -> media_jobs.source_job_id
-=======
-    "timeline_items",        // -> video_clips, synthetic_segments, media_jobs
-    "synthetic_segments",
->>>>>>> 822a0fd90aca7ea1340a9aa60b54b90ea4ed28ff
+    // All three of timeline_items' outbound FKs are on THIS table — clip_id,
+    // synthetic_segment_id and source_job_id — which is why it is deleted first.
+    "timeline_items",        // -> video_clips.clip_id, synthetic_segments.synthetic_segment_id, media_jobs.source_job_id
+    "synthetic_segments",    // no outbound FK to media_jobs (source_job_id is on timeline_items)
     "video_clips",           // -> video_sources.id, projects.intro_clip_id
     "media_jobs",
     "render_jobs",

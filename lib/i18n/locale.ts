@@ -19,7 +19,7 @@
 // Adding French/Spanish later is a new entry in LOCALES — not a new migration
 // and not another pass through the planner.
 
-export const LANGUAGES = ["en", "de"] as const;
+export const LANGUAGES = ["en", "de", "es"] as const;
 export type LanguageCode = (typeof LANGUAGES)[number];
 
 // Every pre-existing project predates the `language` column and is English.
@@ -129,7 +129,60 @@ const DE: LocaleConfig = {
   ],
 };
 
-const LOCALES: Record<LanguageCode, LocaleConfig> = { en: EN, de: DE };
+// SPANISH — targeted at SPAIN / European Spanish.
+//
+// This is a deliberate choice, not an oversight: "Spanish" does not name one
+// visual world. A Madrid street and a Mexico City street share a language and
+// almost nothing on screen, and the image models will happily render either.
+// Spain matches the pattern of the German rollout (a European market) and is
+// the assumption to revisit FIRST if the client's audience is Latin American —
+// change `visualCulture` below, or add an `es-419` entry beside this one if
+// both markets are wanted at once. Nothing outside this object needs to change.
+const ES: LocaleConfig = {
+  code: "es",
+  label: "Spanish",
+  nativeLabel: "Español",
+  promptName: "Spanish",
+  deepgramLanguage: "es",
+  // ~2.7 wps: Spanish is spoken at a higher syllable rate than English and
+  // averages slightly more words for the same wall-clock narration.
+  wordsPerSecond: 2.7,
+  // Spanish abbreviations that are effectively never sentence-final. As with
+  // German this deliberately omits "etc.", which routinely ends a sentence.
+  abbreviations: [
+    "Sr.", "Sra.", "Srta.", "Dr.", "Dra.", "Lic.", "Ing.", "Ud.", "Uds.",
+    "p.ej.", "aprox.", "núm.", "pág.", "Av.", "Cía.", "EE.UU.", "S.A.",
+  ],
+  // Spanish months are LOWERCASE ("1 de enero"), which the ordinal rule's
+  // lowercase-continuation branch already covers. They are listed anyway
+  // because the ordinal form "1.º de enero" does occur, and the month branch
+  // matches case-insensitively.
+  ordinalMonths: [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+  ],
+  visualCulture: [
+    "AUDIENCE / REGION (client requirement): this video is narrated in Spanish for",
+    "a Spanish audience (Spain). Every scene must look like it was shot in southern",
+    "Europe — NOT in the USA and NOT in Latin America:",
+    "  - People: Spanish / southern European, in ordinary everyday clothing.",
+    "  - Homes: Spanish flats and houses — tiled floors, shuttered or grilled",
+    "    windows, small balconies with drying laundry, terraces, compact fitted",
+    "    kitchens. NOT US suburban houses with lawns and double garages.",
+    "  - Streets and towns: Spanish streetscapes — narrow streets and plazas,",
+    "    terrace bars with outdoor tables, awnings, tiled façades, scooters and",
+    "    small European cars with EU number plates. NOT US pickup trucks, NOT",
+    "    strip malls, NOT American road signage.",
+    "  - Everyday life: Spanish supermarkets and product packaging, euro notes and",
+    "    coins, Spanish road signs, strong Mediterranean sunlight, dry southern",
+    "    European vegetation (olive, pine, palm).",
+    "Keep this regional look even when the narration does not mention a place —",
+    "it is the video's default world, not a special case.",
+    "",
+  ],
+};
+
+const LOCALES: Record<LanguageCode, LocaleConfig> = { en: EN, de: DE, es: ES };
 
 /** Every supported locale, in intake-dropdown order. */
 export const ALL_LOCALES: readonly LocaleConfig[] = LANGUAGES.map((c) => LOCALES[c]);

@@ -13,7 +13,7 @@ import {
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
 import { detectLoudnessDropout } from "@/lib/media/ffmpeg";
-import { getLocale, type LocaleConfig } from "@/lib/i18n/locale";
+import { getLocale, type LanguageCode, type LocaleConfig } from "@/lib/i18n/locale";
 import { getEnv } from "@/lib/env";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -104,6 +104,15 @@ async function generateVoiceQC(
   return { voice: best!.voice, attempts: total, clean: false, note: "qc_exhausted_best_effort" };
 }
 
+// Per-language default voice ids. English is absent on purpose: it falls
+// through to the provider's own default (AI33_DEFAULT_VOICE /
+// SIXTYNINE_LABS_DEFAULT_VOICE), which is the behaviour that predates
+// multi-language support.
+function defaultVoiceByLanguage(): Partial<Record<LanguageCode, string>> {
+  const env = getEnv();
+  return { de: env.TTS_DEFAULT_VOICE_DE, es: env.TTS_DEFAULT_VOICE_ES };
+}
+
 // Pick the voice to narrate with.
 //
 // The TTS providers have NO language parameter — both ai33 and 69labs are
@@ -114,11 +123,8 @@ async function generateVoiceQC(
 // provider apply its own default, which is correct for English.
 function resolveVoiceId(projectVoiceId: string | null, locale: LocaleConfig): string | undefined {
   if (projectVoiceId?.trim()) return projectVoiceId.trim();
-  if (locale.code === "de") {
-    const german = getEnv().TTS_DEFAULT_VOICE_DE.trim();
-    if (german) return german;
-  }
-  return undefined;
+  const perLanguage = defaultVoiceByLanguage()[locale.code]?.trim();
+  return perLanguage || undefined;
 }
 
 // STEP 2 + 3 of the synthetic pipeline (voiceover resolution + alignment).

@@ -1,6 +1,41 @@
 import { z } from "zod";
 import { planTimeline } from "@/lib/ai/timeline-plan";
 
+/**
+ * Boolean env var that can actually be switched OFF.
+ *
+ * THE BUG THIS REPLACES: every flag in this file used `z.coerce.boolean()`,
+ * which is `Boolean(value)` — and `Boolean("false")` is `true`. So a flag set to
+ * the string "false" in fly.toml or a Fly secret read as ON, and the only way to
+ * disable anything was to UNSET the variable entirely. Two comments in this file
+ * already documented the trap for individual flags without fixing it, and
+ * SYNTHETIC_PLAN_ALIGN_FIRST worked around it inline.
+ *
+ * It was not theoretical. `SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF = "false"` shipped
+ * in fly.avatar.toml and ran as TRUE, confining the entire clip budget to the
+ * first 15 minutes: on a 31-minute video (2026-08-19, project 36a374a5) minutes
+ * 15-31 rendered with zero moving footage while the summary log reported a
+ * perfectly correct 30.3% clip share. Wrong in a way that reads as right.
+ *
+ * Accepts the usual off-spellings, case- and whitespace-insensitive. An EMPTY
+ * string means "not configured" and falls back to `def` — an accidentally-blank
+ * var must not silently flip a flag in either direction.
+ */
+const boolish = (def: boolean) =>
+  z
+    .preprocess((v) => {
+      if (typeof v !== "string") return v;
+      const s = v.trim();
+      if (s === "") return def;
+      return !/^(0|false|no|off)$/i.test(s);
+    }, z.boolean())
+    .default(def);
+
+// Names of every boolish flag whose raw env value spells "off". Populated at
+// parse time and reported by getEnv() so a deploy shows exactly which flags the
+// fix above turned off — the ones that were silently ON before it landed.
+const FLAGS_EXPLICITLY_OFF: string[] = [];
+
 // Server-only env. Never import this from a "use client" file.
 const ServerEnvSchema = z.object({
   NEXT_PUBLIC_SUPABASE_URL: z.string().url().optional(),
@@ -57,7 +92,7 @@ const ServerEnvSchema = z.object({
   DOWNLOAD_CONCURRENCY: z.coerce.number().int().positive().default(1),
   // Toggle for the per-clip Gemini Vision labeler. Costs ~$0.001 per clip;
   // disable when running cost-sensitive tests.
-  CLIP_LABELING_ENABLED: z.coerce.boolean().default(true),
+  CLIP_LABELING_ENABLED: boolish(true),
   // Toggle for per-clip face-reference verification. After each clip is cut,
   // compare its thumbnail against the project celebrity's Wikipedia photo
   // via verifyPoolAsset. Clips that fail get tagged subject_present:no so
@@ -65,20 +100,20 @@ const ServerEnvSchema = z.object({
   // blocks. Costs one Gemini Vision call per clip (~$0.001) and stops the
   // "wrong person in the clip" failure mode where the source thumbnail
   // shows the celebrity but a cut mid-video shows only a co-host.
-  CLIP_FACE_VERIFY_ENABLED: z.coerce.boolean().default(true),
+  CLIP_FACE_VERIFY_ENABLED: boolish(true),
   // "Clear footage only" gate. When on, each cut clip's sampled frames
   // (start/mid/end) are checked for logos, watermarks, on-screen text/captions,
   // title cards and end-screens; a clip is DROPPED if any frame is dirty. This
   // is stricter than the single-frame labeler junk check (which only looks at
   // the first frame and tolerates lower-third text). Costs up to 3 extra Gemini
   // Vision calls per clip — reuses the frames already sampled for face verify.
-  CLIP_CLEAN_FOOTAGE_ENABLED: z.coerce.boolean().default(true),
+  CLIP_CLEAN_FOOTAGE_ENABLED: boolish(true),
   // "Celebrity images only" mode. When on, the image pool fetches ONLY the
   // main celebrity's images — no buildings, places, company/show logos, posters,
   // or even related people. Blocks that would otherwise show a non-person image
   // fall back to celebrity footage/image instead. Client requirement: the final
   // video shows only the celebrity, never off-person imagery.
-  IMAGE_CELEBRITY_ONLY: z.coerce.boolean().default(true),
+  IMAGE_CELEBRITY_ONLY: boolish(true),
   // Master toggle for analyze-time face verification. When false, both the
   // thumbnail check AND the body-frame check are skipped — candidates are
   // accepted based on rankCandidate score alone. The verify code path is
@@ -89,7 +124,7 @@ const ServerEnvSchema = z.object({
   // 2022" instead of generic "David Walliams interview"), so on-topic
   // candidates land first and the verify gate's value drops. Re-enable
   // when face-recognition is needed to filter look-alike thumbnails.
-  ANALYZE_FACE_VERIFY_ENABLED: z.coerce.boolean().default(false),
+  ANALYZE_FACE_VERIFY_ENABLED: boolish(false),
   // Toggle for analyze-time body-frame verification. In addition to the
   // single mqdefault.jpg check, sample YouTube's auto-generated frames
   // 1.jpg / 2.jpg / 3.jpg (taken at 25%/50%/75% of the video) and verify
@@ -100,7 +135,7 @@ const ServerEnvSchema = z.object({
   // (~$0.003) but stops the user from selecting source videos that will
   // produce zero useful clips. Only consulted when
   // ANALYZE_FACE_VERIFY_ENABLED is true.
-  ANALYZE_BODY_VERIFY_ENABLED: z.coerce.boolean().default(true),
+  ANALYZE_BODY_VERIFY_ENABLED: boolish(true),
   // Toggle for the character-anchored query lane at analyze time. In
   // addition to script-aware queries (which target the story's specific
   // events), run a fixed set of templated queries against the project
@@ -110,7 +145,7 @@ const ServerEnvSchema = z.object({
   // discussion — exactly the content the matcher needs to fill abstract
   // "celebrity_default" blocks. Results merge into every segment's pool
   // and compete with story-aware candidates via the existing ranker.
-  ANALYZE_CHARACTER_LANE_ENABLED: z.coerce.boolean().default(true),
+  ANALYZE_CHARACTER_LANE_ENABLED: boolish(true),
   MAX_VIDEOS_PER_PROJECT: z.coerce.number().int().positive().default(5),
   // Upper bound on the fraction of content blocks (image + footage) that may
   // be images. Gemini's per-sentence visual-type call lands ~50% images,
@@ -343,7 +378,7 @@ const ServerEnvSchema = z.object({
   // video layers is impossible with the concat's -c:v copy fast path), so it
   // adds one libx264 pass over the whole timeline. Audio is stream-copied —
   // the voiceover/music/SFX mix is already baked into the concat output.
-  EFFECT_OVERLAY_ENABLED: z.coerce.boolean().default(false),
+  EFFECT_OVERLAY_ENABLED: boolish(false),
   // PERFORMANCE_MODE — diagnostic "no visual effects" render path for the
   // SYNTHETIC (AI avatar) engine ONLY. When true, a synthetic render skips ALL
   // clip-to-clip transitions (image↔image xfade, image↔video / video↔image
@@ -354,7 +389,7 @@ const ServerEnvSchema = z.object({
   // render-time delta isolates exactly how much those effects cost. The sourced
   // (celebrity) engine ignores this flag entirely (byte-for-byte unchanged).
   // Off by default — a normal deploy renders with effects as before.
-  PERFORMANCE_MODE: z.coerce.boolean().default(false),
+  PERFORMANCE_MODE: boolish(false),
   EFFECT_OVERLAY_PATH: z.string().default("./assets/effect-overlay.mp4"),
   EFFECT_OVERLAY_OPACITY: z.coerce.number().min(0).max(1).default(0.85),
   // Pre-blend brightness gain on the effect layer. Multiplies the particle
@@ -465,7 +500,7 @@ const ServerEnvSchema = z.object({
   // so it would 400 on the `resolution` field we send. gpt-image-2 is therefore
   // the default; switch here if 69labs' Grok model recovers (and blank
   // CELEB_IMAGE_RESOLUTION when you do).
-  CELEB_IMAGE_ENABLED: z.coerce.boolean().default(false),
+  CELEB_IMAGE_ENABLED: boolish(false),
   CELEB_IMAGE_MODEL: z.string().default("gpt-image-2"),
   // Dedicated 69labs key for CelebForge stills. When set, celebrity image
   // generation uses EXACTLY this key and never round-robins the shared pool —
@@ -625,7 +660,7 @@ const ServerEnvSchema = z.object({
   // before this provider existed. On with a key = ai33 participates in the
   // provider chain; WHICH END it sits at is set by SYNTHETIC_*_PROVIDER_PRIMARY
   // below (it is no longer implicitly first — see that note).
-  AI33_ENABLED: z.coerce.boolean().default(true),
+  AI33_ENABLED: boolish(true),
 
   // WHICH PROVIDER LEADS the image / TTS chain. The other one becomes the
   // fallback; both still participate, so an outage on either is ridden out.
@@ -693,17 +728,18 @@ const ServerEnvSchema = z.object({
   // Voice used when a project has none. Empty = fall back to
   // SIXTYNINE_LABS_DEFAULT_VOICE (normalised with the prefix above).
   AI33_DEFAULT_VOICE: z.string().default(""),
-  // Per-language default voice, used when a non-English project does not name
-  // its own tts_voice_id. Without this a German project would silently fall
-  // back to the English default voice and render German text in an
-  // English-accented voice — the one failure mode of this feature that is
+  // Per-language default voices, used when a non-English project does not name
+  // its own tts_voice_id. Without these a German or Spanish project would
+  // silently fall back to the English default voice and narrate foreign text in
+  // an English-accented voice — the one failure mode of this feature that is
   // obvious to the client but invisible in the logs.
   //
   // Same id format as AI33_DEFAULT_VOICE / tts_voice_id (a bare ElevenLabs id
   // is prefixed with AI33_TTS_VOICE_PROVIDER before submit), so one value
-  // serves both the ai33 primary and the 69labs backup. Empty = no German
-  // default; a German project must then set its voice at intake.
+  // serves both the ai33 primary and the 69labs backup. Empty = no default for
+  // that language; such a project must then set its voice at intake.
   TTS_DEFAULT_VOICE_DE: z.string().default(""),
+  TTS_DEFAULT_VOICE_ES: z.string().default(""),
   // Cluster-wide concurrent ai33 generations (Redis-coordinated, same mechanism
   // as the 69labs account cap). ai33 rate-limits per USER — every key on the
   // account shares one quota — so this is a single global ceiling.
@@ -796,7 +832,7 @@ const ServerEnvSchema = z.object({
   // sidestepping 69labs' per-account credit/slot limits. Reuses GEMINI_API_KEY.
   // Enabled only when GEMINI_IMAGE_ENABLED is on AND GEMINI_API_KEY is set; when
   // off, the fallback stays fal.ai. Preferred over fal when both are configured.
-  GEMINI_IMAGE_ENABLED: z.coerce.boolean().default(true),
+  GEMINI_IMAGE_ENABLED: boolish(true),
   // Image model id. Default is the established "nano-banana" (gemini-2.5-flash-
   // image). Bump to a newer image model (e.g. gemini-3-pro-image) via env once
   // confirmed live on the key — no code change needed. The "-latest"-style
@@ -833,9 +869,9 @@ const ServerEnvSchema = z.object({
   // is unset. OFF by default — those proxies are tuned for yt-dlp and can
   // reject the browser with HTTP 407 (proxy auth), failing every avatar job.
   // Only enable if you've confirmed the shared pool authenticates a browser.
-  HEYGEN_USE_YTDLP_PROXIES: z.coerce.boolean().default(false),
+  HEYGEN_USE_YTDLP_PROXIES: boolish(false),
   // Run the browser headful (false) for local debugging of HeyGen automation.
-  HEYGEN_HEADLESS: z.coerce.boolean().default(true),
+  HEYGEN_HEADLESS: boolish(true),
   // Per-attempt timeout (ms) for one HeyGen avatar generation in the browser.
   HEYGEN_NAV_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   // Timeout (ms) for SETUP-phase UI-readiness waits (composer load, photo
@@ -887,7 +923,7 @@ const ServerEnvSchema = z.object({
   // Debug mode (spec G): run the browser headful with slowMo and a page.pause()
   // so you can step through HeyGen's UI when it changes. Forces headless off
   // regardless of HEYGEN_HEADLESS. NEVER enable on a headless worker host.
-  HEYGEN_DEBUG: z.coerce.boolean().default(false),
+  HEYGEN_DEBUG: boolish(false),
   // slowMo (ms) applied to every Playwright action when HEYGEN_DEBUG is on.
   HEYGEN_SLOWMO_MS: z.coerce.number().int().nonnegative().default(500),
   // Anti-bot hardening (Cloudflare flags datacenter IPs + headless fingerprints
@@ -903,7 +939,7 @@ const ServerEnvSchema = z.object({
   // flags IP churn between login and use). Requires a WORKING residential proxy
   // (HEYGEN_PROXIES) — leave false until proxy auth is confirmed (the shared
   // YTDLP pool 407'd). Default false: connect from the human's own IP.
-  HEYGEN_CONNECT_USES_PROXY: z.coerce.boolean().default(false),
+  HEYGEN_CONNECT_USES_PROXY: boolish(false),
   // Use the stealth-patched Chromium (patchright) instead of vanilla Playwright
   // for the HeyGen browser. Vanilla headless Chromium intermittently fails
   // Cloudflare's bot challenge on /home and /avatar — the page comes up blank
@@ -915,7 +951,7 @@ const ServerEnvSchema = z.object({
   // tells that patchright strips automatically. Toggleable so we can A/B and
   // revert without a code change. Requires patchright + its Chromium installed
   // (see Dockerfile.worker). Default false (vanilla Playwright).
-  HEYGEN_USE_STEALTH: z.coerce.boolean().default(false),
+  HEYGEN_USE_STEALTH: boolish(false),
   // Seconds to wait before each avatar attempt, to break up burst patterns that
   // trip HeyGen's anti-bot. 0 disables. Avatar concurrency is already 1, so this
   // just spaces serial jobs apart.
@@ -1099,15 +1135,10 @@ const ServerEnvSchema = z.object({
   // render rejection and 12 minutes of visuals derived from one sentence.
   //
   // Default ON — the legacy path is the bug. Set SYNTHETIC_PLAN_ALIGN_FIRST=0
-  // to fall back to it. NOTE the explicit boolish parse: z.coerce.boolean()
-  // (used by the older flags in this file) maps the STRING "false" to true,
-  // so it cannot express an off switch via env at all.
-  SYNTHETIC_PLAN_ALIGN_FIRST: z
-    .preprocess(
-      (v) => (typeof v === "string" ? !/^(0|false|no|off)$/i.test(v.trim()) : v),
-      z.boolean(),
-    )
-    .default(true),
+  // to fall back to it. (This flag used to spell its own off-switch parse out
+  // inline, because the file's z.coerce.boolean() convention could not express
+  // one; boolish() is that same parse, now used by every flag here.)
+  SYNTHETIC_PLAN_ALIGN_FIRST: boolish(true),
   // Minimum share of transcript sentences that must anchor to real word
   // timings for an align-first plan to be trusted. Below this the plan is
   // rejected instead of silently shipping interpolated timings — the missing
@@ -1126,11 +1157,11 @@ const ServerEnvSchema = z.object({
   // of parking the project at 'plan_ready' and waiting for the review screen's
   // "Generate assets" click. The button/route stay in place either way — they
   // are idempotent and still needed to re-dispatch after a partial failure.
-  // Set to false to restore the gate (inspect/edit blocks before paid calls).
-  // NOTE: z.coerce.boolean() is the repo convention here, but it makes ANY
-  // non-empty string truthy — "false"/"0" both coerce to TRUE. To turn this off
-  // you must UNSET the var, not set it to "false".
-  SYNTHETIC_AUTO_DISPATCH: z.coerce.boolean().default(true),
+  // Set to false to restore the gate (inspect/edit blocks before paid calls) —
+  // which now actually works: this flag used to carry a warning that "false"
+  // coerced to TRUE and the var had to be UNSET to disable it. boolish() fixed
+  // that for every flag in this file.
+  SYNTHETIC_AUTO_DISPATCH: boolish(true),
   // ADMISSION CONTROL: how many synthetic projects may be generating assets at
   // once. Auto-dispatch (above) removed the human review gate that used to
   // serialise this, so every project that finished planning fanned its whole
@@ -1157,10 +1188,10 @@ const ServerEnvSchema = z.object({
   // auto-rendering those would silently ship a video with blocks missing — so
   // any failure falls back to the manual gate for a human to retry first.
   // See SYNTHETIC_AUTO_RENDER_ALLOW_FAILED to override that.
-  SYNTHETIC_AUTO_RENDER: z.coerce.boolean().default(true),
+  SYNTHETIC_AUTO_RENDER: boolish(true),
   // Escape hatch: auto-render even when some blocks failed/were skipped. Off by
   // default — a failed block means a gap in the delivered video.
-  SYNTHETIC_AUTO_RENDER_ALLOW_FAILED: z.coerce.boolean().default(false),
+  SYNTHETIC_AUTO_RENDER_ALLOW_FAILED: boolish(false),
   SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
   SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
   // Minimum on-screen hold for a single visual block (client feedback 2026-06:
@@ -1261,11 +1292,11 @@ const ServerEnvSchema = z.object({
   // guard); the percentages are then met within that window rather than across
   // the whole video. False (default) applies the client's percentages to the
   // WHOLE video as literally stated.
-  SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF: z.coerce.boolean().default(false),
+  SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF: boolish(false),
   // Master switch for the veo clip lane. Off = every clip renders on LTX and
   // the veo quota is ignored (useful to fall back instantly if Veo output is
   // judged unusable, which the client has flagged as a risk).
-  SYNTHETIC_VEO_ENABLED: z.coerce.boolean().default(true),
+  SYNTHETIC_VEO_ENABLED: boolish(true),
   // 69labs video lane (lib/synthetic/sixtynine-video.ts). Model ids come from
   // GET /api/v1/videos/models — "veo-video" is Veo 3.1 Lite (1 credit),
   // "veo-3.1-fast" is Veo Fast BETA (2 credits).
@@ -1375,7 +1406,7 @@ const ServerEnvSchema = z.object({
   // Disabled (client 2026-06-29): client wants the ORIGINAL screen quality in
   // the avatar video — no low-fi degrade. Off by default for both image + video
   // degrade; re-enable per-env if the vlog look is wanted again.
-  SYNTHETIC_DEGRADE_ENABLED: z.coerce.boolean().default(false),
+  SYNTHETIC_DEGRADE_ENABLED: boolish(false),
   SYNTHETIC_DEGRADE_BLUR_SIGMA: z.coerce.number().nonnegative().default(0.8),
   SYNTHETIC_DEGRADE_IMAGE_NOISE: z.coerce.number().nonnegative().default(22),
   SYNTHETIC_DEGRADE_IMAGE_JPEG_QUALITY: z.coerce.number().int().min(1).max(100).default(60),
@@ -1397,7 +1428,7 @@ const ServerEnvSchema = z.object({
   //
   // Off by default so deploying this is a no-op until the client confirms the
   // placement on a real pitch.
-  PITCH_QR_ENABLED: z.coerce.boolean().default(false),
+  PITCH_QR_ENABLED: boolish(false),
   PITCH_QR_SIZE_FRACTION: z.coerce.number().min(0.02).max(0.5).default(0.14),
   PITCH_QR_MARGIN_FRACTION: z.coerce.number().min(0).max(0.4).default(0.0375),
   PITCH_QR_POSITION: z
@@ -1457,7 +1488,7 @@ const ServerEnvSchema = z.object({
   // poll; a probe measured ~60s to completed, so ~4 min of budget is ample.
   // Set PIKZELS_PERSONA_ENABLED=false to disable the face-lock path and fall
   // back to the plain uploaded-face-as-base behavior.
-  PIKZELS_PERSONA_ENABLED: z.coerce.boolean().default(true),
+  PIKZELS_PERSONA_ENABLED: boolish(true),
   PIKZELS_PERSONA_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
   PIKZELS_PERSONA_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(240000),
 
@@ -1473,7 +1504,7 @@ const ServerEnvSchema = z.object({
   // exactly as before, so production behavior is unchanged until a key + flag are
   // provisioned. Auth is the `x-api-key` header; assets + video endpoints are v3.
   HEYGEN_API_KEY: z.string().optional(),
-  HEYGEN_API_FALLBACK: z.coerce.boolean().default(false),
+  HEYGEN_API_FALLBACK: boolish(false),
   HEYGEN_API_BASE_URL: z.string().url().default("https://api.heygen.com"),
   // RETRIEVAL SOURCE (V1→V3 migration). When false (default) the post-Generate
   // render retrieval polls HeyGen's INTERNAL web-app API
@@ -1487,7 +1518,7 @@ const ServerEnvSchema = z.object({
   // needs the browser cookie NOR a 4000-row scan. REQUIRES HEYGEN_API_KEY. Kept
   // behind a flag so v3 retrieval can be canaried on the Fly avatar worker before
   // the v1 path is removed. See lib/synthetic/heygen.ts fetchProjectItems.
-  HEYGEN_RETRIEVAL_V3: z.coerce.boolean().default(false),
+  HEYGEN_RETRIEVAL_V3: boolish(false),
   // Rendered resolution for the API fallback.
   //
   // 4K IS NOT REACHABLE HERE. Probed live 2026-08-03 with a real photo-avatar
@@ -1558,7 +1589,7 @@ const ServerEnvSchema = z.object({
   // before generating and index every fresh asset after generating. Default
   // false so a deploy without the migration applied (or before backfill) is a
   // pure no-op.
-  ASSET_LIBRARY_ENABLED: z.coerce.boolean().default(false),
+  ASSET_LIBRARY_ENABLED: boolish(false),
   // Cosine-SIMILARITY threshold [0..1] a library candidate must clear to be
   // reused (1 = identical embedding). Deliberately strict — a loose match
   // reuses visibly wrong footage, which reads worse than a fresh generation.
@@ -1615,7 +1646,7 @@ const ServerEnvSchema = z.object({
   // prompts, each individually reasonable. This pass compares every visual
   // block's prompt against the ones already accepted and regenerates the ones
   // that are too close, telling Gemini which scenes are already taken.
-  SYNTHETIC_SCENE_DEDUPE_ENABLED: z.coerce.boolean().default(true),
+  SYNTHETIC_SCENE_DEDUPE_ENABLED: boolish(true),
   // Jaccard similarity over content words, above which two prompts count as the
   // same scene. 0.5 is deliberately loose — "close-up of a wooden spoon on a
   // marble counter" vs "a wooden spoon resting on a marble countertop" scores
@@ -1647,7 +1678,41 @@ export function getEnv(): ServerEnv {
     return cached;
   }
   cached = parsed.data;
+  reportFlagsExplicitlyOff(cached);
   return cached;
+}
+
+/**
+ * Log every boolean flag whose env value spells "off".
+ *
+ * Before boolish(), those flags all evaluated to TRUE — so this list is exactly
+ * the set of behaviours that CHANGED when the fix landed. Printed once per
+ * process so a deploy makes the flip visible instead of leaving it to be
+ * discovered in a rendered video, which is how the clip-cutoff bug was found.
+ *
+ * Fly SECRETS override [env] and are not visible in the repo, so this is the
+ * only place a secret-set "false" shows up.
+ *
+ * Detection is by RESULT, not by a hand-maintained list: a key is a boolean flag
+ * iff its parsed value is a boolean, so a flag added later is covered for free.
+ */
+function reportFlagsExplicitlyOff(env: ServerEnv): void {
+  const parsedValues = env as unknown as Record<string, unknown>;
+  for (const [key, raw] of Object.entries(process.env)) {
+    if (typeof raw !== "string" || !/^(0|false|no|off)$/i.test(raw.trim())) continue;
+    if (typeof parsedValues[key] !== "boolean") continue;
+    FLAGS_EXPLICITLY_OFF.push(key);
+  }
+  if (FLAGS_EXPLICITLY_OFF.length === 0) return;
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    msg: "env.flags_explicitly_off",
+    note:
+      "these flags are OFF because their env value spells off — before the " +
+      "boolish() fix every one of them would have read as ON",
+    flags: FLAGS_EXPLICITLY_OFF.slice().sort(),
+  }));
 }
 
 // Clip duration is variable: when scene-detect provides both a start

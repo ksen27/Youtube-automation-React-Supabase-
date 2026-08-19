@@ -95,3 +95,87 @@ describe("splitTranscriptIntoSentences — German", () => {
     expect(texts("Nimm z.B. das Auto.", "fr")).toEqual(texts("Nimm z.B. das Auto."));
   });
 });
+
+describe("splitTranscriptIntoSentences — Spanish", () => {
+  it("does not split inside an abbreviation", () => {
+    expect(texts("Pregunta al Sr. García. Él sabe.", "es")).toEqual([
+      "Pregunta al Sr. García.",
+      "Él sabe.",
+    ]);
+  });
+
+  it("handles an abbreviation with internal periods", () => {
+    expect(texts("Usa p.ej. el aceite. Es mejor.", "es")).toEqual([
+      "Usa p.ej. el aceite.",
+      "Es mejor.",
+    ]);
+  });
+
+  it("keeps an ordinal date together (Spanish months are lowercase)", () => {
+    expect(texts("El 1. de enero empieza todo. Luego veremos.", "es")).toEqual([
+      "El 1. de enero empieza todo.",
+      "Luego veremos.",
+    ]);
+  });
+
+  it("still ends the sentence when a number is genuinely final", () => {
+    expect(texts("Eran 15. Después continuó.", "es")).toEqual([
+      "Eran 15.",
+      "Después continuó.",
+    ]);
+  });
+
+  it("handles inverted question and exclamation marks", () => {
+    expect(texts("¡Hola! ¿Qué tal estás? Muy bien.", "es")).toEqual([
+      "¡Hola!",
+      "¿Qué tal estás?",
+      "Muy bien.",
+    ]);
+  });
+
+  it("preserves accents and ñ untouched", () => {
+    expect(texts("El niño está aquí. Mañana también.", "es")).toEqual([
+      "El niño está aquí.",
+      "Mañana también.",
+    ]);
+  });
+});
+
+// A period between digits is never a sentence end. This rule is
+// language-INDEPENDENT because the bug it fixes is text LOSS, not just a bad
+// split: SENTENCE_REGEX fails mid-number and drops everything before it.
+describe("splitTranscriptIntoSentences — numbers (all languages)", () => {
+  it("does not lose text around a German thousands separator", () => {
+    expect(texts("Das kostet 1.500 Euro im Jahr. Wirklich.", "de")).toEqual([
+      "Das kostet 1.500 Euro im Jahr.",
+      "Wirklich.",
+    ]);
+  });
+
+  it("does not lose text around a Spanish thousands separator", () => {
+    expect(texts("Cuesta 1.500 euros al año. De verdad.", "es")).toEqual([
+      "Cuesta 1.500 euros al año.",
+      "De verdad.",
+    ]);
+  });
+
+  it("does not lose text around an English decimal", () => {
+    expect(texts("It costs 1.5 million a year. Really.")).toEqual([
+      "It costs 1.5 million a year.",
+      "Really.",
+    ]);
+  });
+
+  it("still splits when a sentence genuinely ends in a number", () => {
+    // The digit must follow the period IMMEDIATELY, so a real break before a
+    // number is untouched.
+    expect(texts("I have 5. 3 remain.")).toEqual(["I have 5.", "3 remain."]);
+  });
+
+  it("keeps char offsets valid across masked numbers", () => {
+    const transcript = "Das kostet 1.500 Euro im Jahr. Wirklich.";
+    for (const s of splitTranscriptIntoSentences(transcript, undefined, "de")) {
+      expect(transcript.slice(s.char_offset, s.char_offset + s.text.length)).toBe(s.text);
+    }
+  });
+});
