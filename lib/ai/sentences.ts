@@ -83,8 +83,8 @@ function escapeRegExp(s: string): string {
 const NUMERIC_PERIOD = /\d\.(?=\d)/gu;
 
 // Build the mask patterns for a locale. Always returns at least the
-// language-independent numeric rule.
-function buildMaskPatterns(locale: LocaleConfig): RegExp[] | null {
+// language-independent numeric rule, so there is no empty/null case.
+function buildMaskPatterns(locale: LocaleConfig): RegExp[] {
   const patterns: RegExp[] = [NUMERIC_PERIOD];
 
   // Abbreviations: "z.B.", "d.h.", "Dr." — matched whole, case-sensitively, and
