@@ -1225,19 +1225,24 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_INTRO_IMAGE_RUN: z.coerce.number().int().nonnegative().default(2),
 
   // ---------------------------------------------------------------------
-  // CLIP BUDGET BY DURATION, IN TWO PHASES (client direction 2026-08-18 via
-  // Joey): "The first 4 minutes of the ai avatar video i want 80% clips and 20%
-  // images. After the first 4 mins, change to 70% images and 20% ltx clips and
-  // 10% VEO."
+  // CLIP BUDGET BY DURATION, IN TWO PHASES (client direction 2026-08-20 via
+  // Joey): "The first 3 min, 65 % ltx clips and 35 % images. After 3 mins, 70%
+  // images and 30% clips."
   //
-  // Supersedes the flat 2026-08-17 direction ("25% LTX / 5% VEO across the
-  // video"), which is now just the PHASE 2 setting with the numbers moved to
-  // 20/10. The opening window is deliberately clip-heavy: the reference channel
+  // COST TRIM of the 2026-08-18 direction (4 min @ 80/20, then 70/20/10), which
+  // itself superseded the flat 2026-08-17 one ("25% LTX / 5% VEO across the
+  // video"). Joey: "the ltx cost is a bit high [...] I think we need to lower it
+  // a bit." Only PHASE 1 moved — the window shortened 4 min -> 3 min and the LTX
+  // share dropped 80% -> 65%. PHASE 2 is UNCHANGED because the new ask already
+  // describes it exactly: 20% LTX + 10% VEO is the "30% clips" it asks for,
+  // leaving the 70% images.
+  //
+  // The opening window is still deliberately clip-heavy: the reference channel
   // Joey linked opens on motion, and a still-heavy first minute is where his
-  // videos lose retention.
+  // videos lose retention. 65% keeps that character at ~39% less phase-1 spend.
   //
   // BASIS — read the percentages the way the client states them. Both phases
-  // quote clips-vs-images and both sum to 100 (80+20, 70+20+10), so they are
+  // quote clips-vs-images and both sum to 100 (65+35, 70+20+10), so they are
   // shares of the ASSIGNABLE VISUAL time (image + ai_clip blocks) in that
   // phase, NOT of total screen time. Avatar and split_2 blocks come from the
   // Google Doc highlights and cannot be reassigned (see assignClipDurationQuota),
@@ -1253,10 +1258,13 @@ const ServerEnvSchema = z.object({
   // (assignClipDurationQuota) runs AFTER those and is authoritative for the
   // final mix.
   //
-  // COST NOTE: LTX-2 bills per second (~$0.04/s). The phase-1 window is the
-  // expensive one — 80% of 4 minutes is ~3.2 min of LTX (~$7.70) on EVERY video,
-  // on top of phase 2. Shorten SYNTHETIC_CLIP_PHASE1_SECONDS or drop
-  // SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION to pull that back. The pre-existing
+  // COST NOTE: LTX-2 bills per second (~$0.04/s). The phase-1 window is still
+  // the expensive one, and it is the lever the 2026-08-20 trim pulled: 65% of 3
+  // minutes is ~2.0 min of LTX (~$4.70) per video, down from ~3.2 min (~$7.70)
+  // at 4 min / 80%. Phase 2 absorbs the 60s the opening gave up (+~$0.50 at its
+  // 20% LTX share), so the net is ~$2.50 off a 20-minute video — roughly -16% of
+  // its LTX spend. Shorten SYNTHETIC_CLIP_PHASE1_SECONDS or drop
+  // SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION further to pull back more. The pre-existing
   // SYNTHETIC_CLIP_HEAVY_SECONDS window exists for the same reason ("no more LTX
   // after 15 minutes"); set SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF to keep the
   // whole budget inside it.
@@ -1266,15 +1274,21 @@ const ServerEnvSchema = z.object({
   // at or after it uses the phase-2 fractions. 0 disables phasing entirely (the
   // phase-2 fractions then apply to the whole video, i.e. pre-2026-08-18
   // behaviour).
-  SYNTHETIC_CLIP_PHASE1_SECONDS: z.coerce.number().nonnegative().default(240),
-  // PHASE 1 (first SYNTHETIC_CLIP_PHASE1_SECONDS): LTX share. Client: 80% clips
-  // / 20% images, with no VEO called for in the opening window.
-  SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.80),
+  // NOTE: this value ALSO bounds the split_2 no-promotion window (see the
+  // ensureMinSplit2 caller in lib/synthetic/planner.ts) — shortening it to 180
+  // lets split_2 blocks start appearing from 3:00 rather than 4:00, which is
+  // intended: it gives the separate "80% of splitscreens in the first 12 min"
+  // ask a wider runway.
+  SYNTHETIC_CLIP_PHASE1_SECONDS: z.coerce.number().nonnegative().default(180),
+  // PHASE 1 (first SYNTHETIC_CLIP_PHASE1_SECONDS): LTX share. Client 2026-08-20:
+  // 65% clips / 35% images, with no VEO called for in the opening window.
+  SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION: z.coerce.number().min(0).max(1).default(0.65),
   // PHASE 1 VEO share, on top of the LTX share above. 0 = the opening window is
-  // all-LTX (the client specified only "clips" for the first 4 minutes, and VEO
+  // all-LTX (the client specified only "clips" for the first 3 minutes, and VEO
   // bills per generation, so spending it here buys less than in the long tail).
   SYNTHETIC_CLIP_PHASE1_VEO_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
-  // PHASE 2 (after the window): LTX share. Client 2026-08-18: 20% LTX.
+  // PHASE 2 (after the window): LTX share. Client 2026-08-18: 20% LTX. Left
+  // untouched by the 2026-08-20 trim — 20 LTX + 10 VEO is that ask's "30% clips".
   SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.20),
   // PHASE 2 VEO share, on top of the LTX share above (20% + 10% = 30% clips,
   // leaving the client's 70% images). Veo bills per GENERATION (1 credit), not

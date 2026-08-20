@@ -209,17 +209,18 @@ describe("assignClipDurationQuota", () => {
 });
 
 // ---------------------------------------------------------------------------
-// TWO-PHASE MIX (client 2026-08-18 via Joey: "The first 4 minutes of the ai
-// avatar video i want 80% clips and 20% images. After the first 4 mins, change
-// to 70% images and 20% ltx clips and 10% VEO").
+// TWO-PHASE MIX (client 2026-08-20 via Joey: "The first 3 min, 65 % ltx clips
+// and 35 % images. After 3 mins, 70% images and 30% clips" — the body figure
+// being the 20% LTX + 10% VEO already set on 2026-08-18, so only the opening
+// window moved: 4 min @ 80% -> 3 min @ 65%, to cut LTX spend).
 //
 // The phases are asserted SEPARATELY on purpose: a video-wide percentage can
 // look correct while the opening window — the part the client is watching — is
 // starved, which is exactly what a single flat budget did.
 
 const CLIENT_PHASES = [
-  { startSeconds: 0, endSeconds: 240, clipFraction: 0.8, veoFraction: 0, label: "phase1_opening" },
-  { startSeconds: 240, endSeconds: Infinity, clipFraction: 0.2, veoFraction: 0.1, label: "phase2_body" },
+  { startSeconds: 0, endSeconds: 180, clipFraction: 0.65, veoFraction: 0, label: "phase1_opening" },
+  { startSeconds: 180, endSeconds: Infinity, clipFraction: 0.2, veoFraction: 0.1, label: "phase2_body" },
 ];
 
 const PHASE_OPTS = {
@@ -241,21 +242,21 @@ const secondsInWindow = (
     .reduce((a, s) => a + s.duration, 0);
 
 describe("assignClipDurationQuota — two-phase mix", () => {
-  it("gives the opening window 80% clips and the body 20% LTX + 10% veo", () => {
-    // 20 minutes of visuals: 40 blocks before 4:00, 160 after.
+  it("gives the opening window 65% clips and the body 20% LTX + 10% veo", () => {
+    // 20 minutes of visuals: 30 blocks before 3:00, 170 after.
     const segs = visuals(200); // 1200s
     const q = assignClipDurationQuota(segs, PHASE_OPTS);
     const out = q.segments;
 
-    const p1Visual = secondsInWindow(out, 0, 240, () => true);
-    const p1Clip = secondsInWindow(out, 0, 240, (s) => s.blockType === "ai_clip");
-    // 80% of the opening window, within one block's length.
-    expect(p1Clip / p1Visual).toBeGreaterThanOrEqual(0.8);
-    expect(p1Clip / p1Visual).toBeLessThan(0.8 + 6 / p1Visual + 0.01);
+    const p1Visual = secondsInWindow(out, 0, 180, () => true);
+    const p1Clip = secondsInWindow(out, 0, 180, (s) => s.blockType === "ai_clip");
+    // 65% of the opening window, within one block's length.
+    expect(p1Clip / p1Visual).toBeGreaterThanOrEqual(0.65);
+    expect(p1Clip / p1Visual).toBeLessThan(0.65 + 6 / p1Visual + 0.01);
 
-    const p2Visual = secondsInWindow(out, 240, Infinity, () => true);
-    const p2Clip = secondsInWindow(out, 240, Infinity, (s) => s.blockType === "ai_clip");
-    const p2Veo = secondsInWindow(out, 240, Infinity, (s) => s.clipEngine === "veo");
+    const p2Visual = secondsInWindow(out, 180, Infinity, () => true);
+    const p2Clip = secondsInWindow(out, 180, Infinity, (s) => s.blockType === "ai_clip");
+    const p2Veo = secondsInWindow(out, 180, Infinity, (s) => s.clipEngine === "veo");
     // 30% clips (20 LTX + 10 veo), of which a third is veo.
     expect(p2Clip / p2Visual).toBeGreaterThanOrEqual(0.3);
     expect(p2Clip / p2Visual).toBeLessThan(0.3 + 6 / p2Visual + 0.01);
@@ -264,46 +265,47 @@ describe("assignClipDurationQuota — two-phase mix", () => {
   });
 
   it("keeps veo out of the opening window entirely", () => {
-    // The client asked for "clips" in the first 4 minutes and specified veo only
-    // for the body, so the phase-1 veo floor must NOT fire the way the
+    // The client asked for "ltx clips" in the first 3 minutes and specified veo
+    // only for the body, so the phase-1 veo floor must NOT fire the way the
     // whole-video one does.
     const segs = visuals(200);
     const q = assignClipDurationQuota(segs, PHASE_OPTS);
-    const openingVeo = q.segments.filter((s) => s.startTime < 240 && s.clipEngine === "veo");
+    const openingVeo = q.segments.filter((s) => s.startTime < 180 && s.clipEngine === "veo");
     expect(openingVeo).toHaveLength(0);
     // ...while the body still gets its veo lane.
-    expect(q.segments.some((s) => s.startTime >= 240 && s.clipEngine === "veo")).toBe(true);
+    expect(q.segments.some((s) => s.startTime >= 180 && s.clipEngine === "veo")).toBe(true);
   });
 
   it("measures the visual basis against image/clip time, not avatar time", () => {
     // Half the opening window is avatar (doc-marked, unreassignable). On the
-    // "visual" basis 80% still means 80% of the blocks we can actually touch —
-    // on the "total" basis it would be unreachable and report a shortfall.
+    // "visual" basis 65% still means 65% of the blocks we can actually touch —
+    // on the "total" basis only 50% of the window is reassignable at all, so
+    // the 65% target is unreachable and must report a shortfall.
     const segs: PlannedSegment[] = [];
     let t = 0;
-    for (let i = 0; i < 40; i++) { segs.push(seg(i % 2 === 0 ? "avatar" : "image", 6, t)); t += 6; }
+    for (let i = 0; i < 30; i++) { segs.push(seg(i % 2 === 0 ? "avatar" : "image", 6, t)); t += 6; }
     for (let i = 0; i < 100; i++) { segs.push(seg("image", 6, t)); t += 6; }
 
     const visual = assignClipDurationQuota(segs, PHASE_OPTS);
     const p1 = visual.phases.find((p) => p.label === "phase1_opening")!;
-    expect(p1.basisSeconds).toBe(120);              // only the 20 image blocks
+    expect(p1.basisSeconds).toBe(90);               // only the 15 image blocks
     expect(p1.shortfallSeconds).toBe(0);
-    expect(p1.clipSeconds / p1.basisSeconds).toBeGreaterThanOrEqual(0.8);
+    expect(p1.clipSeconds / p1.basisSeconds).toBeGreaterThanOrEqual(0.65);
 
     const total = assignClipDurationQuota(segs, { ...PHASE_OPTS, basis: "total" });
     const t1 = total.phases.find((p) => p.label === "phase1_opening")!;
-    expect(t1.basisSeconds).toBe(240);              // avatar counted in
-    expect(t1.shortfallSeconds).toBeGreaterThan(0); // 80% of it is unreachable
+    expect(t1.basisSeconds).toBe(180);              // avatar counted in
+    expect(t1.shortfallSeconds).toBeGreaterThan(0); // 65% of it is unreachable
   });
 
   it("reports a per-phase shortfall when the opening window has too few visuals", () => {
-    // A heavily avatar-marked opening: 4 visual blocks in the first 4 minutes.
+    // A heavily avatar-marked opening: 4 visual blocks in the first 3 minutes.
     const segs: PlannedSegment[] = [];
     let t = 0;
-    for (let i = 0; i < 36; i++) { segs.push(seg("avatar", 6, t)); t += 6; }
+    for (let i = 0; i < 26; i++) { segs.push(seg("avatar", 6, t)); t += 6; }
     for (let i = 0; i < 4; i++) { segs.push(seg("image", 6, t)); t += 6; }
     for (let i = 0; i < 100; i++) { segs.push(seg("image", 6, t)); t += 6; }
-    // Every visual in the window promotes, so the 80% target is met on the
+    // Every visual in the window promotes, so the 65% target is met on the
     // visual basis — the pass must not invent a shortfall out of avatar time.
     const q = assignClipDurationQuota(segs, PHASE_OPTS);
     const p1 = q.phases.find((p) => p.label === "phase1_opening")!;
@@ -314,9 +316,9 @@ describe("assignClipDurationQuota — two-phase mix", () => {
   it("still spreads each phase's clips across that phase rather than clumping", () => {
     const segs = visuals(200);
     const q = assignClipDurationQuota(segs, PHASE_OPTS);
-    // Body clips must appear in both halves of the body, not all at 4:00.
-    const body = q.segments.filter((s) => s.startTime >= 240);
-    const mid = 240 + (1200 - 240) / 2;
+    // Body clips must appear in both halves of the body, not all at 3:00.
+    const body = q.segments.filter((s) => s.startTime >= 180);
+    const mid = 180 + (1200 - 180) / 2;
     const early = body.filter((s) => s.startTime < mid && s.blockType === "ai_clip").length;
     const late = body.filter((s) => s.startTime >= mid && s.blockType === "ai_clip").length;
     expect(early).toBeGreaterThan(0);

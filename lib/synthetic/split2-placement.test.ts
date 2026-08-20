@@ -151,9 +151,10 @@ describe("capSplit2Blocks — front-loading", () => {
 });
 
 describe("ensureMinSplit2 — front-loading", () => {
-  // The promoter's intro cutoff is now the PHASE-1 clip window (240s), because
-  // the opening 4 minutes are meant to be 80% clips and a split_2 is not a clip.
-  const INTRO_CUTOFF = 240;
+  // The promoter's intro cutoff is the PHASE-1 clip window (180s since the
+  // 2026-08-20 trim, previously 240), because the opening minutes are meant to
+  // be mostly clips and a split_2 is not a clip.
+  const INTRO_CUTOFF = 180;
 
   it("promotes into the first 12 minutes to reach the front share", () => {
     // No split_2 at all — the exact case the floor pass exists for.
@@ -175,13 +176,14 @@ describe("ensureMinSplit2 — front-loading", () => {
   });
 
   it("counts split_2 already in the front window toward the share", () => {
-    // Gemini already clustered 16 split_2 in the front window. The promoter
-    // should top the total up in the TAIL, not pile more into the front.
+    // Gemini already clustered every 4th block of the front window as split_2
+    // (22 of them between the intro cutoff and 12:00). The promoter should top
+    // the total up in the TAIL, not pile more into the front.
     const segs = timeline(400, (i, t) =>
       t >= INTRO_CUTOFF && t < FRONT_SECONDS && i % 4 === 0 ? "split_2" : "image",
     );
     const haveFront = frontCount(segs);
-    expect(haveFront).toBe(20);
+    expect(haveFront).toBe(22);
 
     const { segments, promotedFront } =
       ensureMinSplit2(segs, haveFront + 5, INTRO_CUTOFF, FRONT_SECONDS, FRONT_SHARE);

@@ -1799,12 +1799,13 @@ export interface ClipQuotaPhaseResult {
 /**
  * Enforce the client's CLIP BUDGET BY DURATION, IN TIME PHASES.
  *
- * Client 2026-08-18 (Joey): "The first 4 minutes of the ai avatar video i want
- * 80% clips and 20% images. After the first 4 mins, change to 70% images and 20%
- * ltx clips and 10% VEO." Each phase is a video-time window with its own LTX and
- * veo shares, filled INDEPENDENTLY from that window's own blocks — a single
- * whole-video budget cannot express this, because an evenly-spread 30% budget
- * puts ~30% in the opening window, not 80%.
+ * Client 2026-08-20 (Joey): "The first 3 min, 65 % ltx clips and 35 % images.
+ * After 3 mins, 70% images and 30% clips." (Phase 2's 30% is the 20% LTX + 10%
+ * VEO already set on 2026-08-18; only the opening window changed, trimmed from
+ * 4 min @ 80% to 3 min @ 65% to cut LTX spend.) Each phase is a video-time
+ * window with its own LTX and veo shares, filled INDEPENDENTLY from that
+ * window's own blocks — a single whole-video budget cannot express this,
+ * because an evenly-spread 30% budget puts ~30% in the opening window, not 65%.
  *
  * This is deliberately a DURATION pass, not a count pass. The older
  * balanceVisualTypesByPosition works on block COUNT and POSITION, and a count
@@ -1823,7 +1824,7 @@ export interface ClipQuotaPhaseResult {
  * BASIS (see SYNTHETIC_CLIP_FRACTION_BASIS): "visual" measures the percentages
  * against the image + ai_clip seconds in the phase — the pool this pass can
  * actually reassign, and the reading under which the client's numbers sum to 100
- * (80+20, 70+20+10). "total" measures against every block in the phase including
+ * (65+35, 70+20+10). "total" measures against every block in the phase including
  * avatar / split_2, the pre-2026-08-18 behaviour.
  *
  * Back-compat: the single-fraction opts shape ({clipFraction, veoFraction, …})
@@ -2027,12 +2028,12 @@ export function assignClipDurationQuota(
 //
 // FRONT-LOADING (client 2026-08-18: "Put 80% of the splitscreens in the first 12
 // min and the 20% to the rest"). Promotions are targeted at the front zone until
-// its share of the total is met, then at the tail. The two client instructions
-// from that day pull against each other — the first 4 minutes are to be 80%
-// clips, and split_2 is not a clip — so `introCutoffSeconds` is now the PHASE-1
-// clip window (4 min), not the old 15-minute clip-heavy cutoff: promotions start
-// once the clip-heavy opening ends, which still leaves 4-12 min to carry the
-// bulk of the front share.
+// its share of the total is met, then at the tail. That instruction pulls against
+// the clip-mix one — the opening window is to be mostly clips, and split_2 is not
+// a clip — so `introCutoffSeconds` is the PHASE-1 clip window (3 min since
+// 2026-08-20, was 4), not the old 15-minute clip-heavy cutoff: promotions start
+// once the clip-heavy opening ends, which leaves 3-12 min to carry the bulk of
+// the front share.
 export function ensureMinSplit2(
   segs: PlannedSegment[],
   minKeep: number,
@@ -3734,13 +3735,13 @@ export async function buildSyntheticTimeline(input: {
     const minFraction = getEnv().SYNTHETIC_SPLIT2_MIN_FRACTION;
     const fracFloor = minFraction > 0 ? Math.ceil(planned.length * minFraction) : 0;
     const minKeep = Math.max(getEnv().SYNTHETIC_SPLIT2_MIN_KEEP, fracFloor);
-    // The no-promotions window is the PHASE-1 clip window (4 min), not the old
-    // 15-minute clip-heavy cutoff. The client's two 2026-08-18 asks conflict
-    // there — "first 4 minutes 80% clips" and "80% of splitscreens in the first
-    // 12 min" — and a split_2 is not a clip, so promoting inside the opening
-    // window would eat the very blocks the 80% clip target needs. Keeping the
-    // opening clear leaves 4-12 min to carry the front share. Falls back to the
-    // clip-heavy cutoff when phase 1 is disabled.
+    // The no-promotions window is the PHASE-1 clip window (3 min since the
+    // 2026-08-20 trim, previously 4), not the old 15-minute clip-heavy cutoff.
+    // Two client asks conflict there — the clip-heavy opening and "80% of
+    // splitscreens in the first 12 min" — and a split_2 is not a clip, so
+    // promoting inside the opening window would eat the very blocks the phase-1
+    // clip target needs. Keeping the opening clear leaves 3-12 min to carry the
+    // front share. Falls back to the clip-heavy cutoff when phase 1 is disabled.
     const cutoff = getEnv().SYNTHETIC_CLIP_PHASE1_SECONDS > 0
       ? getEnv().SYNTHETIC_CLIP_PHASE1_SECONDS
       : getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
@@ -3811,9 +3812,10 @@ export async function buildSyntheticTimeline(input: {
     }
   }
 
-  // CLIP BUDGET BY DURATION, TWO PHASES (client 2026-08-18: "the first 4 minutes
-  // […] 80% clips and 20% images. After the first 4 mins, 70% images and 20% ltx
-  // clips and 10% VEO"). Runs LAST of the type passes so nothing downstream can
+  // CLIP BUDGET BY DURATION, TWO PHASES (client 2026-08-20: "the first 3 min,
+  // 65 % ltx clips and 35 % images. After 3 mins, 70% images and 30% clips" —
+  // the latter being the unchanged 20% LTX + 10% VEO from 2026-08-18, with only
+  // the opening window trimmed for cost). Runs LAST of the type passes so nothing downstream can
   // undo it — the split_2 floor above promotes images, which would otherwise eat
   // into the clip budget after it was measured.
   {
