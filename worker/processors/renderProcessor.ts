@@ -18,6 +18,7 @@ import {
   storeCachedClip,
   clearProjectCache,
 } from "./renderCache";
+import { reconcileTimelineOrder } from "@/lib/synthetic/pitch-timeline";
 
 // Minimum seconds of host clip that must remain after a lower-third's slide-in
 // begins, so a word spoken near the very end of a clip still produces a
@@ -120,6 +121,31 @@ export async function processRenderJob(data: RenderJobData): Promise<void> {
   const { width: outW, height: outH } = renderCanvasFor(
     isSyntheticRender ? "synthetic" : "sourced"
   );
+
+  // ORDER GATE (synthetic only). Everything below concatenates strictly by
+  // `position`, against ONE continuous voiceover — so a wrong position column
+  // does not fail, it silently ships a video whose visuals do not match the
+  // words. That is exactly what happened on 2026-08-21 (project e8177073: the
+  // last 23 blocks played first and the opening avatar landed ~11s in), and
+  // nothing in the pipeline noticed because the positions were unique and
+  // contiguous, just permuted.
+  //
+  // So re-derive the order from synthetic_segments.position and verify it right
+  // before rendering. On a settled timeline this is a couple of reads and zero
+  // writes; on a damaged one it repairs it. If it still does not verify we
+  // FAIL the render — a failed render is recoverable, a scrambled 20-minute
+  // upload that looks fine to the pipeline is not.
+  if (isSyntheticRender) {
+    const order = await reconcileTimelineOrder(projectId);
+    await logJob({ projectId, jobId: mediaJobId }, "render.timeline_order.gate", order);
+    if (!order.verified) {
+      throw new Error(
+        "timeline is out of order (segment positions did not verify) — refusing to " +
+          "render. Re-run the render; if it keeps failing, a concurrent finalize is " +
+          "still writing to this project.",
+      );
+    }
+  }
 
   // Pull approved timeline items (only ones with clips — placeholders are skipped
   // for MVP rendering; their script_text/overlay_text would be added in v2)

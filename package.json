@@ -24,6 +24,7 @@
     "heygen:debug-audio": "tsx scripts/heygen-debug-audio.ts",
     "pitch:debug-gen": "tsx scripts/pitch-debug-gen.ts",
     "test:synthetic": "tsx scripts/test-synthetic.ts",
+    "timeline:repair": "tsx scripts/repair-timeline-order.ts",
     "db:migrate": "echo 'Run the SQL files in supabase/migrations/ via the Supabase SQL editor or `supabase db push`.'",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

@@ -9,7 +9,7 @@ import {
 import { getEnv } from "@/lib/env";
 import type { SyntheticSegment, ProjectStatus } from "@/lib/types";
 import { estimateSegmentCost } from "@/lib/synthetic/cost";
-import { ensurePitchTimelineItem } from "@/lib/synthetic/pitch-timeline";
+import { reconcileTimelineOrder } from "@/lib/synthetic/pitch-timeline";
 
 // Shared orchestration for the synthetic asset-generation fan-out.
 //
@@ -232,31 +232,26 @@ export async function maybeFinalizeSynthetic(projectId: string): Promise<void> {
     if (error && error.code !== "23505") {
       throw new Error(`maybeFinalizeSynthetic materialize: ${error.message}`);
     }
-    // Renumber every synthetic row by its segment's planned position so the
-    // timeline is contiguous and in order, even after a reconcile inserted late
-    // blocks out of sequence. Segments carry the authoritative order via
-    // synthetic_segments.position; map each timeline row back to it.
-    const segPos = new Map(all.map((s) => [s.id, s.position]));
-    const { data: items } = await sb
-      .from("timeline_items")
-      .select("id, synthetic_segment_id")
-      .eq("project_id", projectId);
-    const ordered = (items ?? [])
-      .map((it) => ({
-        id: it.id as string,
-        segId: it.synthetic_segment_id as string | null,
-      }))
-      .filter((x) => x.segId && segPos.has(x.segId))
-      .sort((a, b) => (segPos.get(a.segId!) ?? 0) - (segPos.get(b.segId!) ?? 0));
-    for (let i = 0; i < ordered.length; i++) {
-      await sb.from("timeline_items").update({ position: i }).eq("id", ordered[i].id);
-    }
+    // NOTE: rows are inserted at position 0 and put in order by the reconcile
+    // below. This function deliberately does NOT renumber them itself.
+    //
+    // It used to, with its own 215-round-trip loop — and that loop, racing the
+    // one in the pitch placer, is what shipped a scrambled video on 2026-08-21.
+    // Two finalizes (every asset finish calls this, plus the 5-min reconcile
+    // sweep) each read the rows, each computed positions over the set they saw,
+    // and interleaved their writes: one numbering 193 rows while the other
+    // numbered 215 leaves a timeline zippered together from two different
+    // orderings. The compaction that ran afterwards then made it look tidy.
+    // Ordering lives in exactly one routine now, and that routine re-derives
+    // every position from synthetic_segments.position, so concurrent runs
+    // compute the same answer and can no longer produce a hybrid.
   }
-  // Insert / reconcile the sales-pitch video block (if the project has one).
-  // Runs unconditionally — even on a reconcile pass that materialized nothing
-  // new — so the pitch row appears once all segments are ready regardless of
-  // which finalize call drains the project. Idempotent + boundary-snapped.
-  await ensurePitchTimelineItem(projectId);
+  // Put the whole timeline in play order and place the sales-pitch block (if the
+  // project has one). Runs unconditionally — even on a reconcile pass that
+  // materialized nothing new — so late blocks are slotted in correctly no matter
+  // which finalize call drains the project. Idempotent, verified, and free on a
+  // timeline that is already settled.
+  await reconcileTimelineOrder(projectId);
 
   await setProjectStatus(projectId, "ready_for_review");
 

@@ -201,6 +201,9 @@ export interface PositionWrite {
  * Rows already at their target are omitted, so a settled timeline costs zero
  * writes. Rows that are neither segment nor pitch (an intro row) are left alone
  * — the renderer drops them.
+ *
+ * `boundaryIndex = -1` means the project has no sales-pitch video: no slot is
+ * reserved and the segments lay out contiguously from 0.
  */
 export function buildRenumberPlan(
   segmentIds: ReadonlyArray<string>,
@@ -221,6 +224,322 @@ export function buildRenumberPlan(
   return { segmentWrites, pitchPosition: boundaryIndex };
 }
 
+/** The subset of a timeline_items row the order reconciler needs. */
+export interface TimelineOrderRow {
+  id: string;
+  position: number;
+  synthetic_segment_id: string | null;
+}
+
+/**
+ * Put the segment rows into their AUTHORITATIVE order.
+ *
+ * That order is `synthetic_segments.position` — NOT the timeline row's current
+ * `position`. This distinction is the whole fix for the 2026-08-21 "the video
+ * plays out of order" bug (project e8177073: the last 23 blocks played first and
+ * the opening avatar played third). The old code trusted `timeline_items.position`
+ * as the running order and only ever compacted it, so once anything scrambled
+ * that column the damage was permanent and self-laundering: the compaction
+ * rewrote a scrambled order into a *tidy* scrambled order — unique, contiguous,
+ * and still wrong, which is exactly why nothing downstream noticed.
+ *
+ * Re-deriving from the segment table instead makes the reconcile idempotent AND
+ * self-healing: any two concurrent runs compute the SAME target from the SAME
+ * source, so interleaving their writes can no longer produce a hybrid ordering
+ * (the mechanism that broke it — one pass numbering 193 rows while another
+ * numbered 215, zippered together row by row).
+ *
+ * Rows whose segment no longer exists are returned separately: they are dead
+ * (the segment was deleted or re-planned) and must not be given a slot.
+ */
+export function orderSegmentRows<T extends TimelineOrderRow>(
+  rows: ReadonlyArray<T>,
+  segmentPosition: ReadonlyMap<string, number>,
+): { ordered: T[]; orphans: T[] } {
+  const ordered: T[] = [];
+  const orphans: T[] = [];
+  for (const row of rows) {
+    if (!row.synthetic_segment_id) continue; // pitch / intro — not a segment row
+    if (segmentPosition.has(row.synthetic_segment_id)) ordered.push(row);
+    else orphans.push(row);
+  }
+  ordered.sort((a, b) => {
+    const delta =
+      segmentPosition.get(a.synthetic_segment_id!)! - segmentPosition.get(b.synthetic_segment_id!)!;
+    // Two rows on one segment should be impossible (the partial unique index
+    // timeline_items_project_segment_uq), but a tie must still resolve the same
+    // way in every process or concurrent reconciles would fight over the slot.
+    return delta !== 0 ? delta : a.id.localeCompare(b.id);
+  });
+  return { ordered, orphans };
+}
+
+/**
+ * The id order the finished timeline must be in: segments in segment order, with
+ * the pitch row spliced in at `boundaryIndex`. Pass `pitchId = null` (and any
+ * boundary) for a project with no sales-pitch video.
+ */
+export function expectedTimelineOrder(
+  segmentIds: ReadonlyArray<string>,
+  pitchId: string | null,
+  boundaryIndex: number,
+): string[] {
+  const out = [...segmentIds];
+  if (!pitchId) return out;
+  out.splice(Math.max(0, Math.min(boundaryIndex, segmentIds.length)), 0, pitchId);
+  return out;
+}
+
+/**
+ * Reconcile the WHOLE synthetic timeline's play order, then verify it landed.
+ *
+ * Two jobs, in this order:
+ *   1. Segment rows are renumbered into `synthetic_segments.position` order.
+ *   2. The sales-pitch video row (if any) is placed at the segment boundary
+ *      nearest its insert mark — snapped so it never cuts a sentence in half.
+ *
+ * Both are derived from scratch on every call, so this is idempotent, safe to
+ * run concurrently, and REPAIRS a timeline that is already wrong. A settled
+ * timeline costs zero writes (buildRenumberPlan omits rows already in place),
+ * which is what makes it cheap enough to call again right before rendering.
+ *
+ * Returns whether the finished order verified against the intended one. Callers
+ * about to render should refuse to render on `verified: false` rather than ship
+ * a scrambled video.
+ */
+export async function reconcileTimelineOrder(projectId: string): Promise<{
+  rows: number;
+  writes: number;
+  verified: boolean;
+  orphanRows: number;
+}> {
+  const sb = getServerSupabase();
+
+  const [projRes, segsRes, rowsRes] = await Promise.all([
+    sb
+      .from("projects")
+      .select("pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
+      .eq("id", projectId)
+      .single(),
+    sb.from("synthetic_segments").select("id, position").eq("project_id", projectId),
+    sb
+      .from("timeline_items")
+      .select("id, position, duration, start_time, synthetic_segment_id, metadata, script_text")
+      .eq("project_id", projectId)
+      .order("position", { ascending: true }),
+  ]);
+  // Never reorder off a partial read. A failed select used to surface as "no
+  // rows", which reads exactly like "nothing to do" and silently skipped the work.
+  if (segsRes.error) throw new Error(`reconcileTimelineOrder segments: ${segsRes.error.message}`);
+  if (rowsRes.error) throw new Error(`reconcileTimelineOrder load: ${rowsRes.error.message}`);
+
+  const proj = projRes.data;
+  const rows = (rowsRes.data ?? []).map((r) => ({
+    id: r.id as string,
+    position: Number(r.position),
+    duration: r.duration as number | null,
+    start_time: r.start_time as number | null,
+    script_text: r.script_text as string | null,
+    synthetic_segment_id: (r.synthetic_segment_id as string | null) ?? null,
+    metadata: (r.metadata ?? {}) as Record<string, unknown>,
+  }));
+  const segmentPosition = new Map(
+    (segsRes.data ?? []).map((s) => [s.id as string, Number(s.position)] as const),
+  );
+
+  const { ordered: segmentRows, orphans } = orderSegmentRows(rows, segmentPosition);
+  const existingPitch = rows.find((r) => r.metadata.kind === PITCH_TIMELINE_FLAG);
+  if (segmentRows.length === 0) {
+    return { rows: rows.length, writes: 0, verified: true, orphanRows: orphans.length };
+  }
+  if (orphans.length > 0) {
+    await logJob({ projectId }, "synthetic.timeline_order.orphan_rows", {
+      note: "timeline rows whose synthetic_segment no longer exists — left unplaced",
+      count: orphans.length,
+    });
+  }
+
+  // ---- Where does the pitch go? ----------------------------------------
+  // `boundaryIndex` doubles as the pitch row's final position: the renumber lays
+  // the segments out contiguously from 0 and leaves it that one slot. -1 means
+  // "no pitch on this project", which buildRenumberPlan reads as "leave no gap".
+  const hasPitch = !!proj?.pitch_video_url;
+  let boundaryIndex = -1;
+  let pitchId: string | null = null;
+  // Set when the pitch row was already at its slot and so was never parked —
+  // there is then nothing to move it back from, and re-writing the position it
+  // already holds is the one write that would stop a settled timeline from
+  // costing zero.
+  let pitchStayedPut = false;
+
+  if (hasPitch) {
+    const insertAt = Number(proj!.pitch_video_insert_seconds);
+    const insertSeconds = Number.isFinite(insertAt) && insertAt > 0 ? insertAt : 180;
+    const pitchDuration = Number(proj!.pitch_video_duration_seconds) || 0;
+
+    // Snap against the rows IN SEGMENT ORDER. Snapping against the stored order
+    // would sum the durations of a shuffled timeline, so a scrambled `position`
+    // column used to drag the pitch out of place too.
+    const placement = planPitchPlacement(
+      segmentRows.map((r) => ({
+        id: r.id,
+        position: r.position,
+        duration: r.duration,
+        start_time: r.start_time,
+        script_text: r.script_text,
+      })),
+      insertSeconds,
+    );
+    boundaryIndex = placement.boundaryIndex;
+    if (placement.frontGuardApplied) {
+      await logJob({ projectId }, "synthetic.pitch_video.front_guard", {
+        note:
+          "nearest-boundary snap resolved to index 0 on a timeline longer than the " +
+          "insert mark — timing data is unusable, placed by proportion instead",
+        insertSeconds,
+        timelineEndSeconds: Math.round(placement.timelineEndSeconds),
+        usedStartTimeFallback: placement.usedStartTimeFallback,
+        noTimingData: placement.noTimingData,
+        segmentRows: segmentRows.length,
+        fallbackBoundaryIndex: boundaryIndex,
+      });
+    }
+
+    // Upsert the pitch row. A NEW row is parked past the end of the timeline
+    // rather than at 0 — see PITCH_PARKED_POSITION. An EXISTING row is parked
+    // too unless it is already exactly where it belongs, so an interrupted
+    // renumber leaves the pitch playing LAST rather than first.
+    const pitchPayload = {
+      project_id: projectId,
+      type: PITCH_TIMELINE_FLAG,
+      start_time: insertSeconds,
+      duration: pitchDuration,
+      script_text: null,
+      image_url: null,
+      video_url: proj!.pitch_video_url,
+      right_image_url: null,
+      approved: true, // not a per-row reviewed asset; pre-approved like the intro
+      synthetic_segment_id: null,
+      metadata: { kind: PITCH_TIMELINE_FLAG, insert_seconds: insertSeconds },
+    };
+    const pitchAlreadyPlaced = !!existingPitch && existingPitch.position === boundaryIndex;
+    if (existingPitch) {
+      const { error } = await sb
+        .from("timeline_items")
+        .update(
+          pitchAlreadyPlaced ? pitchPayload : { ...pitchPayload, position: PITCH_PARKED_POSITION },
+        )
+        .eq("id", existingPitch.id);
+      if (error) throw new Error(`reconcileTimelineOrder pitch update: ${error.message}`);
+      pitchId = existingPitch.id;
+    } else {
+      const { data: inserted, error } = await sb
+        .from("timeline_items")
+        .insert({ ...pitchPayload, position: PITCH_PARKED_POSITION })
+        .select("id")
+        .single();
+      if (error) throw new Error(`reconcileTimelineOrder pitch insert: ${error.message}`);
+      if (!inserted?.id) throw new Error("reconcileTimelineOrder pitch insert: no id returned");
+      pitchId = inserted.id as string;
+    }
+    // The pitch is parked NOW, so the map the write plan reasons about has to say
+    // so — otherwise the plan reads it as already in place and never brings it
+    // back off the parking slot.
+    if (pitchAlreadyPlaced) {
+      pitchStayedPut = true;
+    } else {
+      const parked = rows.find((r) => r.id === pitchId);
+      if (parked) parked.position = PITCH_PARKED_POSITION;
+    }
+  } else if (existingPitch) {
+    // The pitch video was removed from the project but its row outlived it. Drop
+    // it rather than leave a stale block in the render.
+    const { error } = await sb.from("timeline_items").delete().eq("id", existingPitch.id);
+    if (error) throw new Error(`reconcileTimelineOrder stale pitch delete: ${error.message}`);
+  }
+
+  // ---- Write the new order ---------------------------------------------
+  // WRITE ORDER IS LOAD-BEARING — see buildRenumberPlan. Segments move first in
+  // descending order; the pitch, parked past the end of the timeline, moves last
+  // in a single update. Errors throw rather than being discarded: a half-finished
+  // renumber that reported success is what let a mis-ordered timeline reach the
+  // renderer unnoticed.
+  const segmentIds = segmentRows.map((r) => r.id);
+  const currentPosition = new Map(rows.map((r) => [r.id, r.position] as const));
+  const { segmentWrites, pitchPosition } = buildRenumberPlan(
+    segmentIds,
+    boundaryIndex,
+    currentPosition,
+  );
+  for (const w of segmentWrites) {
+    const { error } = await sb.from("timeline_items").update({ position: w.position }).eq("id", w.id);
+    if (error) throw new Error(`reconcileTimelineOrder renumber ${w.id}: ${error.message}`);
+  }
+  const pitchMoved = !!pitchId && !pitchStayedPut;
+  if (pitchMoved) {
+    const { error } = await sb
+      .from("timeline_items")
+      .update({ position: pitchPosition })
+      .eq("id", pitchId!);
+    if (error) throw new Error(`reconcileTimelineOrder pitch position: ${error.message}`);
+  }
+
+  // ---- VERIFY ----------------------------------------------------------
+  // Everything above is best-effort per-row writes against a timeline another
+  // finalize may also be touching, so read back what actually LANDED rather than
+  // reporting the intent. This is the check that was missing: the old code
+  // verified only the pitch row's position, so a scrambled SEGMENT order passed
+  // inspection all the way into the finished video.
+  const expected = expectedTimelineOrder(segmentIds, pitchId, boundaryIndex);
+  const { data: after, error: afterErr } = await sb
+    .from("timeline_items")
+    .select("id, synthetic_segment_id, metadata")
+    .eq("project_id", projectId)
+    .order("position", { ascending: true });
+  if (afterErr) throw new Error(`reconcileTimelineOrder verify: ${afterErr.message}`);
+  const orphanIds = new Set(orphans.map((o) => o.id));
+  const actual = (after ?? [])
+    .filter((r) => !orphanIds.has(r.id as string))
+    .filter(
+      (r) =>
+        !!r.synthetic_segment_id ||
+        ((r.metadata ?? {}) as Record<string, unknown>).kind === PITCH_TIMELINE_FLAG,
+    )
+    .map((r) => r.id as string);
+  const divergence = expected.findIndex((id, i) => actual[i] !== id);
+  const verified = actual.length === expected.length && divergence === -1;
+
+  await logJob({ projectId }, "synthetic.timeline_order.reconciled", {
+    rows: rows.length,
+    segmentRows: segmentRows.length,
+    orphanRows: orphans.length,
+    segmentRowsRenumbered: segmentWrites.length,
+    hasPitch,
+    snappedPosition: pitchId ? pitchPosition : null,
+    verified,
+    // Only meaningful on failure: where the landed order first disagrees.
+    firstDivergenceIndex: verified ? null : divergence,
+  });
+  if (!verified) {
+    await logJob({ projectId }, "synthetic.timeline_order.mismatch", {
+      note:
+        "timeline did not land in the intended order — a concurrent finalize may " +
+        "have been mid-write. The render gate re-runs this and refuses to render " +
+        "until it verifies.",
+      expectedRows: expected.length,
+      actualRows: actual.length,
+      firstDivergenceIndex: divergence,
+    });
+  }
+
+  return {
+    rows: rows.length,
+    writes: segmentWrites.length + (pitchMoved ? 1 : 0),
+    verified,
+    orphanRows: orphans.length,
+  };
+}
+
 /**
  * Insert (or re-position) the sales-pitch video as a single timeline_item near
  * the project's pitch_video_insert_seconds mark, SNAPPED to the nearest segment
@@ -229,195 +548,10 @@ export function buildRenumberPlan(
  * pushed forward past the sentence so the pitch always starts after a full
  * sentence (client 2026-07-03).
  *
- * Idempotent: keyed on metadata.kind === 'pitch_video', so repeated finalize
- * calls update the one row rather than inserting duplicates. After placing the
- * pitch row it renumbers EVERY timeline row (synthetic segments + the pitch row)
- * to contiguous integer positions in timeline order, since the pitch row carries
- * no synthetic_segment_id and is therefore invisible to the segment-only
- * renumber in maybeFinalizeSynthetic.
- *
- * The pitch block is non-voiceover-bearing: it consumes video time but the
- * narration pauses over it (handled in the render route's duration guard +
- * renderProcessor's audio splice). Its duration is the probed/uploaded length,
- * falling back to 0 only when unknown (the render worker re-probes the real
- * file regardless).
+ * Thin wrapper now: placing the pitch is one half of reconciling the timeline's
+ * play order, and doing either half on its own is what let the two disagree.
+ * There is exactly ONE routine that writes `timeline_items.position`.
  */
 export async function ensurePitchTimelineItem(projectId: string): Promise<void> {
-  const sb = getServerSupabase();
-
-  const { data: proj } = await sb
-    .from("projects")
-    .select("pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
-    .eq("id", projectId)
-    .single();
-  if (!proj?.pitch_video_url) return; // no pitch video on this project
-
-  const insertAt = Number(proj.pitch_video_insert_seconds);
-  const insertSeconds = Number.isFinite(insertAt) && insertAt > 0 ? insertAt : 180;
-  const pitchDuration = Number(proj.pitch_video_duration_seconds) || 0;
-
-  // Pull current synthetic timeline rows in order. We rebuild their start_times
-  // from the durations rather than trusting the (planner-relative) start_time
-  // column, because the renderer's effective cut is duration-driven. start_time
-  // is still selected as a FALLBACK for the degenerate case below.
-  const { data: rowsRaw, error: rowsErr } = await sb
-    .from("timeline_items")
-    .select("id, position, duration, start_time, synthetic_segment_id, metadata, script_text")
-    .eq("project_id", projectId)
-    .order("position", { ascending: true });
-  // Never place the pitch off a partial read. A failed select used to surface as
-  // "no rows", which reads exactly like "no segments yet" and silently skipped
-  // placement.
-  if (rowsErr) throw new Error(`ensurePitchTimelineItem load: ${rowsErr.message}`);
-  const rows = rowsRaw ?? [];
-
-  // Separate the segment rows (everything with a segment id) from any existing
-  // pitch row. We re-place the pitch row among the segment rows below.
-  const segmentRows = rows.filter((r) => !!r.synthetic_segment_id);
-  const existingPitch = rows.find(
-    (r) => ((r.metadata ?? {}) as Record<string, unknown>).kind === PITCH_TIMELINE_FLAG,
-  );
-  if (segmentRows.length === 0) return; // nothing to anchor against yet
-
-  const placement = planPitchPlacement(
-    segmentRows.map((r) => ({
-      id: r.id as string,
-      position: Number(r.position),
-      duration: r.duration as number | null,
-      start_time: r.start_time as number | null,
-      script_text: r.script_text as string | null,
-    })),
-    insertSeconds,
-  );
-  const { boundaryIndex } = placement;
-  if (placement.frontGuardApplied) {
-    await logJob({ projectId }, "synthetic.pitch_video.front_guard", {
-      note:
-        "nearest-boundary snap resolved to index 0 on a timeline longer than the " +
-        "insert mark — timing data is unusable, placed by proportion instead",
-      insertSeconds,
-      timelineEndSeconds: Math.round(placement.timelineEndSeconds),
-      usedStartTimeFallback: placement.usedStartTimeFallback,
-      noTimingData: placement.noTimingData,
-      segmentRows: segmentRows.length,
-      fallbackBoundaryIndex: boundaryIndex,
-    });
-  }
-
-  // Upsert the pitch row. A NEW row is parked past the end of the timeline
-  // rather than at 0 — see PITCH_PARKED_POSITION. An EXISTING row keeps its
-  // current position through this update; the renumber below is what moves it.
-  const pitchPayload = {
-    project_id: projectId,
-    type: PITCH_TIMELINE_FLAG,
-    start_time: insertSeconds,
-    duration: pitchDuration,
-    script_text: null,
-    image_url: null,
-    video_url: proj.pitch_video_url,
-    right_image_url: null,
-    approved: true, // not a per-row reviewed asset; pre-approved like the intro
-    synthetic_segment_id: null,
-    metadata: { kind: PITCH_TIMELINE_FLAG, insert_seconds: insertSeconds },
-  };
-  // The pitch's final position IS boundaryIndex: the renumber lays the segment
-  // rows out contiguously from 0 and gives the pitch the slot at that index.
-  // Knowing it up front lets an existing row be parked before anything moves.
-  const pitchTargetPosition = boundaryIndex;
-
-  let pitchId: string;
-  if (existingPitch) {
-    // Park an existing row too, unless it is already exactly where it belongs.
-    // A re-run after the old position-0 bug starts with the pitch AT 0, and
-    // leaving it there during the segment renumber would preserve the very
-    // failure this function is being fixed for if that renumber is interrupted.
-    // When it is already correct we write no position at all, so a settled
-    // timeline costs zero writes.
-    const alreadyPlaced = Number(existingPitch.position) === pitchTargetPosition;
-    const { error } = await sb
-      .from("timeline_items")
-      .update(alreadyPlaced ? pitchPayload : { ...pitchPayload, position: PITCH_PARKED_POSITION })
-      .eq("id", existingPitch.id);
-    if (error) throw new Error(`ensurePitchTimelineItem update: ${error.message}`);
-    pitchId = existingPitch.id as string;
-  } else {
-    const { data: inserted, error } = await sb
-      .from("timeline_items")
-      .insert({ ...pitchPayload, position: PITCH_PARKED_POSITION })
-      .select("id")
-      .single();
-    if (error) throw new Error(`ensurePitchTimelineItem insert: ${error.message}`);
-    if (!inserted?.id) throw new Error("ensurePitchTimelineItem insert: no id returned");
-    pitchId = inserted.id as string;
-  }
-
-  // Renumber to contiguous integers in timeline order, splicing the pitch row in
-  // at boundaryIndex. Rows that are neither segment nor pitch (an intro row) are
-  // left alone, as before — the renderer drops them.
-  //
-  // WRITE ORDER IS THE FIX — see buildRenumberPlan. Segments move first in
-  // descending order; the pitch, parked past the end of the timeline, moves last
-  // in a single update. Errors are checked and thrown rather than discarded: a
-  // half-finished renumber that reported success is what let a mis-ordered
-  // timeline reach the renderer unnoticed.
-  const currentPosition = new Map(rows.map((r) => [r.id as string, Number(r.position)]));
-  const { segmentWrites, pitchPosition } = buildRenumberPlan(
-    segmentRows.map((r) => r.id as string),
-    boundaryIndex,
-    currentPosition,
-  );
-  for (const w of segmentWrites) {
-    const { error } = await sb.from("timeline_items").update({ position: w.position }).eq("id", w.id);
-    if (error) throw new Error(`ensurePitchTimelineItem renumber ${w.id}: ${error.message}`);
-  }
-
-  const { error: pitchPosErr } = await sb
-    .from("timeline_items")
-    .update({ position: pitchPosition })
-    .eq("id", pitchId);
-  if (pitchPosErr) {
-    throw new Error(`ensurePitchTimelineItem pitch position: ${pitchPosErr.message}`);
-  }
-
-  // VERIFY. Everything above is best-effort per-row writes against a timeline
-  // another finalize may also be touching, so read back what actually landed
-  // rather than reporting the intent. `verifiedPosition` disagreeing with
-  // `snappedPosition`, or a pitch still parked, is the signal that placement
-  // needs looking at — the previous version logged only its intent and so read
-  // as a success even when the render disagreed.
-  const { data: check } = await sb
-    .from("timeline_items")
-    .select("position")
-    .eq("id", pitchId)
-    .single();
-  const verifiedPosition = check ? Number(check.position) : null;
-
-  await logJob({ projectId }, "synthetic.pitch_video.placed", {
-    insertSeconds,
-    snappedBoundaryIndex: boundaryIndex,
-    // Non-zero shift = the nearest boundary was inside a time-split sentence
-    // and the pitch was pushed forward past it (sentence guard).
-    sentenceGuardShift: placement.sentenceGuardShift,
-    snapDeltaSeconds: Math.round(placement.snapDeltaSeconds * 100) / 100,
-    pitchDurationSeconds: pitchDuration,
-    totalRows: segmentRows.length + 1,
-    snappedPosition: pitchPosition,
-    verifiedPosition,
-    // Roughly where the pitch lands in the finished video. The number to compare
-    // against what the client reports seeing.
-    approxStartSeconds: Math.round(placement.approxStartSeconds),
-    segmentRowsRenumbered: segmentWrites.length,
-    usedStartTimeFallback: placement.usedStartTimeFallback,
-    frontGuardApplied: placement.frontGuardApplied,
-  });
-
-  if (verifiedPosition !== pitchPosition) {
-    await logJob({ projectId }, "synthetic.pitch_video.placement_mismatch", {
-      note:
-        "pitch row is not at its intended position after renumber — a concurrent " +
-        "finalize may have moved it; the next finalize will re-place it",
-      expected: pitchPosition,
-      actual: verifiedPosition,
-    });
-  }
+  await reconcileTimelineOrder(projectId);
 }

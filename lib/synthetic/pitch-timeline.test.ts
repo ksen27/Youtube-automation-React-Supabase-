@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { planPitchPlacement, buildRenumberPlan } from "@/lib/synthetic/pitch-timeline";
-import type { PitchAnchorRow } from "@/lib/synthetic/pitch-timeline";
+import {
+  planPitchPlacement,
+  buildRenumberPlan,
+  orderSegmentRows,
+  expectedTimelineOrder,
+} from "@/lib/synthetic/pitch-timeline";
+import type { PitchAnchorRow, TimelineOrderRow } from "@/lib/synthetic/pitch-timeline";
 
 // SALES-PITCH PLACEMENT (client 2026-08-18 via Joey: "the sales pitch feature is
 // not working correctly / its showing up at the first second").
@@ -184,5 +189,141 @@ describe("buildRenumberPlan", () => {
     expect(order[boundary][0]).toBe("pitch");
     // Segments keep their relative order around the pitch.
     expect(order.filter(([id]) => id !== "pitch").map(([id]) => id)).toEqual(ids(n));
+  });
+});
+
+// TIMELINE PLAY ORDER (client 2026-08-21 via Joey: "the first clip is avatar
+// part but this is not avatar in the rendered video").
+//
+// The render concatenates strictly by timeline_items.position against ONE
+// continuous voiceover, so a permuted position column does not fail — it ships
+// a video whose visuals do not match the words. On project e8177073 the last 23
+// blocks played first and the opening avatar landed third.
+//
+// The cause was two renumber loops racing over different row sets and zippering
+// their writes together, then a compaction pass that tidied the result into
+// unique contiguous positions — wrong, but perfectly well-formed. The fix is
+// that order is re-derived from synthetic_segments.position every time, so any
+// two runs compute the SAME answer and a damaged timeline heals itself. These
+// tests pin that property.
+
+/** `n` timeline rows carrying the positions they currently hold on disk. */
+function timelineRows(currentOrderOfSegments: ReadonlyArray<number>): TimelineOrderRow[] {
+  return currentOrderOfSegments.map((segIndex, i) => ({
+    id: `row-${segIndex}`,
+    position: i,
+    synthetic_segment_id: `seg-${segIndex}`,
+  }));
+}
+
+/** The authoritative order: segment `i` plays at index `i`. */
+function segmentPositions(n: number): Map<string, number> {
+  return new Map(Array.from({ length: n }, (_, i) => [`seg-${i}`, i]));
+}
+
+describe("orderSegmentRows", () => {
+  it("orders by segment position, ignoring the position the row currently holds", () => {
+    // The exact shape observed on e8177073: the tail hoisted to the front.
+    const scrambled = [203, 205, 0, 214, 213, 1, 2];
+    const { ordered } = orderSegmentRows(timelineRows(scrambled), segmentPositions(215));
+    expect(ordered.map((r) => r.synthetic_segment_id)).toEqual([
+      "seg-0", "seg-1", "seg-2", "seg-203", "seg-205", "seg-213", "seg-214",
+    ]);
+  });
+
+  it("returns the same order no matter what order the rows arrive in", () => {
+    // This is the property that kills the race: two concurrent reconciles read
+    // the timeline at different moments, in different states, and must still
+    // agree on the target — otherwise their interleaved writes hybridize.
+    const segPos = segmentPositions(10);
+    const a = orderSegmentRows(timelineRows([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), segPos);
+    const b = orderSegmentRows(timelineRows([7, 2, 9, 0, 4, 1, 8, 3, 6, 5]), segPos);
+    expect(b.ordered.map((r) => r.id)).toEqual(a.ordered.map((r) => r.id));
+  });
+
+  it("holds back rows whose segment no longer exists", () => {
+    // A deleted / re-planned segment leaves a dead row behind. Giving it a slot
+    // would render an asset the review screen no longer shows.
+    const rows = timelineRows([0, 1, 2]);
+    rows.push({ id: "row-ghost", position: 3, synthetic_segment_id: "seg-gone" });
+    const { ordered, orphans } = orderSegmentRows(rows, segmentPositions(3));
+    expect(ordered).toHaveLength(3);
+    expect(orphans.map((r) => r.id)).toEqual(["row-ghost"]);
+  });
+
+  it("skips rows that are not segment rows at all", () => {
+    // The pitch row carries no synthetic_segment_id — it is placed separately.
+    const rows = timelineRows([0, 1]);
+    rows.push({ id: "row-pitch", position: 2, synthetic_segment_id: null });
+    const { ordered, orphans } = orderSegmentRows(rows, segmentPositions(2));
+    expect(ordered.map((r) => r.id)).toEqual(["row-0", "row-1"]);
+    expect(orphans).toHaveLength(0);
+  });
+});
+
+describe("expectedTimelineOrder", () => {
+  it("splices the pitch into its boundary slot", () => {
+    expect(expectedTimelineOrder(["a", "b", "c"], "pitch", 2)).toEqual(["a", "b", "pitch", "c"]);
+  });
+
+  it("appends the pitch when the boundary is past the last segment", () => {
+    expect(expectedTimelineOrder(["a", "b"], "pitch", 9)).toEqual(["a", "b", "pitch"]);
+  });
+
+  it("is just the segments when the project has no pitch video", () => {
+    expect(expectedTimelineOrder(["a", "b", "c"], null, 1)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("order reconcile end to end (pure halves)", () => {
+  // orderSegmentRows -> buildRenumberPlan -> expectedTimelineOrder is the whole
+  // decision path; only the writes are I/O. Running the halves together proves a
+  // scrambled timeline converges in ONE pass rather than needing a second.
+  function applyPlan(rows: TimelineOrderRow[], segCount: number, boundaryIndex: number) {
+    const { ordered } = orderSegmentRows(rows, segmentPositions(segCount));
+    const current = new Map(rows.map((r) => [r.id, r.position] as const));
+    const { segmentWrites, pitchPosition } = buildRenumberPlan(
+      ordered.map((r) => r.id),
+      boundaryIndex,
+      current,
+    );
+    const landed = new Map(current);
+    for (const w of segmentWrites) landed.set(w.id, w.position);
+    return { landed, pitchPosition, writes: segmentWrites.length, ordered };
+  }
+
+  it("repairs a scrambled timeline in a single pass", () => {
+    const rows = timelineRows([3, 0, 4, 1, 2]); // 5 blocks, badly shuffled
+    const { landed, ordered } = applyPlan(rows, 5, -1);
+    const playOrder = [...landed.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .map(([id]) => id);
+    expect(playOrder).toEqual(["row-0", "row-1", "row-2", "row-3", "row-4"]);
+    expect(ordered).toHaveLength(5);
+  });
+
+  it("leaves an already-correct timeline untouched", () => {
+    // Zero writes on a settled timeline is what makes it cheap enough to re-run
+    // as a gate immediately before every render.
+    const rows = timelineRows([0, 1, 2, 3, 4]);
+    expect(applyPlan(rows, 5, -1).writes).toBe(0);
+  });
+
+  it("converges to the same result from two different starting scrambles", () => {
+    const a = applyPlan(timelineRows([4, 3, 2, 1, 0]), 5, 2);
+    const b = applyPlan(timelineRows([1, 4, 0, 3, 2]), 5, 2);
+    const order = (r: typeof a) =>
+      [...r.landed.entries()].sort((x, y) => x[1] - y[1]).map(([id]) => id);
+    expect(order(b)).toEqual(order(a));
+    expect(b.pitchPosition).toBe(a.pitchPosition);
+  });
+
+  it("keeps the pitch slot free while the segments are laid out around it", () => {
+    const rows = timelineRows([2, 0, 3, 1]);
+    const { landed, pitchPosition } = applyPlan(rows, 4, 2);
+    const taken = new Set(landed.values());
+    expect(pitchPosition).toBe(2);
+    expect(taken.has(2)).toBe(false); // nothing else claims the pitch's slot
+    expect([...taken].sort((a, b) => a - b)).toEqual([0, 1, 3, 4]);
   });
 });
