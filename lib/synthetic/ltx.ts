@@ -1,4 +1,5 @@
 import { getEnv } from "@/lib/env";
+import { CLIP_NEGATIVE_PROMPT } from "@/lib/synthetic/constants";
 import { fetchOrThrow, withHttpRetry, isAuthForbidden } from "@/lib/synthetic/http";
 import type { GenerateClipInput, GenerateClipResult } from "@/lib/synthetic/falai";
 
@@ -21,7 +22,32 @@ import type { GenerateClipInput, GenerateClipResult } from "@/lib/synthetic/fala
 
 // Allowed duration tiers at 1080p/25fps. We pick the nearest tier <= the
 // configured max so a requested 7s lands on 6 or 8, never an unsupported value.
-export const LTX_DURATION_TIERS = [6, 8, 10, 12, 14, 16, 18, 20];
+//
+// THE 6s FLOOR IS AN api.ltx.video CONSTRAINT, NOT A MODEL ONE. The hosted API
+// only accepts these discrete tiers, so a 4s request there rounds UP to 6 and we
+// pay for 6. The self-hosted service (services/ltx-selfhost) derives frames from
+// the requested duration directly (snapped to the 8n+1 the latent format needs),
+// so it can render 4s clips the API simply cannot sell us — client 2026-08-21
+// asked for 4s clips, which is only reachable on our own GPU.
+//
+// LTX_DURATION_TIERS_OVERRIDE therefore exists to widen this list when
+// LTX_BASE_URL points at the self-hosted service. Leave it unset while pointing
+// at api.ltx.video or every clip fails with an unsupported-duration error.
+export const LTX_DEFAULT_DURATION_TIERS = [6, 8, 10, 12, 14, 16, 18, 20];
+
+export function ltxDurationTiers(): number[] {
+  const raw = (getEnv().LTX_DURATION_TIERS_OVERRIDE || "").trim();
+  if (!raw) return LTX_DEFAULT_DURATION_TIERS;
+  const tiers = raw
+    .split(",")
+    .map((t) => Number(t.trim()))
+    .filter((t) => Number.isFinite(t) && t > 0)
+    .sort((a, b) => a - b);
+  return tiers.length > 0 ? tiers : LTX_DEFAULT_DURATION_TIERS;
+}
+
+/** @deprecated use ltxDurationTiers() — kept so existing imports keep compiling. */
+export const LTX_DURATION_TIERS = LTX_DEFAULT_DURATION_TIERS;
 
 function cfg() {
   const env = getEnv();
@@ -32,6 +58,13 @@ function cfg() {
   return {
     base: env.LTX_BASE_URL.replace(/\/$/, ""),
     model: env.LTX_MODEL,
+    // "" (the default) means "send no negative_prompt at all" -- see the submit
+    // body. Set to "default" to use the tuned CLIP_NEGATIVE_PROMPT, or to any
+    // literal string to override it.
+    negativePrompt:
+      env.LTX_NEGATIVE_PROMPT === "default"
+        ? CLIP_NEGATIVE_PROMPT
+        : (env.LTX_NEGATIVE_PROMPT || ""),
     resolution: env.LTX_RESOLUTION,
     fps: env.LTX_FPS,
     maxDuration: env.LTX_MAX_DURATION,
@@ -117,12 +150,14 @@ function ltxErrorReason(st: { error?: unknown; message?: unknown; detail?: unkno
   }
 }
 
-// Snap an arbitrary requested duration (seconds) to the nearest LTX tier that
-// does not exceed maxDuration. Tiers start at 6s, so anything shorter rounds up
-// to the 6s floor.
+// Snap an arbitrary requested duration (seconds) to the nearest available tier
+// that does not exceed maxDuration. With the default (api.ltx.video) tiers the
+// floor is 6s, so anything shorter rounds UP to 6; with a self-hosted override
+// that includes 4, a 4s request stays 4.
 export function snapDuration(requested: number, maxDuration: number): number {
-  const allowed = LTX_DURATION_TIERS.filter((t) => t <= maxDuration);
-  const tiers = allowed.length > 0 ? allowed : [LTX_DURATION_TIERS[0]];
+  const all = ltxDurationTiers();
+  const allowed = all.filter((t) => t <= maxDuration);
+  const tiers = allowed.length > 0 ? allowed : [all[0]];
   let best = tiers[0];
   let bestDist = Math.abs(requested - best);
   for (const t of tiers) {
@@ -201,6 +236,12 @@ async function generateLtxVideoWithKey(
       body: JSON.stringify({
         image_uri: input.imageUrl,
         prompt: input.prompt,
+        // Only sent when configured. The SELF-HOSTED service reads this and
+        // falls back to the diffusers default when it is absent; api.ltx.video
+        // has no documented negative_prompt field, so leaving LTX_NEGATIVE_PROMPT
+        // unset keeps the hosted-API request byte-identical to before and makes
+        // a rollback risk-free.
+        ...(c.negativePrompt ? { negative_prompt: c.negativePrompt } : {}),
         model: c.model,
         duration,
         resolution: c.resolution,

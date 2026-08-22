@@ -113,10 +113,45 @@ export const ACTION_CLIP_RULE =
   "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
   "tracking, no orbit, no camera shake. ONLY THE PERSON AND THE OBJECTS THEY " +
   "TOUCH MOVE; the framing never changes. " +
-  "Natural real-time speed — NOT slow motion, NOT sped up, no dramatic or " +
-  "cinematic movement, no motion blur on the camera. " +
+  // SPEED, 2026-08-22. Was "Natural real-time speed — NOT slow motion, NOT sped
+  // up". Client on a real 720p test clip: "the video is quick movement so some
+  // issue is happend / pls generate the slow movement clip". This REVERSES the
+  // 2026-08-17 wording; the two asks are about different things and both hold:
+  // that one banned SLOW-MOTION-AS-AN-EFFECT (a stylised ramp), this one asks
+  // for the action itself to be performed unhurriedly. "Not sped up" is kept for
+  // that reason.
+  "The movement is SLOW, calm and deliberate — unhurried, gentle and gradual, " +
+  "carried smoothly through the whole shot; no sudden, rushed or jerky motion, " +
+  "NOT sped up, no dramatic or cinematic movement, no motion blur on the camera. " +
+  // HAND CONSISTENCY, 2026-08-22. Client: "the hands(right and left) is
+  // different with each other". The library's negative prompt already covers
+  // "disfigured hands / wrong hand count", but only WITHIN a frame — it says
+  // nothing about hands mutating BETWEEN frames, which is the actual artifact.
+  // Stating the invariant positively works better than another negative.
+  "The SAME TWO HANDS stay consistent from the first frame to the last — " +
+  "identical shape, size, skin tone and five fingers each; the hands never " +
+  "swap, morph, duplicate or change. " +
   "Handheld phone video look, slightly low quality and grainy like a real home " +
   "vlog clip — not smooth, not cinematic, no colour grading, no on-screen text.";
+
+// Negative prompt for the clip lane.
+//
+// WHY WE OVERRIDE THE LIBRARY DEFAULT: diffusers' DEFAULT_NEGATIVE_PROMPT
+// suppresses "grainy texture, excessive noise, low contrast, washed out colors"
+// — which is a direct fight with ACTION_CLIP_RULE above, where the house style
+// asks for exactly that low-fi vlog texture. Our prompt was asking for grain
+// while the negative prompt removed it. It also lacks any between-frame hand
+// terms. This list keeps the useful structural negatives, drops the ones that
+// fight the style, and adds the hand/speed artifacts the client reported.
+export const CLIP_NEGATIVE_PROMPT =
+  "blurry, out of focus, distorted proportions, deformed facial features, " +
+  "extra limbs, disfigured hands, wrong hand count, mismatched hands, " +
+  "hands changing shape, morphing fingers, extra fingers, missing fingers, " +
+  "left and right hand swapping, warping hands, hands that do not match each " +
+  "other, fast motion, sped up, rushed movement, jerky movement, sudden " +
+  "movement, jittery movement, camera shake, camera movement, zoom, pan, tilt, " +
+  "unnatural transitions, 3D CGI look, cartoonish rendering, uncanny valley " +
+  "effect, on-screen text";
 
 // The animation prompt used when a block has no per-block one of its own (the
 // planner failed to write one, or the block was promoted to ai_clip by a later

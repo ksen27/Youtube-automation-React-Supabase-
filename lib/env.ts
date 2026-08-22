@@ -803,13 +803,43 @@ const ServerEnvSchema = z.object({
   // 2026-08-03: 6s clip = 5.9MB at 1080p vs 36MB at 4K) and buys nothing he asked
   // for. Probed and CONFIRMED WORKING at "3840x2160" if real 4K clips are ever
   // wanted — flip this one value, and scale PRICE_TABLE.ltx2 in cost.ts with it.
-  LTX_RESOLUTION: z.string().default("1920x1080"),
+  //
+  // 1080p -> 720p (client 2026-08-21): "Can you change it to 720p / I think it
+  // will make the footage look older / Thats what we are aiming for". This is an
+  // AESTHETIC ask, not a cost one — it is the same goal the 2026-06 low-fi
+  // degrade block below was built for (SYNTHETIC_DEGRADE_*), which the client
+  // then disabled on 2026-06-29. Softness now comes from the renderer upscaling
+  // 720p into the 4K export canvas (a 3x upscale) instead of from grain/blur at
+  // full dimensions.
+  // It is ALSO much cheaper on the self-hosted GPU, which is a side effect and
+  // not the reason: measured 2026-08-21 on an RTX PRO 6000, one 6s clip took
+  // 118.2s at 1080p vs 50.1s at 720p (services/ltx-selfhost/README.md).
+  // Revert to "1920x1080" if the client decides the 4K export looks too soft.
+  LTX_RESOLUTION: z.string().default("1280x720"),
   // LTX-2 source frame rate. Allowed values are 25 or 50 (NOT 24 — the API
   // rejects fps 24 for ltx-2-fast at 1080p). The render pipeline re-encodes
   // every clip to SYNTHETIC_FPS (30) downstream, so this only has to be a value
   // LTX accepts; 25 is the documented default for the 1080p duration tiers.
   LTX_FPS: z.coerce.number().int().positive().default(25),
   LTX_MAX_DURATION: z.coerce.number().int().positive().default(20),
+  // Comma-separated clip durations to snap to, REPLACING the api.ltx.video tier
+  // list (6,8,10,...). Only set this when LTX_BASE_URL points at the self-hosted
+  // service, which derives frames from the duration instead of selling fixed
+  // tiers — the hosted API rejects anything off its own list.
+  // Client 2026-08-21 asked for 4s clips; on the API a 4s request silently
+  // becomes 6s (and bills 6s), so "4,6,8,10,12,14,16,18,20" is the self-hosted
+  // setting that actually delivers it. Empty = the API's tiers.
+  LTX_DURATION_TIERS_OVERRIDE: z.string().optional(),
+  // Negative prompt for clip generation. Three states:
+  //   unset/""  -> send NO negative_prompt field (api.ltx.video-safe, unchanged
+  //                request shape; this is the default so rollback stays clean)
+  //   "default" -> send CLIP_NEGATIVE_PROMPT from lib/synthetic/constants.ts
+  //   any text  -> send that literal string
+  // Set to "default" together with LTX_BASE_URL when cutting over to the
+  // self-hosted service: the tuned list fixes the between-frame hand artifacts
+  // the client reported on 2026-08-22, and stops the library default from
+  // suppressing the grain the house style explicitly asks for.
+  LTX_NEGATIVE_PROMPT: z.string().optional(),
   // Hard timeout (seconds) for a single LTX image-to-video job (poll loop).
   LTX_POLL_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(600),
   // fal.ai — image-to-video FALLBACK (Veo 3 Fast, then Kling). Tried only
@@ -1192,8 +1222,25 @@ const ServerEnvSchema = z.object({
   // Escape hatch: auto-render even when some blocks failed/were skipped. Off by
   // default — a failed block means a gap in the delivered video.
   SYNTHETIC_AUTO_RENDER_ALLOW_FAILED: boolish(false),
-  SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(6),
-  SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(8),
+  // 6 -> 4 (client 2026-08-21: "wants to generate the only 4 sec clip"). This is
+  // the knob that decides how long each visual block is, and therefore what
+  // duration the clip lane asks LTX for.
+  // ONLY EFFECTIVE ON THE SELF-HOSTED SERVICE: api.ltx.video's tier floor is 6s,
+  // so against the hosted API a 4s block still snaps up to a 6s clip (and bills
+  // 6s) — see LTX_DURATION_TIERS_OVERRIDE and snapDuration() in
+  // lib/synthetic/ltx.ts. Shorter blocks also mean MORE of them per video, so
+  // clip COUNT rises even as each clip gets cheaper.
+  SYNTHETIC_BLOCK_TARGET_SECONDS: z.coerce.number().positive().default(4),
+  // 8 -> 6 -> 5. Any visual block longer than this splits into
+  // max(2, round(duration / TARGET)) even sub-blocks.
+  //
+  // 5, NOT 6, so EVERY clip lands on the 4s tier (client 2026-08-22: "always
+  // generate the 4s clip"). snapDuration picks the nearest of 4 and 6, so the
+  // decision boundary is 5s: a block <=5s becomes a 4s clip, >5s becomes 6s.
+  // At 6 the (5,6] band survived unsplit and produced 6s clips.
+  // Worst-case piece length after a split is dur/round(dur/4), which peaks just
+  // under 5s (4 + 1.96/k for k>=2 slots) -- still inside the 4s tier.
+  SYNTHETIC_BLOCK_SPLIT_THRESHOLD: z.coerce.number().positive().default(5),
   // Minimum on-screen hold for a single visual block (client feedback 2026-06:
   // "the image switches are too often / only one second in between — slow
   // everything down, make it ~5-6s"). The synthetic timeline pins each visual
@@ -1204,7 +1251,14 @@ const ServerEnvSchema = z.object({
   // minimum, capped at SYNTHETIC_BLOCK_SPLIT_THRESHOLD so a merged ai_clip
   // stays inside LTX's animatable range. avatar blocks are exempt. Set to 0 to
   // disable the merge entirely (back to one-visual-per-sentence pacing).
-  SYNTHETIC_BLOCK_MIN_HOLD: z.coerce.number().nonnegative().default(5),
+  // 5 -> 4 (client 2026-08-22, "always generate the 4s clip"). The merge target
+  // must match SYNTHETIC_BLOCK_TARGET_SECONDS, not sit above it: at 5 the merge
+  // produced blocks of exactly 5.0s, which is the EXACT TIE between the 4s and
+  // 6s tiers in snapDuration -- the tie resolves to 4 today only because the
+  // scan keeps the first-seen tier on an equal distance, so a hair over 5.0 from
+  // floating-point timing would silently yield a 6s clip. 4 keeps merged blocks
+  // clear of that boundary.
+  SYNTHETIC_BLOCK_MIN_HOLD: z.coerce.number().nonnegative().default(4),
   // Mixed clip/image window (client 2026-07-22 via Joey: "30% clips - 70%
   // images for the first 15 mins, and then the rest all images — no more LTX
   // after 15 minutes", LTX cost reduction). Visual blocks whose spoken window
@@ -1287,6 +1341,31 @@ const ServerEnvSchema = z.object({
   // all-LTX (the client specified only "clips" for the first 3 minutes, and VEO
   // bills per generation, so spending it here buys less than in the long tail).
   SYNTHETIC_CLIP_PHASE1_VEO_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
+  // PER-BUCKET ANIMATION SCHEDULE (client 2026-08-22). Supersedes the two-phase
+  // model above WHEN SET: the client supplied a per-minute table of "animated
+  // seconds out of 60" that DECAYS across the video rather than stepping once at
+  // 3 minutes, and a two-window model cannot express a curve.
+  //
+  // Format: "startSeconds:animatedFraction" pairs, ascending. Each entry runs
+  // until the next entry's start; the last runs to the end of the video.
+  // Empty = keep the two-phase behaviour (SYNTHETIC_CLIP_PHASE1_* above).
+  //
+  // The client's table, as fractions of each bucket (animatedSeconds / bucket):
+  //   0-1m 51/60=.85   1-2m 48/60=.80   2-3m 45/60=.75   3-4m 50/60=.83
+  //   4-5m 30/60=.50   5-6m 24/60=.40   6-7m 20/60=.33   7-8m 15/60=.25
+  //   8-9m 10/60=.17   9-10m 10/60=.17  10-11m 5/60=.083
+  //   11-12.3m 7/80=.088  12.3-13.3m 3/60=.05  13.3-14.3m 3/60=.05  14.3m+ 0
+  // (The 80-second buckets are the client's own irregular boundaries, preserved
+  // rather than normalised so the schedule matches the table they measured.)
+  //
+  // This totals ~321 animated seconds/video, up from ~261 under the two-phase
+  // config — MORE animation, not less, so it raises clip volume ~23%.
+  SYNTHETIC_CLIP_SCHEDULE: z.string().optional(),
+  // VEO's share of each scheduled bucket's animated seconds; the remainder is
+  // LTX. Default 0 because the client's table says only "animated" and does not
+  // distinguish providers, and LTX is now self-hosted (near-free) while veo
+  // still bills per generation. Set to e.g. 0.1 to keep a veo look-mix.
+  SYNTHETIC_CLIP_SCHEDULE_VEO_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
   // PHASE 2 (after the window): LTX share. Client 2026-08-18: 20% LTX. Left
   // untouched by the 2026-08-20 trim — 20 LTX + 10 VEO is that ask's "30% clips".
   SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.20),

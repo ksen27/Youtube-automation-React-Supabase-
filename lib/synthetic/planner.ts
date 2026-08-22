@@ -1831,6 +1831,49 @@ export interface ClipQuotaPhaseResult {
  * is still accepted and is treated as one whole-video phase on the "total"
  * basis, which is exactly what it used to mean.
  */
+/**
+ * Build clip phases from SYNTHETIC_CLIP_SCHEDULE.
+ *
+ * The client's 2026-08-22 spec is a per-minute table of animated seconds that
+ * DECAYS across the video (85% in minute 1 down to 0 by ~14 minutes). The
+ * two-phase model cannot express a curve: it has exactly one step. Each schedule
+ * entry becomes one phase running until the next entry starts.
+ *
+ * Format: "0:0.85,60:0.80,...". Malformed entries are skipped rather than
+ * throwing — a typo in a Fly secret should degrade to the two-phase default, not
+ * take the planner down mid-render.
+ *
+ * Returns [] when unset/unusable, which is the caller's signal to fall back.
+ */
+export function parseClipSchedule(raw: string | undefined, veoShare: number): ClipPhase[] {
+  if (!raw || !raw.trim()) return [];
+  const points: { start: number; fraction: number }[] = [];
+  for (const part of raw.split(",")) {
+    const [s, f] = part.split(":");
+    const start = Number((s ?? "").trim());
+    const fraction = Number((f ?? "").trim());
+    if (!Number.isFinite(start) || start < 0) continue;
+    if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) continue;
+    points.push({ start, fraction });
+  }
+  if (points.length === 0) return [];
+  points.sort((a, b) => a.start - b.start);
+
+  return points.map((p, i) => {
+    // veoShare splits each bucket's ANIMATED seconds between the two providers;
+    // the schedule itself says only how much of the window is animated, matching
+    // the client's table which does not name a provider.
+    const veoFraction = p.fraction * veoShare;
+    return {
+      startSeconds: p.start,
+      endSeconds: i + 1 < points.length ? points[i + 1].start : Infinity,
+      clipFraction: p.fraction - veoFraction,
+      veoFraction,
+      label: `sched_${Math.round(p.start)}s`,
+    };
+  });
+}
+
 export function assignClipDurationQuota(
   segs: PlannedSegment[],
   opts: {
@@ -3828,23 +3871,31 @@ export async function buildSyntheticTimeline(input: {
       : 0;
     // phase1Seconds 0 collapses to the single tail phase over the whole video,
     // which is the pre-2026-08-18 flat budget.
-    const phases: ClipPhase[] = [];
-    if (phase1Seconds > 0) {
+    const phases: ClipPhase[] = parseClipSchedule(
+      env.SYNTHETIC_CLIP_SCHEDULE,
+      env.SYNTHETIC_CLIP_SCHEDULE_VEO_FRACTION,
+    );
+    // A schedule REPLACES the two-phase model entirely; appending phase2_body on
+    // top of it would re-open the tail the schedule deliberately closes to 0.
+    const usingSchedule = phases.length > 0;
+    if (!usingSchedule) {
+      if (phase1Seconds > 0) {
+        phases.push({
+          startSeconds: 0,
+          endSeconds: phase1Seconds,
+          clipFraction: env.SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION,
+          veoFraction: env.SYNTHETIC_CLIP_PHASE1_VEO_FRACTION,
+          label: "phase1_opening",
+        });
+      }
       phases.push({
-        startSeconds: 0,
-        endSeconds: phase1Seconds,
-        clipFraction: env.SYNTHETIC_CLIP_PHASE1_CLIP_FRACTION,
-        veoFraction: env.SYNTHETIC_CLIP_PHASE1_VEO_FRACTION,
-        label: "phase1_opening",
+        startSeconds: phase1Seconds > 0 ? phase1Seconds : 0,
+        endSeconds: Infinity,
+        clipFraction: env.SYNTHETIC_CLIP_DURATION_FRACTION,
+        veoFraction: env.SYNTHETIC_VEO_DURATION_FRACTION,
+        label: "phase2_body",
       });
     }
-    phases.push({
-      startSeconds: phase1Seconds > 0 ? phase1Seconds : 0,
-      endSeconds: Infinity,
-      clipFraction: env.SYNTHETIC_CLIP_DURATION_FRACTION,
-      veoFraction: env.SYNTHETIC_VEO_DURATION_FRACTION,
-      label: "phase2_body",
-    });
     if (phases.some((p) => p.clipFraction > 0 || p.veoFraction > 0)) {
       const q = assignClipDurationQuota(planned, {
         phases,
