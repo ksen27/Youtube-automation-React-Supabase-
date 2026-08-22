@@ -679,7 +679,24 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "camera is locked off on a tripod and the framing never changes. Camera",
     "movement is what made earlier footage look blurry and jumpy, which the",
     "client rejected — the motion must come from the SUBJECT, not the lens.",
-    "Also avoid slow motion, dramatic/cinematic movement, and scene changes",
+    // SPEED, client 2026-08-22: "the video is quick movement so some issue is
+    // happend / pls generate the slow movement clip". The old wording told
+    // Gemini to avoid slow motion outright, so every per-block animationPrompt
+    // described a brisk action and the model rendered smeared hands. Those two
+    // asks are compatible once separated: no slow-motion EFFECT (a stylised
+    // speed ramp), but the action itself performed unhurriedly.
+    "The action must be performed SLOWLY, calmly and deliberately — an unhurried,",
+    "gentle, gradual movement carried smoothly across the whole clip. Never",
+    "describe fast, rushed, sudden or jerky motion; a fast action renders as a",
+    "blur where the hands are. Do NOT ask for a slow-motion EFFECT or a speed",
+    "ramp — the action is simply performed gently, at natural speed.",
+    // HANDS, same date: "the hands(right and left) is different with each
+    // other". Stated positively here because the negative prompt only guards
+    // against wrong hands WITHIN a frame, not hands mutating between frames.
+    "Where hands are visible, describe them staying consistent throughout: the",
+    "same two hands, same shape and skin tone, five fingers each, never swapping",
+    "or changing.",
+    "Avoid dramatic/cinematic movement and scene changes",
     "mid-clip. If a block's narration genuinely has no human action in it, that",
     "block should be an `image`, not an `ai_clip`. avatar blocks need no prompts.",
     "",
@@ -826,7 +843,12 @@ function buildSingleSegmentPrompt(
     amateurLookRule(EMPTY_TOPIC),
     "",
     wantsAnimation
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = a REAL HUMAN ACTION the person performs, carried through the whole shot, matching this block\'s narration. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; ONLY the person moves. No slow motion, no cinematic movement.).'
+      // Kept in step with the full planner prompt above (client 2026-08-22): the
+      // action is performed SLOWLY and the hands stay consistent. A regenerated
+      // block goes straight to the clip lane, so wording that drifts from the
+      // planner's shows up as a handful of fast, smeared clips scattered through
+      // an otherwise slow video -- worse than either setting applied uniformly.
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = a REAL HUMAN ACTION the person performs, carried through the whole shot, matching this block\'s narration. The action is performed SLOWLY, calmly and deliberately — unhurried and gradual, never fast, rushed or jerky, because fast motion renders as a blur; this is a gently-performed action, NOT a slow-motion effect. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; ONLY the person moves. No cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,

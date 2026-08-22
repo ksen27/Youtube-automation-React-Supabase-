@@ -8,7 +8,8 @@ import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure, ltxModel, ltxPoolSize } from "@/lib/synthetic/ltx";
 import { generateVeoClip, isVeoConfigured, isVeoPermanentFailure, veoModel } from "@/lib/synthetic/sixtynine-video";
 import { logProviderCall } from "@/lib/synthetic/cost";
-import { r2Keys, DEFAULT_ACTION_ANIMATION_PROMPT } from "@/lib/synthetic/constants";
+import { r2Keys } from "@/lib/synthetic/constants";
+import { resolveAnimationPrompt } from "@/lib/synthetic/clip-motion";
 import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { finishSegment, maybeFinalizeSynthetic, withSegmentHeartbeat } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
@@ -63,7 +64,15 @@ export async function processImageToVideoJob(
   // prompt is editable on the review screen, and silently overriding a prompt
   // an operator can see would make the screen lie about what will render. A
   // re-plan (or a per-segment prompt regenerate) refreshes them.
-  const animationPrompt = (seg.animation_prompt ?? DEFAULT_ACTION_ANIMATION_PROMPT).trim();
+  // The FALLBACK now depends on what the still actually shows. The old default
+  // opened with "The person in the frame continues the everyday action they are
+  // already doing" and was applied to every prompt-less clip -- including the
+  // ~87% of scenes with no person in them, which is why the model invented hands
+  // into spider webs and bark. See lib/synthetic/clip-motion.ts.
+  const { prompt: animationPrompt, source: animationPromptSource } = resolveAnimationPrompt(
+    seg.animation_prompt,
+    imagePrompt,
+  );
   const duration = Math.max(2, Math.min(10, Number(seg.duration) || 5));
 
   // ASSET LIBRARY (migration 0030): a matching PRIOR clip skips BOTH paid
@@ -164,11 +173,14 @@ export async function processImageToVideoJob(
       // Log the actual model so the request line proves which engine ran (the
       // "ltx2" provider label alone can't distinguish ltx-2-fast from
       // ltx-2-3-fast) and how many accounts are balancing.
+      // animationPromptSource makes the "why is every clip hands" class of bug
+      // visible in the logs: a run that is overwhelmingly action_default on
+      // person-less scenes is the symptom, and it was previously invisible.
       extra: wantVeo
-        ? { durationSeconds: duration, model: veoModel(), clipEngine: "veo" }
+        ? { durationSeconds: duration, model: veoModel(), clipEngine: "veo", animationPromptSource }
         : isLtxConfigured()
-          ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize(), clipEngine: "ltx" }
-          : { durationSeconds: duration } });
+          ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize(), clipEngine: "ltx", animationPromptSource }
+          : { durationSeconds: duration, animationPromptSource } });
     // Heartbeat the segment's updated_at across the ~60-95s render so the stall
     // sweeper can't false-fail a segment that is alive and rendering.
     //

@@ -148,7 +148,15 @@ export const CLIP_NEGATIVE_PROMPT =
   "extra limbs, disfigured hands, wrong hand count, mismatched hands, " +
   "hands changing shape, morphing fingers, extra fingers, missing fingers, " +
   "left and right hand swapping, warping hands, hands that do not match each " +
-  "other, fast motion, sped up, rushed movement, jerky movement, sudden " +
+  // MOTION ARTIFACTS, 2026-08-22. Client: the moving part of the clip is
+  // "blur and not clear" while the rest is fine. Separate from the encoder-side
+  // cause (see ENCODE_PRESET in services/ltx-selfhost/server.py): a diffusion
+  // model also resolves moving regions less sharply than static ones, so name
+  // the artifact directly rather than relying on the generic "blurry" above.
+  "other, smearing, ghosting, motion smear, temporal flicker, warping, " +
+  "melting shapes, trailing artifacts, soft or blurred hands while moving, " +
+  "loss of detail during movement, " +
+  "fast motion, sped up, rushed movement, jerky movement, sudden " +
   "movement, jittery movement, camera shake, camera movement, zoom, pan, tilt, " +
   "unnatural transitions, 3D CGI look, cartoonish rendering, uncanny valley " +
   "effect, on-screen text";

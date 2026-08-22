@@ -120,7 +120,17 @@ TWO_STAGE_MIN_PIXELS = int(os.environ.get("LTX_SELFHOST_TWO_STAGE_MIN_PIXELS", s
 ATTENTION_SLICING = os.environ.get("LTX_SELFHOST_ATTENTION_SLICING", "1") not in ("0", "false", "")
 
 # x264 preset for the intermediate encode. See the note at the mimwrite call.
-ENCODE_PRESET = os.environ.get("LTX_SELFHOST_ENCODE_PRESET", "veryfast")
+#
+# veryfast -> slow (client 2026-08-22: "the amount of the action part, the
+# quality is not good / blur and not clear"). The preset governs MOTION
+# ESTIMATION effort, which CRF does not: at veryfast the encoder barely searches
+# for motion between frames, so artifacts concentrate exactly where things move
+# while the static background stays clean -- which is the artifact as described.
+# These clips are short intermediates the renderer re-encodes into a 4K export,
+# so smearing introduced here is baked in and then magnified by the upscale.
+# Encode is a small share of a ~48s clip; buying motion quality with a few
+# seconds of it is the right trade.
+ENCODE_PRESET = os.environ.get("LTX_SELFHOST_ENCODE_PRESET", "slow")
 
 # torch.compile the transformer. Fuses kernels and removes Python dispatch
 # overhead; the cost is a one-off compile on the FIRST generation after boot
