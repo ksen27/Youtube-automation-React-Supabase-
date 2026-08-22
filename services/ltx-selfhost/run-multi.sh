@@ -47,10 +47,25 @@ for g in $GPUS; do
   # PUBLIC_URL still points at the ROUTER: result.video_url must be a URL the app
   # can reach, and only the router port is exposed. The router resolves the file
   # back to whichever backend produced it.
+  # START ONE AT A TIME AND WAIT FOR THE CARD TO BE CLAIMED.
+  #
+  # 2026-08-22: launching both simultaneously put BOTH processes on GPU 0, which
+  # then OOM'd each other (47.5 GiB + 47.5 GiB on a 95 GiB card) and took the
+  # service down -- clips silently failed over to fal.ai until it was noticed.
+  # The CUDA_VISIBLE_DEVICES assignments were correct; the race was in launching
+  # them together. Waiting until this backend has actually allocated on its card
+  # before starting the next removes the race entirely, at the cost of a short
+  # stagger. Model load still overlaps -- only the first allocation is serialised.
   CUDA_VISIBLE_DEVICES="$g" \
   PORT="$port" \
   setsid nohup bash /workspace/ltx/run.sh > "/workspace/ltx/backend${i}.log" 2>&1 < /dev/null &
   disown
+  for _ in $(seq 1 30); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null | tr -d ' ')
+    [ -n "$used" ] && [ "$used" -gt 2000 ] && break
+    sleep 4
+  done
+  echo "  gpu $g claimed (${used:-?} MiB)"
   BACKENDS="${BACKENDS}${BACKENDS:+,}http://127.0.0.1:${port}"
   i=$((i + 1))
 done

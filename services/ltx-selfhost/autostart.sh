@@ -45,6 +45,17 @@ for i in "${!PORTS[@]}"; do
   CUDA_VISIBLE_DEVICES="$gpu" PORT="$port" \
     setsid nohup bash "$LTX_DIR/run.sh" > "$LTX_DIR/backend${i}.log" 2>&1 < /dev/null &
   disown
+  # Wait for this backend to claim its card before starting the next. 2026-08-22:
+  # launching both at once landed BOTH on GPU 0, where they OOM'd each other
+  # (47.5 + 47.5 GiB on a 95 GiB card) and the service went down -- clips failed
+  # over to fal.ai until someone noticed. Only the first allocation is
+  # serialised; the slow part (loading weights) still overlaps.
+  for _ in $(seq 1 30); do
+    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gpu" 2>/dev/null | tr -d ' ')
+    [ -n "$used" ] && [ "$used" -gt 2000 ] && break
+    sleep 4
+  done
+  log "gpu${gpu} claimed (${used:-?} MiB)"
 done
 
 # Weights take ~5 min to reach the card; both backends load in parallel.
