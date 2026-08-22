@@ -1368,12 +1368,22 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_CLIP_SCHEDULE_VEO_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
   // PHASE 2 (after the window): LTX share. Client 2026-08-18: 20% LTX. Left
   // untouched by the 2026-08-20 trim — 20 LTX + 10 VEO is that ask's "30% clips".
-  SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.20),
+  //
+  // 0.20 -> 0.30 (client 2026-08-22: "remove the veo3 clip entirely / generate
+  // the only ltx clip"). The 10% that veo used to cover is ABSORBED here rather
+  // than dropped, because targetClip below is computed as
+  // (clipFraction + veoFraction) — the veo share is part of the ANIMATION
+  // budget, not an addition to it. Turning veo off without this hands those
+  // seconds back to still images and quietly cuts phase-2 animation from 30% to
+  // 20%, which is not what "only LTX clips" asks for.
+  SYNTHETIC_CLIP_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.30),
   // PHASE 2 VEO share, on top of the LTX share above (20% + 10% = 30% clips,
   // leaving the client's 70% images). Veo bills per GENERATION (1 credit), not
   // per second, so this fraction controls clip COUNT rather than spend. Set to 0
   // to disable the veo lane without touching SYNTHETIC_VEO_ENABLED.
-  SYNTHETIC_VEO_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.10),
+  // 0.10 -> 0 (client 2026-08-22, veo removed entirely). Its share moved into
+  // SYNTHETIC_CLIP_DURATION_FRACTION above so total animation is unchanged.
+  SYNTHETIC_VEO_DURATION_FRACTION: z.coerce.number().min(0).max(1).default(0.0),
   // What the fractions above are a share OF. "visual" (default, 2026-08-18) =
   // the image + ai_clip seconds in that phase — the pool the pass can actually
   // reassign, and the reading that makes 80/20 and 70/20/10 sum to 100. "total"
@@ -1389,7 +1399,16 @@ const ServerEnvSchema = z.object({
   // Master switch for the veo clip lane. Off = every clip renders on LTX and
   // the veo quota is ignored (useful to fall back instantly if Veo output is
   // judged unusable, which the client has flagged as a risk).
-  SYNTHETIC_VEO_ENABLED: boolish(true),
+  //
+  // true -> false (client 2026-08-22: "remove the veo3 clip entirely / generate
+  // the only ltx clip"). This is the belt to the braces of
+  // SYNTHETIC_VEO_DURATION_FRACTION=0: the fraction stops veo being PLANNED,
+  // this stops it being HONOURED even if a stale env or an old plan still
+  // carries a veo share. Note it only gates the veo QUOTA — 69labs Veo is also
+  // still reachable as a fal.ai-chain fallback when an LTX clip fails, which is
+  // deliberate: a dead GPU should degrade to a working provider, not to a
+  // missing block.
+  SYNTHETIC_VEO_ENABLED: boolish(false),
   // 69labs video lane (lib/synthetic/sixtynine-video.ts). Model ids come from
   // GET /api/v1/videos/models — "veo-video" is Veo 3.1 Lite (1 credit),
   // "veo-3.1-fast" is Veo Fast BETA (2 credits).
