@@ -118,9 +118,17 @@ export function renderCookbookHtml(doc: AssembledDocument): string {
       font-style: italic; color: #9c3b28; white-space: nowrap; padding-bottom: 1mm; }
     .recipe__category b { font-style: normal; font-size: 13pt; margin-left: 3mm; color: #4a5223; }
 
-    /* Dish photo — framed with a thin retro border */
-    .recipe__photo { display: block; width: 100%; height: 74mm; object-fit: cover; border: 3px solid #fff;
-      outline: 1px solid #6a5636; margin-bottom: 5mm; }
+    /* Dish photo — framed with a thin retro border.
+       The crop is a fixed-height overflow WINDOW with the image centred inside it,
+       NOT 'object-fit: cover' on the <img>. Visually identical, but decisive for file
+       size: Chromium's PDF printer embeds a JPEG byte-for-byte (DCTDecode passthrough)
+       only while the image is drawn at its natural aspect. 'object-fit' makes it
+       rasterise and re-encode the bitmap near-losslessly instead — ~9x per photo,
+       measured — and a cookbook carries one photo per recipe, so a 30-recipe book
+       blew past the export bucket size limit on upload. */
+    .recipe__photo-frame { position: relative; width: 100%; height: 74mm; overflow: hidden;
+      border: 3px solid #fff; outline: 1px solid #6a5636; margin-bottom: 5mm; }
+    .recipe__photo { position: absolute; top: 50%; left: 0; width: 100%; transform: translateY(-50%); }
     .recipe__photo--empty { width: 100%; height: 40mm; margin-bottom: 6mm; border: 1px solid #6a5636;
       background: repeating-linear-gradient(45deg,#e7d9b6,#e7d9b6 8px,#efe2c2 8px,#efe2c2 16px); }
     /* Salvaged text when a recipe's structured content failed to parse. */
@@ -173,7 +181,9 @@ export function renderCookbookHtml(doc: AssembledDocument): string {
 function renderRecipe(r: Recipe, index: number, photo?: string): string {
   const category = inferCategory(r);
   const photoEl = photo
-    ? `<img class="recipe__photo" src="${esc(photo)}" alt="${esc(r.title)}">`
+    ? `<div class="recipe__photo-frame"><img class="recipe__photo" src="${esc(photo)}" alt="${esc(
+        r.title,
+      )}"></div>`
     : `<div class="recipe__photo--empty"></div>`;
   const ingredients = r.ingredients.map((i) => `<li>${esc(i)}</li>`).join('');
   // Vintage cards run the method as prose with a leading bold cue per step.
