@@ -176,3 +176,53 @@ describe('LandingLayoutPrompt', () => {
   });
 
 });
+
+describe('LandingLayoutPrompt — imagery inventory', () => {
+  const withReference = (over: Record<string, unknown> = {}) =>
+    LandingLayoutPrompt.build({
+      ...base,
+      productCount: 1,
+      reference: {
+        url: 'https://vintagelifestyleusa.com/',
+        title: 'Vintage Lifestyle USA',
+        headings: [{ level: 1, text: 'Your mother never wrote them down.' }],
+        text: 'Recovered, not invented.',
+        markup: '<section><img src="dishes/stew.webp"><h2>What people cooked</h2></section>',
+        style: {
+          serifHeadings: true,
+          serifBody: true,
+          headingFont: 'Fraunces',
+          bodyFont: 'Fraunces',
+          grounds: ['#f2ecdb', '#241b0f'],
+          accent: '#8e2f1c',
+          numberedSections: false,
+          // Image-led: 15 pictures on the reference, 1-3 available to us.
+          imageDensity: 7.55,
+          measurePx: 760,
+        },
+      },
+      ...over,
+    });
+
+  const briefOf = (r: { user: string | Array<{ type: string; text?: string }> }) =>
+    typeof r.user === 'string' ? r.user : r.user.map((b) => b.text ?? '').join('\n');
+
+  it('names the cover as the only image when nothing else was supplied', () => {
+    const sys = briefOf(withReference({ hasAuthorPhoto: false, hasLogo: false }));
+    expect(sys).toContain('THE ONLY IMAGES THIS PAGE HAS: {{COVER}}.');
+    expect(sys).not.toContain('{{AUTHOR_PHOTO}}, {{LOGO}}. There are no others');
+  });
+
+  it('adds the author photo and logo when they exist', () => {
+    const sys = briefOf(withReference({ hasAuthorPhoto: true, hasLogo: true }));
+    expect(sys).toContain('THE ONLY IMAGES THIS PAGE HAS: {{COVER}}, {{AUTHOR_PHOTO}}, {{LOGO}}.');
+  });
+
+  it('tells the model to delete the reference photography rather than frame a hole', () => {
+    const sys = briefOf(withReference({ hasAuthorPhoto: true }));
+    expect(sys).toContain('let the section close up around the');
+    expect(sys).toContain('Never emit an');
+    // Repeated at the markup, which is where the <img> tags are actually seen.
+    expect(sys).toContain("is the template owner's photography");
+  });
+});

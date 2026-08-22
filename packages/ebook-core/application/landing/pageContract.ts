@@ -358,6 +358,21 @@ export function validateGeneratedPage(page: GeneratedPage, options: ValidateOpti
   if (/@import|url\(\s*["']?https?:/i.test(css)) {
     errors.push('No @import and no remote url() in CSS. Fonts must be system stacks.');
   }
+  // ── imagery ──
+  // Every real <img> on the finished page is written by the assembler when it
+  // substitutes a placeholder, so a tag the MODEL wrote has, by definition, no
+  // picture behind it. The external-URL rule above catches only the case where
+  // it reaches for the reference's photography by URL; an <img src="">, a
+  // relative path or a bare <img> slipped past it and shipped as a broken icon.
+  // This matters most on an image-led reference, where copying the template
+  // faithfully means copying figures we cannot fill.
+  if (/<img\b/i.test(bodyHtml)) {
+    errors.push(
+      'No <img> tags. This page has only the pictures the placeholders provide ' +
+        `(${PLACEHOLDERS.cover}, ${PLACEHOLDERS.authorPhoto}, ${PLACEHOLDERS.logo}) — ` +
+        "everywhere the reference has photography we do not have, delete the figure and let the section reflow as text.",
+    );
+  }
 
   // ── colour discipline ──
   // Raw colours would bypass the cover-derived palette, whose contrast is

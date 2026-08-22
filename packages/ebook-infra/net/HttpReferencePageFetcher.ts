@@ -199,6 +199,15 @@ export function digest(url: string, html: string, externalCss = ''): ReferencePa
 
   const css =
     [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)].map((m) => m[1] ?? '').join('\n') + '\n' + externalCss;
+  // Every style signal below is read from the DECLARATIONS, so a site that
+  // routes its design through custom properties — `font-family: var(--serif)`,
+  // `background: var(--paper)` — reads as a page that specifies nothing, and the
+  // digest hands the layout call a blank where its design should be. That is
+  // not an exotic shape: it is how most modern marketing pages are built.
+  // Resolving once here means every heuristic downstream sees the real values
+  // without having to know custom properties exist. `styleCss` below stays RAW:
+  // it exists to carry @font-face rules, which have no variables in them.
+  const resolvedCss = resolveCustomProperties(css);
   const text = textOf(stripped).slice(0, 12_000);
   const words = text.split(/\s+/).length || 1;
   const images = (stripped.match(/<img\b/gi) ?? []).length;
@@ -213,16 +222,16 @@ export function digest(url: string, html: string, externalCss = ''): ReferencePa
     // of a stylesheet in practice.
     styleCss: css.slice(0, 200_000),
     style: {
-      serifHeadings: serifHeadingsOf(css),
-      serifBody: serifBodyOf(css),
-      headingFont: fontNameFor(css, /(^|[\s,>+~])h[1-3]/) ?? pickHeadingFont(css),
-      bodyFont: fontNameFor(css, /(^|[\s,>+~])(body|html|:root)/),
-      grounds: uniqueColors(css).slice(0, 5),
-      accent: pickAccent(css),
+      serifHeadings: serifHeadingsOf(resolvedCss),
+      serifBody: serifBodyOf(resolvedCss),
+      headingFont: fontNameFor(resolvedCss, /(^|[\s,>+~])h[1-3]\b/) ?? pickHeadingFont(resolvedCss),
+      bodyFont: fontNameFor(resolvedCss, /(^|[\s,>+~])(body|html|:root)\b/),
+      grounds: uniqueColors(resolvedCss).slice(0, 5),
+      accent: pickAccent(resolvedCss),
       // "I." / "01" / "Step 1" leading a heading is the numbering signal.
       numberedSections: headings.filter((h) => /^([IVXLC]+[.·—]|\d{1,2}[.·—]|step\s+\d)/i.test(h.text)).length >= 2,
       imageDensity: Number(((images * 1000) / words).toFixed(2)),
-      measurePx: readMeasure(css),
+      measurePx: readMeasure(resolvedCss),
     },
   };
 }
@@ -271,6 +280,47 @@ function textOf(fragment: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/**
+ * Substitutes CSS custom properties into the declarations that use them.
+ *
+ * Every style heuristic in this file reads literal values out of declarations —
+ * a font name, a background colour, a measure. A page written as
+ * `font-family: var(--serif)` over `:root { --serif: Fraunces, … }` therefore
+ * looks, to all of them, like a page that specifies nothing: `serifBody` falls
+ * back to false, `bodyFont` to null, `grounds` to empty. The layout call is then
+ * TOLD the reference has sans-serif body text and no grounds, in the imperative
+ * ("USE EXACTLY THIS"), which overrides what the reference screenshots plainly
+ * show. One page-wide pass here is what stops that.
+ *
+ * First definition of a name wins: the base `:root` block precedes the
+ * dark-mode or media-query overrides that redefine it, and the base values are
+ * the ones that describe the page as it is normally seen.
+ */
+export function resolveCustomProperties(css: string): string {
+  if (!css.includes("var(")) return css;
+
+  const values = new Map<string, string>();
+  for (const m of css.matchAll(/(--[\w-]+)\s*:\s*([^;}]+)/g)) {
+    const name = m[1] ?? "";
+    if (!values.has(name)) values.set(name, (m[2] ?? "").trim());
+  }
+
+  // Custom properties routinely reference other custom properties. Each pass
+  // resolves one level; the cap is what keeps a circular definition
+  // (`--a: var(--b)` / `--b: var(--a)`) from spinning here forever.
+  let out = css;
+  for (let pass = 0; pass < 5 && out.includes("var("); pass += 1) {
+    const next = out.replace(
+      /var\(\s*(--[\w-]+)\s*(?:,\s*([^(),]*))?\)/g,
+      (whole, name: string, fallback?: string) => values.get(name) ?? fallback?.trim() ?? whole,
+    );
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
 
 /**
  * "sans-serif" contains "serif", so a naive substring test reads every

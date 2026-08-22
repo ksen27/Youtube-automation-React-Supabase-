@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { HttpReferencePageFetcher, digest } from './HttpReferencePageFetcher';
+import { HttpReferencePageFetcher, digest, resolveCustomProperties } from './HttpReferencePageFetcher';
 
 function htmlResponse(body: string, headers: Record<string, string> = {}): Response {
   return {
@@ -245,5 +245,60 @@ describe('pruneMarkup', () => {
     const m = pruneMarkup(huge);
     expect(m.length).toBeLessThan(37_000);
     expect(m).toContain('TRUNCATED');
+  });
+});
+
+describe('digest — custom properties', () => {
+  // The shape that shipped a sans-serif clone of a serif page: every colour and
+  // font on the reference is written as a var(), so the digest read the page as
+  // specifying nothing and the layout call was told "body: sans-serif".
+  const page = `<html><head><title>Vintage</title><style>
+    :root {
+      --paper: #f2ecdb;
+      --ink: #241b0f;
+      --serif: 'Fraunces', 'EB Garamond', Georgia, serif;
+      --body: var(--serif);
+      --brick: #9c3b26;
+    }
+    @media (prefers-color-scheme: dark) { :root { --paper: #101010; } }
+    body { font-family: var(--body); background: var(--paper); color: var(--ink); }
+    h1, h2 { font-family: var(--serif); }
+    .card { background: var(--brick); }
+  </style></head><body><h1>Your mother never wrote them down.</h1><p>We did.</p></body></html>`;
+
+  it('reads the body face through the variable', () => {
+    const d = digest('https://example.com/', page);
+    expect(d.style.serifBody).toBe(true);
+    expect(d.style.bodyFont).toBe('Fraunces');
+  });
+
+  it('follows a variable that points at another variable', () => {
+    // --body: var(--serif) — one level of indirection, which is how these
+    // stylesheets keep a display face and a body face in step.
+    expect(resolveCustomProperties(':root{--a:red;--b:var(--a)}p{color:var(--b)}')).toContain(
+      'color:red',
+    );
+  });
+
+  it('takes the base definition, not the dark-mode override', () => {
+    const d = digest('https://example.com/', page);
+    expect(d.style.grounds).toContain('#f2ecdb');
+    expect(d.style.grounds).not.toContain('#101010');
+  });
+
+  it('leaves a stylesheet with no variables untouched', () => {
+    const css = 'body{font-family:Georgia,serif;background:#fff}';
+    expect(resolveCustomProperties(css)).toBe(css);
+  });
+
+  it('uses the fallback when the variable was never defined', () => {
+    expect(resolveCustomProperties('p{color:var(--nope, #333)}')).toContain('color:#333');
+  });
+
+  it('terminates on a circular definition', () => {
+    // Left as-is rather than hanging: an unresolvable var is the same to every
+    // heuristic downstream as the var() it started as.
+    const out = resolveCustomProperties(':root{--a:var(--b);--b:var(--a)}p{color:var(--a)}');
+    expect(out).toContain('var(');
   });
 });

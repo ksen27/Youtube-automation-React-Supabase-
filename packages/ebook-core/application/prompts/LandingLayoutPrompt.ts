@@ -381,6 +381,27 @@ export const LandingLayoutPrompt = {
           `  section numbering: ${input.reference.style.numberedSections ? 'yes — number the sections the same way' : 'no'}`,
           `  content column: ${input.reference.style.measurePx ? `${input.reference.style.measurePx}px` : 'unspecified'}`,
           `  imagery: ${input.reference.style.imageDensity < 1 ? 'text-led, very few images' : input.reference.style.imageDensity < 4 ? 'balanced' : 'image-led'}`,
+          // The reference's density is a fact ABOUT THE REFERENCE, and on an
+          // image-led page it reads as an instruction to build image slots. We
+          // have exactly three pictures and cannot make more: a photographed
+          // product shot, a dish, a lifestyle scene are all beyond us. Left
+          // unsaid, the model mirrors the reference's figures and the page ships
+          // with framed holes where the original has photographs, which is worse
+          // than not copying that part of the design at all.
+          '',
+          `  THE ONLY IMAGES THIS PAGE HAS: ${PLACEHOLDERS.cover}` +
+            (input.hasAuthorPhoto ? `, ${PLACEHOLDERS.authorPhoto}` : '') +
+            (input.hasLogo ? `, ${PLACEHOLDERS.logo}` : '') +
+            '. There are no others and none can be obtained.',
+          '  Wherever the reference uses a photograph we cannot supply — product',
+          '  shots, food, people, scenery, press or payment logos, decorative',
+          '  figures — DELETE that element and let the section close up around the',
+          '  gap. Reflow it as a text-led version of the same section: keep its',
+          '  heading, its ground, its rhythm and its padding, and let the copy or a',
+          '  small inline SVG icon carry the space the picture held. Never emit an',
+          '  <img> without a placeholder, an empty frame, a fixed-height box, an',
+          '  aspect-ratio spacer or a "photo goes here" caption.',
+          '  A section that is ONLY a picture gallery is dropped whole.',
           `  distinct section grounds: ${input.reference.style.grounds.length}`,
           '',
           'Its section headings, in order — mirror this sequence and this density:',
@@ -404,6 +425,17 @@ export const LandingLayoutPrompt = {
                 'section whose content we have no equivalent for (e.g. testimonials when',
                 'none are supplied). If it sells several products and we have one, keep',
                 'the offer section\'s design but as a single card.',
+                // The markup is where the reference\'s <img> tags are actually
+                // visible, so the imagery rule has to be repeated at the point
+                // of temptation. Copying an element tree faithfully means
+                // copying its figures unless told otherwise, and here that
+                // produces a page of empty frames.
+                'Every <img> in the markup below that is not our cover, author photo or',
+                'logo is the template owner\'s photography. We do not have it and will',
+                'not have it: delete the tag AND its frame, caption and grid cell, then',
+                'let the section reflow as text. Do not substitute a placeholder image,',
+                'a coloured block, an icon grid standing in for photos, or our cover',
+                'repeated to fill the space.',
                 '',
                 input.reference.markup,
               ]

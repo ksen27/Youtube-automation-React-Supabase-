@@ -301,6 +301,30 @@ describe('validateGeneratedPage', () => {
     });
   });
 
+  describe('imagery', () => {
+    // The reference sites these pages copy are image-led — dish photos, product
+    // shots, payment marks. We have the cover, maybe an author photo, and
+    // nothing else, so a figure the model writes itself is a hole on the page.
+    it.each([
+      ['<img src="">', 'empty src'],
+      ['<img src="dishes/stew.webp">', 'a relative path'],
+      ['<img alt="a photo of the author">', 'no src at all'],
+      ['<figure><img src="./hero.jpg"><figcaption>Sunday dinner</figcaption></figure>', 'a captioned figure'],
+    ])('rejects an <img> the model wrote itself — %s (%s)', (snippet) => {
+      const bad = page({ bodyHtml: page().bodyHtml + snippet });
+      expect(errorsOf(bad).some((e) => e.includes('No <img> tags'))).toBe(true);
+    });
+
+    it('accepts a page whose only pictures are placeholders', () => {
+      // {{COVER}} and {{AUTHOR_PHOTO}} become <img> tags at ASSEMBLY time, which
+      // is after this check — so the clean page has no <img> in it at all.
+      const good = page({
+        bodyHtml: page().bodyHtml + '<section data-section="author">{{AUTHOR_PHOTO}}<p>Who wrote it.</p></section>',
+      });
+      expect(errorsOf(good).some((e) => e.includes('No <img> tags'))).toBe(false);
+    });
+  });
+
   describe('colour discipline', () => {
     // The palette is derived from the cover and its contrast is already proven.
     // A raw colour would bypass that guarantee entirely.
