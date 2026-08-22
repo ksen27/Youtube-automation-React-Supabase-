@@ -2,7 +2,10 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageGenerationJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
-import { generateImage, plannedImageProvider } from "@/lib/synthetic/sixtynine-labs";
+import { generateImage, plannedImageProvider, isCensored } from "@/lib/synthetic/sixtynine-labs";
+import { regenerateSegmentPrompt } from "@/lib/synthetic/planner";
+import { toLanguageCode } from "@/lib/i18n/locale";
+import type { SyntheticBlockType } from "@/lib/types";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { logProviderCall } from "@/lib/synthetic/cost";
 import { r2Keys } from "@/lib/synthetic/constants";
@@ -18,6 +21,125 @@ import type { JobAttemptInfo } from "@/worker/index";
 // Failure policy: BullMQ retries (attempts=3) the whole job. Only on the FINAL
 // exhausted attempt do we mark the segment 'failed' so the pipeline can
 // finalize without it; mid-attempt failures just throw and let BullMQ retry.
+
+// CENSORED RECOVERY. A content refusal is terminal at every layer below this
+// one — no other key and no other provider will accept the same text (see
+// isCensored) — so without this the block is simply lost and a human has to
+// notice, open the review screen, and rewrite the prompt by hand.
+//
+// The refusal is a fact about the PROMPT, and we already have the machine that
+// writes prompts. So: ask Gemini for a safe rewrite of THIS block (printing the
+// refused text so it rewrites rather than re-rolls), persist it so the review
+// screen shows what actually ran, and resubmit ONCE. Bounded to one rewrite per
+// media job (`promptRewrittenForCensor`) — if the rewrite is refused too, the
+// content is beyond an automatic fix and the block should fail loudly.
+async function recoverFromCensoredPrompt(input: {
+  projectId: string;
+  mediaJobId: string;
+  segmentId: string;
+  blockType: SyntheticBlockType;
+  script: string;
+  basePrompt: string;
+  refusedPrompt: string;
+  onSubmit: (jobId: string, keyIdx: number) => Promise<void>;
+  refusalMessage: string;
+  // This job already spent its one free re-roll on a prior BullMQ attempt.
+  alreadyResubmitted: boolean;
+}) {
+  const { projectId, mediaJobId, segmentId, blockType, script, basePrompt, refusedPrompt } = input;
+  const sb = getServerSupabase();
+
+  await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.censored", {
+    err: input.refusalMessage.slice(0, 200),
+    prompt: refusedPrompt.slice(0, 300),
+  });
+
+  // STEP 1 — RE-ROLL THE SAME PROMPT, ONCE.
+  //
+  // A refusal is not a fixed property of the text. Measured against the live
+  // provider 2026-08-22, one prompt submitted six times:
+  //     PASS  PASS  PASS  CENSORED  PASS  CENSORED
+  // Borderline content is scored stochastically, so roughly a third of these
+  // "blocked" blocks were never a wording problem at all — they were one
+  // unlucky roll. And the pipeline never re-rolled: the refused provider job id
+  // stays in this job's metadata, so BullMQ attempts 2 and 3 hit the resume
+  // guard in generateImage and RE-POLL the dead job instead of resubmitting.
+  // Every block therefore died on a single submit.
+  //
+  // So: clear the pointer and submit the same text again before spending a
+  // Gemini call rewriting a prompt that may be perfectly generatable. Bounded to
+  // one re-roll per media job, and only for CENSORED — a refusal that survives
+  // two independent rolls is much more likely to be real, and that is when the
+  // rewrite below earns its cost.
+  if (!input.alreadyResubmitted) {
+    await setMediaJob(mediaJobId, {
+      metadata: { censorResubmitted: true, sixtynineJobId: null, sixtynineKeyIdx: null },
+    });
+    try {
+      const retried = await generateImage(refusedPrompt, { jobId: "", keyIdx: -1, onSubmit: input.onSubmit });
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.censor_reroll_ok", {
+        note: "same prompt passed on a second submit; the refusal was not about the text",
+      });
+      return retried;
+    } catch (err) {
+      // Anything OTHER than a second refusal is a real failure of this attempt
+      // (timeout, auth, provider outage) and must not be masked by a prompt
+      // rewrite — BullMQ retries those on their own terms.
+      if (!isCensored(err)) throw err;
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.censor_reroll_failed", {
+        note: "refused twice; escalating to a safe rewrite",
+      });
+    }
+  }
+
+  // The base prompt is stamped on every segment at plan time, but dispatchSegments
+  // overwrites a segment's metadata once it generates — so THIS row may no longer
+  // carry it. Fall back to a sibling (it is identical project-wide), exactly as
+  // the review screen's Regenerate-prompt route does.
+  let base = basePrompt;
+  if (!base) {
+    const { data: siblings } = await sb
+      .from("synthetic_segments")
+      .select("metadata")
+      .eq("project_id", projectId)
+      .not("metadata->base_prompt", "is", null)
+      .limit(1);
+    base = ((siblings?.[0]?.metadata as { base_prompt?: string } | null)?.base_prompt ?? "").trim();
+  }
+  const { data: proj } = await sb.from("projects").select("language").eq("id", projectId).single();
+
+  const rewritten = await regenerateSegmentPrompt({
+    projectId,
+    jobId: mediaJobId,
+    script,
+    basePrompt: base,
+    blockType,
+    language: toLanguageCode(proj?.language as string | null),
+    refusedPrompt,
+  });
+  const nextPrompt = rewritten.imagePrompt.trim();
+  // A rewrite that came back identical would be refused identically; spending a
+  // second generation on it only buys the same error more slowly.
+  if (!nextPrompt || nextPrompt === refusedPrompt.trim()) {
+    throw new Error(`image_gen: CENSORED and the safe rewrite was unchanged — edit the prompt manually. ${input.refusalMessage}`);
+  }
+
+  // Persist BEFORE resubmitting, so the review screen shows the prompt that
+  // actually ran even if the retry dies, and so a BullMQ retry of this job
+  // starts from the rewritten text.
+  await sb.from("synthetic_segments").update({ image_prompt: nextPrompt }).eq("id", segmentId);
+  await setMediaJob(mediaJobId, {
+    metadata: { promptRewrittenForCensor: true, sixtynineJobId: null, sixtynineKeyIdx: null },
+  });
+  await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.prompt_rewritten", {
+    prompt: nextPrompt.slice(0, 300),
+  });
+
+  // Fresh submit — the refused generation is dead, so a resume pointer would
+  // only re-poll a job that will never complete.
+  return generateImage(nextPrompt, { jobId: "", keyIdx: -1, onSubmit: input.onSubmit });
+}
+
 export async function processImageGenJob(
   data: ImageGenerationJobData,
   attempt?: JobAttemptInfo,
@@ -40,7 +162,15 @@ export async function processImageGenJob(
     .select("metadata")
     .eq("id", mediaJobId)
     .single();
-  const jobMeta = (jobRow?.metadata as { sixtynineJobId?: string; sixtynineKeyIdx?: number } | null) ?? {};
+  // promptRewrittenForCensor: this job already spent its ONE automatic safe
+  // rewrite (see recoverFromCensoredPrompt). It survives across BullMQ attempts
+  // with the rest of the metadata, so a retry can't rewrite the prompt again.
+  const jobMeta = (jobRow?.metadata as {
+    sixtynineJobId?: string;
+    sixtynineKeyIdx?: number;
+    promptRewrittenForCensor?: boolean;
+    censorResubmitted?: boolean;
+  } | null) ?? {};
   const resume = {
     // A prior attempt's recorded 69labs job, or ("", -1) when there's nothing to
     // resume — generateImage's canResume guard falls through to a fresh submit in
@@ -107,7 +237,27 @@ export async function processImageGenJob(
   try {
     const t0 = Date.now();
     await logProviderCall({ projectId, jobId: mediaJobId, segmentId, provider: plannedImageProvider(), phase: "request" });
-    const out = await generateImage(prompt, resume);
+    // A CENSORED refusal is not retryable as-is (same text, same verdict, every
+    // key and every provider), so it is caught HERE rather than left to BullMQ:
+    // the only thing that can change the outcome is the prompt itself.
+    let out;
+    try {
+      out = await generateImage(prompt, resume);
+    } catch (err) {
+      if (!isCensored(err) || jobMeta.promptRewrittenForCensor) throw err;
+      out = await recoverFromCensoredPrompt({
+        projectId,
+        mediaJobId,
+        segmentId,
+        blockType: seg.block_type as SyntheticBlockType,
+        script: (seg.script as string) ?? "",
+        basePrompt,
+        refusedPrompt: prompt,
+        onSubmit: resume.onSubmit,
+        refusalMessage: (err as Error).message ?? "",
+        alreadyResubmitted: !!jobMeta.censorResubmitted,
+      });
+    }
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId,
       provider: out.provider, phase: "response",

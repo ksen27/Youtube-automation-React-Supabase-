@@ -8,6 +8,7 @@ import {
   HttpError,
 } from "@/lib/synthetic/http";
 import { withStylePrompt } from "@/lib/synthetic/constants";
+import { softenImagePrompt } from "@/lib/synthetic/safe-depiction";
 import { withAccountSlot, acquirePollToken } from "@/lib/synthetic/rate-limit";
 import {
   isAi33Configured,
@@ -851,7 +852,7 @@ async function generateNanoBananaImage(
 // FAILOVER sweep: every account rejects the same content, so trying the next one
 // just spends money to fail again. The real fix is to edit the prompt (see the
 // de-naming rule). Match the CENSORED reason text generateNanoBananaImage throws.
-function isCensored(err: unknown): boolean {
+export function isCensored(err: unknown): boolean {
   const text = (err as Error)?.message ?? "";
   // 69labs labels it CENSORED (or reports a moderation refusal as FAILED with a
   // safety userMessage, which generateNanoBananaImage re-labels). ai33 surfaces
@@ -1118,7 +1119,24 @@ export async function generateImage(
   resume?: ImageResume,
   options: GenerateImageOptions = {},
 ): Promise<GenerateImageResult> {
-  const prompt = options.rawPrompt ? basePrompt : withStylePrompt(basePrompt);
+  // PRE-FLIGHT CONTENT SOFTENING. A prompt that reads as harm to a living
+  // subject comes back CENSORED, and CENSORED is terminal for BOTH providers
+  // and every key (see isCensored) — the block just dies. This rewrite removes
+  // the unambiguously-refusable shapes before a single credit is spent, and is
+  // a no-op on the overwhelming majority of prompts. It runs for rawPrompt
+  // callers too: owning your own STYLE is not a reason to be refused.
+  const soft = softenImagePrompt(basePrompt);
+  if (soft.changed) {
+    console.warn(
+      JSON.stringify({
+        msg: "image.prompt_softened",
+        note: "rewrote a refusable depiction before submit (see safe-depiction.ts)",
+        matches: soft.matches,
+        risky: soft.risky,
+      }),
+    );
+  }
+  const prompt = options.rawPrompt ? soft.prompt : withStylePrompt(soft.prompt);
   const modelOpts = {
     model: options.model,
     resolution: options.resolution,

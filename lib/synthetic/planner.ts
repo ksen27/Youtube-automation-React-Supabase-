@@ -11,6 +11,7 @@ import {
   repairCoverage,
   type TimedSentence,
 } from "@/lib/synthetic/sentence-windows";
+import { NAMED_IP_RULE, SAFE_DEPICTION_RULE } from "@/lib/synthetic/safe-depiction";
 import type { SyntheticBlockType } from "@/lib/types";
 import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
 import {
@@ -358,22 +359,38 @@ const SHOT_VARIETY_RULE =
 
 // Product / brand exception (client requirement 2026-06, signed off to relax the
 // blanket no-text / no-logo ban for product lines ONLY). When the narration is
-// genuinely about a specific PRODUCT or BRAND — a named part, a bottle of oil, a
-// branded tool — the client WANTS that product shown: its packaging, label, or a
+// genuinely about a specific PRODUCT — a named part, a bottle of oil, a branded
+// tool — the client WANTS that product shown: its packaging, label, or a
 // brand/company logo may appear. This overrides the otherwise-blanket "NO text /
 // NO logo / NO label" rule for that one block only; every NON-product block still
 // follows the no-text rule strictly.
+//
+// SCOPE NARROWED 2026-08-22. As written, this rule told the planner to draw the
+// packaging and logo of whatever the line was about — which on a collectibles
+// video means a Star Wars blister card or a Pokémon card face, i.e. exactly the
+// prompts gpt-image-2 refuses (12 dead blocks; see NAMED_IP_RULE). The client's
+// intent was ordinary consumer goods, where showing the label is the whole point
+// of the shot. Franchise merchandise is carved back out and handed to
+// NAMED_IP_RULE, which draws the same object without naming it.
 function productBrandRule(topic: VideoTopic): string {
   const examplePhrase = topic.subjectExamples.trim()
     ? `(e.g. ${topic.subjectExamples.trim()}, a bottle or bag of a named product, a branded tool)`
     : "(e.g. a named part, a bottle or bag of a named product, a branded tool)";
   return (
-    "PRODUCT / BRAND LINES (client requirement): when the narration is genuinely " +
-    `about a specific product or brand ${examplePhrase}, SHOW THAT PRODUCT as the ` +
-    "single subject — its packaging or label, or the product's brand/company logo, " +
-    "IS allowed and wanted here (prefer a 'product shot' shotType). This is the ONLY " +
-    "case where text/labels/logos are permitted. For every other (non-product) " +
-    "line keep the strict no-text, no-label, no-logo rule."
+    "PRODUCT LINES (client requirement): when the narration is genuinely " +
+    `about a specific everyday product ${examplePhrase}, SHOW THAT PRODUCT as the ` +
+    "single subject — its packaging or label IS allowed and wanted here (prefer a " +
+    "'product shot' shotType). This is the ONLY case where text/labels/logos are " +
+    "permitted. For every other (non-product) line keep the strict no-text, " +
+    "no-label, no-logo rule. " +
+    "LIMIT: this covers ORDINARY CONSUMER GOODS only — food, drink, household " +
+    "supplies, tools, parts, materials. It does NOT cover licensed or collectible " +
+    "merchandise: toys, action figures, dolls, model and die-cast cars, trading " +
+    "cards, games, consoles, comics, or anything tied to a film, show, studio, or " +
+    "character. For THOSE the NO NAMED BRANDS OR CHARACTERS rule wins outright — " +
+    "no name, no logo, no wordmark, no reproduced card or box art; describe the " +
+    "object itself instead. When the two rules could both apply, the no-names " +
+    "rule always wins: a block that is refused shows the viewer nothing at all."
   );
 }
 
@@ -617,6 +634,17 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "",
     SINGLE_SUBJECT_RULE,
     "",
+    // A prompt that breaks this rule is REFUSED by the provider (CENSORED),
+    // which is terminal — no key and no provider will accept it. Cheaper to
+    // never write it than to catch it downstream. See safe-depiction.ts.
+    SAFE_DEPICTION_RULE,
+    "",
+    // The other half of the refusal surface, and the one that actually killed
+    // blocks: a named franchise or trademark. Placed BEFORE productBrandRule,
+    // which permits packaging/logos for ordinary products and must not be read
+    // as permission to name a character or a toy line. See safe-depiction.ts.
+    NAMED_IP_RULE,
+    "",
     brollObjectRule(topic),
     "",
     contextVarietyRule(topic),
@@ -699,9 +727,16 @@ function buildSingleSegmentPrompt(
   // Narration language. The `script` below is in it; the prompt we ask for is
   // not (see promptLanguageRule).
   language: LanguageCode = DEFAULT_LANGUAGE,
+  // The prompt the image provider REFUSED on content policy, when this regen is
+  // the recovery from a CENSORED generation. Printing it makes the retry a
+  // targeted rewrite ("this exact text was refused") instead of another roll of
+  // the same dice — without it the model has no way to know what to avoid and
+  // routinely writes back a near-identical prompt that is refused again.
+  refusedPrompt?: string,
 ): string {
   const wantsAnimation = blockType === "ai_clip";
   const hasAvoid = avoidScenes.filter((s) => s.trim()).length > 0;
+  const refused = (refusedPrompt ?? "").trim();
   const locale = getLocale(language);
   return [
     ...promptLanguageRule(locale),
@@ -739,6 +774,40 @@ function buildSingleSegmentPrompt(
       : []),
     "",
     SINGLE_SUBJECT_RULE,
+    "",
+    // A prompt that breaks this rule is REFUSED by the provider (CENSORED),
+    // which is terminal — no key and no provider will accept it. Cheaper to
+    // never write it than to catch it downstream. See safe-depiction.ts.
+    SAFE_DEPICTION_RULE,
+    "",
+    // Same rule as the full planner: a single-block regen is exactly where a
+    // refused IP prompt lands, so it needs this MORE than the batch path does.
+    NAMED_IP_RULE,
+    ...(refused
+      ? [
+          "",
+          "REFUSED PROMPT (critical): the image provider REJECTED the prompt below",
+          "on CONTENT POLICY, so the block could not be generated at all. Write a",
+          "prompt that tells the SAME story beat but shows NOTHING the filter can",
+          "refuse. There are only two things it ever refuses, so check BOTH:",
+          "  1. HARM — an act of force, or a subject in distress. Remove the act,",
+          "     remove the distress, and show the AFTERMATH or a neutral object",
+          "     standing in for it (see the SAFE DEPICTION rule above).",
+          "  2. A BRAND, FRANCHISE, or CHARACTER — either NAMED, or described",
+          "     closely enough to recognise (its costume, helmet, colours, face),",
+          "     or a logo / wordmark / packaging text / card face asked to be",
+          "     reproduced. Strip the name AND the likeness, and shoot the",
+          "     ARTEFACT instead: size, material, wear, the hands holding it, the",
+          "     packaging, the shelf (see the NO NAMED BRANDS OR CHARACTERS rule",
+          "     above). If the refused prompt names or describes any character,",
+          "     property, or product, assume THIS is why it was refused and fix it",
+          "     first — it is by far the more common of the two.",
+          "Do NOT reword the refused prompt — picture a genuinely different, calm,",
+          "nameless moment of the same idea.",
+          "REFUSED prompt (do NOT reproduce it):",
+          `  ${refused}`,
+        ]
+      : []),
     "",
     // Regeneration anchors the niche via the stored basePrompt (printed below),
     // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
@@ -798,8 +867,11 @@ export async function regenerateSegmentPrompt(input: {
   // Narration language (projects.language). Omitted = English, so callers that
   // predate multi-language support are unaffected.
   language?: LanguageCode;
+  // Set by the CENSORED-recovery path in imageGenProcessor: the exact prompt the
+  // provider refused. Makes this a targeted safe rewrite instead of a re-roll.
+  refusedPrompt?: string;
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -815,7 +887,7 @@ export async function regenerateSegmentPrompt(input: {
     "regenerateSegmentPrompt",
     async (model) => {
       const res = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? [], language ?? DEFAULT_LANGUAGE) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? [], language ?? DEFAULT_LANGUAGE, refusedPrompt) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.4,

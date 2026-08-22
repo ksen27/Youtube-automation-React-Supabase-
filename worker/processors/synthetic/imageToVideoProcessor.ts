@@ -2,7 +2,7 @@ import { getServerSupabase } from "@/lib/supabase/server";
 import { setMediaJob, logJob } from "@/lib/jobs/db";
 import type { ImageToVideoJobData } from "@/lib/jobs/queue";
 import { uploadBuffer } from "@/lib/storage";
-import { generateImage, plannedImageProvider } from "@/lib/synthetic/sixtynine-labs";
+import { generateImage, plannedImageProvider, isCensored } from "@/lib/synthetic/sixtynine-labs";
 import { degradeImageLowFi } from "@/lib/synthetic/degrade";
 import { generateClipWithFallback } from "@/lib/synthetic/falai";
 import { isLtxConfigured, isLtxPermanentFailure, ltxModel, ltxPoolSize } from "@/lib/synthetic/ltx";
@@ -106,7 +106,24 @@ export async function processImageToVideoJob(
     // imagePrompt already resolves to the per-block scene, else the video's
     // recurring world (base_prompt). It is intentionally NOT the spoken script.
     if (!imagePrompt) throw new Error(`image_to_video: segment ${segmentId} has no usable image prompt`);
-    const img = await generateImage(imagePrompt);
+    // A clip's source still goes through the same content filter as a plain
+    // image, and the same refusal is partly a coin flip — the same prompt was
+    // measured passing 4 of 6 fresh submits (see imageGenProcessor's re-roll,
+    // and safe-depiction.ts). This path had no handling at all, so an ai_clip
+    // block died on one unlucky roll with no second chance anywhere. One
+    // re-roll, in-process: BullMQ's own retries cannot serve here because the
+    // still may already have been uploaded by then.
+    let img;
+    try {
+      img = await generateImage(imagePrompt);
+    } catch (err) {
+      if (!isCensored(err)) throw err;
+      await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.censored", {
+        err: (err as Error).message?.slice(0, 200),
+        note: "re-rolling the same prompt once",
+      });
+      img = await generateImage(imagePrompt);
+    }
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId, provider: img.provider, phase: "response",
       durationMs: Date.now() - t0, cost: { provider: img.provider, images: 1 },
