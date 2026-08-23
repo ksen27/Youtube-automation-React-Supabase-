@@ -224,6 +224,27 @@ export function buildRenumberPlan(
   return { segmentWrites, pitchPosition: boundaryIndex };
 }
 
+/**
+ * Pick which sales-pitch row survives when a project has more than one.
+ *
+ * There should never be more than one — but the partial unique index that stops
+ * duplicate SEGMENT rows (timeline_items_project_segment_uq, migration 0024) is
+ * predicated on `synthetic_segment_id is not null`, and the pitch row's is null,
+ * so until migration 0040 nothing at the DB level covered it. Two overlapping
+ * reconciles could both read "no pitch row" and both insert one.
+ *
+ * Deterministic by lowest id, so two concurrent reconciles choose the SAME
+ * survivor and cannot delete each other's keeper. The rows are interchangeable
+ * by construction (identical payload, written from the same projects columns),
+ * so the choice only has to agree — which one wins does not matter.
+ */
+export function planPitchDedupe<T extends { id: string }>(
+  pitchRows: ReadonlyArray<T>,
+): { keep: T | undefined; remove: T[] } {
+  const sorted = [...pitchRows].sort((a, b) => a.id.localeCompare(b.id));
+  return { keep: sorted[0], remove: sorted.slice(1) };
+}
+
 /** The subset of a timeline_items row the order reconciler needs. */
 export interface TimelineOrderRow {
   id: string;
@@ -348,7 +369,41 @@ export async function reconcileTimelineOrder(projectId: string): Promise<{
   );
 
   const { ordered: segmentRows, orphans } = orderSegmentRows(rows, segmentPosition);
-  const existingPitch = rows.find((r) => r.metadata.kind === PITCH_TIMELINE_FLAG);
+  // DE-DUPLICATE THE PITCH ROW FIRST.
+  //
+  // The pitch row carries no synthetic_segment_id, so the partial unique index
+  // that stops duplicate SEGMENT rows (timeline_items_project_segment_uq,
+  // migration 0024) does not cover it — its predicate is
+  // `where synthetic_segment_id is not null`. Nothing at the DB level was left
+  // to stop two concurrent reconciles (finalize fires on every asset finish,
+  // plus the 5-minute sweep) from both reading "no pitch row" and both
+  // inserting one. Migration 0040 adds the missing index; this clears the rows
+  // already duplicated before it.
+  //
+  // A duplicate is not cosmetic: BOTH rows are renderable, so the sales pitch
+  // plays twice and its duration is double-counted — and the order gate fails
+  // PERMANENTLY, because the verify below expects exactly one pitch row (project
+  // 6b0e9ba7, 2026-08-23: 434 rows landed against 433 expected, refusing every
+  // render even though the segment order itself was perfect).
+  const { keep: existingPitch, remove: duplicatePitches } = planPitchDedupe(
+    rows.filter((r) => r.metadata.kind === PITCH_TIMELINE_FLAG),
+  );
+  const duplicatePitchIds = duplicatePitches.map((r) => r.id);
+  if (duplicatePitchIds.length > 0) {
+    const { error } = await sb.from("timeline_items").delete().in("id", duplicatePitchIds);
+    if (error) throw new Error(`reconcileTimelineOrder duplicate pitch delete: ${error.message}`);
+    for (const id of duplicatePitchIds) {
+      const i = rows.findIndex((r) => r.id === id);
+      if (i >= 0) rows.splice(i, 1);
+    }
+    await logJob({ projectId }, "synthetic.pitch_video.duplicate_rows_removed", {
+      note:
+        "more than one sales-pitch timeline row existed (concurrent finalizes both " +
+        "inserted one) — kept the lowest id, deleted the rest",
+      removed: duplicatePitchIds.length,
+      keptId: existingPitch!.id,
+    });
+  }
   if (segmentRows.length === 0) {
     return { rows: rows.length, writes: 0, verified: true, orphanRows: orphans.length };
   }
@@ -438,9 +493,28 @@ export async function reconcileTimelineOrder(projectId: string): Promise<{
         .insert({ ...pitchPayload, position: PITCH_PARKED_POSITION })
         .select("id")
         .single();
-      if (error) throw new Error(`reconcileTimelineOrder pitch insert: ${error.message}`);
-      if (!inserted?.id) throw new Error("reconcileTimelineOrder pitch insert: no id returned");
-      pitchId = inserted.id as string;
+      if (error?.code === "23505") {
+        // A concurrent reconcile inserted the pitch row between our read and this
+        // write, and timeline_items_project_pitch_uq (migration 0040) refused the
+        // second copy — which is the index doing its job. Adopt the row that won
+        // rather than failing: both callers computed the same target, so there is
+        // nothing to reconcile between them. It is still parked (the winner parks
+        // before renumbering too), so the write plan below moves it into place.
+        const { data: won, error: reread } = await sb
+          .from("timeline_items")
+          .select("id")
+          .eq("project_id", projectId)
+          .contains("metadata", { kind: PITCH_TIMELINE_FLAG })
+          .limit(1)
+          .single();
+        if (reread) throw new Error(`reconcileTimelineOrder pitch re-read: ${reread.message}`);
+        if (!won?.id) throw new Error("reconcileTimelineOrder pitch re-read: no row");
+        pitchId = won.id as string;
+      } else {
+        if (error) throw new Error(`reconcileTimelineOrder pitch insert: ${error.message}`);
+        if (!inserted?.id) throw new Error("reconcileTimelineOrder pitch insert: no id returned");
+        pitchId = inserted.id as string;
+      }
     }
     // The pitch is parked NOW, so the map the write plan reasons about has to say
     // so — otherwise the plan reads it as already in place and never brings it

@@ -4,6 +4,7 @@ import {
   buildRenumberPlan,
   orderSegmentRows,
   expectedTimelineOrder,
+  planPitchDedupe,
 } from "@/lib/synthetic/pitch-timeline";
 import type { PitchAnchorRow, TimelineOrderRow } from "@/lib/synthetic/pitch-timeline";
 
@@ -325,5 +326,41 @@ describe("order reconcile end to end (pure halves)", () => {
     expect(pitchPosition).toBe(2);
     expect(taken.has(2)).toBe(false); // nothing else claims the pitch's slot
     expect([...taken].sort((a, b) => a - b)).toEqual([0, 1, 3, 4]);
+  });
+});
+
+describe("planPitchDedupe", () => {
+  // A project is only ever supposed to have ONE sales-pitch row, but until
+  // migration 0040 no unique index covered it (the one from 0024 is predicated
+  // on synthetic_segment_id, which the pitch row leaves null), so two
+  // overlapping finalizes could each insert one. Both rows then render — the
+  // pitch plays twice — and the render's order gate, which expects exactly one,
+  // refuses the project forever (6b0e9ba7, 2026-08-23).
+  it("keeps the only row and removes nothing in the normal case", () => {
+    const { keep, remove } = planPitchDedupe([{ id: "b" }]);
+    expect(keep).toEqual({ id: "b" });
+    expect(remove).toEqual([]);
+  });
+
+  it("keeps the lowest id and removes the rest", () => {
+    const { keep, remove } = planPitchDedupe([{ id: "c" }, { id: "a" }, { id: "b" }]);
+    expect(keep).toEqual({ id: "a" });
+    expect(remove.map((r) => r.id)).toEqual(["b", "c"]);
+  });
+
+  it("picks the same survivor whatever order the rows are read in", () => {
+    // Two concurrent reconciles read the same rows in different orders (the
+    // read is ordered by `position`, and duplicates tie). If they disagreed
+    // they would delete each other's keeper and leave the project with none.
+    const a = planPitchDedupe([{ id: "y" }, { id: "x" }, { id: "z" }]);
+    const b = planPitchDedupe([{ id: "z" }, { id: "y" }, { id: "x" }]);
+    expect(a.keep).toEqual(b.keep);
+    expect(a.remove.map((r) => r.id)).toEqual(b.remove.map((r) => r.id));
+  });
+
+  it("reports no keeper when the project has no pitch row", () => {
+    const { keep, remove } = planPitchDedupe([]);
+    expect(keep).toBeUndefined();
+    expect(remove).toEqual([]);
   });
 });
