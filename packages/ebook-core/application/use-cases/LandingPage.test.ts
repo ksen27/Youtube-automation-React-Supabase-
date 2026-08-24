@@ -980,6 +980,79 @@ function buildPublish(project: Project, page: LandingPage | null, publisher: Sit
   return { useCase, pages };
 }
 
+function clonedPage(): LandingPage {
+  const page = LandingPage.create({ id: { value: 'lp-2' } as never, projectId: 'p1', now });
+  page.setClonedDraft(
+    {
+      copy: {} as never,
+      html: '<html><img src="assets/dish.webp"><img src="assets/cover.webp"></html>',
+      inputHash: 'h',
+      templateId: 'tpl-1',
+      binding: { scalars: {}, repeats: {} },
+      assets: [{ sitePath: 'assets/cover.webp', storagePath: 'pages/p1/cover.webp', contentType: 'image/webp' }],
+      fidelity: { visual: [], findings: [], unresolvedSlots: [] },
+    },
+    now,
+  );
+  return page;
+}
+
+/**
+ * A cloned page deploys as several files. The template's own photography — dish
+ * photos, payment marks, the site's logo — travels on the TEMPLATE's asset list,
+ * which is a different list from the page's own cover and portrait. Only the
+ * second of the two was reaching Netlify, so every 'assets/<hash>' 404'd while
+ * the cover came through and made the breakage look cosmetic.
+ */
+describe("PublishLandingPageUseCase — a cloned page's files", () => {
+  const withCheckout = () => makeProject({ landingCheckoutUrl: 'https://payhip.com/b/AbC9' });
+
+  function buildClonePublish(publisher: SitePublisher, templateAssets: Array<{ sitePath: string }>) {
+    const pages = new FakeLandingRepo(clonedPage());
+    const useCase = new PublishLandingPageUseCase(
+      { findById: async () => withCheckout() } as never,
+      { findByProject: async () => makeBook(), findSummaryByProject: async () => makeBookSummary() } as never,
+      pages,
+      publisher,
+      { now: () => now },
+      { listAssets: async () => templateAssets } as never,
+      {
+        loadAssets: async (assets: Array<{ sitePath: string }>) =>
+          assets.map((a) => ({ sitePath: a.sitePath, bytes: new TextEncoder().encode('bytes') })),
+      } as never,
+      { getBytes: async () => Result.ok({ bytes: new TextEncoder().encode('cover') }) } as never,
+    );
+    return { useCase, pages };
+  }
+
+  it("deploys the template's assets beside the page", async () => {
+    const publisher = new FakePublisher();
+    const { useCase } = buildClonePublish(publisher, [
+      { sitePath: 'assets/dish.webp' },
+      { sitePath: 'assets/visa.svg' },
+    ]);
+
+    expect((await useCase.execute({ projectId: 'p1' })).isOk()).toBe(true);
+
+    const paths = (publisher.calls[0]?.files ?? []).map((f) => f.path);
+    expect(paths).toContain('index.html');
+    expect(paths).toContain('assets/dish.webp');
+    expect(paths).toContain('assets/visa.svg');
+    // The page's own cover rides a different list; both must arrive.
+    expect(paths).toContain('assets/cover.webp');
+  });
+
+  it('deploys only index.html and the cover when the template recorded no assets', async () => {
+    // The shape of the bug: listAssets returning empty is indistinguishable, at
+    // this layer, from a template that genuinely has no images.
+    const publisher = new FakePublisher();
+    const { useCase } = buildClonePublish(publisher, []);
+
+    expect((await useCase.execute({ projectId: 'p1' })).isOk()).toBe(true);
+    expect((publisher.calls[0]?.files ?? []).map((f) => f.path)).toEqual(['index.html', 'assets/cover.webp']);
+  });
+});
+
 describe('PublishLandingPageUseCase', () => {
   const withCheckout = () => makeProject({ landingCheckoutUrl: 'https://payhip.com/b/AbC9' });
 

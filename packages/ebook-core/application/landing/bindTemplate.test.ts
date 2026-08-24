@@ -93,6 +93,29 @@ describe('bindTemplate', () => {
     });
   });
 
+  describe("the template owner's branding", () => {
+    // vintagelifestyleusa.com carries its logo twice — masthead and footer. Only
+    // one could be labelled while BRAND_LOGO was single-use, so the other kept
+    // that site's own mark and it published under the new seller's name.
+    it('removes every logo node when no brand mark was supplied', () => {
+      const html =
+        '<header><img src="{{BRAND_LOGO}}" data-optional="BRAND_LOGO"></header>' +
+        '<footer><img src="{{BRAND_LOGO}}" data-optional="BRAND_LOGO"></footer>';
+      const out = bindTemplate(html, empty) as Result<BindOutcome, string[]>;
+      expect(out.isOk()).toBe(true);
+      expect(out.value.removedOptional).toContain('BRAND_LOGO');
+      expect(out.value.html).not.toContain('<img');
+      expect(out.value.html).not.toContain('{{BRAND_LOGO}}');
+    });
+
+    it("uses the seller's mark when there is one", () => {
+      const html = '<header><img src="{{BRAND_LOGO}}" data-optional="BRAND_LOGO"></header>';
+      const out = bindTemplate(html, { scalars: { BRAND_LOGO: 'assets/logo.webp' }, repeats: {} });
+      expect(out.isOk()).toBe(true);
+      expect((out as Result<BindOutcome, string[]>).value.html).toContain('assets/logo.webp');
+    });
+  });
+
   describe('html slots', () => {
     // An `html` token writes unescaped markup, so routing model prose into one
     // must take a deliberate act rather than a typo in a key name.

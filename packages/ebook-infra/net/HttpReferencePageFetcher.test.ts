@@ -302,3 +302,45 @@ describe('digest — custom properties', () => {
     expect(out).toContain('var(');
   });
 });
+
+describe('digest — content column', () => {
+  const wrap = (extra: string) =>
+    `<html><head><title>T</title><style>
+      :root { --max: 1180px; }
+      .wrap { max-width: var(--max); margin: 0 auto; padding: 0 28px; }
+      ${extra}
+    </style></head><body><h1>H</h1></body></html>`;
+
+  it('takes the centred container, not the most repeated width', () => {
+    // The shape that built every page at 64% of the reference: the container is
+    // declared once, the prose measures inside it are declared on every block.
+    const d = digest('https://example.com/', wrap(`
+      .lede { max-width: 760px; } .body p { max-width: 760px; } .note { max-width: 760px; }
+      .card { max-width: 780px; } .card p { max-width: 780px; } .quote { max-width: 780px; }
+    `));
+    expect(d.style.measurePx).toBe(1180);
+  });
+
+  it('prefers the outer container when prose is centred too', () => {
+    const d = digest('https://example.com/', wrap('.lede { max-width: 640px; margin-inline: auto; }'));
+    expect(d.style.measurePx).toBe(1180);
+  });
+
+  it('falls back to the most common width when nothing centres itself', () => {
+    // Flex- and grid-centred pages never write `margin: auto`.
+    const html = `<html><head><title>T</title><style>
+      .a { max-width: 900px; } .b { max-width: 900px; } .c { max-width: 1200px; }
+    </style></head><body><h1>H</h1></body></html>`;
+    expect(digest('https://example.com/', html).style.measurePx).toBe(900);
+  });
+
+  it('ignores widths outside the plausible column range', () => {
+    const d = digest('https://example.com/', wrap('.full { max-width: 2400px; margin: 0 auto; }'));
+    expect(d.style.measurePx).toBe(1180);
+  });
+
+  it('reports nothing when the page sets no width at all', () => {
+    const html = '<html><head><title>T</title><style>body{color:#111}</style></head><body><h1>H</h1></body></html>';
+    expect(digest('https://example.com/', html).style.measurePx).toBeNull();
+  });
+});

@@ -188,6 +188,7 @@ describe('LandingLayoutPrompt — imagery inventory', () => {
         headings: [{ level: 1, text: 'Your mother never wrote them down.' }],
         text: 'Recovered, not invented.',
         markup: '<section><img src="dishes/stew.webp"><h2>What people cooked</h2></section>',
+        styleCss: '',
         style: {
           serifHeadings: true,
           serifBody: true,

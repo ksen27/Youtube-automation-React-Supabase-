@@ -430,12 +430,39 @@ function pickAccent(css: string): string | null {
   return top?.[0] ?? null;
 }
 
+/** A qualifying content width: wide enough to be a column, narrow enough to be one. */
+const inMeasureRange = (n: number) => n >= 480 && n <= 1400;
+
+/**
+ * The width of the reference's page container.
+ *
+ * Identified by what a centred container DOES — a max-width plus an auto
+ * inline margin — rather than by how often its value repeats. Counting was the
+ * previous rule and it loses on any page with a real type system: the container
+ * is declared once, while the narrow measures on the prose INSIDE it are
+ * declared on every text block. vintagelifestyleusa.com resolves to
+ * 760×3, 780×3, 560×2, 640×2 … and 1180×1 — so the mode returned 760 and the
+ * page was built at 64% of the reference's true 1180px column, every section
+ * short by 420px.
+ *
+ * Falls back to the old mode when no rule centres itself, which is the case on
+ * pages that centre with flex or grid instead.
+ */
 function readMeasure(css: string): number | null {
+  // `margin: 0 auto`, `margin-inline: auto`, `margin: 0 auto 40px` — the pair
+  // has to be read from the SAME rule, so match each rule and inspect its body.
+  const centred = (css.match(/[^{}]+\{[^}]*\}/g) ?? [])
+    .filter((rule) => /margin(-inline)?\s*:[^;}]*\bauto\b/i.test(rule))
+    .map((rule) => Number(/max-width:\s*(\d{3,4})px/i.exec(rule)?.[1] ?? 0))
+    .filter(inMeasureRange);
+  // Widest wins: a page that centres both a container and an inner prose column
+  // matches twice, and the container is the outer of the two.
+  if (centred.length > 0) return Math.max(...centred);
+
   const widths = [...css.matchAll(/max-width:\s*(\d{3,4})px/gi)]
     .map((m) => Number(m[1]))
-    .filter((n) => n >= 480 && n <= 1400);
+    .filter(inMeasureRange);
   if (widths.length === 0) return null;
-  // The most common qualifying max-width is the content column.
   const counts = new Map<number, number>();
   for (const w of widths) counts.set(w, (counts.get(w) ?? 0) + 1);
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;

@@ -399,6 +399,22 @@ export class ExtractTemplateUseCase {
       assets: stored.value.assets,
     });
 
+    // The bytes are in the bucket by now, but nothing can FIND them until the
+    // rows exist: `listAssets` is what both the preview route and the deploy
+    // read, and it was returning empty for every template ever extracted. The
+    // page then shipped with its markup intact and every `assets/<hash>` a 404 —
+    // dish photos, payment marks and the site's logo all rendering as alt text,
+    // while the book cover (which travels on the page's own asset list, not
+    // this one) came through fine and made the failure look cosmetic.
+    //
+    // Fatal rather than logged: a template whose assets are unfindable produces
+    // a visibly broken page on every book built from it, and the seller cannot
+    // tell that from a template that merely looks wrong.
+    const savedAssets = await this.templates.saveAssets(templateId, pruned);
+    if (savedAssets.isFail()) {
+      return Result.fail({ reason: `The template's assets could not be recorded: ${savedAssets.error}`, report: partial() });
+    }
+
     const finalHtml = await this.artifacts.storeParameterised({
       templateId,
       html: parameterised.value.html,
@@ -629,13 +645,25 @@ function resolveAnnotation(
     //     (rather than leave it loading from the copied site) — which is how a
     //     published page ends up with one cover rendered and the other slot
     //     empty. Its best case was no better: the original seller's cover.
+    //   BRAND_LOGO / AUTHOR_IMAGE — the same failure, and worse in what it
+    //     leaves behind. A masthead logo is repeated in the footer; a portrait
+    //     sits in the author block and again beside a testimonial. Only one
+    //     could be labelled, so the others kept the template's own src — and
+    //     unlike a cover, what those nodes show is the original seller's
+    //     BRANDING. vintagelifestyleusa.com carries its logo twice, which is
+    //     how a published page ended up serving that site's mark, at its size,
+    //     with its name as the alt text. Labelled everywhere, an unsupplied
+    //     brand mark is removed by bindTemplate instead of falling back to
+    //     theirs.
     const repeatable =
       entry.placeholder === 'CHECKOUT_URL' ||
       entry.placeholder === 'CTA_TEXT' ||
       entry.placeholder === 'PRICE' ||
       entry.placeholder === 'COMPARE_AT_PRICE' ||
       entry.placeholder === 'BOOK_COVER' ||
-      entry.placeholder === 'BOOK_COVER_ALT';
+      entry.placeholder === 'BOOK_COVER_ALT' ||
+      entry.placeholder === 'BRAND_LOGO' ||
+      entry.placeholder === 'AUTHOR_IMAGE';
     const isCore = Boolean(CORE_PLACEHOLDERS[entry.placeholder]);
     if (isCore && !repeatable) {
       const already = claimed.get(entry.placeholder);

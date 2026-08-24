@@ -17,6 +17,7 @@ import {
   REQUIRED_PLACEHOLDERS,
   isCopyKey,
   splitRepeaterField,
+  token,
 } from '../../domain/landing/PlaceholderVocabulary';
 import type { Finding, PlaceholderEntry, Rect, StoredLandingTemplate } from '../../domain/landing/TemplateManifest';
 import { validateBoundPage } from '../landing/templateContract';
@@ -448,9 +449,21 @@ export class GenerateClonedLandingPageUseCase {
 
     const binding: LandingBinding = { scalars, repeats };
 
+    // A template with no portrait region anywhere on it — vintagelifestyleusa.com
+    // is one; its only images are a logo, a bundle mockup, dish photos, payment
+    // marks and a cover — gives the seller's uploaded photograph nowhere to go,
+    // and it is silently left out of a page that does have an author paragraph.
+    // Placed beside that paragraph it reads the way an author block is meant to,
+    // and this is the one addition to the template's design the clone makes: the
+    // alternative is asking the seller to upload a photo and then discarding it.
+    const withPortrait =
+      authorPhoto && !loaded.value.html.includes(token('AUTHOR_IMAGE'))
+        ? injectAuthorPortrait(loaded.value.html, `${strategy?.author ?? channel?.title ?? title}`)
+        : { html: loaded.value.html, injected: false };
+
     const assembled = this.binder.assemble({
-      templateHtml: loaded.value.html,
-      css: loaded.value.css,
+      templateHtml: withPortrait.html,
+      css: withPortrait.injected ? `${loaded.value.css}\n${AUTHOR_PORTRAIT_CSS}` : loaded.value.css,
       themeOverrideCss: theme.overrideCss,
       accentLiteral: theme.literalFrom && theme.accentHex ? { from: theme.literalFrom, to: theme.accentHex } : null,
       values: {
@@ -1030,4 +1043,55 @@ function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i] as number);
   return btoa(binary);
+}
+
+/**
+ * The portrait's own styling, appended to the template's stylesheet.
+ *
+ * Floated rather than laid out in a grid: a float needs no knowledge of the
+ * container it lands in, and the container here is whatever element the
+ * template happens to wrap its author paragraph in. `shape-outside` is what
+ * stops the text from squaring off against a circular image.
+ */
+const AUTHOR_PORTRAIT_CSS = `
+/* Added by the clone: this template has no portrait region, and the seller
+   uploaded one. */
+.lp-author-portrait {
+  float: left;
+  width: clamp(96px, 22%, 168px);
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 50%;
+  shape-outside: circle(50%);
+  margin: 0 22px 12px 0;
+}
+@media (max-width: 560px) {
+  /* Too narrow to wrap around: centre it and let the text run full width. */
+  .lp-author-portrait { float: none; display: block; margin: 0 auto 16px; }
+}`;
+
+/**
+ * Puts the seller's portrait at the front of the author paragraph.
+ *
+ * Inserted immediately before the `{{AUTHOR_BIO}}` token rather than as a
+ * sibling of the element holding it: nothing in this pipeline parses HTML, and
+ * the token's position is already known exactly, whereas an element boundary
+ * would have to be inferred. Inside the paragraph the float still reads as a
+ * portrait beside the text, which is the arrangement asked for.
+ *
+ * Returns the html unchanged when the template has no author paragraph either —
+ * there is then no introduction to sit beside, and dropping the image in at a
+ * guessed position would be a worse outcome than leaving it out.
+ */
+export function injectAuthorPortrait(html: string, authorName: string): { html: string; injected: boolean } {
+  const bio = token('AUTHOR_BIO');
+  if (!html.includes(bio)) return { html, injected: false };
+  const alt = authorName.trim()
+    ? `${authorName.trim().replace(/[<>"&]/g, '')}`
+    : 'The author';
+  const img = `<img class="lp-author-portrait" src="assets/author.webp" alt="${alt}" loading="lazy">`;
+  // Only the FIRST occurrence: the bio is a single-use core placeholder, and a
+  // second match would mean the template repeats it, where a second portrait
+  // would be a duplicate rather than a pair.
+  return { html: html.replace(bio, `${img}${bio}`), injected: true };
 }
