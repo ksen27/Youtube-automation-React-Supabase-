@@ -450,20 +450,22 @@ export class GenerateClonedLandingPageUseCase {
     const binding: LandingBinding = { scalars, repeats };
 
     // A template with no portrait region anywhere on it — vintagelifestyleusa.com
-    // is one; its only images are a logo, a bundle mockup, dish photos, payment
-    // marks and a cover — gives the seller's uploaded photograph nowhere to go,
-    // and it is silently left out of a page that does have an author paragraph.
-    // Placed beside that paragraph it reads the way an author block is meant to,
-    // and this is the one addition to the template's design the clone makes: the
-    // alternative is asking the seller to upload a photo and then discarding it.
+    // is one; its only images are a logo, a mockup, dish photos, payment marks
+    // and a cover — gives the seller's uploaded photograph nowhere to go, and it
+    // is silently dropped from a page that does have an introduction. The image
+    // that introduction is set against becomes the portrait's slot, so the
+    // template keeps the shape it was designed with and the photograph a reader
+    // reads as the author's is the seller's own.
     const withPortrait =
       authorPhoto && !loaded.value.html.includes(token('AUTHOR_IMAGE'))
-        ? injectAuthorPortrait(loaded.value.html, `${strategy?.author ?? channel?.title ?? title}`)
-        : { html: loaded.value.html, injected: false };
+        ? placeAuthorPortrait(loaded.value.html, `${strategy?.author ?? channel?.title ?? title}`)
+        : { html: loaded.value.html, placed: 'none' as const };
 
     const assembled = this.binder.assemble({
       templateHtml: withPortrait.html,
-      css: withPortrait.injected ? `${loaded.value.css}\n${AUTHOR_PORTRAIT_CSS}` : loaded.value.css,
+      // Only the ADDED portrait needs styling; a replaced one inherits whatever
+      // the template already sized and framed that slot with.
+      css: withPortrait.placed === 'added' ? `${loaded.value.css}\n${AUTHOR_PORTRAIT_CSS}` : loaded.value.css,
       themeOverrideCss: theme.overrideCss,
       accentLiteral: theme.literalFrom && theme.accentHex ? { from: theme.literalFrom, to: theme.accentHex } : null,
       values: {
@@ -1046,16 +1048,17 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 /**
- * The portrait's own styling, appended to the template's stylesheet.
+ * Styling for a portrait that had to be ADDED rather than substituted.
  *
- * Floated rather than laid out in a grid: a float needs no knowledge of the
- * container it lands in, and the container here is whatever element the
- * template happens to wrap its author paragraph in. `shape-outside` is what
- * stops the text from squaring off against a circular image.
+ * Only reached on the fallback path below, where the introduction has no image
+ * beside it to take over. Floated, because a float needs to know nothing about
+ * the element it lands in — and here that element is whatever the template
+ * happens to wrap its introduction in. `shape-outside` is what keeps the text
+ * from squaring off against a circular image.
  */
 const AUTHOR_PORTRAIT_CSS = `
-/* Added by the clone: this template has no portrait region, and the seller
-   uploaded one. */
+/* Added by the clone: this template's introduction has no image of its own,
+   and the seller uploaded a portrait. */
 .lp-author-portrait {
   float: left;
   width: clamp(96px, 22%, 168px);
@@ -1070,28 +1073,64 @@ const AUTHOR_PORTRAIT_CSS = `
   .lp-author-portrait { float: none; display: block; margin: 0 auto 16px; }
 }`;
 
+/** The section element enclosing an offset, as [start, end) into `html`. */
+function enclosingSection(html: string, at: number): [number, number] {
+  // Bounded by the section the introduction lives in rather than by a character
+  // window: a window wide enough to reach the figure column on one template
+  // reaches into the NEXT section on another, and swapping an image there would
+  // replace something nobody asked about.
+  const opens = [...html.slice(0, at).matchAll(/<section\b/gi)];
+  const start = opens.length > 0 ? (opens[opens.length - 1]?.index ?? 0) : 0;
+  const closeAt = html.indexOf('</section>', at);
+  return [start, closeAt === -1 ? html.length : closeAt];
+}
+
 /**
- * Puts the seller's portrait at the front of the author paragraph.
+ * Puts the seller's portrait where the introduction's own image is.
  *
- * Inserted immediately before the `{{AUTHOR_BIO}}` token rather than as a
- * sibling of the element holding it: nothing in this pipeline parses HTML, and
- * the token's position is already known exactly, whereas an element boundary
- * would have to be inferred. Inside the paragraph the float still reads as a
- * portrait beside the text, which is the arrangement asked for.
+ * A template with no portrait region still frames its introduction against
+ * SOMETHING — vintagelifestyleusa.com sets its "Recovered, not invented"
+ * paragraphs in a two-column grid with a dish photo in the other column. That
+ * image is the one a reader reads as belonging to the introduction, so it is
+ * the one the seller's face replaces. Adding a second portrait beside it, which
+ * is what this did first, leaves the template owner's photograph on the page
+ * and puts two images where the design has one.
  *
- * Returns the html unchanged when the template has no author paragraph either —
- * there is then no introduction to sit beside, and dropping the image in at a
- * guessed position would be a worse outcome than leaving it out.
+ * Only the image inside the introduction's own <section> is considered. When
+ * that section has none, the portrait is added to the text instead — a
+ * template whose introduction is pure prose has nothing to substitute into.
  */
-export function injectAuthorPortrait(html: string, authorName: string): { html: string; injected: boolean } {
+export function placeAuthorPortrait(
+  html: string,
+  authorName: string,
+): { html: string; placed: 'replaced' | 'added' | 'none' } {
   const bio = token('AUTHOR_BIO');
-  if (!html.includes(bio)) return { html, injected: false };
-  const alt = authorName.trim()
-    ? `${authorName.trim().replace(/[<>"&]/g, '')}`
-    : 'The author';
-  const img = `<img class="lp-author-portrait" src="assets/author.webp" alt="${alt}" loading="lazy">`;
-  // Only the FIRST occurrence: the bio is a single-use core placeholder, and a
-  // second match would mean the template repeats it, where a second portrait
-  // would be a duplicate rather than a pair.
-  return { html: html.replace(bio, `${img}${bio}`), injected: true };
+  const at = html.indexOf(bio);
+  if (at === -1) return { html, placed: 'none' };
+
+  // Quotes and angle brackets would break out of the attribute; the name comes
+  // from channel data rather than from a model, but this is the only place it
+  // is written into markup, so it is escaped here rather than trusted.
+  const alt = authorName.trim().replace(/[<>"&]/g, '').trim() || 'The author';
+  const [from, to] = enclosingSection(html, at);
+  const section = html.slice(from, to);
+
+  const img = /<img\b[^>]*>/i.exec(section);
+  if (img?.[0]) {
+    const replaced = img[0]
+      .replace(/\ssrc\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/i, ' src="assets/author.webp"')
+      .replace(/\salt\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/i, ` alt="${alt}"`);
+    // A template whose image carries neither attribute is not one we can
+    // meaningfully substitute into; adding them blind would produce an <img>
+    // the template's own CSS never sized.
+    if (replaced !== img[0]) {
+      return {
+        html: html.slice(0, from) + section.replace(img[0], replaced) + html.slice(to),
+        placed: 'replaced',
+      };
+    }
+  }
+
+  const portrait = `<img class="lp-author-portrait" src="assets/author.webp" alt="${alt}" loading="lazy">`;
+  return { html: html.replace(bio, `${portrait}${bio}`), placed: 'added' };
 }
