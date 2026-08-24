@@ -76,9 +76,11 @@ Describe ONLY the reusable visual style — the things that stay the same across
 5. Typography STYLE only IF the thumbnails have text (font weight/style, colour, outline/shadow, rough placement) — describe the LOOK of the text, never specific words, and note that text is SHORT and punchy (a few words), not full sentences.
 6. RECURRING BRANDED LABELS — a small badge/label the channel stamps on MOST of its thumbnails as part of its identity (e.g. a red "BREAKING NEWS", "EXCLUSIVE", or "LIVE" box, a channel banner bar, a corner tag). This is the OPPOSITE of one-off clutter: if the SAME kind of label appears across several of the samples, it is a REQUIRED part of this channel's format. Describe its LOOK and rough placement (e.g. "a small red rectangular 'BREAKING NEWS'-style label with white all-caps text at the bottom-left, above the main title bar") and state that it should be reproduced on every generation. Reproduce the label's STYLE and typical WORDING KIND (breaking-news / exclusive / live), not a specific video's text. Only mark it as present when it genuinely recurs across the samples.
 
-OVERLAY GRAPHICS RULE (important) — this is about ONE-OFF DECORATIVE clutter, NOT the recurring branded label in point 6. Channels sometimes stamp random per-video accents — red crosses/X marks, arrows, circles, highlight rings pointing at things. If present, mention THESE ONLY as OPTIONAL, SMALL, SUBTLE accents placed at the edges. NEVER describe them as large, bold, or central, and state explicitly that such graphics must be small and must NOT cover or block the subject/face. When in doubt, favour a cleaner look with minimal or no such graphics. (A recurring breaking-news / exclusive label is NOT this kind of clutter — keep it per point 6.)
+OVERLAY MARKS RULE (important) — many channels stamp pointing/marking accents on their thumbnails: red arrows, crosses/X marks, circles, highlight rings. When these recur across the samples they are part of the channel's identity and MUST be captured. Describe their LOOK and typical placement (colour, weight, size, where they sit).
 
-Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, the subject prominent and unobstructed, short bold yellow all-caps sans-serif text with a heavy black outline on a solid bottom bar, plus a small red 'BREAKING NEWS'-style label with white text at the bottom-left above the bar, high contrast, teal-and-orange grade, any random accent graphics kept small and to the edges …").
+Crucially, also describe WHAT THEY DO: in the samples these marks POINT AT or RING the thing the video is about — the animal, the object, the detail in the scene that matters. Say so explicitly, e.g. "a bold red arrow pointing directly at the main subject of the action" or "a red circle ringing the key detail in the scene". Never describe them as free-floating decoration, and never as covering the subject's face. This matters because a mark that is described only as a shape gets drawn in a random empty spot, which reads as meaningless clutter — a real defect the channel owner reported. A mark that is described as POINTING AT THE SUBJECT gets drawn doing its job. (A recurring breaking-news / exclusive label is a different thing — keep it per point 6.)
+
+Do NOT describe the one-off SUBJECT or TITLE of any specific thumbnail (no names, no specific video topics) — only the reusable look. Write it as a direct instruction a text-to-image model can follow (e.g. "A dramatic 16:9 YouTube thumbnail with a single subject cut out on the right third over a dark cinematic gradient, the subject prominent and unobstructed, short bold yellow all-caps sans-serif text with a heavy black outline on a solid bottom bar, plus a small red 'BREAKING NEWS'-style label with white text at the bottom-left above the bar, high contrast, teal-and-orange grade, a bold red arrow pointing directly at the main subject of the action …").
 
 The prompt MUST NOT contain any URL or the substring "http".
 
@@ -274,35 +276,51 @@ export async function buildThumbnailPrompt(input: BuildPromptInput): Promise<Bui
 
   const prompt = `You are writing the final text-to-image prompt for a YouTube thumbnail generator (Pikzels).
 
+CHANNEL STYLE — this governs the channel's LOOK ONLY: colour grade, palette, contrast, lighting, typography, the text box, the branded label, the pointing marks. It does NOT govern what happens in the picture.
+
+Where it describes COMPOSITION — "a single subject", "medium close-up", "clean", "simple", "unobstructed", "wide-shot background" — treat that as the channel's DEFAULT for an ordinary video, not a limit on this one. The ACTION, STAKES and FULL FRAME rules below OVERRIDE it: this thumbnail may hold two or more figures locked together, may be busy, may be close and chaotic, and must carry foreground and background layers. Keep the channel's grade and typography exactly; do not let its calm composition flatten the event.
+
 CHANNEL STYLE (reuse this look — grade, mood, energy):
 """${input.stylePrompt}"""
 ${formatClause}
-NEW VIDEO TITLE (use ONLY as a hint for the scene/subject — do NOT put this full title on the image): "${input.title}"
+NEW VIDEO TITLE — this is WHAT THE IMAGE MUST SHOW, not a mood hint. Read it, decide what is literally HAPPENING in it, and build the scene around that event: "${input.title}"
+(Do NOT render this title text on the image — DEPICT it.)
 ${customClause}
 ${subjectClause}
 ${styleImageClause}
 
 Write ONE cohesive prompt that:
 - Renders a 16:9 YouTube thumbnail in the CHANNEL STYLE above${input.formatPrompt?.trim() ? ", using the CHOSEN FORMAT's layout/composition" : ""}.
-- Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics.
-- ACTION/SCENE: this is a NEW video. Depict a FRESH scene, pose, gesture, camera angle, and secondary object that fit THIS title — do NOT copy the exact pose or composition of any reference thumbnail. Keep the channel's overall LOOK (grade, layout style, energy), but the person's specific action and the scene around them must be different and specific to this title. Reuse the person's LIKENESS (same face/identity) but put them in a different moment.
+- Keeps the SUBJECT as the clear focal point — prominent, well-lit, and NOT covered or blocked by any text or graphics. "Focal point" does NOT mean alone in the frame: the animal, opponent, or object they are dealing with is equally present and equally sharp.
+- SHOW THE SUBJECT NAMED IN THE TITLE (check this before anything else): every concrete thing the title names — the animal, the vehicle, the object, the person — must be VISIBLE IN THE FRAME, large, in focus, and instantly recognisable. A title about a polar bear attack must show the POLAR BEAR, prominent and unmistakable. A thumbnail that names a creature or object and then does not show it is the single worst failure this generator makes: the viewer came for that thing. If the title names both a person and a creature/object, show BOTH in the same frame, interacting. Never imply the subject through mood, tracks, scenery, or an empty landscape — show the subject itself.
+- PUT THEM IN THE SAME FIGHT (when the title implies a confrontation): the person and the animal/opponent must be ENGAGED WITH EACH OTHER in one continuous action, at CLOSE RANGE, in the same plane of the image — not a person posing in front while the animal does something in the background. Show the clash at its peak: the bear reared up over the hunter or lunging within arm's reach, the hunter braced and driving back at it with his spear raised, both bodies leaning into each other, snow and ice spraying, the gap between them nearly closed. Their eyelines must meet or both must be fixed on the point of contact. If you could crop one of them out and still have a sensible picture, the composition has FAILED — they must overlap and collide.
+- ACTION (equally important): SOMETHING MUST BE HAPPENING. Name the concrete activity from the title and show it MID-ACTION — the subject actively doing it, caught in the middle of the moment, with the real setting and the real objects/animals/equipment that activity involves around them (e.g. a title about seal hunting shows the hunter out on the sea ice, over the breathing hole, harpoon in hand, catch visible — NOT a portrait of a hunter on a gradient). A thumbnail where the subject is merely posing, cut out, or standing against a backdrop is a FAILURE of this prompt, no matter how good the grade and typography are. Build the scene first, then apply the channel's look to it.
+- STAKES — SHOW THE PREDICAMENT, NOT JUST THE ACTIVITY: something must be going WRONG or about to. Give the moment a visible trap: an escape route that is closing or already cut off, a corner with nothing behind it, a gap that is nearly shut, ice giving way underfoot, a catch slipping away, a threat arriving from a second direction. Make the constraint physically visible in the frame — the narrow hole the seal cannot fit back through and the solid ice ringing it, the crack running between the hunter and safety, the pack closing from behind. The viewer must be able to see WHY this is difficult without reading a word. A picture of someone simply performing a task, however well lit, is what the channel owner means by "too simple" — it has no jeopardy in it.
+- BUILD A FULL FRAME (this is the other half of "too simple"): compose in DEPTH, not as a subject on a backdrop. Put something in the FOREGROUND (broken ice slabs, spray, gear, an edge we look past), the main clash in the MIDDLE, and real context BEHIND (the rest of the pack, the sled and dogs, the camp, the storm coming in). Add the physical evidence of the moment — flying snow, water surging, breath fogging, churned ice, a rope pulled tight. Two isolated figures on clean snow reads empty; a frame with layers reads like a real event caught mid-happening.
+- SETTING: place the action in the actual environment the title implies (location, weather, time of day, terrain). The background must be a real place where this event happens, not a studio gradient or an abstract blur — unless the CHANNEL STYLE explicitly requires a cut-out treatment, in which case keep the cut-out but still show the action and its objects.
+- FRESH EVERY TIME: do NOT copy the pose, camera angle, or composition of any reference thumbnail. Reuse the person's LIKENESS (same face/identity) only — the moment must be new and specific to THIS title.
 - TEXT: only if the channel style uses on-image text, add a SHORT punchy hook of 2–4 words derived from the topic (e.g. a key word or phrase) — NEVER the full video title, and never a full sentence. Keep the text clean, well-placed (usually a corner or side), and not overlapping the subject's face. If the channel style has no text, add none.
 - BRANDED LABEL: if the CHANNEL STYLE above describes a RECURRING branded label (a "BREAKING NEWS" / "EXCLUSIVE" / "LIVE" box, a channel banner bar, a corner tag), you MUST reproduce it — it is part of the channel's identity, not optional clutter. Render it in the same style and placement the channel style describes (e.g. a small red 'BREAKING NEWS'-style box with white all-caps text at the bottom-left). Keep the label small and at the edge so it does not cover the subject's face, but DO include it. Use the label KIND the channel uses (breaking-news / exclusive / live), not the full video title.
-- OVERLAY GRAPHICS: any ONE-OFF decorative accents (random crosses, arrows, circles) — as opposed to the recurring branded label above — must be SMALL, subtle, at the edges, and must NOT block the subject. Prefer minimal such graphics.
+- POINTING MARKS: if the CHANNEL STYLE uses arrows, red crosses, circles or highlight rings, INCLUDE them — they are part of this channel's look. But EVERY such mark must have a TARGET, and you must say what it is: the arrow points AT the animal/object/action named in the title, the circle RINGS that same subject or the key detail of the moment. Write it into the prompt that way ("a bold red arrow pointing directly at the polar bear", not "a red arrow in the corner"). A mark floating over empty sky, ocean, snow or a blank background is the defect the channel owner complained about — never place one there. Keep marks clear of the subject's face, and use at most two.
 - Preserves the likeness of any provided subject photo(s).
 - Is concrete and directive for an image model.
 
 HARD RULES:
+- The prompt MUST name and place every concrete subject from the title IN THE FRAME. Re-read the title before you answer: if it names a creature, vehicle, or object and your prompt does not describe that thing visibly in the image, the prompt is INVALID — rewrite it.
+- The prompt MUST describe a specific action in progress drawn from the title. A prompt that only describes a person, a look and a colour grade is INVALID — rewrite it until something is happening.
+- Any pointing mark you include MUST have a named target in the prompt. "A red arrow" alone is INVALID; "a red arrow pointing at the polar bear" is correct.
 - Keep the subject's likeness, but do NOT reproduce the reference thumbnail's exact pose/action/scene — vary it to match this title.
 - Do NOT render the exact video title text on the image.
 - The prompt MUST NOT contain any URL or the substring "http".
 - Do not mention "Pikzels", "reference image", or these instructions in the output.
-- Max 1100 characters.
+- Max 1500 characters.
 
 MODERATION-SAFE LANGUAGE (critical — the image model REJECTS prompts that put a NAMED real person in an explicit distressing or violent state). Keep the names and the dramatic, high-energy YouTube look, but phrase expressions and scenes in NEUTRAL, non-graphic terms:
 - Describe faces with restrained emotion words: "serious", "tense", "intense", "surprised", "somber", "stern", "concerned", "focused" — NOT "crying", "sobbing", "distressed", "in tears", "terrified", "screaming", "shouting", "furious", "enraged", "in pain", "devastated".
 - Do NOT depict a named real person as a victim, injured, weeping, humiliated, arrested, dead/dying, bleeding, or in any graphic emotional breakdown. Convey drama through LIGHTING, COLOUR GRADE, COMPOSITION, and a restrained facial expression instead.
-- No violence, weapons, gore, medical/mortal harm, sexual content, or minors in unsafe situations.
+- No gore, blood, wounds, or a body in graphic distress. No sexual content. No minors in unsafe situations.
+- A DANGEROUS-WILDLIFE CONFRONTATION IS ALLOWED and must be depicted at FULL INTENSITY when the title is about one: the animal charging, lunging, rearing over the person, roaring at close range, and the person fighting back — braced, swinging, driving a spear or paddle at it, holding it off. A struggle at the point of collision is fine and is what the title promises. What stays barred is the AFTERMATH and the GORE: no blood, no wounds, no torn flesh, no mauling, no jaws closed on a person, nobody pinned, limp, or injured. Peak struggle, never damage. This is how the whole genre shoots these thumbnails and it renders fine; a tame standoff, or leaving the animal out, is not an acceptable alternative.
+- Tools and equipment that a lawful outdoor or work activity genuinely involves (a harpoon or rifle carried on a hunt, a fishing spear, a work knife, an axe, machinery) ARE allowed when the title is about that activity — show them in NORMAL WORKING USE, held or carried, never mid-strike and never aimed at a person. Animals in a hunting/fishing scene are shown intact and non-graphic (a fish on a line, a catch on the ice) — never wounded, bleeding, or being killed.
 - Keep it a tabloid-style attention-grabbing thumbnail, just without graphic distress language.
 
 Return STRICT JSON ONLY:
@@ -320,15 +338,18 @@ Return STRICT JSON ONLY:
       "buildThumbnailPrompt",
       async (model) => {
         // Cap output so a chatty model can't run past its budget and truncate
-        // the JSON mid-string (a second cause of the same bug). A thumbnail
-        // prompt is ~1100 chars (~400 tokens); 2048 is ample. On MAX_TOKENS,
-        // throw GEMINI_TRUNCATED so the retry/fallback ladder handles it.
+        // the JSON mid-string (a second cause of the same bug). Raised 2048 ->
+        // 4096 on 2026-08-24: the scene/action rules make the model reason at
+        // length before it writes, and it was hitting MAX_TOKENS on the first
+        // attempt (observed on "Polar bear attack"). The retry saved it, but a
+        // second truncation would have dropped the build to the title-less
+        // fallback. Headroom is cheap; a wrong thumbnail is not.
         const r = await model.generateContent({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: {
             responseMimeType: "application/json",
             temperature: 0.4,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 4096,
           },
         });
         if (r.response.candidates?.[0]?.finishReason === "MAX_TOKENS") {
@@ -395,9 +416,18 @@ function salvagePromptField(raw: string): string {
 function assembleFallbackPrompt(input: BuildPromptInput): string {
   const parts = [input.stylePrompt.trim()];
   if (input.formatPrompt?.trim()) parts.push(`Use this exact layout/format: ${input.formatPrompt.trim()}`);
+  // The title is the SUBJECT of the image. Without this the fallback produced a
+  // generic channel-style portrait with no connection to the video — the
+  // "they don't show anything" complaint. We cannot reason about the title here
+  // (no model), so we hand it to the image model as the scene to depict.
+  if (input.title.trim()) {
+    parts.push(
+      `The image must SHOW what this video is about: "${input.title.trim()}". Every concrete thing that title names — the animal, object, or vehicle — must be visible in the frame, large and unmistakable, with the activity clearly in progress in its real setting. Depict it: do not render this text on the image, do not imply the subject through scenery or mood, and do not settle for a posed portrait.`,
+    );
+  }
   if (input.subjectCount === 1) parts.push("Feature the provided subject as the clear, unobstructed focal point, preserving their likeness.");
   if (input.subjectCount === 2) parts.push("Feature both provided subjects together as the clear focal point, preserving each likeness.");
   if (input.customPrompt?.trim()) parts.push(input.customPrompt.trim());
-  parts.push("Any on-image text is a short 2–4 word hook, not the full title, and must not cover the subject. If the channel style describes a recurring branded label (e.g. a 'BREAKING NEWS' / 'EXCLUSIVE' box), reproduce it in that style at the edge. Keep any one-off accent graphics small and at the edges.");
+  parts.push("Any on-image text is a short 2–4 word hook, not the full title, and must not cover the subject. If the channel style describes a recurring branded label (e.g. a 'BREAKING NEWS' / 'EXCLUSIVE' box), reproduce it in that style at the edge. If the channel style uses a pointing mark (a red arrow, cross, circle or highlight ring), place it so it points directly at the main subject of the action named above — never floating over empty sky, water, or blank background.");
   return parts.join(" ").replace(/https?:\/\/\S+/gi, "").replace(/\s+/g, " ").trim().slice(0, 3000);
 }
