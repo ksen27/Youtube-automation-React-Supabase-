@@ -823,6 +823,29 @@ export class GenerateLandingPageUseCase {
       // identical, which reads as "the fix did nothing" rather than "the fix
       // was never run".
       layoutVersion: LANDING_LAYOUT_VERSION,
+      // The rules THEMSELVES, so the bump above stops being the only defence.
+      //
+      // LANDING_LAYOUT_VERSION has to be remembered, and it was not: the commit
+      // that taught the fetcher to resolve CSS variables — which is what the
+      // layout call is TOLD the reference looks like — shipped without touching
+      // it, so every reference already in the cache kept its pre-deploy layout
+      // and the fix read as a no-op. Hashing the prompt's own text makes an edit
+      // to these rules invalidate exactly the layouts they govern, with nothing
+      // to remember.
+      //
+      // `system` is the rules half and nothing else: the reference page and its
+      // screenshots ride in `user`. That is the line worth holding — hashing the
+      // reference's digest too would rebuild a layout every time the source site
+      // shifted a colour, at ~$2 a time, for a page that should not change.
+      // Reader changes stay on the manual bump; rule changes are automatic.
+      rules: this.hasher.hash(
+        LandingLayoutPrompt.build({
+          reference: null,
+          productCount: input.productCount,
+          hasAuthorPhoto: input.hasAuthorPhoto,
+          hasLogo: input.hasLogo,
+        }).system,
+      ),
     });
 
     // Reuse only a layout captured under the SAME inputs.

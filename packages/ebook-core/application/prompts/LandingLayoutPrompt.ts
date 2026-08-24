@@ -34,10 +34,22 @@ import type { AiContentBlock } from '../ports/services/AiTextGenerator';
  * layouts it actually affects, and nothing else — the same job LANDING_PIPELINE_VERSION
  * does for cloned templates.
  *
+ * The layout's input hash also carries a hash of this prompt's own `system`
+ * text, so an edit to the rules below invalidates the layouts it governs
+ * without anyone bumping anything. This number is still here for the changes
+ * that hash cannot see: how the REFERENCE is read (the fetcher's style digest)
+ * and the page contract's validation rules. Version 2 shipped with exactly
+ * that gap — a fetcher change reached no cached reference — which is what the
+ * rules hash now covers for the prompt half.
+ *
  * 2: sections follow the reference (hero/order only are required),
  *    {{CONTENTS_LIST}} added, design-plan and finish rules added.
+ * 3: the fetcher resolves CSS custom properties before its style heuristics
+ *    run, so a reference whose design lives in variables is no longer read as
+ *    having no design at all. Layouts derived before this were told the wrong
+ *    typefaces and grounds.
  */
-export const LANDING_LAYOUT_VERSION = 2;
+export const LANDING_LAYOUT_VERSION = 3;
 
 export const LandingLayoutPrompt = {
   build(input: {

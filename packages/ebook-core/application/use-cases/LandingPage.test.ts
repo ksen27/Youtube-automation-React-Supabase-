@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { GenerateLandingPageUseCase } from './GenerateLandingPageUseCase';
-import { LANDING_LAYOUT_VERSION } from '../prompts/LandingLayoutPrompt';
+import { LandingLayoutPrompt, LANDING_LAYOUT_VERSION } from '../prompts/LandingLayoutPrompt';
 import { PublishLandingPageUseCase } from './PublishLandingPageUseCase';
 import { Project } from '../../domain/project/Project';
 import { ProjectId } from '../../domain/project/ProjectId';
@@ -920,6 +920,17 @@ describe('GenerateLandingPageUseCase — reference-driven layout', () => {
           // Layouts derived under an older idea of what a good layout is are
           // rebuilt, not reused — see LANDING_LAYOUT_VERSION.
           layoutVersion: LANDING_LAYOUT_VERSION,
+          // ...and under older RULES. Built here the same way the use case
+          // builds it, so this fixture keeps proving "same inputs, same hash"
+          // rather than freezing today's prompt text into the test.
+          rules: JSON.stringify(
+            LandingLayoutPrompt.build({
+              reference: null,
+              productCount: 1,
+              hasAuthorPhoto: false,
+              hasLogo: false,
+            }).system,
+          ),
         }),
       },
     });
