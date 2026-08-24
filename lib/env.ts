@@ -680,6 +680,47 @@ const ServerEnvSchema = z.object({
   SYNTHETIC_IMAGE_PROVIDER_PRIMARY: z.enum(["sixtynine", "ai33"]).default("sixtynine"),
   SYNTHETIC_TTS_PROVIDER_PRIMARY: z.enum(["sixtynine", "ai33"]).default("sixtynine"),
 
+  // ── OpenAI direct: LAST-RESORT image fallback (client direction 2026-08-24) ──
+  //
+  // Deliberately NOT part of SYNTHETIC_IMAGE_PROVIDER_PRIMARY. That setting is
+  // an ORDERING over the two resellers and is read by the TTS lane too; OpenAI
+  // serves images only, and promoting it would imply a voiceover lane that does
+  // not exist. It is instead appended to the END of the image chain, so it runs
+  // only when BOTH resellers have failed.
+  //
+  // Off by default — NOT on price grounds. At quality=low this path measured
+  // CHEAPER per still than the reseller entries in cost.ts. It is off because it
+  // bills a SEPARATE account the client funds directly, so switching it on moves
+  // spend off the reseller accounts, and that should be a deliberate act rather
+  // than something that happens silently the first time a provider wobbles.
+  // Env-level so it flips without a deploy when an outage does hit.
+  SYNTHETIC_IMAGE_OPENAI_FALLBACK: boolish(false),
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_BASE_URL: z.string().url().default("https://api.openai.com"),
+  // MUST stay the same model family the resellers run (see AI33_IMAGE_MODEL).
+  // gpt-image-2 is on the official API — verified 2026-08-24 against
+  // GET /v1/models. Pointing this at a different family re-creates the
+  // 2026-08-15 Gemini/fal bug, where a failover silently changed the house look.
+  OPENAI_IMAGE_MODEL: z.string().default("gpt-image-2"),
+  // low|medium|high|auto. LOW per client direction 2026-08-24 ("its very
+  // important to use the lowest quality, otherwise its very expensive"). This
+  // path pays RETAIL — there is no reseller margin absorbing the difference —
+  // so it is the one place the setting matters most. Omitting the field
+  // entirely would bill at the model default, which is NOT the cheap end.
+  OPENAI_IMAGE_QUALITY: z.string().default("low"),
+  // OpenAI takes explicit pixel sizes, not the resolution/aspect_ratio pair the
+  // resellers use — hence a separate setting rather than a shared one. 1536x1024
+  // is the 3:2 landscape option, the closest the API offers to the 16:9 the
+  // engine composites onto its 3840x2160 canvas (lib/media/ffmpeg.ts).
+  OPENAI_IMAGE_SIZE: z.string().default("1536x1024"),
+  // Conservative: this is a fallback carrying an outage's whole load, and the
+  // account is new, so a low ceiling keeps a burst from tripping a tier limit.
+  OPENAI_IMAGE_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  // MEASURED 2026-08-24: gpt-image-2 at 1024x1024/low returned in ~20s, and
+  // gpt-image-1 at 1024x1536/low in ~18s. 180s leaves generous headroom while
+  // still bounding a stall — this call is synchronous, so a hang holds the slot.
+  OPENAI_IMAGE_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(180),
+
   AI33_BASE_URL: z.string().url().default("https://api.ai33.pro"),
   // Client direction 2026-08-16: gpt-image-2 on BOTH providers, matching the
   // reference channel's look. Model ids come from GET /v1i/models.

@@ -19,6 +19,7 @@ import {
   fromAi33Pointer,
   AI33_STALE_RESUME,
 } from "@/lib/synthetic/ai33";
+import { isOpenAiImageConfigured, generateOpenAiImage } from "@/lib/synthetic/openai-image";
 
 // Stable per-account id for the Redis slot pool. The slot cap this feeds is
 // enforced by 69labs PER ACCOUNT, not per key — so this id must identify the
@@ -598,7 +599,13 @@ export interface GenerateImageResult {
   //
   // cost.ts still knows "gemini_image" / "fal_flux_image" because historical job
   // rows recorded them; nothing NEW can produce those values.
-  provider: "sixtynine_image" | "ai33_image";
+  //
+  // "openai_image" joins on 2026-08-24 as the last-resort fallback. It holds the
+  // line above: OpenAI serves gpt-image-2 directly, so it is the SAME model the
+  // two resellers proxy, not a third look. What it does change is the PRICE —
+  // which is the whole reason it is attributed separately here rather than
+  // folded into one of the existing values (see cost.ts).
+  provider: "sixtynine_image" | "ai33_image" | "openai_image";
 }
 
 // Cross-attempt resume for 69labs image generation (the zombie-loop fix). When a
@@ -859,7 +866,17 @@ export function isCensored(err: unknown): boolean {
   // the same class of refusal as a task `error` whose error_message carries the
   // model's safety text — match that too, so a refusal doesn't send the image
   // round the provider list to be refused again by the same model.
-  return /CENSORED|safety check|blocked by the model|content polic|moderation/i.test(text);
+  //
+  // OpenAI direct phrases it differently again ("rejected as a result of our
+  // safety system", error code moderation_blocked), and "safety check" does not
+  // match "safety system" — hence the separate alternatives. Getting this right
+  // matters even though OpenAI sits LAST and has nowhere to fail over to:
+  // callers read isCensored() to decide a block is permanently dead rather than
+  // worth another attempt, so a refusal misread as a transient fault gets
+  // retried — and every retry here is a fresh billed render.
+  return /CENSORED|safety system|safety check|blocked by the model|content polic|moderation/i.test(
+    text,
+  );
 }
 
 // The caller's own per-image generation deadline expired (generationTimeoutMs).
@@ -1057,10 +1074,17 @@ export interface GenerateImageOptions {
  * the work. The `response` line reports what actually ran, and the two differing
  * is exactly how a failover becomes visible.
  */
-export function plannedImageProvider(pinnedKey?: string): "ai33_image" | "sixtynine_image" {
+export function plannedImageProvider(
+  pinnedKey?: string,
+): "ai33_image" | "sixtynine_image" | "openai_image" {
   // A pinned key means the caller demanded 69labs (CelebForge) — see generateImage.
   if (pinnedKey?.trim()) return "sixtynine_image";
   const first = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY)[0];
+  // OpenAI can only LEAD when neither reseller is configured at all. Reporting
+  // it in that case is the whole point of this function: the old hardcoded line
+  // named a vendor that was not running, and a log that names the wrong vendor
+  // is worse than one that names none, because it gets believed.
+  if (!first) return isOpenAiImageConfigured() ? "openai_image" : "sixtynine_image";
   return first === "ai33" ? "ai33_image" : "sixtynine_image";
 }
 
@@ -1168,11 +1192,18 @@ export async function generateImage(
 
   // A PINNED 69labs key (CelebForge) means the caller demanded that vendor, so
   // ai33 is dropped from the chain entirely rather than merely demoted.
-  const providers = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY).filter(
-    (p) => !(pinnedSixtyNine && p === "ai33"),
-  );
+  const providers: Array<"ai33" | "sixtynine" | "openai"> = providerOrder(
+    getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY,
+  ).filter((p) => !(pinnedSixtyNine && p === "ai33"));
   // A 69labs resume pointer jumps 69labs to the front (see above).
   if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
+
+  // OpenAI direct is appended AFTER the reseller ordering is settled — including
+  // after the reverse() above — so it is always the last thing tried and never
+  // displaces a resume pointer. It is skipped for a PINNED key for the same
+  // reason ai33 is: that caller demanded a specific vendor's provisioning.
+  if (!pinnedSixtyNine && isOpenAiImageConfigured()) providers.push("openai");
+
   if (providers.length === 0) {
     // Preserves the old error text for an unconfigured engine.
     throw new Error("SIXTYNINE_LABS_API_KEY not configured (synthetic engine)");
@@ -1184,6 +1215,17 @@ export async function generateImage(
     try {
       if (provider === "ai33") {
         return await generateAi33ImageWithResume(prompt, resume, modelOpts);
+      }
+      if (provider === "openai") {
+        // No resume pointer is passed or recorded: this API is synchronous and
+        // hands back no task id, so there is nothing a later attempt could
+        // re-poll. modelOpts carries reseller-shaped model/resolution values
+        // that mean nothing here, so only the timeouts cross over.
+        const out = await generateOpenAiImage(prompt, {
+          generationTimeoutMs: modelOpts.generationTimeoutMs,
+          acquireTimeoutMs: modelOpts.acquireTimeoutMs,
+        });
+        return { ...out, provider: "openai_image" };
       }
       // 69labs only understands its OWN resume pointers; an ai33 one would be
       // submitted as a job id it has never seen.

@@ -78,6 +78,28 @@ kill_timeout = "300s"
   AI33_IMAGE_MODEL = "gpt-image-2"
   AI33_IMAGE_RESOLUTION = "1K"
   AI33_IMAGE_QUALITY = "high"
+  # OpenAI direct — LAST-RESORT still fallback, tried only after BOTH ai33 and
+  # 69labs have failed (client direction 2026-08-24, after a 69labs outage).
+  # OPENAI_API_KEY is a SECRET (flyctl secrets set), never [env]; these are the
+  # tuning knobs. Without the secret this stays dark no matter what the flag says.
+  #
+  # The model MUST track the two pins above. gpt-image-2 is on the official API
+  # (verified 2026-08-24, GET /v1/models), and that is the entire reason this
+  # fallback is allowed to exist: the resellers PROXY this same model, so a
+  # failover changes the vendor and not the look. Pointing it at another family
+  # would repeat the 2026-08-15 Gemini/fal regression the note above describes.
+  #
+  # quality=low is deliberate and is the client's explicit instruction. Measured
+  # 2026-08-24 at these exact settings: 158 image output tokens (~$0.006/still),
+  # which is actually BELOW the reseller rate — because they run quality=high.
+  # Raising this to "high" is roughly a 10x per-image increase; don't, without
+  # asking. Size is OpenAI's 3:2 landscape, the closest offered to the 16:9 the
+  # engine composites onto its 3840x2160 canvas.
+  SYNTHETIC_IMAGE_OPENAI_FALLBACK = "true"
+  OPENAI_IMAGE_MODEL = "gpt-image-2"
+  OPENAI_IMAGE_QUALITY = "low"
+  OPENAI_IMAGE_SIZE = "1536x1024"
+  OPENAI_IMAGE_CONCURRENCY = "4"
   # Cluster-wide concurrent ai33 generations. 8 is MEASURED (2026-08-16): 8 at
   # once all finished in 110s, the same as one alone; 16 degraded badly (slowest
   # 363s, one timed out). The initial 4 was a placeholder and was too low —

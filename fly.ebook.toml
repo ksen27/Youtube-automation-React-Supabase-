@@ -90,6 +90,14 @@ kill_timeout = "300s"
   # exist in the image, and every PDF export fails with "Could not find Chrome".
   PUPPETEER_CACHE_DIR = "/root/.cache/puppeteer"
 
+  # Cover-art spend control. gpt-image-1 bills roughly an order of magnitude more
+  # per image at "high" than at "low", and leaving the field unset bills at the
+  # model default rather than the cheap end. Client direction 2026-08-24 is the
+  # lowest quality; the cover is composited under HTML-typeset title text, so the
+  # extra fidelity buys nothing a reader sees. Raise to "medium" here — no code
+  # change needed — if the art ever looks too rough.
+  OPENAI_IMAGE_QUALITY = "low"
+
   # Deno, installed to this path in Dockerfile.worker. yt-dlp uses it to solve
   # YouTube's player challenge; WITHOUT a JS runtime YouTube rejects every
   # request as a bot ("Sign in to confirm you're not a bot") regardless of how

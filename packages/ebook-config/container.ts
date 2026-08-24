@@ -106,7 +106,7 @@ export function buildContainer(env: Env = loadEnv()) {
   const queue = new BullJobQueue(redis);
   const ai = ClaudeTextGenerator.fromApiKey(env.ANTHROPIC_API_KEY, telemetry);
   // OpenAI gpt-image-1 powers the COVER art.
-  const images = OpenAIImageGenerator.fromApiKey(env.OPENAI_API_KEY ?? '');
+  const images = OpenAIImageGenerator.fromApiKey(env.OPENAI_API_KEY ?? '', env.OPENAI_IMAGE_QUALITY);
   // 69labs (img-flux) powers the in-chapter ILLUSTRATIONS — cheap and fast — but
   // its jobs fail intermittently, so OpenAI gpt-image-1 is a reliable fallback:
   // FallbackImageGenerator only pays for OpenAI when a 69labs job fails.

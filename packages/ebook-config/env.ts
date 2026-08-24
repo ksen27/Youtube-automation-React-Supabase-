@@ -63,6 +63,13 @@ const EnvSchema = z.object({
   WHISPER_PROVIDER: z.enum(['openai', 'self-hosted']).default('openai'),
   OPENAI_API_KEY: z.string().optional(),
 
+  // gpt-image-1 exposes low|medium|high|auto. LOW is the default on client
+  // direction 2026-08-24 ("its very important to use the lowest quality,
+  // otherwise its very expensive") — high is roughly an order of magnitude
+  // dearer per image, and the cover is composited under HTML-typeset text
+  // anyway, so the extra fidelity buys nothing a reader sees.
+  OPENAI_IMAGE_QUALITY: z.enum(['low', 'medium', 'high', 'auto']).default('low'),
+
   // 69labs — generates ONLY the in-chapter illustrations. If unset, books carry
   // no illustrations.
   //

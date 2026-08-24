@@ -15,6 +15,10 @@ export type SyntheticProvider =
   // 69labs is the backup. Both render gpt-image-2 / the same ElevenLabs voices.
   | "ai33_image"
   | "ai33_tts"
+  // OpenAI direct — LAST-RESORT image fallback since 2026-08-24. Same
+  // gpt-image-2 the two resellers proxy, bought at retail instead of through
+  // them, which is why it is attributed separately.
+  | "openai_image"
   | "gemini_image"
   | "flux_image"
   | "fal_flux_image"
@@ -41,6 +45,22 @@ const PRICE_TABLE: Record<SyntheticProvider, { unit: string; usd: number }> = {
   // nothing else.
   ai33_image:      { unit: "per_image",    usd: 0.04 },
   ai33_tts:        { unit: "per_1k_chars", usd: 0.015 },
+  // MEASURED live 2026-08-24 at the exact settings the fallback runs
+  // (gpt-image-2, 1536x1024, quality=low): 158 image output tokens per still.
+  // At OpenAI's $40/1M image-output-token rate that is ~$0.0063.
+  //
+  // NOTE the counter-intuitive result: at LOW quality this retail path prices
+  // BELOW the $0.04 reseller entries above — the resellers run quality=high
+  // (AI33_IMAGE_QUALITY), and quality dominates the per-image price far more
+  // than the reseller margin does. So this is not a "the fallback is expensive"
+  // line item. Raising OPENAI_IMAGE_QUALITY is what would make it one: high at
+  // this size is roughly an order of magnitude more per image.
+  //
+  // The $40/1M rate is gpt-image-1's published image-output rate, applied here
+  // because the measurement is in tokens and gpt-image-2's own rate was not
+  // confirmed against a bill. Coarse by design (see the header) — worth a
+  // re-check against a real invoice before anyone quotes it to the client.
+  openai_image:    { unit: "per_image",    usd: 0.0063 },
   // Gemini's own nano-banana image model — the PREFERRED still fallback when the
   // 69labs pool is exhausted (same model 69labs resells, so matching look).
   // Google bills per image; tune if GEMINI_IMAGE_MODEL changes to a Pro tier.

@@ -68,7 +68,13 @@ import { isProductPrompt } from "@/lib/synthetic/constants";
 // their stills are interchangeable for reuse. This is NOT the fallback-era
 // problem the allow-list was built to solve — that was about FLUX/Gemini stills
 // from a DIFFERENT model quietly entering the pool.
-export const REUSABLE_IMAGE_PROVIDERS = ["sixtynine_image", "ai33_image"] as const;
+//
+// "openai_image" joins on 2026-08-24 on exactly that test, not on seniority:
+// OpenAI serves gpt-image-2 directly — the same model both resellers proxy —
+// against the same style prompt, so its stills are interchangeable for reuse
+// too. It is the vendor that changes on a failover, not the picture, which is
+// the only thing this list cares about.
+export const REUSABLE_IMAGE_PROVIDERS = ["sixtynine_image", "ai33_image", "openai_image"] as const;
 
 // Stills from the REMOVED fallback chain. Distinct from the allow-list above:
 // these are the rows we can PROVE are off-style, so they are the only ones
