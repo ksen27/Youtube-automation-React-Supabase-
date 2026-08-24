@@ -65,21 +65,33 @@ kill_timeout = "300s"
   # is accepted at submit on 69labs and then FAILS ~4 min into the render
   # (measured twice, 2026-08-16). 2K comes from ai33 instead — see below.
   SIXTYNINE_LABS_IMAGE_MODEL = "gpt-image-2"
-  # ai33.pro (OpenSpeaker) — PRIMARY image + voiceover provider; 69labs is the
-  # backup. AI33_API_KEY is a SECRET (flyctl secrets set), never [env]. These
-  # three are just tuning:
+  # ai33.pro (OpenSpeaker) — VOICEOVER ONLY as of 2026-08-24. AI33_API_KEY is a
+  # SECRET (flyctl secrets set), never [env].
+  #
+  # Client direction 2026-08-24: drop ai33 from the STILLS chain. Its TTS role
+  # behind 69labs is deliberately kept, which is why this is the lane-scoped
+  # AI33_IMAGE_ENABLED and NOT the AI33_ENABLED master switch — the master would
+  # have taken voiceover's only fallback down with it and left that stage
+  # single-provider. Set back to "true" to restore ai33 stills; no code change.
+  #
+  # The image chain is therefore: 69labs -> OpenAI direct.
+  AI33_IMAGE_ENABLED = "false"
+  # The three settings below now only matter if AI33_IMAGE_ENABLED goes back to
+  # "true". Kept, not deleted, so restoring ai33 stills stays a one-word edit:
   #   - ai33 resolutions are UPPERCASE ("2K"); the lowercase 69labs spelling is
   #     rejected, which is why the providers keep separate settings.
   #   - "1K" per client direction 2026-08-16. Measured: 1K = 1280x720, 1,902
   #     credits, ~113s; 2K = 2048x1152, 2,574 credits, ~130s. So 1K saves 26% of
   #     credits and ~13% of time for 2.6x fewer pixels, and the synthetic engine
   #     renders on a 3840x2160 canvas — 1K upscales 3x into the frame vs 1.9x
-  #     for 2K. Set "2K" here to reverse it; no code change needed.
+  #     for 2K.
   AI33_IMAGE_MODEL = "gpt-image-2"
   AI33_IMAGE_RESOLUTION = "1K"
   AI33_IMAGE_QUALITY = "high"
-  # OpenAI direct — LAST-RESORT still fallback, tried only after BOTH ai33 and
-  # 69labs have failed (client direction 2026-08-24, after a 69labs outage).
+  # OpenAI direct — the ONLY still fallback now that ai33 is out of this lane,
+  # tried when 69labs fails (client direction 2026-08-24, after a 69labs outage).
+  # Note what that promotion means: this used to be third in line and is now
+  # second, so an outage reaches it immediately instead of via ai33.
   # OPENAI_API_KEY is a SECRET (flyctl secrets set), never [env]; these are the
   # tuning knobs. Without the secret this stays dark no matter what the flag says.
   #

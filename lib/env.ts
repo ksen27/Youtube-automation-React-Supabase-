@@ -661,6 +661,18 @@ const ServerEnvSchema = z.object({
   // provider chain; WHICH END it sits at is set by SYNTHETIC_*_PROVIDER_PRIMARY
   // below (it is no longer implicitly first — see that note).
   AI33_ENABLED: boolish(true),
+  // Per-lane override, IMAGES ONLY. Off = ai33 is dropped from the image chain
+  // while its VOICEOVER role is untouched (client direction 2026-08-24: drop
+  // ai33 from stills, keep it behind 69labs for TTS).
+  //
+  // This exists because AI33_ENABLED is a MASTER switch across both lanes, so
+  // using it here would have silently taken the TTS fallback down too and left
+  // voiceover single-provider — an outage on 69labs would then fail the stage
+  // outright rather than ride it out.
+  //
+  // AI33_ENABLED still wins: off there means off everywhere, and this flag can
+  // only subtract. It cannot put ai33 back into a lane the master switch closed.
+  AI33_IMAGE_ENABLED: boolish(true),
 
   // WHICH PROVIDER LEADS the image / TTS chain. The other one becomes the
   // fallback; both still participate, so an outage on either is ridden out.

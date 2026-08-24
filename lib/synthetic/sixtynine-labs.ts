@@ -1079,7 +1079,12 @@ export function plannedImageProvider(
 ): "ai33_image" | "sixtynine_image" | "openai_image" {
   // A pinned key means the caller demanded 69labs (CelebForge) — see generateImage.
   if (pinnedKey?.trim()) return "sixtynine_image";
-  const first = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY)[0];
+  // Must apply the SAME ai33 filter generateImage does, or this reports a vendor
+  // the image lane has been switched away from — the exact class of lie this
+  // function was written to stop.
+  const first = providerOrder(getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY).filter(
+    (p) => getEnv().AI33_IMAGE_ENABLED || p !== "ai33",
+  )[0];
   // OpenAI can only LEAD when neither reseller is configured at all. Reporting
   // it in that case is the whole point of this function: the old hardcoded line
   // named a vendor that was not running, and a log that names the wrong vendor
@@ -1192,9 +1197,14 @@ export async function generateImage(
 
   // A PINNED 69labs key (CelebForge) means the caller demanded that vendor, so
   // ai33 is dropped from the chain entirely rather than merely demoted.
+  // ai33 leaves the IMAGE chain on two independent grounds, hence one filter:
+  //   - a PINNED 69labs key (CelebForge), for the reason given above; or
+  //   - AI33_IMAGE_ENABLED=false, the lane-scoped switch. Its TTS role is
+  //     deliberately unaffected — see the note on that setting in lib/env.ts.
+  const dropAi33 = pinnedSixtyNine || !getEnv().AI33_IMAGE_ENABLED;
   const providers: Array<"ai33" | "sixtynine" | "openai"> = providerOrder(
     getEnv().SYNTHETIC_IMAGE_PROVIDER_PRIMARY,
-  ).filter((p) => !(pinnedSixtyNine && p === "ai33"));
+  ).filter((p) => !(dropAi33 && p === "ai33"));
   // A 69labs resume pointer jumps 69labs to the front (see above).
   if (resumeIsSixtyNine && providers.length > 1 && providers[0] === "ai33") providers.reverse();
 
