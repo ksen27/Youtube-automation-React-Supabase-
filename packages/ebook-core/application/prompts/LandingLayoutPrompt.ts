@@ -48,8 +48,12 @@ import type { AiContentBlock } from '../ports/services/AiTextGenerator';
  *    run, so a reference whose design lives in variables is no longer read as
  *    having no design at all. Layouts derived before this were told the wrong
  *    typefaces and grounds.
+ * 4: the reference is a reference, not a thing to transcribe — its words,
+ *    claims, products and reviews are explicitly off the table, and no slot
+ *    may ask for a review, rating or social-proof count. The page contract
+ *    now refuses those outright, which this hash cannot see.
  */
-export const LANDING_LAYOUT_VERSION = 3;
+export const LANDING_LAYOUT_VERSION = 4;
 
 export const LandingLayoutPrompt = {
   build(input: {
@@ -109,6 +113,24 @@ export const LandingLayoutPrompt = {
       '"Add to cart" — you may write directly. Anything specific to a book is a slot.',
       'Structural text you can see in the reference (section headings, eyebrows,',
       'card titles, FAQ questions and answers, body paragraphs) is ALL slots.',
+      '',
+      // The vocabulary already refuses to let a model write TESTIMONIALS, and
+      // the copy prompt already refuses to invent one. Neither helped: the slot
+      // manifest is written HERE, so declaring {"key":"hero.quote","purpose":
+      // "Reader quote"} routes an invented endorsement around both. A page
+      // shipped with "I cried the first time I tasted it again — HOME COOK,
+      // RURAL TENNESSEE" against a book nobody had read yet.
+      'NO SLOT MAY ASK FOR SOMEONE ELSE\'S WORDS OR A NUMBER NOBODY MEASURED.',
+      'Do not declare a slot for a review, a reader quote, a testimonial, a star',
+      'rating, a customer count, a copies-sold figure, a subscriber count, an award,',
+      'a press mention or a "as seen in" line. Do not draw the furniture for them',
+      'either — no star glyphs, no rating rows, no quote cards, no avatar circles',
+      'beside a name. An endorsement nobody gave is a fabricated claim about a real',
+      `person, and it is the seller who carries that. ${PLACEHOLDERS.testimonials} is the ONLY`,
+      'route for a quote, it is filled from what the seller actually supplied, and it',
+      'renders to nothing when they have supplied none — so design as though it will.',
+      'Persuade with what is TRUE and checkable instead: what the book contains, how',
+      'many pages and chapters, who it is for, what it costs, the guarantee.',
       '',
       'PLACEHOLDERS. Position these exactly as written; the system substitutes real',
       'markup for them afterwards. Never write a price, a link or an image yourself.',
@@ -422,17 +444,32 @@ export const LandingLayoutPrompt = {
           ...(input.reference.markup
             ? [
                 '',
-                '=== THE TEMPLATE MARKUP (pruned) ===',
-                'This is the reference page\'s actual DOM. Your task is to COPY THIS',
-                'TEMPLATE, not to design in its spirit: reproduce its element structure,',
-                'section order, spacing and component shapes as faithfully as the rules',
-                'allow, translating its styling — including what its utility class names',
-                'imply — into your own stylesheet on the palette variables.',
-                'Change ONLY these things:',
-                '  - the words: swap every piece of its text for the approved copy',
-                '  - the colours: express everything through the palette variables',
-                '  - images, prices, buy links, guarantees: use the placeholders',
-                '  - branding: our book\'s title and author, never theirs',
+                '=== THE REFERENCE MARKUP (pruned) ===',
+                // This block used to open "your task is to COPY THIS TEMPLATE,
+                // not to design in its spirit", and the pages it produced were
+                // reproductions: the same sections in the same order holding the
+                // same claims, which is someone else's work republished under
+                // our seller's name. The markup is still worth showing — it is
+                // the clearest record of how the page is BUILT — but as
+                // something to learn from, not to transcribe.
+                'This is the reference page\'s DOM. Read it the way a designer reads a',
+                'site they admire: to understand how it is put together — how it opens,',
+                'what it establishes before it asks for money, how its sections are',
+                'proportioned, where it puts air, what its component shapes are.',
+                'Then build OUR page for OUR book. What you take:',
+                '  - the visual language: palette, type treatment, spacing, rhythm,',
+                '    component shapes, how much air sits around things',
+                '  - the ARGUMENT ORDER: what it establishes first, second, third — that',
+                '    sequence is why the page converts, and it belongs to no one',
+                'What you do NOT take:',
+                '  - its words. Not one sentence, headline, label or list item. Every',
+                '    piece of prose comes from the approved copy for THIS book',
+                '  - its claims, statistics, prices, guarantees, reviews or credentials',
+                '  - its products. It may sell books we do not have; we sell ours',
+                '  - its branding, its name, its author, its contact details',
+                '  - its photographs (see the imagery rule above)',
+                'A section of theirs we have no equivalent for is DROPPED, not filled with',
+                'something invented to occupy it.',
                 'Drop entirely: its scripts, cookie/consent chrome, tracking, and any',
                 'section whose content we have no equivalent for (e.g. testimonials when',
                 'none are supplied). If it sells several products and we have one, keep',

@@ -325,6 +325,37 @@ describe('validateGeneratedPage', () => {
     });
   });
 
+  describe('endorsements nobody gave', () => {
+    // TESTIMONIALS is system-sourced and the copy prompt refuses to invent one,
+    // and a page still shipped "I cried the first time I tasted it again — HOME
+    // COOK, RURAL TENNESSEE" for a book nobody had read. The layout model writes
+    // its own slot manifest, so a slot declared as a reader quote routes around
+    // both guards.
+    it.each([
+      ['<div class="stars">★★★★★</div>', 'star ratings'],
+      ['<p>Rated 4.8 out of 5 by readers</p>', 'a rating figure'],
+      ['<div class="testimonial"><p>Changed how I cook.</p></div>', 'a review or testimonial block'],
+      ['<p>Join 12,000 happy readers</p>', 'a social-proof count'],
+      ['<p>As seen in Good Housekeeping</p>', 'a press mention'],
+    ])('rejects %s', (snippet) => {
+      const bad = page({ bodyHtml: page().bodyHtml + snippet });
+      expect(errorsOf(bad).some((e) => e.includes('fabricated claim'))).toBe(true);
+    });
+
+    it("still allows the seller's own supplied quotes", () => {
+      // The placeholder is filled from what the seller actually provided, and
+      // renders to nothing when they provided none.
+      const good = page({ bodyHtml: page().bodyHtml + '<section>{{TESTIMONIALS}}</section>' });
+      expect(errorsOf(good).some((e) => e.includes('fabricated claim'))).toBe(false);
+    });
+
+    it("does not fire on the book's own page and chapter counts", () => {
+      // The checkable facts the page is supposed to persuade with instead.
+      const good = page({ bodyHtml: page().bodyHtml + '<p>101 recipes across 111 pages.</p>' });
+      expect(errorsOf(good).some((e) => e.includes('fabricated claim'))).toBe(false);
+    });
+  });
+
   describe('colour discipline', () => {
     // The palette is derived from the cover and its contrast is already proven.
     // A raw colour would bypass that guarantee entirely.

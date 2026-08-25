@@ -374,6 +374,33 @@ export function validateGeneratedPage(page: GeneratedPage, options: ValidateOpti
     );
   }
 
+  // ── endorsements nobody gave ──
+  // TESTIMONIALS is `source: 'system'` and the copy prompt refuses to invent
+  // one, and a page still shipped with "I cried the first time I tasted it
+  // again — HOME COOK, RURAL TENNESSEE" against a book nobody had read. The
+  // layout model writes its own slot manifest, so a slot declared as a reader
+  // quote is filled by the copywriter without either guard ever applying. This
+  // is the check that does not depend on a model following an instruction: a
+  // fabricated endorsement is a claim about a real person, and the seller is
+  // the one who answers for it.
+  const invented: Array<[RegExp, string]> = [
+    [/★|⭐|<[^>]+class="[^"]*\bstars?\b[^"]*"/i, 'star ratings'],
+    [/\b\d(?:\.\d)?\s*(?:\/\s*5|out of 5|stars?)\b/i, 'a rating figure'],
+    [/<[^>]+class="[^"]*(?:testimonial|review|quote-card)[^"]*"/i, 'a review or testimonial block'],
+    [/\b(?:\d[\d,.]*\+?\s*(?:happy\s+)?(?:readers|customers|reviews|copies sold|subscribers))\b/i, 'a social-proof count'],
+    [/\bas seen (?:in|on)\b/i, 'a press mention'],
+  ];
+  for (const [pattern, what] of invented) {
+    const hit = pattern.exec(bodyHtml);
+    if (!hit) continue;
+    errors.push(
+      `Remove ${what} ("${hit[0].slice(0, 40)}"). Nobody supplied it, so it would be a fabricated claim. ` +
+        `Reader quotes come only from ${PLACEHOLDERS.testimonials}, which renders nothing when the seller has ` +
+        'supplied none — persuade with the page count, the chapter list, the price and the guarantee instead.',
+    );
+    break; // one example is enough to make the point
+  }
+
   // ── colour discipline ──
   // Raw colours would bypass the cover-derived palette, whose contrast is
   // already proven. Translucent black and white are allowed for shadows and
