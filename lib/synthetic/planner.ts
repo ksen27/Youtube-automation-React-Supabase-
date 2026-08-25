@@ -166,6 +166,42 @@ export interface PlannedSegment {
 // BOTH the full planner prompt and the per-segment prompt regenerator so they
 // produce identically-clean prompts. nano-banana was drawing multi-subject
 // collages (read as a "split image") and burning text/captions into frames.
+// SHOW WHAT THE LINE IS ABOUT (client 2026-08-25, Loom).
+//
+// The complaint, in his words, with the shot we actually produced:
+//   "this mower that cost eight hundred dollars"  -> we showed GLOVES
+//   "it's talking about an email"                 -> we showed a letter
+//   "when he says mugs, you should show mugs"     -> we showed something else
+//   "the script is talking about retained water"  -> we showed no water
+// and the reference channel he holds up as correct: "flour in the bin" is a bin
+// with flour in it; "she made her own cookbook" is a cookbook; "tomato gravy
+// over a biscuit" is tomato gravy over a biscuit.
+//
+// So the standard is literal depiction of the named thing, and it was NOT a
+// model failure -- two rules in this file were instructing the model away from
+// it (contextVarietyRule's one-in-three quota, and the DIFFERENT SCENE block's
+// "do not reuse the subject"). Both are now scoped so that neither can change
+// WHAT the shot is of. This rule is the one that outranks them, and it is
+// placed before them deliberately.
+const SCRIPT_MATCH_RULE =
+  "SHOW WHAT THE LINE IS ABOUT (critical, the client's first requirement): when " +
+  "this block's narration names a CONCRETE THING — an object, a place, a " +
+  "creature, a person, an action, a document — the imagePrompt MUST show THAT " +
+  "THING as the subject of the frame. If the line says mugs, show mugs. If it " +
+  "says an email, show the email. If it says water, show water. If it says a " +
+  "mower that cost eight hundred dollars, show the mower. " +
+  "THE TEST: a viewer who hears this line while looking at this picture must " +
+  "see the connection instantly, with nothing to work out. A shot that is " +
+  "merely in the same WORLD as the line (its setting, its mood, a nearby or " +
+  "related object) is WRONG and is the single thing the client rejects hardest " +
+  "— gloves for a line about a mower, a letter for a line about an email. " +
+  "Pick the MAIN thing the sentence is about, not a detail at its edge: if the " +
+  "line is about what someone paid for a machine, the shot is the machine. " +
+  "Only when a line names NO concrete thing at all (pure commentary, a " +
+  "transition, an abstract claim) may you invent an on-topic visual from the " +
+  "video's world — and even then, prefer whatever the surrounding sentences are " +
+  "physically about.";
+
 const SINGLE_SUBJECT_RULE =
   "SINGLE SUBJECT (critical, client requirement): the imagePrompt MUST " +
   "describe ONE single photographic scene with ONE clear subject that fills the " +
@@ -275,42 +311,61 @@ function brollObjectRule(topic: VideoTopic): string {
     ? `close, candid, hands-on B-roll of the real object in ${topic.setting.trim()}`
     : "close, candid, hands-on B-roll of the real object in the video's own setting";
   return (
-    "B-ROLL, OBJECTS NOT PEOPLE (critical, client requirement): this is an " +
+    "REAL B-ROLL, NOT STOCK (client requirement): this is an " +
     `owner filming ${settingPhrase}, NOT a stock-photo library. When the narration ` +
-    `names a concrete thing ${examplePhrase} the imagePrompt MUST show THAT thing ` +
-    `as the single subject (${brollPhrase}), NOT a person. Do NOT default to ` +
-    "people (no 'an elderly woman', 'a man' standing there) for lines that are " +
-    "about objects — that reads as generic stock footage, which the client does " +
-    "NOT want. Put a PERSON in frame ONLY when the line is genuinely about a " +
-    "person or a first-person action; otherwise show the object / part / place itself."
+    `names a concrete OBJECT ${examplePhrase} the imagePrompt MUST show THAT thing ` +
+    `as the single subject (${brollPhrase}). Do NOT pad an object line with a ` +
+    "person who is just standing there ('an elderly woman', 'a man') — that is " +
+    "the generic stock look the client rejects. " +
+    // 2026-08-25: the old wording read "OBJECTS NOT PEOPLE" and banned people by
+    // default, which was over-read into every clip being disembodied hands. The
+    // reference channel the client holds up as correct is full of people DOING
+    // things -- a mother at a pantry, someone cooking. A person doing the thing
+    // the line describes is not stock footage; a person loitering beside it is.
+    "But when the line IS about a person, or about someone DOING something, SHOW " +
+    "THAT PERSON doing it — a whole person in frame, working, not a pair of " +
+    "disembodied hands. If the line is about someone being told something, show " +
+    "them being told (on the phone, in conversation, reading the letter). People " +
+    "acting out what the narration describes are exactly what we want; people " +
+    "posed beside it are not."
   );
 }
 
-// Context-variety rule (client feedback 2026-07). The object-first rule above
-// made every visual a literal close-up of the narrated thing — an engine video
-// became wall-to-wall engine bays. The client wants the niche's WIDER world on
-// screen too: the subject in use / in motion in its real environment (for an
-// engine video, the vehicles those engines live in driving on real roads). The
-// environment examples come from deriveVideoTopic() so this stays generic for
-// any niche; when the topic is empty the phrasing stays niche-neutral.
+// Context-variety rule (client feedback 2026-07), RESCOPED 2026-08-25.
+//
+// Its original job stands: an engine video should not be wall-to-wall engine
+// bays, so the niche's wider world — the subject in use, in motion, in its real
+// environment — belongs on screen too.
+//
+// What it must no longer do is DECIDE THE SUBJECT. It used to read "do NOT make
+// every visual a literal close-up of the exact object the narration names ...
+// roughly one in three MUST instead show the niche's WIDER real-world context",
+// which is a standing instruction to ignore the script on a third of all blocks.
+// That is where "$800 mower -> gloves" comes from: the model was doing what this
+// rule told it to. Variety is now expressed as a choice of SHOT (angle, scale,
+// moment, whether the thing is in use), never as a licence to show something
+// else. See SCRIPT_MATCH_RULE, which outranks this.
+//
+// The environment examples come from deriveVideoTopic() so this stays generic
+// for any niche; when the topic is empty the phrasing stays niche-neutral.
 function contextVarietyRule(topic: VideoTopic): string {
   const envPhrase = topic.environmentExamples.trim()
     ? `(e.g. ${topic.environmentExamples.trim()})`
     : "(the thing being used, driven, cooked, grown, worn… out in its real environment)";
   return (
-    "CONTEXT VARIETY (critical, client requirement): do NOT make every visual a " +
-    "literal close-up of the exact object the narration names — that reads as the " +
-    "same shot over and over. A meaningful share of blocks (roughly one in three) " +
-    "MUST instead show the niche's WIDER real-world context: the subject in use or " +
-    `in motion in its environment ${envPhrase}. These context shots are on-topic ` +
-    "and in-world — prefer them for imagePrompt2 second visuals, for " +
-    "wide/establishing shotTypes, and for abstract or filler lines (describe the " +
-    "scene as a captured moment; the camera-motion rules elsewhere still apply). " +
-    "When the narration keeps returning to the same " +
-    "object for several blocks in a row, break the run with a context shot rather " +
-    "than another close-up of that same object. The object-first rule above still " +
-    "decides the DEFAULT subject when a line names a concrete thing; this rule " +
-    "supplies the variety around it."
+    "SHOT VARIETY (client requirement): vary HOW you show things, so the video " +
+    "does not read as the same framing over and over. Change the scale and the " +
+    "moment: a close-up of the thing, the thing being used or handled, the thing " +
+    `out in its real environment ${envPhrase}, a wide shot of the place it lives ` +
+    "in. Prefer the in-use and wider framings for imagePrompt2 second visuals and " +
+    "for wide/establishing shotTypes. " +
+    "STRICT LIMIT — this rule NEVER changes WHAT is in the frame: when the line " +
+    "names a concrete thing, that thing is the subject no matter which framing " +
+    "you pick (see SHOW WHAT THE LINE IS ABOUT, which outranks this rule). " +
+    "Showing an unrelated object for the sake of variety is the worst outcome " +
+    "available, far worse than two similar shots in a row. " +
+    "Only for lines that name NOTHING concrete may you fall back to a pure " +
+    "context shot of the niche's wider world."
   );
 }
 
@@ -469,6 +524,31 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
 type PlannerPayload =
   | { mode: "text"; transcript: string }
   | { mode: "sentences"; numbered: string; from: number; to: number };
+
+// HOW FAST THE MOTION IN AN ai_clip RUNS.
+//
+// One definition, shared by the full planner prompt and the single-block
+// regenerate, because a block that drifts from the others shows up as a handful
+// of clips moving at a different speed from the rest of the video — worse than
+// either setting applied uniformly.
+//
+// The wording is deliberately two-sided. It has to hold BOTH client reports:
+//   - 2026-08-22 "the video is quick movement so some issue is happend" — the
+//     smear complaint, which is why nothing here asks for speed;
+//   - 2026-08-25 "the clips ... do not match at all / very very bad" — which
+//     came after the 08-22 fix made the subject stop moving, so the clip was
+//     indistinguishable from the still under it.
+// "Completes within the clip" is the load-bearing half: it is the only line
+// that makes an unmoving result WRONG rather than merely cautious.
+const ANIMATION_SPEED_RULE_LINES = [
+  "The motion runs at a STEADY, EVEN, NATURAL pace and must be CLEARLY VISIBLE:",
+  "describe an action that BEGINS AND COMPLETES inside the clip, so there is",
+  "real, continuous movement from the first frame to the last. Never describe a",
+  "frozen, static or barely-moving shot — a clip that looks like the still it",
+  "was made from is a failed clip. Equally, never describe rushed, sudden or",
+  "jerky motion (it renders as a blur), and never ask for a slow-motion EFFECT",
+  "or a speed ramp.",
+];
 
 function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): string {
   const topicBlock = buildTopicBlock(topic);
@@ -645,6 +725,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     // as permission to name a character or a toy line. See safe-depiction.ts.
     NAMED_IP_RULE,
     "",
+    SCRIPT_MATCH_RULE,
+    "",
     brollObjectRule(topic),
     "",
     contextVarietyRule(topic),
@@ -679,17 +761,11 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "camera is locked off on a tripod and the framing never changes. Camera",
     "movement is what made earlier footage look blurry and jumpy, which the",
     "client rejected — the motion must come from the SUBJECT, not the lens.",
-    // SPEED, client 2026-08-22: "the video is quick movement so some issue is
-    // happend / pls generate the slow movement clip". The old wording told
-    // Gemini to avoid slow motion outright, so every per-block animationPrompt
-    // described a brisk action and the model rendered smeared hands. Those two
-    // asks are compatible once separated: no slow-motion EFFECT (a stylised
-    // speed ramp), but the action itself performed unhurriedly.
-    "The action must be performed SLOWLY, calmly and deliberately — an unhurried,",
-    "gentle, gradual movement carried smoothly across the whole clip. Never",
-    "describe fast, rushed, sudden or jerky motion; a fast action renders as a",
-    "blur where the hands are. Do NOT ask for a slow-motion EFFECT or a speed",
-    "ramp — the action is simply performed gently, at natural speed.",
+    // SPEED, revised 2026-08-25 — same note as on ACTION_CLIP_RULE. The
+    // 2026-08-22 "SLOWLY, calmly and deliberately" wording made Gemini write
+    // barely-moving actions, and on a 4s clip behind a locked-off camera those
+    // render as stills. Steady natural pace, and the action must COMPLETE.
+    ...ANIMATION_SPEED_RULE_LINES,
     // HANDS, same date: "the hands(right and left) is different with each
     // other". Stated positively here because the negative prompt only guards
     // against wrong hands WITHIN a frame, not hands mutating between frames.
@@ -779,13 +855,28 @@ function buildSingleSegmentPrompt(
     ...(hasAvoid
       ? [
           "",
-          "DIFFERENT SCENE (critical): this sentence is shown with MULTIPLE visuals.",
-          "The OTHER visuals of this same sentence ALREADY show the scene(s) listed",
-          "below. Your imagePrompt MUST be a GENUINELY DIFFERENT picture of the same",
-          "thought — a different subject, a different moment, or a different detail —",
-          "NOT the same scene with a reworded angle. Do NOT reuse the subject or",
-          "composition of any already-shown scene; the viewer must see something NEW.",
-          "ALREADY-SHOWN scene(s) to avoid repeating:",
+          "SAME SUBJECT, DIFFERENT SHOT (critical — read this before anything else):",
+          "some scenes below have already been used in this video. You must write a",
+          "DIFFERENT PICTURE. You must NOT write a different SUBJECT.",
+          "",
+          "If this block's line is about the same thing an earlier line was about,",
+          "that thing STAYS in the frame. Change the shot instead: a different",
+          "moment in the same process, a different stage, a different part or",
+          "detail, a different scale, the same thing in a different place, someone",
+          "using it, the result of using it.",
+          "",
+          "FORBIDDEN, and this is the failure the client rejects: dropping the",
+          "line's own subject in order to avoid repeating. Showing a different",
+          "object that merely belongs to the same world — the receipt instead of",
+          "the machine, the tool instead of the thing it was used on, someone's",
+          "hands instead of the person the line is about — is WRONG even when the",
+          "picture is beautiful and even when every scene below is avoided. Two",
+          "similar shots of the correct subject beat one shot of the wrong one.",
+          "",
+          "If you genuinely cannot find another angle on the subject, repeat it",
+          "with a different framing. That is the correct answer, not a substitute",
+          "subject.",
+          "ALREADY-USED scene(s) — frame this block's subject differently from these:",
           ...avoidScenes.filter((s) => s.trim()).map((s, i) => `  ${i + 1}. ${s.trim()}`),
         ]
       : []),
@@ -829,6 +920,8 @@ function buildSingleSegmentPrompt(
     // Regeneration anchors the niche via the stored basePrompt (printed below),
     // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
     // re-derive the topic for a single-block regen.
+    SCRIPT_MATCH_RULE,
+    "",
     brollObjectRule(EMPTY_TOPIC),
     "",
     contextVarietyRule(EMPTY_TOPIC),
@@ -848,7 +941,7 @@ function buildSingleSegmentPrompt(
       // block goes straight to the clip lane, so wording that drifts from the
       // planner's shows up as a handful of fast, smeared clips scattered through
       // an otherwise slow video -- worse than either setting applied uniformly.
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = a REAL HUMAN ACTION the person performs, carried through the whole shot, matching this block\'s narration. The action is performed SLOWLY, calmly and deliberately — unhurried and gradual, never fast, rushed or jerky, because fast motion renders as a blur; this is a gently-performed action, NOT a slow-motion effect. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; ONLY the person moves. No cinematic movement.).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs at a steady, even, natural pace and COMPLETES within the clip: clearly visible movement, never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. No cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
@@ -863,6 +956,26 @@ const SingleSegmentSchema = z.object({
   shotType: optString(),
   animationPrompt: optString(),
 });
+
+// Animation answers that describe NO motion. Stored verbatim these produce a
+// frozen clip, so they are treated as if the field were empty -- see
+// resolveAnimationPrompt for what then covers the block.
+// Only a word that ASSERTS ABSENCE counts. An earlier version also keyed on a
+// leading "motion"/"movement", which matched ordinary descriptions ("motion of
+// the water settles") and threw them away.
+const NO_MOTION_ANSWER_RE = /^(no|none|n\/a|null|nothing|static|still|frozen|motionless|zero)\b/i;
+
+export function isNoMotionAnswer(text: string | null | undefined): boolean {
+  const t = (text ?? "").trim().replace(/^["']|["'.]+$/g, "");
+  if (!t) return true;
+  if (!NO_MOTION_ANSWER_RE.test(t)) return false;
+  // A real description that merely STARTS with one of those words ("still water
+  // in the trough ripples as the tap drips") is a sentence. An answer meaning
+  // "there is no motion here" is two or three words. Bias to keeping the text:
+  // a false positive only falls back to the scene-aware default, while a false
+  // negative stores a frozen clip.
+  return t.split(/\s+/).length <= 5;
+}
 
 export interface RegeneratedPrompt {
   imagePrompt: string;        // composed WITH the base prompt in front
@@ -960,8 +1073,207 @@ export async function regenerateSegmentPrompt(input: {
     imagePrompt:
       composePrompt(basePrompt, safe.imagePrompt.trim(), safe.shotType?.trim() || null) ??
       safe.imagePrompt.trim(),
-    animationPrompt: blockType === "ai_clip" ? (safe.animationPrompt?.trim() || null) : null,
+    animationPrompt:
+      blockType === "ai_clip" && !isNoMotionAnswer(safe.animationPrompt)
+        ? (safe.animationPrompt?.trim() || null)
+        : null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// MOTION FOR BLOCKS THAT WERE NEVER PLANNED AS CLIPS
+// (client 2026-08-25 via Joey: "im not happy with the logic behind the clips /
+// they are very random and do not match at all / its very very bad actually").
+// ---------------------------------------------------------------------------
+// Gemini writes an animationPrompt only for the blocks IT chose as ai_clip. But
+// most clips in a shipped video were not chosen by Gemini at all -- they were
+// PROMOTED by the two budget passes, which pick blocks by TIMING and SECONDS:
+//
+//   - clip_heavy_intro promotes every 'image' block starting before
+//     SYNTHETIC_CLIP_HEAVY_SECONDS (900s);
+//   - assignClipDurationQuota promotes stills until each phase's seconds budget
+//     is full -- 80% of the opening 4 minutes, per the client's 2026-08-18 ask.
+//
+// Neither writes an animationPrompt (both left it null, with a comment pointing
+// at "the worker's default gentle pan" -- wording that predates the action-clip
+// direction by two months). So the worker fell back to a GENERIC prompt chosen
+// by a regex over the image prompt: either "the person continues the everyday
+// action they are already doing" or ambient leaves-and-dust. Both are written
+// blind to what the block is actually SAYING, which is exactly the report: the
+// footage moves, but the movement has no relationship to the narration.
+//
+// The fix is not to promote fewer blocks -- the 80% share is the client's own
+// number -- but to write real motion for the ones we promote. One batched call
+// covers a dozen blocks; a failure is non-fatal and leaves those blocks on the
+// worker's fallback, exactly as before this pass existed.
+const AnimationBatchSchema = z.object({
+  animations: z.array(z.object({ i: z.number().int(), animationPrompt: z.string().min(1) })),
+});
+
+// Blocks per Gemini call. Small enough that one bad response costs a handful of
+// blocks rather than the video, large enough that a 300-block plan is ~25 calls.
+const ANIMATION_BATCH_SIZE = 12;
+
+function buildAnimationBatchPrompt(
+  basePrompt: string,
+  blocks: Array<{ i: number; script: string; imagePrompt: string }>,
+): string {
+  return [
+    "You are writing the MOTION for shots in a documentary-style video. Each shot",
+    "below already exists as a still photograph, and each one is spoken over by a",
+    "specific line of narration. For every shot, write one animationPrompt: what",
+    "MOVES in that frame while those words are heard.",
+    "",
+    "THE RULE THAT MATTERS MOST: the movement must be about what THIS shot's own",
+    "narration is saying. A shot whose motion has nothing to do with its own line",
+    "is worthless to us -- it is the single thing the client rejects.",
+    "",
+    "LOOK AT WHAT THE STILL ACTUALLY SHOWS before choosing:",
+    "  - If the scene shows a person, hands, or any part of a body, write the REAL",
+    "    HUMAN ACTION that person performs -- the thing the narration describes",
+    "    them doing (pouring, stirring, lifting, digging, wiping, pointing).",
+    "  - If the scene shows NO person, write the natural movement the scene ITSELF",
+    "    contains and that the narration is about: an animal moving, water running,",
+    "    a web swaying, leaves stirring, steam rising, a machine turning, light",
+    "    shifting. In that case NO PEOPLE, hands, fingers or arms may enter the",
+    "    frame at any point -- never invent a person who is not in the still.",
+    "",
+    ...ANIMATION_SPEED_RULE_LINES,
+    "",
+    "THE CAMERA IS LOCKED OFF ON A TRIPOD and never moves: no push-in, no zoom, no",
+    "pan, no tilt, no tracking, no orbit, no shake. Only the subject moves and the",
+    "framing never changes. Do not describe camera moves, cuts, scene changes or",
+    "on-screen text.",
+    "",
+    "Where hands are visible, say they stay consistent throughout: the same two",
+    "hands, same shape and skin tone, five fingers each, never swapping or changing.",
+    "",
+    "Write 1-2 sentences per shot, present tense, describing only the movement. Do",
+    "NOT re-describe the whole scene -- the still already exists.",
+    "",
+    basePrompt.trim() ? `The video's recurring world: ${basePrompt.trim()}` : "",
+    "",
+    "SHOTS:",
+    ...blocks.map((b) =>
+      [
+        `--- shot ${b.i}`,
+        `narration: ${b.script.trim().slice(0, 600)}`,
+        `still shows: ${b.imagePrompt.trim().slice(0, 600)}`,
+      ].join("\n"),
+    ),
+    "",
+    'Respond ONLY with JSON: {"animations":[{"i":<the shot number>,"animationPrompt":"..."}]}',
+    "Return one entry for EVERY shot listed above, keyed by its shot number.",
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+}
+
+/**
+ * Write a per-block animationPrompt for clips that have none, from each block's
+ * OWN narration and its OWN scene. Returns a map of block index -> prompt;
+ * blocks the model omits are simply absent, and the caller leaves those on the
+ * worker's fallback rather than failing the plan over them.
+ */
+export async function generateAnimationPrompts(input: {
+  projectId: string;
+  jobId?: string;
+  basePrompt?: string;
+  blocks: Array<{ i: number; script: string; imagePrompt: string }>;
+}): Promise<Map<number, string>> {
+  const { projectId, jobId, basePrompt = "", blocks } = input;
+  const out = new Map<number, string>();
+  if (blocks.length === 0) return out;
+
+  const batches: Array<Array<{ i: number; script: string; imagePrompt: string }>> = [];
+  for (let i = 0; i < blocks.length; i += ANIMATION_BATCH_SIZE) {
+    batches.push(blocks.slice(i, i + ANIMATION_BATCH_SIZE));
+  }
+
+  // Same concurrency as the plan's other regeneration passes, for the same
+  // reason: enough to keep a long video's fill under a minute, low enough not to
+  // trip Gemini's rate limit alongside them.
+  const limit = makeLimit(5);
+  let failedBatches = 0;
+  await Promise.all(
+    batches.map((batch) =>
+      limit(async () => {
+        try {
+          const { result } = await withGeminiModelFallback(
+            "generateAnimationPrompts",
+            async (model) => {
+              const res = await model.generateContent({
+                contents: [
+                  { role: "user", parts: [{ text: buildAnimationBatchPrompt(basePrompt, batch) }] },
+                ],
+                generationConfig: {
+                  responseMimeType: "application/json",
+                  // Slightly warm: a whole video of promoted blocks written at
+                  // temperature 0 converges on the same three verbs.
+                  temperature: 0.6,
+                  // ~12 short motion descriptions, with headroom so a verbose
+                  // batch cannot truncate mid-string.
+                  maxOutputTokens: 4096,
+                  // No chain-of-thought needed to describe movement, and the
+                  // current model will otherwise spend the whole budget on it
+                  // before emitting any JSON (see buildSyntheticTimeline).
+                  thinkingConfig: { thinkingBudget: 0 },
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                } as any,
+              });
+              const txt = res.response.text();
+              const finishReason = res.response.candidates?.[0]?.finishReason;
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(txt);
+              } catch {
+                // Tagged retryable so the fallback model gets a turn -- same
+                // handling as regenerateSegmentPrompt.
+                throw new Error(
+                  `GEMINI_TRUNCATED generateAnimationPrompts non-JSON (finishReason=${finishReason}, chars=${txt.length})`,
+                );
+              }
+              const safe = AnimationBatchSchema.safeParse(parsed);
+              if (!safe.success) {
+                throw new Error(
+                  `generateAnimationPrompts: schema: ${JSON.stringify(safe.error.flatten()).slice(0, 200)}`,
+                );
+              }
+              return safe.data;
+            },
+            { attempts: 2, baseMs: 800 },
+            { attempts: 4, baseMs: 1500 },
+          );
+          // Only accept indices we actually asked about. A model that invents a
+          // shot number would otherwise write motion onto an unrelated block --
+          // the very bug this pass exists to fix.
+          const asked = new Set(batch.map((b) => b.i));
+          for (const a of result.animations) {
+            const prompt = a.animationPrompt.trim();
+            // isNoMotionAnswer: the model answers "no movement" / "still image"
+            // on scenes it judges static, and a stored answer beats every
+            // fallback -- so drop it and let the scene-aware default cover the
+            // block instead of storing a frozen clip.
+            if (prompt && asked.has(a.i) && !isNoMotionAnswer(prompt)) out.set(a.i, prompt);
+          }
+        } catch (e) {
+          failedBatches++;
+          await logJob({ projectId, jobId }, "synthetic.plan.animation_prompts.batch_failed", {
+            blocks: batch.map((b) => b.i),
+            err: (e as Error).message?.slice(0, 200),
+          });
+        }
+      }),
+    ),
+  );
+  if (failedBatches > 0) {
+    await logJob({ projectId, jobId }, "synthetic.plan.animation_prompts.partial", {
+      batches: batches.length,
+      failedBatches,
+      note: "those blocks keep the worker's generic fallback motion",
+    });
+  }
+  return out;
 }
 
 // Stamp each Gemini segment with its real spoken window from the Deepgram word
@@ -1040,6 +1352,102 @@ function alignSegments(
 // now lead with the block's SHOT TYPE + scene-specific prompt (the thing that
 // actually varies) and append the basePrompt as a trailing setting/mood clause,
 // so the subject and framing dominate and the world is context, not the lede.
+// A DRIFTED basePrompt POISONS THE WHOLE VIDEO (client 2026-08-25, Loom:
+// "the footage is so repetitive ... constantly someone holding a computer on a
+// mountain. It doesn't make sense").
+//
+// composePrompt below appends the base to EVERY visual block as
+// "`. Setting: <base>.`". With ~200 blocks in a 20-minute video, one bad
+// sentence is rendered two hundred times. If the base says "a person holding a
+// laptop on a mountainside", every shot in the video contains a person holding a
+// laptop on a mountainside -- which is both the repetition the client reports
+// and the nonsense he reports, from a single cause.
+//
+// The planner prompt already TELLS Gemini what a base may contain (setting, era,
+// mood only -- no fixed framing, no named subject). Nothing ENFORCED it: the
+// answer was taken verbatim with `if (i === 0) basePrompt = bp`. An instruction
+// without a check is a suggestion, and on a long enough run the model declines
+// it. This is the check.
+//
+// STRIPS rather than rejects: a base is a comma-separated list of clauses, and
+// the offending one is usually a single clause among several good ones ("a rural
+// kitchen, warm afternoon light, a woman kneading dough" -> drop the last).
+// Dropping beats regenerating: it needs no extra model call on the plan's
+// critical path, and it cannot fail open.
+//
+// An EMPTY result is a perfectly safe outcome -- composePrompt returns the
+// block's own prompt when the base is empty, so each shot simply stands on its
+// own scene description. That is strictly better than a poisoned world.
+
+// Framing/composition words. A base must never fix the camera: that is each
+// block's shotType, and baking one in makes every shot the same picture.
+const BASE_FRAMING_RE =
+  /\b(close[- ]?up|closeup|wide shot|medium shot|macro|portrait|overhead|bird'?s[- ]eye|low[- ]angle|high[- ]angle|over[- ]the[- ]shoulder|shot of|framed?|composition)\b/i;
+
+// A named human subject, usually with an action attached. This is the clause
+// that produced "someone holding a computer": a person doing a specific thing,
+// pinned into every frame of the video.
+const BASE_SUBJECT_RE =
+  /\b(a|an|the|one|someone|somebody)\s+(?:\w+\s+){0,2}(man|woman|person|people|guy|girl|boy|child|kid|adult|figure|worker|farmer|scientist|researcher|presenter|host)\b/i;
+
+// Actions pin a subject into a fixed pose across the whole video.
+const BASE_ACTION_RE =
+  /\b(holding|carrying|standing|sitting|kneeling|walking|wearing|using|operating|pointing|looking at|working on)\b/i;
+
+function clauseIsPoison(clause: string): boolean {
+  const c = clause.trim();
+  if (!c) return true;
+  return BASE_FRAMING_RE.test(c) || BASE_SUBJECT_RE.test(c) || BASE_ACTION_RE.test(c);
+}
+
+export interface BasePromptCheck {
+  cleaned: string;
+  dropped: string[];
+}
+
+/**
+ * Strip clauses that must not be repeated across every block of a video.
+ *
+ * Returns the surviving clauses joined back together, plus what was removed so
+ * the plan log can show it. A base that is entirely poison cleans to "" -- see
+ * the note above for why that is safe.
+ */
+export function sanitizeBasePrompt(basePrompt: string | null | undefined): BasePromptCheck {
+  const raw = (basePrompt ?? "").trim();
+  if (!raw) return { cleaned: "", dropped: [] };
+
+  // Split on commas and semicolons only. Sentences are NOT split on "." because
+  // a base is written as one sentence and periods appear inside abbreviations.
+  const clauses = raw.split(/[,;]+/).map((c) => c.trim()).filter(Boolean);
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const c of clauses) {
+    if (clauseIsPoison(c)) dropped.push(c);
+    else kept.push(c);
+  }
+
+  // Nothing splittable (a single clause) that is itself poison -> empty.
+  return { cleaned: kept.join(", ").replace(/[.,\s]+$/, ""), dropped };
+}
+
+/** sanitizeBasePrompt + a log line naming what was removed and why. */
+async function applyBasePromptGuard(
+  raw: string,
+  ids: { projectId: string; jobId?: string },
+): Promise<string> {
+  const { cleaned, dropped } = sanitizeBasePrompt(raw);
+  if (dropped.length > 0) {
+    await logJob(ids, "synthetic.plan.base_prompt_sanitized", {
+      original: raw.slice(0, 300),
+      cleaned: cleaned.slice(0, 300),
+      dropped,
+      // Every block of the video would have carried these clauses.
+      note: "clauses fixing a subject/action/framing were removed from the recurring world",
+    });
+  }
+  return cleaned;
+}
+
 function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?: string | null): string | null {
   const base = basePrompt.trim();
   const block = (blockPrompt ?? "").trim();
@@ -1608,7 +2016,8 @@ export function splitMergedVisuals(
 //     to image. Even spacing avoids a clump of clips then a clump of stills.
 // avatar / split_2 are NEVER touched (different render paths). A block flipped
 // to image loses its animationPrompt (a still has no motion); a block flipped to
-// ai_clip gets a null animationPrompt and the worker's default gentle push-in.
+// ai_clip gets a null animationPrompt here and has one written for it by the
+// fill pass at the end of the plan (see generateAnimationPrompts).
 //
 // Pre-cutoff mix (client 2026-07-22: "30% clips - 70% images for the first 15
 // mins"): when `introClipFraction` > 0 the window uses the SAME even-spacing
@@ -3313,7 +3722,7 @@ export async function buildSyntheticTimeline(input: {
         `${i + 1}/${ranges.length}`,
         topic,
       );
-      if (i === 0) basePrompt = bp;
+      if (i === 0) basePrompt = await applyBasePromptGuard(bp, { projectId, jobId });
       // Gemini's grouping is a suggestion; the partition is not. Repair each
       // chunk against its OWN range so a chunk can never bleed into another.
       const fixed = repairCoverage(blocks, from, to);
@@ -3392,7 +3801,7 @@ export async function buildSyntheticTimeline(input: {
         `${i + 1}/${chunks.length}`,
         topic,
       );
-      if (i === 0) basePrompt = bp;
+      if (i === 0) basePrompt = await applyBasePromptGuard(bp, { projectId, jobId });
       rawSegments.push(...segments);
     }
     if (rawSegments.length === 0) {
@@ -3687,9 +4096,12 @@ export async function buildSyntheticTimeline(input: {
   // BEFORE the duration-split pass (so a promoted long clip is still carved into
   // LTX-tier pieces with the usual clip-then-fill-image handling).
   //
-  // A promoted block has no animationPrompt from Gemini (it was an 'image'); the
-  // worker falls back to the client's default gentle pan, so we leave it null
-  // here rather than inventing per-block motion text.
+  // A promoted block has no animationPrompt from Gemini (it was an 'image').
+  // It is left null HERE -- the later fill pass writes one from the block's own
+  // narration once every type pass has run, which is the only point where the
+  // block's final scene is known. Before that pass existed this null reached the
+  // worker and became a generic fallback motion unrelated to the line being
+  // spoken, which is the "clips do not match" report of 2026-08-25.
   {
     const cutoff = getEnv().SYNTHETIC_CLIP_HEAVY_SECONDS;
     if (cutoff > 0) {
@@ -4354,6 +4766,64 @@ export async function buildSyntheticTimeline(input: {
     if (demotedZeroWindow > 0) {
       await logJob({ projectId, jobId }, "synthetic.plan.zero_window_split2_demoted", {
         count: demotedZeroWindow, minWindowSeconds: AVATAR_MIN_WINDOW,
+      });
+    }
+  }
+
+  // MOTION FOR EVERY CLIP, WRITTEN FROM ITS OWN NARRATION (client 2026-08-25
+  // via Joey: "the clips ... are very random and do not match at all").
+  //
+  // Runs LAST of the content passes, and that position is the point of it: by
+  // here the block types are final (both promotion passes and the duration
+  // quota have run) and the scenes are final (the second-visual and scene-dedupe
+  // regenerations have run), so every ai_clip that will actually ship is visible
+  // and every one of them is matched against the scene it will really show.
+  //
+  // Before this pass, a promoted block reached the worker with animation_prompt
+  // NULL and got a generic fallback picked by a regex -- motion unrelated to the
+  // line being spoken over it. See generateAnimationPrompts.
+  //
+  // Non-fatal by construction: a block the model skips keeps its null and the
+  // worker's fallback still covers it, so a Gemini outage degrades the clips
+  // rather than failing a plan that is otherwise complete.
+  {
+    const needMotion = planned
+      .map((p, i) => ({ p, i }))
+      .filter(
+        ({ p }) =>
+          p.blockType === "ai_clip" &&
+          !(p.animationPrompt ?? "").trim() &&
+          !!(p.imagePrompt ?? "").trim() &&
+          !!(p.script ?? "").trim(),
+      );
+    if (needMotion.length > 0) {
+      const filled = await generateAnimationPrompts({
+        projectId,
+        jobId,
+        basePrompt,
+        blocks: needMotion.map(({ p, i }) => ({
+          i,
+          script: p.script,
+          imagePrompt: p.imagePrompt as string,
+        })),
+      });
+      let written = 0;
+      for (const { p, i } of needMotion) {
+        const motion = filled.get(i);
+        if (motion) {
+          p.animationPrompt = motion;
+          written++;
+        }
+      }
+      const clipBlocks = planned.filter((p) => p.blockType === "ai_clip").length;
+      await logJob({ projectId, jobId }, "synthetic.plan.animation_prompts_filled", {
+        clipBlocks,
+        missingBefore: needMotion.length,
+        written,
+        // Non-zero means that many clips still ship on the worker's generic
+        // fallback -- the metric to watch if the client reports mismatched
+        // footage again.
+        stillMissing: needMotion.length - written,
       });
     }
   }

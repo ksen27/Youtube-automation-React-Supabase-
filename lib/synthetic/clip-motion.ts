@@ -69,8 +69,9 @@ export const AMBIENT_MOTION_ANIMATION_PROMPT =
   "NO PEOPLE APPEAR and no hands, fingers, arms or any part of a body enters " +
   "the frame at any point — nothing is added to the scene that is not already " +
   "visible in it. " +
-  "The movement is SLOW, calm and subtle — unhurried and gradual, never fast, " +
-  "rushed or jerky. " +
+  "The movement is UNHURRIED but CLEARLY VISIBLE — steady and continuous from " +
+  "the first frame to the last, never rushed or jerky, and never so slight that " +
+  "the shot could be mistaken for a still photograph. " +
   "The CAMERA IS COMPLETELY STILL AND LOCKED OFF on a tripod — absolutely NO " +
   "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
   "tracking, no orbit, no camera shake; the framing never changes. " +

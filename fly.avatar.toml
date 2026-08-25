@@ -263,7 +263,15 @@ kill_timeout = "300s"
   #     repeat an earlier scene in the SAME script (the "spoons" complaint).
   ASSET_LIBRARY_MAX_REUSE_FRACTION = "0.15"
   SYNTHETIC_SCENE_DEDUPE_ENABLED = "true"
-  SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.5"
+  # 0.5 -> 0.7 (client 2026-08-25, Loom: "it doesn't match the script at all").
+  # Note his ORIGINAL 08-19 ask was "not too repetitive AND it matches the
+  # script better" -- only the first half got built. At 0.5 a Jaccard overlap of
+  # half the content words counts as a repeat, so on a script that stays on one
+  # subject (every script we get) most blocks were flagged and regenerated away
+  # from that subject. 0.7 flags near-clones only. The prompt half of this fix
+  # matters more: a flagged block is now told to reframe the SAME subject rather
+  # than to find a different one (see the DIFFERENT SHOT block in planner.ts).
+  SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.7"
   SYNTHETIC_SCENE_DEDUPE_WINDOW = "40"
   SYNTHETIC_SCENE_DEDUPE_MAX_REGEN = "80"
   # Confine the clip budget inside the 15-minute SYNTHETIC_CLIP_HEAVY_SECONDS

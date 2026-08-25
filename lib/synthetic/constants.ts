@@ -106,23 +106,41 @@ export function withStylePrompt(basePrompt: string): string {
 // footage's amateur-phone texture, or the moving shots stand out as the
 // polished ones.
 export const ACTION_CLIP_RULE =
-  "Show the PERSON PERFORMING THE ACTION — a single, clearly readable everyday " +
-  "human action carried through the whole shot (hands doing the thing the " +
-  "narration describes: pouring, stirring, lifting, wiping, planting). " +
+  "Show the SUBJECT PERFORMING THE ACTION the narration describes — one " +
+  "clearly readable action carried through the whole shot. " +
+  // 2026-08-25: this used to read "hands doing the thing the narration
+  // describes", which is why every clip came back as disembodied hands. Where
+  // there is a person, show the person doing it; hands alone are one option
+  // among many, not the house style.
+  "When a person is in the scene, show THE PERSON doing it — their body and " +
+  "posture in frame, working — not a close-up of hands alone. Hands-only " +
+  "framing is allowed when the action genuinely is a pair of hands at work, " +
+  "never as the default. When no person is in the scene, the thing itself " +
+  "moves and NO hands, arms or people enter the frame at any point. " +
   "The CAMERA IS COMPLETELY STILL AND LOCKED OFF on a tripod — absolutely NO " +
   "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
   "tracking, no orbit, no camera shake. ONLY THE PERSON AND THE OBJECTS THEY " +
   "TOUCH MOVE; the framing never changes. " +
-  // SPEED, 2026-08-22. Was "Natural real-time speed — NOT slow motion, NOT sped
-  // up". Client on a real 720p test clip: "the video is quick movement so some
-  // issue is happend / pls generate the slow movement clip". This REVERSES the
-  // 2026-08-17 wording; the two asks are about different things and both hold:
-  // that one banned SLOW-MOTION-AS-AN-EFFECT (a stylised ramp), this one asks
-  // for the action itself to be performed unhurriedly. "Not sped up" is kept for
-  // that reason.
-  "The movement is SLOW, calm and deliberate — unhurried, gentle and gradual, " +
-  "carried smoothly through the whole shot; no sudden, rushed or jerky motion, " +
-  "NOT sped up, no dramatic or cinematic movement, no motion blur on the camera. " +
+  // SPEED, revised 2026-08-25. The 2026-08-22 wording ("The movement is SLOW,
+  // calm and deliberate") was written for the client's "pls generate the slow
+  // movement clip" note, and it overshot: paired with the negative prompt's
+  // "sudden movement / rushed movement" terms, a LOCKED-OFF camera and a 4s
+  // clip, nothing in frame was left allowed to move at a visible rate. Clips
+  // came back reading as stills, which is the 2026-08-17 complaint ("human
+  // movement, actions in the clips, not just random zoom") all over again from
+  // the other direction.
+  //
+  // What the client reported on 2026-08-22 is SMEAR, not speed — and smear is
+  // fought by the artifact terms in CLIP_NEGATIVE_PROMPT (smearing, ghosting,
+  // motion smear, trailing artifacts), which is where that fight belongs. So: a
+  // steady natural pace, plus an explicit requirement that the action READS —
+  // it has to start and finish inside the clip.
+  "The action is performed at a STEADY, EVEN, NATURAL pace and is CLEARLY " +
+  "VISIBLE: it begins and completes within the clip, so the movement reads " +
+  "plainly on screen. Not rushed, jerky or sudden; NOT sped up; NOT a " +
+  "slow-motion effect; and NOT a frozen or barely-moving shot — there is real, " +
+  "continuous movement from the first frame to the last. " +
+  "No dramatic or cinematic movement, no motion blur on the camera. " +
   // HAND CONSISTENCY, 2026-08-22. Client: "the hands(right and left) is
   // different with each other". The library's negative prompt already covers
   // "disfigured hands / wrong hand count", but only WITHIN a frame — it says
@@ -156,8 +174,19 @@ export const CLIP_NEGATIVE_PROMPT =
   "other, smearing, ghosting, motion smear, temporal flicker, warping, " +
   "melting shapes, trailing artifacts, soft or blurred hands while moving, " +
   "loss of detail during movement, " +
-  "fast motion, sped up, rushed movement, jerky movement, sudden " +
-  "movement, jittery movement, camera shake, camera movement, zoom, pan, tilt, " +
+  // MOTION SUPPRESSION, removed 2026-08-25. This list used to carry "fast
+  // motion, sped up, rushed movement, sudden movement" on top of the SLOW
+  // wording in ACTION_CLIP_RULE — two independent brakes on the same pedal, and
+  // between them the subject stopped moving at all. "jerky / jittery" stay:
+  // those name an ARTIFACT (stepped, unstable motion), not a speed, so they
+  // cost nothing that should be there.
+  "jerky movement, jittery movement, stuttering motion, " +
+  // Camera terms only. ACTION_CLIP_RULE locks the camera off; the SUBJECT is
+  // supposed to move, so nothing here may suppress subject motion.
+  "camera shake, camera movement, camera zoom, camera pan, camera tilt, " +
+  // Added with the same edit: the failure this lane now has to avoid is a clip
+  // indistinguishable from its own source still.
+  "static frozen frame, no movement, still photograph, motionless subject, " +
   "unnatural transitions, 3D CGI look, cartoonish rendering, uncanny valley " +
   "effect, on-screen text";
 
