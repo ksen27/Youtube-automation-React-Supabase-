@@ -33,6 +33,35 @@ export async function processImageToVideoJob(
   const sb = getServerSupabase();
   const isFinalAttempt = (attempt?.attemptsMade ?? 1) >= (attempt?.attemptsAllowed ?? 1);
 
+  // ABANDONED-JOB GUARD. BullMQ entries are keyed on mediaJobId, but nothing
+  // removes a waiting entry when its media_jobs row reaches a terminal state by
+  // another route — the stall sweep failing it, or the row being deleted by a
+  // re-plan. Those entries stay in the queue and, on pickup, ran the FULL job:
+  // a paid nano-banana still plus a multi-minute LTX render, writing the result
+  // onto a segment nobody is waiting for (or resurrecting one the sweep had
+  // already failed). Measured on the live queue: 388 of 1060 waiting entries
+  // (37%) were in exactly this state — 163 already failed, 225 with no row at
+  // all — so better than a third of clip throughput was being spent on work
+  // that could not land. Checking first turns each one into a no-op.
+  //
+  // Deliberately BEFORE the status='running' write, which would otherwise flip
+  // a swept row back to running and undo the sweep's decision.
+  //
+  // A BullMQ RETRY is not affected: attempt 1 sets the row to 'running' and
+  // markJobFailedIfExhausted only writes 'failed' once attempts are spent, so
+  // a mid-retry row still reads 'running' here.
+  const { data: jobRow } = await sb
+    .from("media_jobs")
+    .select("status")
+    .eq("id", mediaJobId)
+    .maybeSingle();
+  if (!jobRow || jobRow.status === "completed" || jobRow.status === "failed") {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_to_video.abandoned", {
+      reason: jobRow ? `media_job already ${jobRow.status}` : "media_job row no longer exists",
+    });
+    return;
+  }
+
   await setMediaJob(mediaJobId, { status: "running", progress: 10, metadata: { segmentId } });
 
   const { data: seg, error } = await sb
@@ -181,17 +210,25 @@ export async function processImageToVideoJob(
         : isLtxConfigured()
           ? { durationSeconds: duration, model: ltxModel(), ltxPoolSize: ltxPoolSize(), clipEngine: "ltx", animationPromptSource }
           : { durationSeconds: duration, animationPromptSource } });
-    // Heartbeat the segment's updated_at across the ~60-95s render so the stall
-    // sweeper can't false-fail a segment that is alive and rendering.
+    // Heartbeat the segment AND the media_job across the render so neither
+    // stall sweeper can false-fail work that is alive and rendering.
     //
     // The engine is NOT a fallback chain: a block planned as veo renders on veo
     // or fails. Quietly re-rendering it on LTX would silently dissolve the 5%
     // veo share the plan exists to enforce, and the shortfall would be
     // invisible — the failure has to be visible and retryable instead.
-    const clip = await withSegmentHeartbeat(segmentId, () =>
-      wantVeo
-        ? generateVeoClip({ imageUrl, prompt: animationPrompt, durationSeconds: duration })
-        : generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration }),
+    const clip = await withSegmentHeartbeat(
+      segmentId,
+      () =>
+        wantVeo
+          ? generateVeoClip({ imageUrl, prompt: animationPrompt, durationSeconds: duration })
+          : generateClipWithFallback({ imageUrl, prompt: animationPrompt, durationSeconds: duration }),
+      60_000,
+      // Beat the media_jobs row too. Between the progress:45 write above and
+      // the completion write below this processor is silent for the entire
+      // render, so without this the row's updated_at freezes and a slow render
+      // is indistinguishable from a dead worker to sweepStalledJobs.
+      mediaJobId,
     );
     await logProviderCall({
       projectId, jobId: mediaJobId, segmentId, provider: clip.provider, phase: "response",

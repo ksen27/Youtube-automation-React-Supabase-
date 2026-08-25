@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { fetchAllRows } from "@/lib/supabase/fetch-all";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,12 +21,25 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     sb.from("projects")
       .select("id, title, engine, status, voiceover_url, voiceover_duration_seconds, avatar_image_url, heygen_avatar_name, voiceover_source, tts_voice_id, language, transcript, script_doc_url, avatar_mark_ranges, pitch_video_url, pitch_video_duration_seconds, pitch_video_insert_seconds")
       .eq("id", id).single(),
-    sb.from("media_jobs")
-      .select("id, type, status, progress, attempts, error, metadata, created_at, updated_at")
-      .eq("project_id", id).order("created_at", { ascending: true }),
-    sb.from("synthetic_segments")
-      .select("id, position, block_type, avatar_model, start_time, end_time, duration, script, image_prompt, animation_prompt, status, image_url, video_url, right_image_url, provider, error, metadata, asset_history")
-      .eq("project_id", id).order("position", { ascending: true }),
+    // Paged, not a plain unbounded select: PostgREST silently clips an
+    // unbounded read at max-rows (1000). Ascending + clipped returned the
+    // OLDEST 1000 jobs on long projects, so the review screen's "latest job per
+    // segment" resolved to a long-dead one and flagged live blocks as stuck.
+    // Segments page for the same reason — a long enough script crosses 1000
+    // blocks and the timeline would silently stop at the cap. `id` breaks
+    // created_at / position ties so no row shifts between pages.
+    fetchAllRows((from, to) =>
+      sb.from("media_jobs")
+        .select("id, type, status, progress, attempts, error, metadata, created_at, updated_at", { count: "exact" })
+        .eq("project_id", id)
+        .order("created_at", { ascending: true }).order("id", { ascending: true })
+        .range(from, to)),
+    fetchAllRows((from, to) =>
+      sb.from("synthetic_segments")
+        .select("id, position, block_type, avatar_model, start_time, end_time, duration, script, image_prompt, animation_prompt, status, image_url, video_url, right_image_url, provider, error, metadata, asset_history", { count: "exact" })
+        .eq("project_id", id)
+        .order("position", { ascending: true }).order("id", { ascending: true })
+        .range(from, to)),
     // render_jobs is what POST /render's "already in progress" guard reads, so
     // the review screen must decide from THIS table too — deriving "a render is
     // live" from media_jobs/project.status instead let the two disagree and

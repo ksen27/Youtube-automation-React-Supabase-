@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
 import { createMediaJob } from "@/lib/jobs/db";
-import { enqueueImageGeneration, enqueueImageToVideo, enqueueAvatar } from "@/lib/jobs/queue";
+import { enqueueImageGeneration, enqueueImageToVideo, enqueueAvatar, queuePriority } from "@/lib/jobs/queue";
 import { queueForBlockType, resetSegmentForRegen } from "@/worker/processors/synthetic/_shared";
 import type { SyntheticBlockType } from "@/lib/types";
 
@@ -103,7 +103,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const mediaJobId = await createMediaJob({ projectId: id, type: mediaType, metadata: { segmentId, regenerate: true } });
   if (queue === "avatar") await enqueueAvatar({ projectId: id, mediaJobId, segmentId, imageOnly: imageOnly && blockType === "split_2" });
-  else if (queue === "image_to_video") await enqueueImageToVideo({ projectId: id, mediaJobId, segmentId });
+  else if (queue === "image_to_video") {
+    // A hand-retried block is the most urgent thing in the queue: someone is on
+    // the review screen waiting for exactly this one, so it outranks even the
+    // current project's bulk dispatch.
+    await enqueueImageToVideo({ projectId: id, mediaJobId, segmentId }, { priority: queuePriority() });
+  }
   else await enqueueImageGeneration({ projectId: id, mediaJobId, segmentId });
 
   return NextResponse.json({ ok: true, media_job_id: mediaJobId }, { status: 202 });

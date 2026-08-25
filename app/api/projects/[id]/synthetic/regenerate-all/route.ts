@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { fetchAllRows } from "@/lib/supabase/fetch-all";
 import { checkProjectEngine, setProjectStatus } from "@/lib/jobs/db";
 import { dispatchSegments, resetSegmentForRegen } from "@/worker/processors/synthetic/_shared";
 
@@ -50,17 +51,34 @@ const TERMINAL_JOB_STATUSES = new Set(["failed", "completed"]);
 // (about to be dispatched), is left alone.
 async function selectStuckSegmentIds(projectId: string): Promise<string[]> {
   const sb = getServerSupabase();
+  // Both reads are PAGED. An unbounded PostgREST select is clipped at
+  // max-rows (1000) with no error, and ascending order means the rows dropped
+  // are the NEWEST — exactly the ones that say whether a segment is still live.
+  // On a 3,116-job project that made every recently-requeued segment look
+  // stuck, so this scope reset and re-dispatched blocks already mid-render.
   const [segRes, jobRes] = await Promise.all([
-    sb.from("synthetic_segments").select("id").eq("project_id", projectId).eq("status", "generating"),
-    sb.from("media_jobs").select("status, metadata, created_at").eq("project_id", projectId)
-      .order("created_at", { ascending: true }),
+    fetchAllRows((from, to) =>
+      sb.from("synthetic_segments").select("id", { count: "exact" })
+        .eq("project_id", projectId).eq("status", "generating")
+        .order("id", { ascending: true }).range(from, to)),
+    fetchAllRows((from, to) =>
+      sb.from("media_jobs").select("status, metadata, created_at", { count: "exact" })
+        .eq("project_id", projectId)
+        .order("created_at", { ascending: true }).order("id", { ascending: true })
+        .range(from, to)),
   ]);
-  const generatingIds = (segRes.data ?? []).map((s) => s.id);
+  // A partial read is worse than no read here: a half-drained job list makes
+  // live segments look job-less or dead, and this scope RESETS what it selects.
+  // Fail loudly instead of resetting a set derived from incomplete data.
+  const readErr = segRes.error ?? jobRes.error;
+  if (readErr) throw new Error(`selectStuckSegmentIds: ${readErr.message}`);
+
+  const generatingIds = segRes.data.map((s) => s.id);
   if (generatingIds.length === 0) return [];
 
   // Latest job per segment (jobs are asc by created_at, so the last write wins).
   const latestBySegment = new Map<string, string>();
-  for (const j of jobRes.data ?? []) {
+  for (const j of jobRes.data) {
     const segId = (j.metadata as { segmentId?: string } | null)?.segmentId;
     if (segId) latestBySegment.set(segId, j.status);
   }
@@ -105,24 +123,33 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     // prompt-retest scopes ("images"/"all") ignore status and instead target by
     // block type so a READY segment is re-generated too (that's the whole point —
     // re-run already-good blocks against the new prompt).
-    let query = sb.from("synthetic_segments").select("id").eq("project_id", id);
-    if (scope === "images") {
-      query = query.in("block_type", IMAGE_BLOCK_TYPES as unknown as string[]);
-    } else if (scope === "all") {
-      // no extra filter — every segment
-    } else {
-      const statuses = scope === "incomplete"
-        ? ["failed", "pending", "generating"]
-        : ["failed"];
-      query = query.in("status", statuses);
-    }
+    //
+    // Built per PAGE rather than once: the read is paged (an unbounded select
+    // stops at PostgREST's max-rows, so on a long project "regenerate all" would
+    // quietly reset only the first 1000 blocks while reporting the whole set),
+    // and a PostgREST builder carries its own range — it cannot be re-ranged.
+    const pageQuery = (from: number, to: number) => {
+      let query = sb.from("synthetic_segments")
+        .select("id", { count: "exact" }).eq("project_id", id);
+      if (scope === "images") {
+        query = query.in("block_type", IMAGE_BLOCK_TYPES as unknown as string[]);
+      } else if (scope === "all") {
+        // no extra filter — every segment
+      } else {
+        const statuses = scope === "incomplete"
+          ? ["failed", "pending", "generating"]
+          : ["failed"];
+        query = query.in("status", statuses);
+      }
+      return query.order("id", { ascending: true }).range(from, to);
+    };
 
     // Reset the targeted segments to 'pending' and clear prior asset state so
     // dispatchSegments (which only picks up 'pending') re-enqueues them. We also
     // drop any timeline_items materialized from a prior run for these segments.
-    const { data: targets, error: selErr } = await query;
+    const { data: targets, error: selErr } = await fetchAllRows(pageQuery);
     if (selErr) return NextResponse.json({ error: selErr.message }, { status: 500 });
-    ids = (targets ?? []).map((t) => t.id);
+    ids = targets.map((t) => t.id);
   }
   if (ids.length === 0) {
     return NextResponse.json({ ok: true, enqueued: 0, note: "nothing to regenerate" }, { status: 200 });
@@ -140,11 +167,17 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     if (scope === "images") {
       await resetSegmentForRegen(ids, "pending");
     } else {
-      const { data: typed } = await sb
-        .from("synthetic_segments")
-        .select("id, block_type")
-        .in("id", ids);
-      const clearIds = (typed ?? [])
+      // Paged for the same max-rows reason: a truncated read here would leave
+      // the tail of a long selection without clearStill, so those blocks would
+      // be re-sent to the provider with the very still that failed.
+      const { data: typed, error: typeErr } = await fetchAllRows((from, to) =>
+        sb.from("synthetic_segments")
+          .select("id, block_type", { count: "exact" })
+          .in("id", ids)
+          .order("id", { ascending: true })
+          .range(from, to));
+      if (typeErr) throw new Error(typeErr.message);
+      const clearIds = typed
         .filter((s) => s.block_type === "image" || s.block_type === "ai_clip")
         .map((s) => s.id);
       const keepIds = ids.filter((i) => !clearIds.includes(i));

@@ -1,8 +1,9 @@
 import { getServerSupabase } from "@/lib/supabase/server";
-import { createMediaJob, setMediaJob, setProjectStatus, logJob } from "@/lib/jobs/db";
+import { createMediaJob, setMediaJob, setProjectStatus, logJob, touchMediaJob } from "@/lib/jobs/db";
 import {
   enqueueImageGeneration,
   enqueueImageToVideo,
+  queuePriority,
   enqueueAvatar,
   enqueueRender,
 } from "@/lib/jobs/queue";
@@ -94,7 +95,11 @@ export async function dispatchSegments(
       // split_2 in image-only mode regenerates just the right still.
       await enqueueAvatar({ projectId, mediaJobId, segmentId: seg.id, imageOnly: opts.imageOnly && seg.block_type === "split_2" });
     } else if (queue === "image_to_video") {
-      await enqueueImageToVideo({ projectId, mediaJobId, segmentId: seg.id });
+      // Stamped with THIS dispatch's time, so a batch you kick off now outranks
+      // everything queued earlier. Resolved per call rather than hoisted: the
+      // loop can run long on a big project, and a block dispatched later in it
+      // is genuinely later.
+      await enqueueImageToVideo({ projectId, mediaJobId, segmentId: seg.id }, { priority: queuePriority() });
     } else {
       await enqueueImageGeneration({ projectId, mediaJobId, segmentId: seg.id });
     }
@@ -628,13 +633,27 @@ export { setMediaJob };
 // that were still rendering (a running-but-quiet job is normal during a long
 // HeyGen render), surfacing a "failed" badge on a video that then completed fine.
 // A genuinely orphaned spinner is cleared by the user via Regenerate instead.
+//
+// mediaJobId is optional but should be passed by any caller whose `work` is a
+// single long provider call. The SEGMENT heartbeat alone is not enough: the
+// media_jobs row has its OWN staleness sweep (sweepStalledJobs, 45 min), and a
+// processor that writes no progress between "submit" and "done" leaves that row
+// untouched for the whole render. An LTX clip can burn ~13 min of that window
+// on one attempt (600s poll deadline + submit retries + a 120s download), and a
+// provider outage stretches it further — at which point the sweep fails a job
+// that is alive, the segment is marked failed under it, and the queue slot is
+// spent for nothing. Beating both rows keeps the sweep honest.
 export async function withSegmentHeartbeat<T>(
   segmentId: string,
   work: () => Promise<T>,
   intervalMs = 60_000,
+  mediaJobId?: string,
 ): Promise<T> {
   const sb = getServerSupabase();
   const beat = setInterval(() => {
+    // touchMediaJob is itself guarded on status='running', so a beat that races
+    // the job's own completion cannot resurrect a terminal row.
+    if (mediaJobId) void touchMediaJob(mediaJobId);
     // Guard on status='generating' so we never resurrect a segment that finished
     // or was swept between ticks. Best-effort: a failed beat just means this tick
     // didn't refresh updated_at; the next one will.

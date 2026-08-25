@@ -333,18 +333,29 @@ function computeStuckSegmentIds(
   const generating = segments.filter((s) => s.status === "generating");
   if (generating.length === 0) return new Set();
 
-  // media_jobs arrive ordered by created_at asc, so the last write per segment
-  // is its latest job.
-  const latestBySegment = new Map<string, string>();
+  // Pick each segment's newest job by COMPARING created_at rather than trusting
+  // arrival order. The route sends jobs ascending, but relying on that made this
+  // silently wrong the moment the list was clipped by PostgREST's max-rows: the
+  // "last" entry for a segment was then an old dead job, not its live one, and
+  // every affected block rendered as stuck. The route pages properly now; this
+  // comparison means a future ordering change can't resurrect that bug.
+  const latestBySegment = new Map<string, { status: string; at: number }>();
   for (const j of mediaJobs) {
     const segId = (j.metadata as { segmentId?: string } | null)?.segmentId;
-    if (segId) latestBySegment.set(segId, j.status);
+    if (!segId) continue;
+    const at = Date.parse(j.created_at);
+    const prev = latestBySegment.get(segId);
+    // NaN (a malformed/absent created_at) loses to any real timestamp but still
+    // seeds an empty slot, so such a job is never silently dropped.
+    if (!prev || (Number.isFinite(at) && !(at < prev.at))) {
+      latestBySegment.set(segId, { status: j.status, at: Number.isFinite(at) ? at : -Infinity });
+    }
   }
 
   const stuck = new Set<string>();
   for (const s of generating) {
-    const jobStatus = latestBySegment.get(s.id);
-    if (jobStatus !== undefined && TERMINAL_JOB_STATUSES.has(jobStatus)) stuck.add(s.id);
+    const latest = latestBySegment.get(s.id);
+    if (latest !== undefined && TERMINAL_JOB_STATUSES.has(latest.status)) stuck.add(s.id);
   }
   return stuck;
 }

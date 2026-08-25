@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { getServerSupabase } from "@/lib/supabase/server";
+import { fetchAllRows } from "@/lib/supabase/fetch-all";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,7 +19,13 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     { data: sources },
     { data: clipRows },
   ] = await Promise.all([
-    sb.from("media_jobs").select("*").eq("project_id", id).order("created_at", { ascending: true }),
+    // Paged: an unbounded select is clipped at PostgREST's max-rows (1000)
+    // with no error, and ascending order drops the NEWEST rows — the ones the
+    // processing screen reads to tell a live job from a dead one.
+    fetchAllRows((from, to) =>
+      sb.from("media_jobs").select("*", { count: "exact" }).eq("project_id", id)
+        .order("created_at", { ascending: true }).order("id", { ascending: true })
+        .range(from, to)),
     sb.from("render_jobs").select("*").eq("project_id", id).order("created_at", { ascending: false }),
     sb.from("projects").select("status").eq("id", id).single(),
     sb.from("video_sources")

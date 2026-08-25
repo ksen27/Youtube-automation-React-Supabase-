@@ -232,8 +232,60 @@ export async function enqueueSyntheticPlanner(data: SyntheticPlannerJobData) {
 export async function enqueueImageGeneration(data: ImageGenerationJobData) {
   return getQueue<ImageGenerationJobData>(QUEUE_NAMES.imageGeneration).add("image_gen", data, { jobId: data.mediaJobId });
 }
-export async function enqueueImageToVideo(data: ImageToVideoJobData) {
-  return getQueue<ImageToVideoJobData>(QUEUE_NAMES.imageToVideo).add("image_to_video", data, { jobId: data.mediaJobId });
+// BullMQ priority bounds. Lower value = served earlier; 0 means "unprioritized"
+// and lands in the plain wait LIST instead of the prioritized ZSET.
+const BULLMQ_MAX_PRIORITY = 2 ** 21 - 1;
+// Minute zero for the clip-queue priority scale. Only the DIFFERENCE matters,
+// so any fixed past instant works; this one keeps the numbers inside the
+// 2^21 ceiling until ~2030, when the scale needs re-basing (clamped below, so
+// the failure mode past that date is "everything ties at 1", not a crash).
+const PRIORITY_EPOCH_MS = Date.UTC(2026, 0, 1);
+
+// Clip-queue priority, ordered by DISPATCH RECENCY — the most recently
+// enqueued work is served first.
+//
+// The clip queue is one FIFO shared by every project, so blocks you dispatch
+// now sit behind every block of every project queued before them: hundreds of
+// jobs and many hours, most of it for videos already abandoned or left
+// half-done. Priority puts the work you just asked for at the front.
+//
+// Recency of DISPATCH, not of the project row. Ranking by project created_at
+// was the obvious first guess and it is wrong: a video created yesterday that
+// you came back to today is the one you are waiting on, yet it sorts behind a
+// project created this morning and abandoned an hour later. When a batch was
+// dispatched is what actually tracks attention. It also needs no project
+// lookup — the caller is dispatching right now, so the default argument is
+// already the right answer.
+//
+// TRADEOFF, deliberate: strict recency, NOT round-robin fairness. A project
+// that keeps losing to newer dispatches can starve indefinitely. That is right
+// while your attention is on the current video, but an old backlog only drains
+// once new work stops. Re-dispatching a stalled project (Retry all) re-stamps
+// it as recent and pulls it back to the front, which is the intended escape.
+//
+// IMPORTANT: a priority is only honoured against OTHER prioritized jobs.
+// moveToActive drains the unprioritized wait list FIRST and consults the
+// prioritized set only when wait is empty, so a job enqueued with a priority
+// goes BEHIND any already-waiting unprioritized job. An existing backlog must
+// be migrated with scripts/prioritize-clip-queue.ts or this ranks nothing.
+export function queuePriority(dispatchedAt: string | Date = new Date()): number {
+  const ms = new Date(dispatchedAt).getTime();
+  if (!Number.isFinite(ms)) return BULLMQ_MAX_PRIORITY; // unknown time sorts last
+  const minutes = Math.floor((ms - PRIORITY_EPOCH_MS) / 60_000);
+  // Invert: a LATER dispatch yields a SMALLER number, i.e. higher priority.
+  return Math.min(BULLMQ_MAX_PRIORITY, Math.max(1, BULLMQ_MAX_PRIORITY - minutes));
+}
+
+export async function enqueueImageToVideo(
+  data: ImageToVideoJobData,
+  opts: { priority?: number } = {},
+) {
+  return getQueue<ImageToVideoJobData>(QUEUE_NAMES.imageToVideo).add("image_to_video", data, {
+    jobId: data.mediaJobId,
+    // Omitted rather than passed as 0: an explicit 0 is BullMQ's "no priority"
+    // and would drop the job into the wait list, ahead of every prioritized one.
+    ...(opts.priority ? { priority: opts.priority } : {}),
+  });
 }
 export async function enqueueAvatar(data: AvatarJobData) {
   return getQueue<AvatarJobData>(QUEUE_NAMES.avatar).add("avatar", data, { jobId: data.mediaJobId });
