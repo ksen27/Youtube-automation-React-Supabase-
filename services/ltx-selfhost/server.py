@@ -107,6 +107,43 @@ TWO_STAGE = os.environ.get("LTX_SELFHOST_TWO_STAGE", "1") not in ("0", "false", 
 # between the two so 1080p still routes through the upscaler.
 TWO_STAGE_MIN_PIXELS = int(os.environ.get("LTX_SELFHOST_TWO_STAGE_MIN_PIXELS", str(1280 * 720 + 1)))
 
+# TEXT-ENCODER OFFLOAD — the lever aimed squarely at the 2.49 GiB OOM.
+#
+# THE MEASUREMENT THIS IS BUILT ON (2026-08-21, recorded above): a native 1080p
+# render asked for 2.49 GiB more than the card had, with 92.68 of 94.97 GiB
+# already resident. Only 2.49. Every fix tried for it was a blunt instrument --
+# full CPU offload (673s/clip, worse than the API), FP8 (unproven on quality),
+# two-stage (costs real detail by construction) -- and the cheap targeted one was
+# never tried: LTX-2's text encoder is a multi-GiB T5-class model that runs ONCE
+# per clip, to turn the prompt into embeddings, and then sits on the card doing
+# nothing for the entire denoising loop that OOMs.
+#
+# accelerate's cpu_offload keeps its weights in host RAM and streams them in for
+# that single forward pass. The cost is a few seconds per clip on a ~77s job; the
+# prize is native 1080p, which is the ONLY path to matching the pre-cutover
+# api.ltx.video quality on our own GPU. Two-stage 1080p cannot get there: it
+# generates 960x544 = 522k real pixels, which is LESS than native 720p's 922k.
+#
+# UNVERIFIED — this has not been run on the pod. It is written to be switched off
+# in one env var precisely because f926156 shipped a GPU change unverified and
+# the client is still living with the result. Verify before customer output:
+#   LTX_SELFHOST_TEXT_ENCODER_OFFLOAD=1 LTX_SELFHOST_TWO_STAGE_MIN_PIXELS=2073601 \
+#     python benchmark.py --resolution 1920x1080 --duration 4
+# and confirm (a) it does not OOM, (b) the clip is sharper than the 720p one.
+TEXT_ENCODER_OFFLOAD = os.environ.get("LTX_SELFHOST_TEXT_ENCODER_OFFLOAD", "0") not in ("0", "false", "")
+
+# Sampling steps. The distilled checkpoint ships a fixed few-step sigma schedule
+# (DISTILLED_SIGMA_VALUES) and that is what makes a clip cost $0.043 instead of
+# $0.24. Raising it is the other quality lever, and unlike resolution it is a
+# smooth dial: set a count here to subdivide the distilled schedule and trade
+# wall-clock for detail. Empty = the distilled schedule exactly as shipped, which
+# is the measured-cost configuration.
+#
+# NOTE it is NOT a like-for-like comparison with the API: api.ltx.video's
+# ltx-2-3-fast is itself a fast/distilled variant, so steps are probably NOT the
+# delta between the two lanes. Resolution is. Try resolution first.
+STEPS_OVERRIDE = int(os.environ.get("LTX_SELFHOST_STEPS", "0") or 0)
+
 # Slice attention into chunks instead of materialising it whole. Trades speed for
 # peak memory; the point is to make a NATIVE 1080p render fit so we can stop
 # upscaling from 960x544.
@@ -244,6 +281,21 @@ def _load_pipeline():
     else:
         pipe.to("cuda")
 
+    if TEXT_ENCODER_OFFLOAD and not CPU_OFFLOAD:
+        # Only meaningful when the rest of the pipeline is resident: with
+        # CPU_OFFLOAD on, accelerate is already streaming every submodule and
+        # adding a second set of hooks to one of them would just fight it.
+        try:
+            from accelerate import cpu_offload
+
+            cpu_offload(pipe.text_encoder, execution_device=torch.device("cuda"))
+            print('{"msg":"ltx_selfhost.text_encoder_offloaded"}', flush=True)
+        except Exception as e:  # noqa: BLE001 - never let a memory tweak stop startup
+            print(
+                '{"msg":"ltx_selfhost.text_encoder_offload_failed","err":"%s"}' % str(e)[:200],
+                flush=True,
+            )
+
     if VAE_TILING:
         # Tiling decodes the frame stack in pieces instead of allocating it whole.
         # Note: on its own this did NOT rescue native 1080p -- the OOM is in the
@@ -319,7 +371,16 @@ def _generate(job: Job) -> str:
     from diffusers.pipelines.ltx2.utils import (
         DEFAULT_NEGATIVE_PROMPT,
         DISTILLED_SIGMA_VALUES,
+        STAGE_2_DISTILLED_SIGMA_VALUES,
     )
+
+    # Hand back reserved-but-unallocated blocks before the largest allocation of
+    # the job -- see the note above _generate. A 1080p render OOM'd by 78 MiB
+    # while 3.03 GiB sat reserved and unused.
+    try:
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - a memory hint must never fail a render
+        pass
 
     p = job.params
     width, height = _parse_resolution(p["resolution"])
@@ -339,45 +400,197 @@ def _generate(job: Job) -> str:
         gen_w, gen_h = _round_dim(width), _round_dim(height)
 
     image = _download_image(p["image_uri"])
+    negative = p.get("negative_prompt") or DEFAULT_NEGATIVE_PROMPT
 
-    # sigmas=DISTILLED_SIGMA_VALUES + guidance_scale=1.0 is the distilled
-    # checkpoint's few-step schedule -- this is what makes it fast enough to beat
-    # the API on cost. Do not raise guidance_scale here: the distilled model is
-    # trained for CFG-free sampling and a higher value degrades it.
-    # return_dict=False yields (video, audio); the audio track is discarded --
-    # the renderer strips clip audio anyway (keepAudio:false), so we never pay to
-    # keep it. output_type="pil" because the upsampler consumes decoded frames.
-    # Callers may override the negative prompt. The library default suppresses
-    # "grainy texture" and "excessive noise", which fights the house low-fi vlog
-    # look (ACTION_CLIP_RULE in lib/synthetic/constants.ts asks for exactly that
-    # texture), and it says nothing about hands CHANGING between frames -- only
-    # about hands being wrong in a single frame. Both are worth tuning per-call.
-    video, _audio = PIPE(
-        image=image,
-        prompt=p["prompt"],
-        negative_prompt=p.get("negative_prompt") or DEFAULT_NEGATIVE_PROMPT,
-        height=gen_h,
-        width=gen_w,
-        num_frames=num_frames,
-        frame_rate=fps,
-        guidance_scale=1.0,
-        sigmas=DISTILLED_SIGMA_VALUES,
-        output_type="pil" if use_two_stage else "np",
-        return_dict=False,
-    )
-
+    # THE OFFICIAL LTX-2.5 DISTILLED PIPELINE IS THREE PARTS, NOT TWO.
+    #
+    # Corrected 2026-08-25 against Lightricks' own documented workflow
+    # (huggingface.co/docs/diffusers/main/en/api/pipelines/ltx2):
+    #
+    #   1. generate at HALF resolution on the distilled sigma schedule, keeping
+    #      LATENTS (not decoded pixels);
+    #   2. latent x2 upsample;
+    #   3. REFINE at FULL resolution -- 3 steps on STAGE_2_DISTILLED_SIGMA_VALUES,
+    #      re-noised to STAGE_2[0], guidance 1.0.
+    #
+    # This service implemented 1 and 2 and stopped. Step 3 is the one that puts
+    # the detail back, so its absence is why "two-stage" output looked soft and
+    # why the code above it concluded two-stage "costs real detail" -- a verdict
+    # drawn from a pipeline missing its refinement pass. Lightricks document the
+    # full three-part flow as producing BETTER quality than single-stage, and it
+    # is almost certainly what api.ltx.video runs.
+    #
+    # Staying in latent space between 1 and 2 also removes a lossy VAE
+    # round-trip: the old code decoded to PIL, upsampled pixels, and re-encoded.
+    #
+    # NOTE ON STEPS: the distilled checkpoint is driven by an EXPLICIT SIGMA
+    # SCHEDULE, not a step count -- [1.0, 0.99375, 0.9875, 0.98125, 0.975,
+    # 0.909375, 0.725, 0.421875], five fine steps near 1.0 then three large
+    # drops. The docs warn that passing num_inference_steps "would hand the model
+    # a generic linear schedule and quietly cost quality". An earlier attempt
+    # here interpolated that schedule to 20 points and produced structurally
+    # melted faces. Do NOT reintroduce a steps knob for the distilled model; the
+    # count is fixed at 8 by the checkpoint.
     if use_two_stage:
-        # width/height here are stage 1's dimensions -- the upsampler doubles
-        # them internally (rational_spatial_scale 2.0), so passing the TARGET
-        # size would yield a 4K frame and OOM the decode.
-        out = UPSAMPLER(
-            video=video,
+        # Stage 1 -- half resolution, latents out.
+        video_latent, audio_latent = PIPE(
+            image=image,
+            prompt=p["prompt"],
+            negative_prompt=negative,
+            height=gen_h,
+            width=gen_w,
+            num_frames=num_frames,
+            frame_rate=fps,
+            # THE FULL DISTILLED PARAMETER SET -- all of it, not just guidance_scale.
+            #
+            # Root cause of the client's 2026-08-25 report ("the not action part is
+            # good but the around action part such as body is not good"), found by
+            # reading the pipeline's own gate properties:
+            #
+            #   do_classifier_free_guidance    = guidance_scale > 1 or audio_guidance_scale > 1
+            #   do_spatio_temporal_guidance    = stg_scale > 0 or audio_stg_scale > 0
+            #   do_modality_isolation_guidance = modality_scale > 1 or audio_modality_scale > 1
+            #
+            # This service passed ONLY guidance_scale=1.0 and left the rest at their
+            # NON-distilled defaults (audio_guidance_scale=7.0, stg_scale=1.0,
+            # modality_scale=3.0). So every gate evaluated TRUE and the distilled
+            # checkpoint ran with all three guidance mechanisms active.
+            #
+            # STG is the one that shows: it is Spatio-Temporal Guidance, applied at
+            # transformer block 28, and its delta
+            #     video_stg_delta = stg_scale * (pred - pred_uncond_stg)
+            # is added to the prediction at every step. It perturbs the TEMPORAL
+            # pathway specifically -- which is why static regions were clean and
+            # anything in motion degraded.
+            #
+            # Cost, too: CFG doubles the batch and STG/modality each add a forward
+            # pass, so a "distilled 8-step" render was doing 3-4x the compute it
+            # should. Turning them off makes it faster AND correct.
+            #
+            # NOTE: with CFG off the negative_prompt is unused -- the distilled model
+            # is trained for unguided sampling. It is still passed so that flipping
+            # guidance back on for an experiment needs no other change.
+            guidance_scale=1.0,
+            audio_guidance_scale=1.0,
+            stg_scale=0.0,
+            audio_stg_scale=0.0,
+            modality_scale=1.0,
+            audio_modality_scale=1.0,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            output_type="latent",
+            return_dict=False,
+        )
+
+        # Latent x2 upsample. width/height here are STAGE 1's dimensions -- the
+        # upsampler doubles them internally, so passing the target size would
+        # yield a 4K frame and OOM the decode.
+        upscaled_latent = UPSAMPLER(
+            latents=video_latent,
             width=gen_w,
             height=gen_h,
-            output_type="np",
+            output_type="latent",
             return_dict=False,
         )[0]
-        video = out[0] if hasattr(out, "__len__") else out
+
+        # Stage 3 -- refinement at full resolution. Only 3 steps, so this costs a
+        # fraction of a full-resolution generation while working at full detail.
+        video, _audio = PIPE(
+            image=image,
+            latents=upscaled_latent,
+            audio_latents=audio_latent,
+            prompt=p["prompt"],
+            negative_prompt=negative,
+            num_frames=num_frames,
+            frame_rate=fps,
+            # THE FULL DISTILLED PARAMETER SET -- all of it, not just guidance_scale.
+            #
+            # Root cause of the client's 2026-08-25 report ("the not action part is
+            # good but the around action part such as body is not good"), found by
+            # reading the pipeline's own gate properties:
+            #
+            #   do_classifier_free_guidance    = guidance_scale > 1 or audio_guidance_scale > 1
+            #   do_spatio_temporal_guidance    = stg_scale > 0 or audio_stg_scale > 0
+            #   do_modality_isolation_guidance = modality_scale > 1 or audio_modality_scale > 1
+            #
+            # This service passed ONLY guidance_scale=1.0 and left the rest at their
+            # NON-distilled defaults (audio_guidance_scale=7.0, stg_scale=1.0,
+            # modality_scale=3.0). So every gate evaluated TRUE and the distilled
+            # checkpoint ran with all three guidance mechanisms active.
+            #
+            # STG is the one that shows: it is Spatio-Temporal Guidance, applied at
+            # transformer block 28, and its delta
+            #     video_stg_delta = stg_scale * (pred - pred_uncond_stg)
+            # is added to the prediction at every step. It perturbs the TEMPORAL
+            # pathway specifically -- which is why static regions were clean and
+            # anything in motion degraded.
+            #
+            # Cost, too: CFG doubles the batch and STG/modality each add a forward
+            # pass, so a "distilled 8-step" render was doing 3-4x the compute it
+            # should. Turning them off makes it faster AND correct.
+            #
+            # NOTE: with CFG off the negative_prompt is unused -- the distilled model
+            # is trained for unguided sampling. It is still passed so that flipping
+            # guidance back on for an experiment needs no other change.
+            guidance_scale=1.0,
+            audio_guidance_scale=1.0,
+            stg_scale=0.0,
+            audio_stg_scale=0.0,
+            modality_scale=1.0,
+            audio_modality_scale=1.0,
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+            output_type="np",
+            return_dict=False,
+        )
+    else:
+        # Single stage: the target already fits, so generate straight at it.
+        video, _audio = PIPE(
+            image=image,
+            prompt=p["prompt"],
+            negative_prompt=negative,
+            height=gen_h,
+            width=gen_w,
+            num_frames=num_frames,
+            frame_rate=fps,
+            # THE FULL DISTILLED PARAMETER SET -- all of it, not just guidance_scale.
+            #
+            # Root cause of the client's 2026-08-25 report ("the not action part is
+            # good but the around action part such as body is not good"), found by
+            # reading the pipeline's own gate properties:
+            #
+            #   do_classifier_free_guidance    = guidance_scale > 1 or audio_guidance_scale > 1
+            #   do_spatio_temporal_guidance    = stg_scale > 0 or audio_stg_scale > 0
+            #   do_modality_isolation_guidance = modality_scale > 1 or audio_modality_scale > 1
+            #
+            # This service passed ONLY guidance_scale=1.0 and left the rest at their
+            # NON-distilled defaults (audio_guidance_scale=7.0, stg_scale=1.0,
+            # modality_scale=3.0). So every gate evaluated TRUE and the distilled
+            # checkpoint ran with all three guidance mechanisms active.
+            #
+            # STG is the one that shows: it is Spatio-Temporal Guidance, applied at
+            # transformer block 28, and its delta
+            #     video_stg_delta = stg_scale * (pred - pred_uncond_stg)
+            # is added to the prediction at every step. It perturbs the TEMPORAL
+            # pathway specifically -- which is why static regions were clean and
+            # anything in motion degraded.
+            #
+            # Cost, too: CFG doubles the batch and STG/modality each add a forward
+            # pass, so a "distilled 8-step" render was doing 3-4x the compute it
+            # should. Turning them off makes it faster AND correct.
+            #
+            # NOTE: with CFG off the negative_prompt is unused -- the distilled model
+            # is trained for unguided sampling. It is still passed so that flipping
+            # guidance back on for an experiment needs no other change.
+            guidance_scale=1.0,
+            audio_guidance_scale=1.0,
+            stg_scale=0.0,
+            audio_stg_scale=0.0,
+            modality_scale=1.0,
+            audio_modality_scale=1.0,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            output_type="np",
+            return_dict=False,
+        )
 
     frames = np.asarray(video)
     # Both paths can hand back a BATCH: (B, F, H, W, C). The two-stage branch
@@ -533,6 +746,9 @@ async def submit(request: Request, authorization: str | None = Header(default=No
             # Optional; falls back to the library default. ltx.ts does not send
             # this, so production behaviour is unchanged.
             "negative_prompt": body.get("negative_prompt"),
+            # Optional sampling-step count, see STEPS_OVERRIDE. Per-request so a
+            # quality experiment costs one clip instead of one model reload.
+            "steps": body.get("steps"),
         },
     )
     JOBS[job_id] = job

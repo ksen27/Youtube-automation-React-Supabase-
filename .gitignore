@@ -65,3 +65,6 @@ next-env.d.ts
 
 # Throwaway output from scripts/celeb-image-spike.ts
 scripts/.spike-out/
+
+# Local clip-quality comparison output (scripts/clip-quality-sample.ts)
+clip-quality-sample/

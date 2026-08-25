@@ -130,6 +130,82 @@ back to the LTX account key.
 multi-key pool; keeping the real keys funded means a bad GPU deploy can be
 reverted in seconds.
 
+## Clip quality: what was actually wrong (2026-08-25)
+
+The client reported that clips degraded after the GPU cutover, specifically:
+"the not action part is good but the around action part such as body is not
+good" -- static regions clean, anything in motion falling apart.
+
+**Three real bugs, found in this order. The first is the one that mattered.**
+
+### 1. Guidance was ON for a distilled checkpoint (the cause)
+
+`_generate` passed `guidance_scale=1.0` and nothing else, leaving every other
+guidance parameter at its NON-distilled default. The pipeline's own gates:
+
+```python
+do_classifier_free_guidance    = guidance_scale > 1 or audio_guidance_scale > 1
+do_spatio_temporal_guidance    = stg_scale > 0 or audio_stg_scale > 0
+do_modality_isolation_guidance = modality_scale > 1 or audio_modality_scale > 1
+```
+
+With `audio_guidance_scale=7.0`, `stg_scale=1.0`, `modality_scale=3.0` all left
+at defaults, **all three evaluated TRUE**. The damaging one is STG --
+Spatio-Temporal Guidance -- applied at transformer block 28, adding
+`stg_scale * (pred - pred_uncond_stg)` to every prediction. It perturbs the
+TEMPORAL pathway, which is exactly why static areas were fine and motion was not.
+
+It was also costing 3-4x the compute: CFG doubles the batch, STG and modality
+each add a forward pass.
+
+MEASURED, 4s @ 1080p: **24.0 s/it -> 5.9 s/it, 170s -> 60s per clip.** Faster
+AND correct. The fix is to pass the full distilled set (see `_generate`).
+
+Note: with CFG correctly off, **`negative_prompt` does nothing** -- the distilled
+model is trained for unguided sampling. Leave `LTX_NEGATIVE_PROMPT` unset.
+
+### 2. Stage 2 refinement never ran
+
+The official LTX-2.5 distilled workflow is THREE parts: generate at half
+resolution (latents) -> latent x2 upsample -> **refine at full resolution**, 3
+steps on `STAGE_2_DISTILLED_SIGMA_VALUES`. This service did parts 1 and 2 and
+stopped, so the step that restores detail never ran -- and it decoded to pixels
+between stages, adding a lossy VAE round-trip.
+
+That omission is what produced the earlier note claiming two-stage "costs real
+detail". It does not. Two-stage IS the recommended production path; a two-stage
+pipeline **missing its refinement** costs real detail.
+
+### 3. Allocator fragmentation blocked native 1080p
+
+`Tried to allocate 894.00 MiB. 816.31 MiB free. 3.03 GiB reserved by PyTorch but
+unallocated.` Missed by 78 MiB while holding 3 GB it was not using.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (now set in `run.sh`) plus an
+`empty_cache()` before the largest allocation.
+
+Largely moot once #1 was fixed -- correct distilled sampling uses far less
+memory -- but it is cheap insurance and it is what proved native 1080p fits.
+
+### Dead ends, recorded so they are not retried
+
+- **Text-encoder CPU offload** freed ~16 GB and did allow native 1080p, but at
+  24 s/it -- which turned out to be the guidance bug, not the offload. Not
+  needed. `LTX_SELFHOST_TEXT_ENCODER_OFFLOAD` remains for emergencies only.
+- **Raising the step count.** The distilled checkpoint is driven by an explicit
+  sigma schedule `[1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725,
+  0.421875]`, not a step count. Interpolating it to 20 points produced
+  structurally melted faces. The docs are explicit that passing
+  `num_inference_steps` "would hand the model a generic linear schedule and
+  quietly cost quality". **The count is fixed at 8.**
+- **Setting `LTX_RESOLUTION=1920x1080`.** It was already 1920x1080 in
+  production and always correct. The label was never the problem.
+
+### Comparing by eye
+
+`scripts/clip-quality-sample.ts` animates one still against whichever endpoint
+`LTX_BASE_URL` names. This is the side-by-side check f926156 said it needed and
+never got -- run it before any future cutover.
+
 ## Known differences from `api.ltx.video`
 
 These are behavioural, not contractual — the app cannot tell the difference, but

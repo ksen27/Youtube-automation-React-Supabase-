@@ -23,6 +23,13 @@ if [ -f /workspace/ltx/.env ]; then
   set +a
 fi
 
+# Let a CUDA segment grow in place instead of forcing a new one. Without it a
+# native-1080p render OOM'd by 78 MiB while the caching allocator sat on 3.03 GiB
+# of reserved-but-unallocated blocks -- fragmentation, not capacity. Costs
+# nothing; belongs here rather than on the launch command line so a rebooted pod
+# (autostart.sh -> run.sh) comes up with it too.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 export HF_HOME=/workspace/hf
 export HF_HUB_ENABLE_HF_TRANSFER=1
 # Weights are already on disk; never reach out to the Hub at request time (a
