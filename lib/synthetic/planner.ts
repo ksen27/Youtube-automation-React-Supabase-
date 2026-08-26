@@ -233,6 +233,111 @@ const HANDS_RULE =
   "it rather than a disembodied hand. If you are about to write 'a hand', ask " +
   "what the line is really about and show that instead.";
 
+// WHAT HAPPENS OUTRANKS WHAT IS MENTIONED (client 2026-08-26).
+//
+// "The script is saying a collector drove four hours. Why are you showing a gun?
+// You should show someone driving." And: "the script is saying the firearms were
+// built. You should show someone building a gun."
+//
+// MEASURED on three live plans -- of the lines where a person DOES something:
+//
+//   Old Guns   89 action lines ->  12% a person doing it,  75% an object
+//   test1     108 action lines ->  10% a person doing it,  74% an object
+//   turkey     18 action lines ->   0% a person doing it,  56% an object
+//
+// The client's exact example is in the data: "A collector drove four hours to
+// get there. He paid the eight hundred, loaded the truck" was planned as "a
+// close-up of a vintage firearm resting on a velvet-lined shelf".
+//
+// The cause is that every subject rule here points at NOUNS. brollObjectRule
+// requires the named OBJECT to be the single subject; SCRIPT_MATCH_RULE's
+// examples are all objects. Nothing said a VERB outranks a noun, so a line about
+// a person driving, next to a video about guns, resolves to a gun.
+//
+// Placed ABOVE the object rules deliberately: it decides whether this line is
+// about an event at all, and only when it is not do the object rules apply.
+const ACTION_FIRST_RULE =
+  "WHAT HAPPENS OUTRANKS WHAT IS MENTIONED (critical, the client's clearest " +
+  "requirement): read this block's line and ask FIRST — does something HAPPEN in " +
+  "it? Does a person do something, go somewhere, make, build, buy, sell, carry, " +
+  "open, find, choose or hand over anything? " +
+  "If yes, THAT EVENT is the picture, and a person performing it must be in " +
+  "frame. 'A collector drove four hours' is someone DRIVING — a person at the " +
+  "wheel on a long road, not the thing they were driving to. 'The firearms were " +
+  "built' is someone BUILDING — hands and body at a workbench, tools, parts, work " +
+  "in progress. 'He loaded the truck' is a person LOADING A TRUCK. " +
+  "Showing the object the sentence happens to mention, instead of the event, is " +
+  "the single most common mistake in our videos and the client rejects it every " +
+  "time: a static object where the line described a person acting. " +
+  "The object still belongs in the frame — as what is being driven to, built, " +
+  "loaded or sold — but it is NOT the subject. The person and the action are. " +
+  "Only when a line genuinely has NO event in it (a fact, a number, a " +
+  "description of a thing) do the object rules below decide the subject.";
+
+// THE SUBJECT LIVES SOMEWHERE (client 2026-08-26: "I know the script is about
+// guns, but all we do is show footage about guns ... it's just random showing
+// guns").
+//
+// MEASURED across two live plans, every visual block classified:
+//
+//                              Old Guns      test1
+//   a person in frame              9%          8%
+//   hands only                     8%         11%
+//   the object ALONE, no place    80%         79%
+//   the object in a real place      3%          2%
+//
+// So ~87% of a video is the topic object on a surface, with no one present and
+// nowhere in particular. Every one of those blocks MATCHES its line -- the line
+// is about the object and the picture is the object -- and the result is still
+// three hundred near-identical close-ups. Matching and monotony are different
+// failures, and fixing the first does not touch the second.
+//
+// The resolution of the tension that has whipsawed this file all week: VARY THE
+// SITUATION, NEVER THE SUBJECT. The 2026-07 context rule failed because it let
+// the model show a DIFFERENT OBJECT for variety ("$800 mower" -> gloves). This
+// keeps the named subject in every frame and moves it through the world instead.
+const SUBJECT_IN_THE_WORLD_RULE =
+  "SHOW THE SUBJECT IN THE WORLD, NOT ON A VELVET CUSHION (critical, client " +
+  "requirement): the thing this line is about must be in the picture — but it " +
+  "must be SOMEWHERE, in a real situation, not floating alone on a surface. " +
+  "Measured on our own output, ~80% of blocks were the topic object 'resting on' " +
+  "something with no person and no place around it, and the client's summary was " +
+  "'it's just random showing guns'. " +
+  "DEFAULT TO A SITUATION: the thing where it actually lives and is actually " +
+  "used — on a shop counter, in a case among others, in a cardboard box being " +
+  "packed, on a workbench mid-repair, in the back of a car, at a fair or market " +
+  "stall, in a drawer being opened, on a kitchen table beside the post, in " +
+  "someone's arms, in the room of the person who owns it. " +
+  "A bare 'product shot' — the object centred on a plain, velvet, dark or " +
+  "neutral surface — is allowed ONLY when the line is specifically about how the " +
+  "object LOOKS (a marking, a serial number, a finish, a defect). Everywhere " +
+  "else it is the lazy answer and it is what makes our videos monotonous. " +
+  "Consecutive blocks about the same subject MUST move it: different place, " +
+  "different moment, different company, different scale. The subject never " +
+  "changes; the situation always does. " +
+  // PEOPLE, 2026-08-26. Re-planning randomly sampled real lines with the
+  // situation rule alone left ten of twelve frames as the object on a surface --
+  // now a surface somewhere, but still no one present. The client's reference
+  // channel is mostly PEOPLE DOING THINGS, and his instruction was "you should
+  // show someone building a gun or like trying to". A story about a thing is
+  // told through the people around it: who owned it, sold it, drove to get it,
+  // missed what it was worth.
+  //
+  // NOT a return to the stock people rejected in June -- those were posed beside
+  // the subject doing nothing. The test is whether the person is DOING something
+  // the line implies.
+  "MOST SHOTS SHOULD HAVE A PERSON IN THEM. This script is a story about " +
+  "people — who owned this thing, who sold it, who bought it, who missed what it " +
+  "was worth — and a video of objects on tables tells none of it. Unless the line " +
+  "is specifically about a marking, a measurement or a physical detail, put the " +
+  "person whose story this line belongs to IN THE FRAME, doing something " +
+  "plausible: examining it, carrying it, packing it, selling it across a counter, " +
+  "showing it to someone, walking away from it, opening the cabinet it has sat in " +
+  "for forty years. " +
+  "They must be DOING something — a person standing posed beside the subject is " +
+  "the stock-photo look the client rejected before, and is just as wrong as an " +
+  "empty table.";
+
 const SINGLE_SUBJECT_RULE =
   "SINGLE SUBJECT (critical, client requirement): the imagePrompt MUST " +
   "describe ONE single photographic scene with ONE clear subject that fills the " +
@@ -345,7 +450,12 @@ function brollObjectRule(topic: VideoTopic): string {
     ? `close, candid B-roll of the real object in ${topic.setting.trim()}`
     : "close, candid B-roll of the real object in the video's own setting";
   return (
-    "REAL B-ROLL, NOT STOCK (client requirement): this is an " +
+    // Scoped 2026-08-26: this rule decides the subject only for lines with no
+    // event in them. ACTION_FIRST_RULE handles the rest, and saying so here stops
+    // the two rules fighting over a line like "a collector drove four hours".
+    "REAL B-ROLL FOR LINES WITH NO ACTION IN THEM (client requirement): when " +
+    "this line simply describes or names a thing — no one doing anything — " +
+    "this is an " +
     `owner filming ${settingPhrase}, NOT a stock-photo library. When the narration ` +
     `names a concrete OBJECT ${examplePhrase} the imagePrompt MUST show THAT thing ` +
     `as the single subject (${brollPhrase}). Do NOT pad an object line with a ` +
@@ -765,7 +875,11 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     // as permission to name a character or a toy line. See safe-depiction.ts.
     NAMED_IP_RULE,
     "",
+    ACTION_FIRST_RULE,
+    "",
     SCRIPT_MATCH_RULE,
+    "",
+    SUBJECT_IN_THE_WORLD_RULE,
     "",
     HANDS_RULE,
     "",
@@ -962,7 +1076,11 @@ function buildSingleSegmentPrompt(
     // Regeneration anchors the niche via the stored basePrompt (printed below),
     // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
     // re-derive the topic for a single-block regen.
+    ACTION_FIRST_RULE,
+    "",
     SCRIPT_MATCH_RULE,
+    "",
+    SUBJECT_IN_THE_WORLD_RULE,
     "",
     HANDS_RULE,
     "",
@@ -985,7 +1103,7 @@ function buildSingleSegmentPrompt(
       // block goes straight to the clip lane, so wording that drifts from the
       // planner's shows up as a handful of fast, smeared clips scattered through
       // an otherwise slow video -- worse than either setting applied uniformly.
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs at a steady, even, natural pace and COMPLETES within the clip: clearly visible movement, never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. No cinematic movement.).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs at a steady, even, natural pace and COMPLETES within the clip: clearly visible movement, never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. NEVER a product-turntable shot: the object must not spin, rotate or revolve on its own and the camera must not circle it — a thing rotating in space is stock-video filler. No cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
@@ -1008,6 +1126,29 @@ const SingleSegmentSchema = z.object({
 // leading "motion"/"movement", which matched ordinary descriptions ("motion of
 // the water settles") and threw them away.
 const NO_MOTION_ANSWER_RE = /^(no|none|n\/a|null|nothing|static|still|frozen|motionless|zero)\b/i;
+
+// Motion answers that move the CAMERA, or spin the subject on a turntable.
+//
+// Client 2026-08-26: "not just guns that rotate like this". Caught in our own
+// test output the same day: for a line with no action in it, the model answered
+// "the camera slowly rotates around the Luger pistol" -- both a camera move
+// (banned: the camera is locked off) and the product-turntable cliche.
+//
+// A stored answer beats every fallback, so an unguarded one of these renders as
+// the shot the client rejects on sight. Treated as absent, exactly like a
+// no-motion answer: the scene-aware default then covers the block.
+const CAMERA_MOVE_RE =
+  /\bcamera\b[^.]{0,40}?\b(?:rotat|revolv|orbit|circl|spin|pan|tilt|zoom|track|dolly|mov|drift|push|pull|swing|glide|sweep)\w*|\b(?:slow|slowly)?\s*(?:push[- ]in|pull[- ]back|dolly\s+shot|crane\s+shot|orbit(?:ing)?\s+shot|tracking\s+shot|turntable)\b|\b(?:rotat|circl|revolv|orbit)\w*\s+(?:slowly\s+)?around\b/i;
+
+// The SUBJECT spinning in place with nothing else happening -- the product
+// turntable, arrived at from the other direction.
+const TURNTABLE_RE = /\b(rotat\w*|spin\w*|revolv\w*|turn\w*)\s+(?:slowly\s+)?(?:on|in place|on the spot|on a turntable)\b/i;
+
+export function describesCameraMove(text: string | null | undefined): boolean {
+  const t = (text ?? "").trim();
+  if (!t) return false;
+  return CAMERA_MOVE_RE.test(t) || TURNTABLE_RE.test(t);
+}
 
 export function isNoMotionAnswer(text: string | null | undefined): boolean {
   const t = (text ?? "").trim().replace(/^["']|["'.]+$/g, "");
@@ -1118,7 +1259,9 @@ export async function regenerateSegmentPrompt(input: {
       composePrompt(basePrompt, safe.imagePrompt.trim(), safe.shotType?.trim() || null) ??
       safe.imagePrompt.trim(),
     animationPrompt:
-      blockType === "ai_clip" && !isNoMotionAnswer(safe.animationPrompt)
+      blockType === "ai_clip" &&
+      !isNoMotionAnswer(safe.animationPrompt) &&
+      !describesCameraMove(safe.animationPrompt)
         ? (safe.animationPrompt?.trim() || null)
         : null,
   };
@@ -1188,6 +1331,12 @@ function buildAnimationBatchPrompt(
     "pan, no tilt, no tracking, no orbit, no shake. Only the subject moves and the",
     "framing never changes. Do not describe camera moves, cuts, scene changes or",
     "on-screen text.",
+    "",
+    "NEVER a product-turntable shot: the object must not spin, rotate, revolve or",
+    "orbit on its own, and the frame must not circle around it. A thing rotating in",
+    "space is stock-video filler and the client rejects it on sight — if the only",
+    "motion you can think of for a scene is the object turning, you have chosen the",
+    "wrong scene, and the block should show whatever its line describes happening.",
     "",
     "Where hands are visible, say they stay consistent throughout: the same two",
     "hands, same shape and skin tone, five fingers each, never swapping or changing.",
@@ -1298,7 +1447,11 @@ export async function generateAnimationPrompts(input: {
             // on scenes it judges static, and a stored answer beats every
             // fallback -- so drop it and let the scene-aware default cover the
             // block instead of storing a frozen clip.
-            if (prompt && asked.has(a.i) && !isNoMotionAnswer(prompt)) out.set(a.i, prompt);
+            // describesCameraMove: the camera is locked off, and a subject
+            // spinning on the spot is the turntable shot the client rejects.
+            if (prompt && asked.has(a.i) && !isNoMotionAnswer(prompt) && !describesCameraMove(prompt)) {
+              out.set(a.i, prompt);
+            }
           }
         } catch (e) {
           failedBatches++;

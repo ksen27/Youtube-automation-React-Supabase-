@@ -135,6 +135,7 @@ export const ACTION_CLIP_RULE =
   // motion smear, trailing artifacts), which is where that fight belongs. So: a
   // steady natural pace, plus an explicit requirement that the action READS —
   // it has to start and finish inside the clip.
+  "NEVER a product-turntable shot: the object must not spin, rotate, revolve or orbit on its own, and the frame must not circle around it. A thing rotating in space is stock-video filler and is rejected on sight. " +
   "The action is performed at a STEADY, EVEN, NATURAL pace and is CLEARLY " +
   "VISIBLE: it begins and completes within the clip, so the movement reads " +
   "plainly on screen. Not rushed, jerky or sudden; NOT sped up; NOT a " +

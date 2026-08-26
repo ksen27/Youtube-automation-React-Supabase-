@@ -69,6 +69,7 @@ export const AMBIENT_MOTION_ANIMATION_PROMPT =
   "NO PEOPLE APPEAR and no hands, fingers, arms or any part of a body enters " +
   "the frame at any point — nothing is added to the scene that is not already " +
   "visible in it. " +
+  "NEVER a product-turntable shot: the object must not spin, rotate, revolve or orbit on its own, and the frame must not circle around it. A thing rotating in space is stock-video filler and is rejected on sight. " +
   "The movement is UNHURRIED but CLEARLY VISIBLE — steady and continuous from " +
   "the first frame to the last, never rushed or jerky, and never so slight that " +
   "the shot could be mistaken for a still photograph. " +
