@@ -950,7 +950,14 @@ export function rankCandidate(input: RankInput): RankedCandidate {
     score += 20;
     reasons.push(`segment_entity:${segmentEntityHit}`);
   }
-  if (input.inheritedSegment && !subjectHit && !contextHit && !segmentEntityHit) {
+  // Content b-roll is exempt from the inherited-segment anchor: a section
+  // narrating a process/place/object ("how the rifles were assembled")
+  // legitimately pulls footage whose title never mentions the subject
+  // ("Inside a rifle factory"). Rejecting those re-created the
+  // every-part-shows-the-subject repetition the client complained about.
+  // Broll candidates still have to pass the content-signal gate below, so
+  // a result matching none of the segment's keywords is dropped anyway.
+  if (input.inheritedSegment && intentType !== "broll" && !subjectHit && !contextHit && !segmentEntityHit) {
     return { ...c, score: 0, displayScore: 0, reasons, rejected: true, rejectReason: "inherited segment without subject/context anchor" };
   }
 

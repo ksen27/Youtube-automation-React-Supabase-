@@ -496,6 +496,7 @@ export function buildSegmentQuery(
   rawQuery: string,
   context: SegmentContext,
   segmentSubject: string,
+  intentType?: "talking_head" | "broll" | "archival",
 ): string {
   const subject = (segmentSubject || context.mainSubject || "").trim();
   const aliases = (context.subjectAliases ?? []).map((s) => s.toLowerCase());
@@ -508,6 +509,15 @@ export function buildSegmentQuery(
   const containsContext = contextTerms.some((t) => t && lower.includes(t));
   if (containsSubject || containsAlias || containsContext) {
     // Already anchored. Return as-is.
+    return cleaned;
+  }
+  // Content b-roll is the one intent type allowed to leave the subject out.
+  // A section narrating a process/place/object searches for THAT content
+  // ("rifle factory assembly line"); prepending the subject would turn the
+  // content query back into a subject query and re-create the every-part-
+  // shows-the-subject repetition the client rejects. Generic b-roll phrasing
+  // ("company profile") still falls through to the subject prepend below.
+  if (intentType === "broll" && !isGenericPhrase(cleaned)) {
     return cleaned;
   }
   // No anchor present. If we have a subject, prepend it; otherwise, prepend
@@ -531,7 +541,7 @@ export async function analyzeSegment(
   const aliasList = (context.subjectAliases ?? []).filter(Boolean);
   const contextTermList = (context.contextTerms ?? []).filter(Boolean);
   const subjectBlock = subject
-    ? `\nPROJECT SUBJECT: ${subject}\nThis whole video is about ${subject}. The current section may not re-state the name, but every visual we pull must still be about ${subject} or directly involve them.${
+    ? `\nPROJECT SUBJECT: ${subject}\nThis whole video is about ${subject}, so ${subject} is the DEFAULT visual for narration that is about them. But match each section to its OWN content: when this section's narration is concretely about something else — a process (how something is made), an industry, a place, an object, another named person — the visuals for that stretch must show THAT content, not ${subject} again. Showing ${subject} over every section regardless of what the words say is the repetitive-video failure the client rejects. Fall back to ${subject} only for pronoun-heavy or general narration with no concrete content of its own.${
         aliasList.length ? `\nAliases the script may use: ${aliasList.join(", ")}.` : ""
       }${
         contextTermList.length ? `\nContext terms tied to ${subject}: ${contextTermList.join(", ")}.` : ""
@@ -544,9 +554,10 @@ export async function analyzeSegment(
     return parts.length ? `\n${parts.join(" ")}\n` : "";
   })();
   const subjectQueryRule = subject
-    ? `- ANCHOR RULE: every "query" MUST mention "${subject}" (or an alias / context term uniquely tied to ${subject}, like ${
+    ? `- ANCHOR RULE: a query about ${subject}'s OWN story MUST mention "${subject}" (or an alias / context term uniquely tied to ${subject}, like ${
         [...aliasList, ...contextTermList].slice(0, 3).join(" / ") || "their business"
-      }). A generic query like "Utah court ruling 2016" will pull unrelated trials — instead write "${subject} lawsuit 2016" or "${(contextTermList[0]) ?? subject} court ruling". If you cannot anchor a query to ${subject} or one of their named entities, drop the intent.`
+      }). A generic query like "Utah court ruling 2016" will pull unrelated trials — instead write "${subject} lawsuit 2016" or "${(contextTermList[0]) ?? subject} court ruling".
+- CONTENT EXCEPTION to the anchor rule: when THIS section's narration is concretely about something other than ${subject} — a process, an industry, a place, a machine, how something is built or made — add a "broll" intent whose query names THAT content with its own concrete nouns and NO forced ${subject} mention (e.g. for a section describing a manufacturing process, "<that product> factory assembly line", NOT "${subject} factory"; for a section about a city, that city's own streets). Take the nouns from THIS section's narration, never from this instruction. Forcing ${subject} into a content query turns the section's footage back into more ${subject}, which is the repetitive-video failure we are fixing. Drop an intent only when it is BOTH un-anchored to ${subject} AND has no concrete content nouns of its own.`
     : "";
   const prompt = `You are helping a video editor understand one section of a celebrity-focused voiceover.
 ${subjectBlock}${relatedBlock}Return STRICT JSON ONLY in this shape:
@@ -602,9 +613,15 @@ searchable specific that already appears in the text:
   - named venues / buildings (e.g. "London Palladium")
   - 4-digit years
   - named events / lawsuits / awards / incidents
+Also harvest concrete CONTENT the narration describes at length — a
+process (how a thing gets made, built, cooked, filmed, repaired), an
+industry, a machine, a trade, a place — those become content "broll"
+intents built from the content's own nouns as THIS section words them
+(see the content exception in the query rules below).
 Then BUILD each searchIntent's query by combining the project subject
-with ONE OR TWO of those harvested specifics. Every searchIntent must be
-grounded in something that LITERALLY appears in this section's narration.
+with ONE OR TWO of those harvested specifics (content "broll" intents
+keep their own nouns instead). Every searchIntent must be grounded in
+something that LITERALLY appears in this section's narration.
 If the section uses pronouns and you can't find any harvested specific,
 build queries from secondary anchors (the show, the year, the publication,
 the venue) — never default to a bare subject query.
@@ -629,6 +646,14 @@ person. So:
   a movie title, a company logo, a courthouse, a specific named building, a
   specific document, a family. Then "image" + "specific_event" or
   "specific_object". The visual is that exact thing.
+- CONTENT STRETCH — when one or more sentences narrate a process, industry,
+  place, or activity in its own right (how something is built or made, a
+  factory, a trade, a journey), those blocks show THAT content, not the
+  person: set "visual_intent" to describe the content, use "footage" with a
+  matching content "broll" searchIntent, or "image" + "specific_object" with
+  the content in "specific_visual_references". The person's face returning
+  over words about something else is the repetitive-video failure the client
+  rejects.
 - FALLBACK — if no exact image exists, the matcher falls back to the person's
   image. NEVER random unrelated visuals. You don't need to handle the fallback
   — just mark the block correctly and the matcher does the rest.
@@ -785,8 +810,11 @@ Query construction rules — these matter most. YouTube indexes against the
 literal query string, so abstract or editorial words pull in the wrong videos:
 ${subjectQueryRule}
 - Every "query" MUST contain at least one proper noun: a person's name, a place
-  name, a 4-digit year, or a specific event name. If you can't anchor the query
-  to a proper noun, drop the intent — don't pad with filler.
+  name, a 4-digit year, or a specific event name — EXCEPT content "broll"
+  queries (see the content exception above), which may instead carry two or
+  more concrete nouns taken from what THIS section's narration describes. If a
+  query has neither a proper noun nor concrete content nouns, drop the intent —
+  don't pad with filler.
 - NEVER use these editorial framing words in a query (they don't appear in real
   YouTube titles): institution, powerful, iconic, legendary, legacy, modern,
   classic, important, significant, historic, beautiful, stunning, ultimate,
@@ -886,7 +914,7 @@ SECTION (~${TARGET_SEGMENT_MINUTES} minutes, words ${segment.wordCount}):
   //    words via sanitizeQuery (already invoked inside buildSegmentQuery).
   const rewrittenIntents = safe.data.searchIntents.map((it) => ({
     ...it,
-    query: buildSegmentQuery(it.query, context, resolved.segmentSubject),
+    query: buildSegmentQuery(it.query, context, resolved.segmentSubject, it.intentType),
   }));
 
   // 2b) Deterministic story-anchor backstop. The new prompt asks Gemini to
