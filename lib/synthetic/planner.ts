@@ -1101,6 +1101,21 @@ function buildSingleSegmentPrompt(
   // draw from and collapsed to the same modal base-world scene every time (the
   // duplicate-prompt failure measured on the Old Guns review, 2026-08-26).
   surroundingScript?: string,
+  // This block is visual `index` of `total` covering ONE sentence. A long
+  // sentence is split into N slots (splitByDuration), and each slot used to be
+  // regenerated with nothing but "be different from these" — so every slot
+  // independently picked another angle on the same idea and they converged.
+  //
+  // MEASURED on a live plan, one long sentence about manufacturing standards
+  // held six slots, and the run around it read: cleaning a mechanism with a
+  // brush, inspecting the bluing, oiling the stock, applying bluing solution,
+  // inspecting the engraving, polishing the barrel. Each is "different" by the
+  // dedupe metric and the sequence is still one person fiddling with a gun at a
+  // bench for half a minute.
+  //
+  // Knowing the slot's place in the run lets the prompt ask for a PROGRESSION
+  // — successive moments of one process — instead of N independent variations.
+  sequence?: { index: number; total: number },
   // The model's OWN previous answer, when it came back as a duplicate of an
   // already-used scene. Appending that answer to avoidScenes was not enough:
   // measured on the list script, a block returned a listed scene VERBATIM twice
@@ -1164,6 +1179,22 @@ function buildSingleSegmentPrompt(
           "that exact frame.",
           "ALREADY-USED scene(s) — frame this block's subject differently from these:",
           ...avoidScenes.filter((s) => s.trim()).map((s, i) => `  ${i + 1}. ${s.trim()}`),
+        ]
+      : []),
+    ...(sequence && sequence.total > 1
+      ? [
+          "",
+          `ONE SENTENCE, ${sequence.total} PICTURES — this is picture ${sequence.index} of ${sequence.total}.`,
+          "The line below is on screen long enough to need several visuals, and",
+          "they play BACK TO BACK. So they must read as a SEQUENCE, not as",
+          `${sequence.total} separate attempts at the same idea. Move the story`,
+          "forward: an earlier and a later moment of the same process, a step and",
+          "its result, the wide view and then the thing it was about, one place",
+          "and then the next place. Picture " + sequence.index + " should look like",
+          "what happens AFTER the scenes listed above, not another angle on them.",
+          "If the earlier pictures were all one person at one surface, this one",
+          "must leave that surface — a different place, a different scale, or the",
+          "consequence of what they were doing.",
         ]
       : []),
     ...((clonedPrompt ?? "").trim()
@@ -1356,8 +1387,11 @@ export async function regenerateSegmentPrompt(input: {
   // instead of collapsing to the base world's modal scene — see
   // buildSingleSegmentPrompt.
   surroundingScript?: string;
+  // This visual's place in a run of visuals covering ONE sentence, so the run
+  // reads as a sequence rather than N variations. See buildSingleSegmentPrompt.
+  sequence?: { index: number; total: number };
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt, surroundingScript } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt, surroundingScript, sequence } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -1373,7 +1407,7 @@ export async function regenerateSegmentPrompt(input: {
     "regenerateSegmentPrompt",
     async (model) => {
       const res = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoid, language ?? DEFAULT_LANGUAGE, refusedPrompt, surroundingScript, cloned) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoid, language ?? DEFAULT_LANGUAGE, refusedPrompt, surroundingScript, sequence, cloned) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.4,
@@ -1865,8 +1899,28 @@ async function applyBasePromptGuard(
 // Deliberately conservative: it looks for an explicit place, not any noun, so a
 // block that merely names an object still gets the world appended (the base's
 // original and correct job).
+// Does the block name a place of its own? If so composePrompt must NOT append
+// the video's recurring world, or the prompt carries two contradictory
+// locations.
+//
+// This used to require a PREPOSITION-FIRST shape — in/at/on + article + ≤1 word
+// + noun — which only matches when the sentence happens to be phrased that way.
+// Measured 2026-08-26 on a live plan: "a man ... standing beside an open truck
+// bed, carefully lifting a long, wrapped object into the truck, a rural
+// driveway in the background" matched NOTHING and was shipped as "... a rural
+// driveway in the background. Setting: a collector's private armory." Three
+// separate place mentions, all missed: "beside" is not in the preposition list,
+// "into" is not the word "in", and "driveway" came BEFORE its preposition. The
+// very next block matched only by the incidental phrase "looking focused on the
+// road", which is luck, not detection.
+//
+// The place NOUN is the signal; the grammar around it is noise. So match the
+// noun wherever it appears. Over-matching is the safe direction here: a block
+// that mentions a table, a truck or a shop genuinely does have a place, and
+// leaving the recurring world off it costs nothing — the scene still describes
+// itself. Appending a contradictory world is the failure that shows on screen.
 const PLACE_RE =
-  /\b(in|at|on|inside|outside|indoors|outdoors)\s+(a|an|the|his|her|their|its)?\s*[\w-]*\s*(kitchen|counter|countertop|table|aisle|shelf|store|supermarket|market|shop|laboratory|lab|office|desk|home|house|room|garage|workshop|yard|garden|field|farm|barn|street|road|car|truck|warehouse|factory|restaurant|cafe|diner|studio|clinic|hospital|classroom|library|dock|harbour|harbor|beach|forest|mountain|trail|park|basement|attic|porch|driveway|sidewalk|checkout|register|freezer|fridge|refrigerator|pantry|cupboard|cart|trolley)\b/i;
+  /\b(kitchen|counter|countertop|table|tabletop|aisle|shelf|shelves|rack|store|supermarket|market|stall|shop|storefront|showroom|armor?y|laboratory|lab|office|boardroom|desk|home|house|room|hall|hallway|garage|workshop|workbench|bench|yard|garden|lawn|field|farm|barn|shed|street|road|highway|roadside|lane|car|truck|tailgate|van|trailer|warehouse|factory|plant|mill|foundry|restaurant|cafe|diner|studio|clinic|hospital|classroom|library|museum|church|dock|harbour|harbor|beach|forest|woods|mountain|desert|trail|park|basement|attic|cellar|loft|porch|doorway|driveway|sidewalk|pavement|checkout|register|counter|freezer|fridge|refrigerator|pantry|cupboard|drawer|cabinet|safe|vault|case|crate|cart|trolley|auction|estate sale|yard sale|fair|tent|site|camp|mine|tunnel|deck|patio|balcony|rooftop|roof)\b/i;
 
 export function blockNamesItsOwnPlace(blockPrompt: string | null | undefined): boolean {
   const p = (blockPrompt ?? "").trim();
@@ -5100,7 +5154,12 @@ export async function buildSyntheticTimeline(input: {
           const avoid: string[] = [];
           const anchorScene = anchor.imagePrompt?.trim();
           if (anchorScene) avoid.push(anchorScene);
-          for (const slot of slots) {
+          // The anchor is picture 1 of the run; each slot is the next one.
+          // Passing the position lets the regen build a PROGRESSION instead of
+          // another independent variation — see the sequence block in
+          // buildSingleSegmentPrompt for the measured failure this fixes.
+          const runTotal = slots.length + 1;
+          for (const [slotIdx, slot] of slots.entries()) {
             try {
               const r = await regenerateSegmentPrompt({
                 projectId,
@@ -5110,6 +5169,7 @@ export async function buildSyntheticTimeline(input: {
                 blockType: slot.blockType,
                 language,
                 avoidScenes: avoid,
+                sequence: { index: slotIdx + 2, total: runTotal },
               });
               // regenerateSegmentPrompt returns a prompt already composed WITH the
               // base in front and the shot folded in, so clear shotType and the
