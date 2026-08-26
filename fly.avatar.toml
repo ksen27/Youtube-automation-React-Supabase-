@@ -263,17 +263,28 @@ kill_timeout = "300s"
   #     repeat an earlier scene in the SAME script (the "spoons" complaint).
   ASSET_LIBRARY_MAX_REUSE_FRACTION = "0.15"
   SYNTHETIC_SCENE_DEDUPE_ENABLED = "true"
-  # 0.5 -> 0.7 (client 2026-08-25, Loom: "it doesn't match the script at all").
-  # Note his ORIGINAL 08-19 ask was "not too repetitive AND it matches the
-  # script better" -- only the first half got built. At 0.5 a Jaccard overlap of
-  # half the content words counts as a repeat, so on a script that stays on one
-  # subject (every script we get) most blocks were flagged and regenerated away
-  # from that subject. 0.7 flags near-clones only. The prompt half of this fix
-  # matters more: a flagged block is now told to reframe the SAME subject rather
-  # than to find a different one (see the DIFFERENT SHOT block in planner.ts).
-  SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.7"
+  # 0.5 -> 0.7 -> 0.55. MEASURED, and the 0.7 step was a mistake worth recording.
+  #
+  # Raising it to 0.7 on 2026-08-25 was meant to stop the dedupe pass pushing
+  # shots off-subject. It did, but it also stopped the pass catching repeats: the
+  # first post-deploy plan (2026-08-26) came back with 833 near-identical prompt
+  # pairs against 471 and 177 on the two plans before it. The repetition the
+  # client has complained about three times got measurably WORSE.
+  #
+  # 0.55 is safe now in a way it was not on 08-25, because the THRESHOLD is no
+  # longer the thing protecting subject-match. The instruction a flagged block
+  # receives was rewritten in the same commit: it now says "same subject,
+  # different shot" and names dropping the subject as the forbidden outcome. So
+  # flagging more blocks means reframing more blocks, not losing more subjects.
+  SYNTHETIC_SCENE_DEDUPE_SIMILARITY = "0.55"
   SYNTHETIC_SCENE_DEDUPE_WINDOW = "40"
-  SYNTHETIC_SCENE_DEDUPE_MAX_REGEN = "80"
+  # 80 -> 400. The cap was sized for a much shorter plan: the projects we
+  # actually ship carry 420-460 visual blocks, so a video could flag hundreds of
+  # repeats and only ever fix the first 80 -- the overflow keeps its original
+  # prompt and ships as-is. That is most of the 833 pairs measured on 2026-08-26.
+  # 400 covers a full-length plan; the pass is concurrency-limited and each regen
+  # is one small Gemini call, so the cost is latency at plan time, not quality.
+  SYNTHETIC_SCENE_DEDUPE_MAX_REGEN = "400"
   # Confine the clip budget inside the 15-minute SYNTHETIC_CLIP_HEAVY_SECONDS
   # window instead of spreading it across the whole video — the July "no more LTX
   # after 15 minutes" cost guard. "false" spreads clips across the whole video,

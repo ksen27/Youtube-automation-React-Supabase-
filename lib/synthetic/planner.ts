@@ -202,6 +202,37 @@ const SCRIPT_MATCH_RULE =
   "video's world — and even then, prefer whatever the surrounding sentences are " +
   "physically about.";
 
+// HANDS ARE NOT A SUBJECT (client, repeatedly: "What is this hand movement?
+// Every time it like uses it on the hand movement, it doesn't make any sense",
+// and "why the all clip is ther hands?").
+//
+// Measured 2026-08-26 on a live plan: five CONSECUTIVE blocks all resolved to
+// "a person's hand + a ground turkey package + a label". Their pairwise word
+// overlap was 0.24-0.52, so the scene-dedupe pass could not see them as repeats
+// at any usable threshold -- they are the same PICTURE described five ways.
+//
+// Every hands rule in this codebase before today governed MOTION (what moves in
+// a clip). Nothing governed COMPOSITION, and brollObjectRule was actively asking
+// for "hands-on B-roll". So the model was following instructions.
+//
+// This rule is about the still. It is deliberately blunt: "a hand holding X" is
+// the single most repeated composition in our output, and naming it as forbidden
+// is what stops it being the default answer for every object line.
+const HANDS_RULE =
+  "HANDS ARE NOT A SUBJECT (critical, client requirement): do NOT make a hand, " +
+  "hands or fingers the subject of the picture. 'A hand holding X', 'a hand " +
+  "pointing at X', 'hands reaching for X' are FORBIDDEN compositions — they are " +
+  "the most over-used shot in our videos and the client has rejected them by " +
+  "name. " +
+  "When the line is about an OBJECT, show the OBJECT: on the shelf, on a " +
+  "counter, in a cart, beside its price tag, in use, in its real place. When the " +
+  "line is about a PERSON, show the PERSON — their body and face in frame, doing " +
+  "the thing. " +
+  "A hand may appear ONLY when the line is genuinely about a hand action " +
+  "(opening it, pouring it, picking it up), and even then frame the PERSON doing " +
+  "it rather than a disembodied hand. If you are about to write 'a hand', ask " +
+  "what the line is really about and show that instead.";
+
 const SINGLE_SUBJECT_RULE =
   "SINGLE SUBJECT (critical, client requirement): the imagePrompt MUST " +
   "describe ONE single photographic scene with ONE clear subject that fills the " +
@@ -307,9 +338,12 @@ function brollObjectRule(topic: VideoTopic): string {
   const examplePhrase = topic.subjectExamples.trim()
     ? `— e.g. ${topic.subjectExamples.trim()}, a tool, water, a part, a surface, etc. —`
     : "— a tool, a part, an object, a place, etc. —";
+  // "hands-on B-roll" was in the prompt for EVERY visual block of every video,
+  // which is part of why 11-17% of blocks across four audited projects put a
+  // disembodied hand in frame. The intent was "candid, close, real" -- say that.
   const brollPhrase = topic.setting.trim()
-    ? `close, candid, hands-on B-roll of the real object in ${topic.setting.trim()}`
-    : "close, candid, hands-on B-roll of the real object in the video's own setting";
+    ? `close, candid B-roll of the real object in ${topic.setting.trim()}`
+    : "close, candid B-roll of the real object in the video's own setting";
   return (
     "REAL B-ROLL, NOT STOCK (client requirement): this is an " +
     `owner filming ${settingPhrase}, NOT a stock-photo library. When the narration ` +
@@ -660,6 +694,12 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "video's recurring visual world — the SETTING / location type, the era, and",
     "the overall mood ONLY. This is a shared style bible that every block builds",
     "on, added as trailing context to each block. Keep it SHORT (one sentence).",
+    "Keep it GENERAL — a kind of place, an era and a mood, not one specific",
+    "room. 'an ordinary American home and the shops around it, present day, warm",
+    "and plain' is right; 'a brightly lit supermarket meat aisle and a sterile",
+    "food laboratory' is WRONG, because every block in the video then happens in",
+    "those two rooms no matter what its own line is about. Name at most ONE kind",
+    "of place, and never two joined with 'and'.",
     "Do NOT bake in a fixed framing or composition (do NOT say 'close-up' or",
     "one repeated shot here) and do NOT name one specific subject — the",
     "framing comes from each block's shotType and the subject from each block's",
@@ -726,6 +766,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     NAMED_IP_RULE,
     "",
     SCRIPT_MATCH_RULE,
+    "",
+    HANDS_RULE,
     "",
     brollObjectRule(topic),
     "",
@@ -921,6 +963,8 @@ function buildSingleSegmentPrompt(
     // so the rule text here stays niche-neutral (EMPTY_TOPIC) — no need to
     // re-derive the topic for a single-block regen.
     SCRIPT_MATCH_RULE,
+    "",
+    HANDS_RULE,
     "",
     brollObjectRule(EMPTY_TOPIC),
     "",
@@ -1448,6 +1492,33 @@ async function applyBasePromptGuard(
   return cleaned;
 }
 
+// Does this block already establish WHERE it happens?
+//
+// The base prompt is appended to every block as ". Setting: <base>.", which is
+// right when the block only describes a subject and wrong when the block has
+// already chosen a place. Measured 2026-08-26 on a live plan:
+//
+//   block: "A person at home, holding a package... kitchen counter in background"
+//   base : "Setting: A brightly lit, clean supermarket meat aisle and a sterile
+//           food laboratory..."
+//
+// Two contradictory locations in one prompt. The image model cannot satisfy
+// both, and every one of that project's 428 blocks was pinned to those two rooms
+// regardless of what its own line was about -- which is the "everything looks
+// the same" complaint, arriving through the world rather than the subject.
+//
+// Deliberately conservative: it looks for an explicit place, not any noun, so a
+// block that merely names an object still gets the world appended (the base's
+// original and correct job).
+const PLACE_RE =
+  /\b(in|at|on|inside|outside|indoors|outdoors)\s+(a|an|the|his|her|their|its)?\s*[\w-]*\s*(kitchen|counter|countertop|table|aisle|shelf|store|supermarket|market|shop|laboratory|lab|office|desk|home|house|room|garage|workshop|yard|garden|field|farm|barn|street|road|car|truck|warehouse|factory|restaurant|cafe|diner|studio|clinic|hospital|classroom|library|dock|harbour|harbor|beach|forest|mountain|trail|park|basement|attic|porch|driveway|sidewalk|checkout|register|freezer|fridge|refrigerator|pantry|cupboard|cart|trolley)\b/i;
+
+export function blockNamesItsOwnPlace(blockPrompt: string | null | undefined): boolean {
+  const p = (blockPrompt ?? "").trim();
+  if (!p) return false;
+  return PLACE_RE.test(p);
+}
+
 function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?: string | null): string | null {
   const base = basePrompt.trim();
   const block = (blockPrompt ?? "").trim();
@@ -1459,6 +1530,9 @@ function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?
   // Avoid a duplicated base if a block prompt already contains it (e.g. an edited
   // row re-run through the planner).
   if (lead.toLowerCase().includes(base.toLowerCase())) return lead;
+  // The block already chose a place -- appending the world here would put two
+  // contradictory locations in one prompt. See blockNamesItsOwnPlace.
+  if (blockNamesItsOwnPlace(lead)) return lead.replace(/[.\s]+$/, "");
   // Subject/shot first; world as trailing context.
   return `${lead.replace(/[.\s]+$/, "")}. Setting: ${base.replace(/[.\s]+$/, "")}.`;
 }
@@ -2205,6 +2279,132 @@ export interface RepeatedScene {
  * `maxRegen` caps how many are flagged — each one costs a Gemini call. The
  * caller reports the overflow rather than silently truncating.
  */
+// SAME PICTURE, DIFFERENT WORDS.
+//
+// findRepeatedScenes below compares CONTENT WORDS, which catches near-clones and
+// nothing else. Measured 2026-08-26 on five CONSECUTIVE live blocks that were
+// all "a person's hand + a ground turkey package + a label":
+//
+//   pairwise word overlap 0.24 - 0.52   ->  flagged at 0.70: 0   at 0.55: 0
+//
+// You would need a threshold near 0.25 to catch them, which would flag nearly
+// every block in the video. Lexical similarity is blind to a repeated
+// COMPOSITION described in different vocabulary, and that composition is exactly
+// what the client keeps reporting ("the footage is so repetitive").
+//
+// So compare the SHAPE of the shot instead of its wording:
+//   - is a hand/body the subject?
+//   - what is the framing (the shotType prefix)?
+//   - which concrete OBJECT nouns appear, as a set?
+//
+// The five examples above all reduce to hands + package/label, and collapse onto
+// one signature. Two shots of the same object at different framings do NOT
+// collapse, which is the variety we want to keep.
+const SIG_STOP = new Set([
+  "close", "closeup", "wide", "medium", "macro", "shot", "angle", "view", "scene",
+  "photo", "image", "frame", "framing", "establishing", "product", "level",
+  "ground", "low", "high", "over", "shoulder", "with", "that", "this", "from",
+  "into", "onto", "showing", "shown", "visible", "background", "foreground",
+  "focus", "detail", "details", "small", "large", "generic", "simple", "clean",
+  "brightly", "lit", "dark", "light", "some", "several", "various", "partially",
+  "almost", "very", "real", "clearly", "slightly",
+]);
+
+const BODY_RE = /\b(hands?|fingers?|palm|arms?|person|people|man|woman|shopper|customer)\b/i;
+
+/**
+ * A coarse fingerprint of WHAT THE PICTURE IS, independent of how it is worded.
+ *
+ * Exported for testing: the value is opaque, only equality between two prompts
+ * is meaningful.
+ */
+export function compositionSignature(prompt: string | null | undefined): string {
+  const raw = (prompt ?? "").trim();
+  if (!raw) return "";
+  // Drop the appended world and the shot-type prefix -- neither says what the
+  // subject IS, and both are shared by most blocks.
+  const body = raw.replace(/\.\s*Setting:[\s\S]*$/i, "").replace(/^[^:]{0,40}:\s*/, "");
+  const hasBody = BODY_RE.test(body) ? "body" : "nobody";
+  // KEEP THEM ALL. An earlier version sorted and took the first six, which is
+  // alphabetical truncation: "…back, held, ingredients, list, meat" survived
+  // while "package" and "turkey" -- the actual subject -- were cut. Two shots of
+  // the same thing then shared none of the words that made them the same shot.
+  const nouns = [
+    ...new Set(
+      body
+        .toLowerCase()
+        .replace(/[^a-z\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 3 && !SIG_STOP.has(w) && !BODY_RE.test(w)),
+    ),
+  ].sort();
+  return `${hasBody}|${nouns.join(",")}`;
+}
+
+export interface RepeatedComposition {
+  index: number;
+  signature: string;
+  avoid: string[];
+  anchor: number;
+}
+
+/**
+ * Blocks whose SHOT SHAPE repeats one already used within `window` accepted
+ * visuals. Same contract as findRepeatedScenes so both feed one regeneration
+ * pass: the first use of a composition is kept, later ones are flagged.
+ *
+ * `minShared` is how many signature nouns two shots must have in common (on top
+ * of agreeing about whether a body is in frame) before they count as the same
+ * picture. 2 is deliberately loose -- "hands + package" and "hands + label" are
+ * the same shot to a viewer even though only one noun matches, but requiring 2
+ * keeps unrelated scenes apart.
+ */
+export function findRepeatedCompositions(
+  scenes: ReadonlyArray<string | null>,
+  opts: { window: number; maxRegen: number; minShared?: number },
+): { repeats: RepeatedComposition[]; flaggedTotal: number } {
+  const minShared = opts.minShared ?? 2;
+  const accepted: { index: number; sig: string; nouns: Set<string>; body: string; text: string }[] = [];
+  const repeats: RepeatedComposition[] = [];
+  let flaggedTotal = 0;
+
+  for (let i = 0; i < scenes.length; i++) {
+    const text = (scenes[i] ?? "").trim();
+    if (!text) continue;
+    const sig = compositionSignature(text);
+    if (!sig) continue;
+    const [body, nounCsv] = sig.split("|");
+    const nouns = new Set(nounCsv ? nounCsv.split(",") : []);
+    if (nouns.size === 0) {
+      accepted.push({ index: i, sig, nouns, body, text });
+      continue;
+    }
+
+    let match: (typeof accepted)[number] | null = null;
+    for (let k = accepted.length - 1; k >= 0; k--) {
+      const cand = accepted[k];
+      if (opts.window > 0 && accepted.length - k > opts.window) break;
+      if (cand.body !== body) continue;
+      let shared = 0;
+      for (const n of nouns) if (cand.nouns.has(n)) shared++;
+      if (shared >= minShared) {
+        match = cand;
+        break;
+      }
+    }
+
+    if (match) {
+      flaggedTotal++;
+      if (repeats.length < opts.maxRegen) {
+        repeats.push({ index: i, signature: sig, avoid: [match.text], anchor: match.index });
+      }
+      continue;
+    }
+    accepted.push({ index: i, sig, nouns, body, text });
+  }
+  return { repeats, flaggedTotal };
+}
+
 export function findRepeatedScenes(
   scenes: ReadonlyArray<string | null>,
   opts: { basePrompt?: string; similarity: number; window: number; maxRegen: number },
@@ -2942,10 +3142,26 @@ export function splitByDuration(
   // angle" suffix is needed because the scene is already different. Only when
   // imagePrompt2 is missing do we fall back to flagging secondVisual so persist
   // appends the variation nudge to the (reused) first prompt.
-  const applySecondScene = (piece: PlannedSegment): PlannedSegment =>
-    seg.imagePrompt2
-      ? { ...piece, imagePrompt: seg.imagePrompt2, shotType: seg.shotType2 ?? seg.shotType, secondVisual: false }
+  // imagePrompt2 is only worth taking if it is genuinely a DIFFERENT picture.
+  //
+  // Measured 2026-08-26 on a live post-deploy plan: blocks #202/#203, #304/#305
+  // and #407/#408 held BYTE-IDENTICAL prompts -- the same shot rendered twice in
+  // a row. Gemini had returned imagePrompt2 equal to imagePrompt, and this
+  // branch trusted it because it was non-empty. The planner prompt asks for "a
+  // SECOND, genuinely DIFFERENT picture"; nothing checked that it got one.
+  //
+  // When it is missing OR too close to the first, fall through to
+  // secondVisual: true, which is the path that already exists for exactly this
+  // case -- persist adds the different-angle nudge and the distinct-scene pass
+  // regenerates it against the first.
+  const applySecondScene = (piece: PlannedSegment): PlannedSegment => {
+    const first = (seg.imagePrompt ?? "").trim();
+    const second = (seg.imagePrompt2 ?? "").trim();
+    const distinct = second.length > 0 && sceneSimilarity(sceneWords(second), sceneWords(first)) < 0.85;
+    return distinct
+      ? { ...piece, imagePrompt: second, shotType: seg.shotType2 ?? seg.shotType, secondVisual: false }
       : { ...piece, secondVisual: true };
+  };
 
   const pieces: PlannedSegment[] = [];
   for (let k = 0; k < slots; k++) {
@@ -4590,12 +4806,44 @@ export async function buildSyntheticTimeline(input: {
     const scenes = planned.map((p) =>
       p.blockType === "avatar" ? null : (p.imagePrompt ?? null),
     );
-    const { repeats, flaggedTotal } = findRepeatedScenes(scenes, {
+    const { repeats: wordRepeats, flaggedTotal } = findRepeatedScenes(scenes, {
       basePrompt,
       similarity: env.SYNTHETIC_SCENE_DEDUPE_SIMILARITY,
       window: env.SYNTHETIC_SCENE_DEDUPE_WINDOW,
       maxRegen: env.SYNTHETIC_SCENE_DEDUPE_MAX_REGEN,
     });
+
+    // SECOND PASS, on the SHAPE of the shot rather than its wording.
+    //
+    // findRepeatedScenes compares content words and therefore only ever sees
+    // near-clones. Measured 2026-08-26 on five consecutive live blocks that were
+    // all "a person's hand + a ground turkey package + a label": pairwise word
+    // overlap 0.24-0.52, so ZERO of them were flagged at any threshold we could
+    // ship. They are the same picture written five ways, and that is the
+    // repetition the client keeps reporting.
+    //
+    // findRepeatedCompositions catches exactly those. Both passes feed ONE
+    // regeneration below, and a block already flagged by the word pass is not
+    // flagged twice -- its avoid list is the more specific of the two.
+    const { repeats: shapeRepeats, flaggedTotal: shapeFlagged } = findRepeatedCompositions(scenes, {
+      window: env.SYNTHETIC_SCENE_DEDUPE_WINDOW,
+      maxRegen: env.SYNTHETIC_SCENE_DEDUPE_MAX_REGEN,
+    });
+    const seenIdx = new Set(wordRepeats.map((r) => r.index));
+    const repeats: RepeatedScene[] = [
+      ...wordRepeats,
+      ...shapeRepeats
+        .filter((r) => !seenIdx.has(r.index))
+        .map((r) => ({ index: r.index, avoid: r.avoid, anchor: r.anchor, similarity: 1 })),
+    ].sort((a, b) => a.index - b.index);
+
+    if (shapeRepeats.length > 0) {
+      await logJob({ projectId, jobId }, "synthetic.plan.composition_repeats", {
+        flagged: shapeFlagged,
+        regenerating: repeats.length - wordRepeats.length,
+        note: "same shot shape, different wording — invisible to the word-overlap pass",
+      });
+    }
 
     if (repeats.length > 0) {
       // Blocks that duplicate the SAME earlier scene must also differ from each
