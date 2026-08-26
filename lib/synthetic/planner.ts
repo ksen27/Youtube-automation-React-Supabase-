@@ -5614,6 +5614,55 @@ export async function buildSyntheticTimeline(input: {
   await sb.from("timeline_items").delete().eq("project_id", projectId);
   await sb.from("synthetic_segments").delete().eq("project_id", projectId);
 
+  // EMPTY-SCENE REPAIR. The planner prompt ends "An empty imagePrompt is
+  // INVALID output" and nothing checked it. When a visual block comes back with
+  // no scene, composePrompt has nothing to lead with and returns the BARE
+  // recurring world, so the row ships as e.g. "workshops, gun shops, estate
+  // sales and the roads between them, present day, warm and plain" — a mood
+  // with no subject, for a line that had one. The image processor's last-resort
+  // fallback is the same base_prompt, so nothing downstream catches it either.
+  //
+  // Observed on a live plan for "Casual sellers have no idea the conversation is
+  // even happening." Rare, which is why it went unnoticed: one dead block in a
+  // few hundred is invisible in a log and obvious on screen.
+  //
+  // Repaired with the single-block path, which carries the full rule stack plus
+  // the neighbouring lines — the same machinery the dedupe pass uses. A failure
+  // here leaves the block exactly as it is now, so this can only improve it.
+  {
+    const empties = planned
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => p.blockType !== "avatar" && !(p.imagePrompt ?? "").trim());
+    if (empties.length > 0) {
+      const emptyLimit = makeLimit(5);
+      let repaired = 0;
+      await Promise.all(empties.map(({ p, i }) => emptyLimit(async () => {
+        try {
+          const r = await regenerateSegmentPrompt({
+            projectId,
+            jobId,
+            script: p.script,
+            basePrompt,
+            blockType: p.blockType,
+            language,
+            surroundingScript: [planned[i - 1]?.script, planned[i + 1]?.script].filter(Boolean).join(" "),
+          });
+          p.imagePrompt = r.imagePrompt;
+          p.shotType = null;
+          if (p.blockType === "ai_clip") p.animationPrompt = r.animationPrompt;
+          repaired++;
+        } catch {
+          // Non-fatal: the block keeps the bare-world prompt it already had.
+        }
+      })));
+      await logJob({ projectId, jobId }, "synthetic.plan.empty_scene_repair", {
+        found: empties.length,
+        repaired,
+        positions: empties.map(({ p }) => p.position),
+      });
+    }
+  }
+
   // THE NARRATOR APPEARS IN THE STORY. Pick the few blocks whose still will be
   // generated with the project's avatar as an identity reference — narration in
   // the presenter's own voice, over a scene that already has a person in it.
