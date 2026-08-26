@@ -317,6 +317,23 @@ const INSTITUTION_NOT_PRODUCT_RULE =
   "building or its gates, an empty or closing plant, ledgers and paperwork, a " +
   "handshake between people in business clothes, a newspaper business page. Show " +
   "PEOPLE doing the business wherever you can. " +
+  // HOW IT WAS MADE IS NOT THE FINISHED THING (2026-08-26, same live plan).
+  // "a number of manufacturers were producing firearms to a standard of fit,
+  // finish and mechanical integrity" is a line about an INDUSTRY AND A PROCESS,
+  // and it produced six consecutive close-ups of a finished gun being cleaned,
+  // oiled, blued and polished on one bench. The subject of the sentence is how
+  // the things were MADE, and the making has factories, machines and people in
+  // it — none of which appeared.
+  "MAKING IS NOT THE MADE THING: when a line is about how something was " +
+  "produced, built, assembled, inspected or finished — its standards, its " +
+  "tolerances, its materials, the labour in it — the picture is the MAKING. " +
+  "Show the factory floor, the machine mid-cut, the bench with work in " +
+  "progress and a worker at it, the inspection, the parts before they are a " +
+  "product, the people who did it, the building they did it in. A polished " +
+  "finished specimen being handled, cleaned or admired is the WRONG picture " +
+  "for these lines, and a run of them is what makes a video feel like one long " +
+  "product shoot. Only when the line is specifically about how the finished " +
+  "thing LOOKS does the finished thing become the subject. " +
   "Likewise read FIGURES OF SPEECH for their meaning, not their words: someone " +
   "who 'cleaned out' a cupboard EMPTIED it (they did not wipe it with a cloth); " +
   "something that 'changed hands' was SOLD; a market that 'dried up' lost its " +
@@ -914,12 +931,29 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "video's recurring visual world — the SETTING / location type, the era, and",
     "the overall mood ONLY. This is a shared style bible that every block builds",
     "on, added as trailing context to each block. Keep it SHORT (one sentence).",
-    "Keep it GENERAL — a kind of place, an era and a mood, not one specific",
-    "room. 'an ordinary American home and the shops around it, present day, warm",
-    "and plain' is right; 'a brightly lit supermarket meat aisle and a sterile",
-    "food laboratory' is WRONG, because every block in the video then happens in",
-    "those two rooms no matter what its own line is about. Name at most ONE kind",
-    "of place, and never two joined with 'and'.",
+    // 2026-08-26. This block used to end with "Name at most ONE kind of place,
+    // and never two joined with 'and'" — which contradicts its own worked
+    // example ("an ordinary American home AND the shops around it"). Given a
+    // rule and an example that disagree, the model obeyed the rule and picked
+    // the NARROWEST single room it could: a live plan came back with "a
+    // collector's private armory, present day, well-lit and organized", and
+    // every placeless block in a script about estate sales, a four-hour drive,
+    // a truck bed, a factory floor and a boardroom inherited that one room.
+    //
+    // A recurring WORLD is the right idea; a recurring ROOM is the failure. So
+    // the requirement is inverted: name the kind of place AND what surrounds it.
+    "Keep it GENERAL — a WORLD, not a room. Name the kind of place AND the",
+    "everyday places around it, so blocks that leave the main setting still have",
+    "somewhere to be. 'an ordinary American home and the shops around it,",
+    "present day, warm and plain' is right, and so is 'workshops, gun shops,",
+    "estate sales and the roads between them'. A single named room is WRONG —",
+    "'a collector's private armory' or 'a brightly lit supermarket meat aisle'",
+    "means every block in the video happens in that one room no matter what its",
+    "own line is about, which is the most common cause of a monotonous video.",
+    "Never a possessive, private or one-off location ('a collector's private X',",
+    "'the workshop of a master Y'): those are a single room wearing a costume.",
+    "If the transcript travels — a journey, a sale, a factory, an office, a",
+    "different decade — the world must be broad enough to contain all of it.",
     "Do NOT bake in a fixed framing or composition (do NOT say 'close-up' or",
     "one repeated shot here) and do NOT name one specific subject — the",
     "framing comes from each block's shotType and the subject from each block's",
