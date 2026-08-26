@@ -110,6 +110,20 @@ describe('YtDlpAudioDownloader proxy handling', () => {
     expect(second.runs).toHaveLength(0);
   });
 
+  // The count of proxies TRIED is smaller than the pool whenever something is
+  // quarantined, and a bare "7 proxies tried" against a pool of 10 reads as a
+  // broken rotation. The error has to account for the missing three.
+  it('says how many proxies were skipped, so the tried-count reconciles', async () => {
+    const health = new ProxyHealth(60_000, () => 0);
+    const first = downloader([AUTH_ERROR, 'Sign in to confirm you are not a bot'], health);
+    await first.d.downloadAudio(TARGET);
+
+    const second = downloader(['Sign in to confirm you are not a bot'], health);
+    const r = await second.d.downloadAudio(TARGET);
+    expect(r.isFail()).toBe(true);
+    expect(r.error).toMatch(/1 proxies tried, 1 skipped \(auth-quarantined\)/);
+  });
+
   // With no pool configured there is nothing to quarantine and no account to
   // blame — a direct attempt that fails is just a failed download.
   it('keeps the no-proxy path retryable', async () => {

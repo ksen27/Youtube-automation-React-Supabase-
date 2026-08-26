@@ -47,6 +47,35 @@
 #                         still be generated and previewed, just not published.
 #   NETLIFY_ACCOUNT_SLUG — only when the token has access to more than one team.
 #
+#   YT_DLP_COOKIES_B64  — base64 of a Netscape cookies.txt for a signed-in
+#                         YouTube account, materialized to a private temp file
+#                         at startup (see ytdlpCookies.ts). Without it, gated
+#                         videos fail the Whisper fallback with "Sign in to
+#                         confirm you're not a bot" NO MATTER how clean the
+#                         proxy IP is — the gate is on the player request, not
+#                         the page fetch, and a residential proxy that loads the
+#                         watch page fine still gets refused a format. Set with:
+#                           echo "YT_DLP_COOKIES_B64=$(base64 -w0 cookies.txt)" \
+#                             | fly secrets import -c fly.ebook.toml
+#                         (`secrets import` reads KEY=VALUE from stdin; a plain
+#                         `secrets set` would put the whole jar in shell history.)
+#                         Export the jar from an INCOGNITO window and close it
+#                         right after — YouTube rotates session cookies as you
+#                         browse, which invalidates a jar exported from a window
+#                         you keep using.
+#                         Cookies expire; a recurrence of the bot gate on ALL
+#                         videos at once means re-export, not a proxy purchase.
+#
+#   YT_DLP_PROXIES      — the residential proxy pool, `host:port:user:pass`
+#                         comma-separated. Verify every entry BEFORE setting it:
+#                         a proxy that 407s is quarantined for 10 minutes and
+#                         silently shrinks the pool, and a wholly-bad list stops
+#                         the stage outright. Check one with:
+#                           curl -x http://user:pass@host:port https://ipinfo.io/json
+#                         Also note the spelling — this app ALSO reads
+#                         YTDLP_PROXIES (no underscore), and YT_DLP_PROXIES wins
+#                         when both are set. See youtubeProxyList().
+#
 # BEFORE THE FIRST DEPLOY, the ebook schema must exist:
 #   1. Run supabase/migrations/0031_ebook_schema.sql, then 0032_..., in the
 #      Supabase SQL editor. They MUST run as two separate statement batches —

@@ -103,6 +103,32 @@ Hard caps (configurable in `.env.local`):
 | `npm run lint`         | ESLint                                                         |
 | `npm run build`        | `next build` (production)                                      |
 
+## Boards (project management)
+
+`/boards` is a Kanban surface for planning the team's work — boards → lists →
+cards, with labels, assignees, due dates, checklists, comments, attachments and
+an activity history. It is independent of the render pipeline; a board may
+optionally reference a video project (`boards.project_id`) when a team wants to
+track the work around one specific video.
+
+Apply `supabase/migrations/0037_boards.sql` before using it (Supabase SQL editor
+or `supabase db push`). It creates the `boards*` / `board_*` tables and the SQL
+functions the API calls for the operations that must be transactional.
+
+Two things worth knowing before extending it:
+
+- **Ordering** is a fractional `position` (Trello's approach), so a drag writes
+  ONE row. `lib/boards/position.ts` owns that algebra and is unit-tested; when
+  repeated midpoints exhaust the precision of a double, the API calls the
+  `board_normalize_*` SQL functions and recomputes. Never order by array index.
+- **Identity.** This app authenticates a team, not a person (one shared
+  password — see `lib/auth.ts`), so `board_members` models named collaborators
+  and the browser remembers which one you are. Roles (owner / member / viewer)
+  are enforced server-side on every route, but they are a collaboration
+  guardrail between colleagues, not an isolation boundary; the shared password
+  is still what keeps outsiders out. If real user accounts ever land, add
+  `user_id` to `board_members` and put RLS on these tables.
+
 ## Listing a book for sale (Payhip)
 
 A finished ebook needs a buy link before its landing page can be published. That

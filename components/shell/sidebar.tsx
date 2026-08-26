@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
-import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot, Image as ImageIcon, Megaphone, BookOpen } from "lucide-react";
+import { ChevronLeft, FolderClosed, Settings, Sparkles, Bot, Image as ImageIcon, Megaphone, BookOpen, KanbanSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Top-level products in this one app:
@@ -14,6 +14,9 @@ import { cn } from "@/lib/utils";
 //                      to an AI Avatar project. Kept SEPARATE from AI Avatar so
 //                      the two aren't confused (client 2026-07-21).
 //   Thumbnails       — YouTube thumbnail generation (Pikzels) at /thumbnails
+//   Boards           — Trello-style project management for the team at
+//                      /boards. Independent of the render pipeline; a board can
+//                      optionally reference a video project.
 //   Ebooks           — the ebook engine (YouTube channel → ~100-page book,
 //                      PDF + DOCX) at /books. Its own pipeline and Postgres
 //                      schema; shares only Redis and the 69labs account.
@@ -23,6 +26,7 @@ const NAV = [
   { href: "/books", label: "Ebooks", icon: BookOpen },
   { href: "/sales-pitch", label: "Sales Pitch", icon: Megaphone },
   { href: "/thumbnails", label: "Thumbnails", icon: ImageIcon },
+  { href: "/boards", label: "Boards", icon: KanbanSquare },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

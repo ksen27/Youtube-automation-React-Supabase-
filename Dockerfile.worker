@@ -1,5 +1,23 @@
 FROM node:20-bookworm-slim
 
+# Which yt-dlp to bake in. Two reasons this is an ARG rather than a bare
+# "latest" download:
+#
+#   1. CACHE. This layer is cached, so a rebuild months later happily
+#      reinstalls the SAME binary "latest" resolved to on the first build.
+#      YouTube changes its player continuously, and a stale extractor fails
+#      with "No title found in player responses" followed by a bot-gate error
+#      - a symptom that reads as a proxy problem and is not. Bumping this ARG
+#      changes the layer key and forces a real re-download.
+#   2. REPRODUCIBILITY. A worker that broke overnight should be diagnosable;
+#      "whatever was latest at build time" is not a version you can roll back
+#      to, or even name.
+#
+# Pin to a release tag, or leave "latest" and pass one at deploy time:
+#   fly deploy -c fly.ebook.toml --build-arg YT_DLP_VERSION=2026.07.21
+# The resolved version is printed during the build - read it from the log.
+ARG YT_DLP_VERSION=latest
+
 # ffmpeg + yt-dlp + redis. Redis runs in the same container as the worker
 # so we don't pay for a separate Upstash plan or Fly Redis VM. State is
 # written to /data which is a Fly volume — survives container restarts.
@@ -11,9 +29,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     redis-server \
     fonts-dejavu-core \
- && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-      -o /usr/local/bin/yt-dlp \
+ && if [ "$YT_DLP_VERSION" = "latest" ]; then \
+      YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"; \
+    else \
+      YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/$YT_DLP_VERSION/yt-dlp"; \
+    fi \
+ && curl -fL "$YT_DLP_URL" -o /usr/local/bin/yt-dlp \
  && chmod +x /usr/local/bin/yt-dlp \
+ && yt-dlp --version \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 

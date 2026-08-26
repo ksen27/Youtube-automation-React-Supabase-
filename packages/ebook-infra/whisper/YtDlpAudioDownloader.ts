@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { NonRetryableError, Result, type AudioDownloader, type AudioDownloadTarget, type ObjectStorage } from '@ebook/core';
 import { youtubeProxyList } from '../net/ProxyRotator';
 import { ProxyHealth, classifyProxyFailure, maskProxy, youtubeProxyHealth, type ProxyFailureKind } from '../net/proxyHealth';
+import { resolveCookiesFile } from './ytdlpCookies';
 
 /** Trimmed so a wall of yt-dlp stderr can't drown the per-proxy tally. */
 const LAST_ERROR_CHARS = 300;
@@ -15,14 +16,22 @@ const LAST_ERROR_CHARS = 300;
  * in the UI. Previously only the LAST proxy's stderr survived, which is why a
  * pool-wide auth failure was indistinguishable from one bad proxy.
  */
-function summarize(failures: Array<{ proxy: string | undefined; kind: ProxyFailureKind; message: string }>): string {
+function summarize(
+  failures: Array<{ proxy: string | undefined; kind: ProxyFailureKind; message: string }>,
+  skipped = 0,
+): string {
   if (failures.length === 0) return 'no attempts were made';
   const tally = new Map<ProxyFailureKind, number>();
   for (const f of failures) tally.set(f.kind, (tally.get(f.kind) ?? 0) + 1);
   const counts = [...tally].map(([kind, n]) => `${kind}: ${n}`).join(', ');
   const perProxy = failures.map((f) => `${maskProxy(f.proxy)} ${f.kind}`).join('; ');
   const last = failures[failures.length - 1]!.message.slice(0, LAST_ERROR_CHARS);
-  return `${failures.length} proxies tried (${counts}) [${perProxy}] — last error: ${last}`;
+  // Name the quarantined proxies explicitly. Without this the tried-count is
+  // smaller than the configured pool for no visible reason — "7 proxies tried"
+  // against a pool of 10 reads as a bug in the rotation, when it is three
+  // proxies correctly sidelined for returning 407.
+  const quarantined = skipped > 0 ? `, ${skipped} skipped (auth-quarantined)` : '';
+  return `${failures.length} proxies tried${quarantined} (${counts}) [${perProxy}] — last error: ${last}`;
 }
 
 const AUDIO_BUCKET = 'ebook-audio';
@@ -50,7 +59,9 @@ export class YtDlpAudioDownloader implements AudioDownloader {
   // you're not a bot") for audio downloads. Supply them via either:
   //   YT_DLP_COOKIES_FROM_BROWSER=chrome|edge|firefox  (reads the local browser)
   //   YT_DLP_COOKIES_FILE=/path/to/cookies.txt          (exported Netscape file)
-  // Both unset = no cookies (works only for videos YouTube doesn't gate).
+  //   YT_DLP_COOKIES_B64=<base64 of that file>          (for Fly: secrets, no files)
+  // All unset = no cookies (works only for videos YouTube doesn't gate).
+  // See ytdlpCookies.ts for why the jar is never baked into the image.
   // A proxy routes the download through a different IP to clear YouTube's
   // IP-reputation block. Residential/mobile proxies work best; datacenter ones
   // are often already flagged. Supply ONE via YT_DLP_PROXY, or a POOL via
@@ -62,7 +73,7 @@ export class YtDlpAudioDownloader implements AudioDownloader {
     private readonly storage: ObjectStorage,
     private readonly binary: string = process.env.YT_DLP_PATH || 'yt-dlp',
     private readonly cookiesFromBrowser: string | undefined = process.env.YT_DLP_COOKIES_FROM_BROWSER || undefined,
-    private readonly cookiesFile: string | undefined = process.env.YT_DLP_COOKIES_FILE || undefined,
+    private readonly cookiesFile: string | undefined = resolveCookiesFile(),
     private readonly proxies: string[] = youtubeProxyList(),
     // ffmpeg/ffprobe do the audio extraction. Defaults to PATH lookup (Docker
     // installs them); set YT_DLP_FFMPEG_LOCATION to the bin folder (or binary)
@@ -96,6 +107,7 @@ export class YtDlpAudioDownloader implements AudioDownloader {
           'check the proxy account (credentials, quota, IP allow-list). Retrying cannot fix a 407.',
       );
     }
+    const skipped = configured ? this.proxies.length - live.length : 0;
     const pool: Array<string | undefined> = configured ? live : [undefined];
     const start = this.cursor++ % pool.length;
     const ordered = pool.map((_, i) => pool[(start + i) % pool.length]);
@@ -121,7 +133,7 @@ export class YtDlpAudioDownloader implements AudioDownloader {
       // Whole pool exhausted. If EVERY proxy rejected our credentials, the fault
       // is the proxy account, not this video — three more BullMQ attempts would
       // spend minutes reproducing the same 407, so stop now and say why.
-      const summary = summarize(failures);
+      const summary = summarize(failures, skipped);
       if (configured && failures.every((f) => f.kind === 'auth')) {
         throw new NonRetryableError(`proxy pool rejected authentication — ${summary}`);
       }
@@ -152,6 +164,13 @@ export class YtDlpAudioDownloader implements AudioDownloader {
       if (this.ffmpegLocation) args.push('--ffmpeg-location', this.ffmpegLocation);
       // Use deno to solve YouTube's JS challenge (cuts the bot-block rate).
       if (this.denoPath) args.push('--js-runtimes', `deno:${this.denoPath}`);
+      // The JS runtime alone is not enough: YouTube also obfuscates the format
+      // URLs behind a signature that this remote solver deobfuscates. The video
+      // pipeline has passed it since its own bot-gate fix (lib/media/ytdlp.ts)
+      // and the ebook path did not — same YouTube, same requirement. That gap is
+      // why audio downloads here hit the bot gate while video downloads on the
+      // same machine, through the same proxies, succeeded.
+      args.push('--remote-components', 'ejs:github');
       args.push('-o', output, `https://www.youtube.com/watch?v=${youtubeId}`);
       const proc = spawn(this.binary, args);
       let stderr = '';
