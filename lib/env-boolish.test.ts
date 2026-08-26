@@ -67,21 +67,28 @@ describe("boolean env flags", () => {
     }
   });
 
+  // These two need one flag that defaults ON and one that defaults OFF. They
+  // used SYNTHETIC_VEO_ENABLED as the default-ON case, but "Drop the veo clip
+  // lane; route its share to LTX" (a590e28) deliberately flipped that default to
+  // false and did not update the tests, so both have been failing since. The
+  // default-ON case is now SYNTHETIC_SCENE_DEDUPE_ENABLED. Should that default
+  // ever change too, repoint these at another boolish(true) flag — do NOT
+  // "fix" them by asserting the new default, which would delete the coverage.
   it("falls back to the default when unset", async () => {
-    delete process.env.SYNTHETIC_VEO_ENABLED;
+    delete process.env.SYNTHETIC_SCENE_DEDUPE_ENABLED;
     delete process.env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF;
     const env = await loadEnv();
-    expect(env.SYNTHETIC_VEO_ENABLED).toBe(true);            // default true
+    expect(env.SYNTHETIC_SCENE_DEDUPE_ENABLED).toBe(true);      // default true
     expect(env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF).toBe(false); // default false
   });
 
   it("treats an EMPTY value as not-configured, flipping nothing", async () => {
     // A blank var is an accident, not an instruction. It must not turn a
     // default-on flag off (the old coercion did) or a default-off flag on.
-    process.env.SYNTHETIC_VEO_ENABLED = "";
+    process.env.SYNTHETIC_SCENE_DEDUPE_ENABLED = "";
     process.env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF = "";
     const env = await loadEnv();
-    expect(env.SYNTHETIC_VEO_ENABLED).toBe(true);
+    expect(env.SYNTHETIC_SCENE_DEDUPE_ENABLED).toBe(true);
     expect(env.SYNTHETIC_CLIP_QUOTA_RESPECT_CUTOFF).toBe(false);
   });
 
