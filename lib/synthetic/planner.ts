@@ -12,6 +12,7 @@ import {
   type TimedSentence,
 } from "@/lib/synthetic/sentence-windows";
 import { NAMED_IP_RULE, SAFE_DEPICTION_RULE } from "@/lib/synthetic/safe-depiction";
+import { selectCharacterBlocks } from "@/lib/synthetic/character-blocks";
 import type { SyntheticBlockType } from "@/lib/types";
 import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
 import {
@@ -197,6 +198,9 @@ const SCRIPT_MATCH_RULE =
   "— gloves for a line about a mower, a letter for a line about an email. " +
   "Pick the MAIN thing the sentence is about, not a detail at its edge: if the " +
   "line is about what someone paid for a machine, the shot is the machine. " +
+  "This rule outranks the VIDEO SUBJECT / NICHE: when the line's concrete thing " +
+  "is OUTSIDE the video's niche (a car in an airplane video, a factory process " +
+  "in a product video), show the line's thing, not the niche's subject. " +
   "Only when a line names NO concrete thing at all (pure commentary, a " +
   "transition, an abstract claim) may you invent an on-topic visual from the " +
   "video's world — and even then, prefer whatever the surrounding sentences are " +
@@ -273,6 +277,53 @@ const ACTION_FIRST_RULE =
   "loaded or sold — but it is NOT the subject. The person and the action are. " +
   "Only when a line genuinely has NO event in it (a fact, a number, a " +
   "description of a thing) do the object rules below decide the subject.";
+
+// WHO THE SENTENCE IS ABOUT IS NOT ALWAYS A THING YOU CAN HOLD (2026-08-26).
+//
+// MEASURED on the client's own review script (the "Old Guns" manufacturing
+// passage), planning every line through the rules above:
+//
+//   "Then came the acquisitions."          -> a person placing a rifle in a case
+//   "The consolidations."                  -> boxes of firearm parts on a shelf
+//   "Winchester was sold."                 -> a person wiping down a Winchester
+//   "Colt changed hands more than once."   -> a person examining a Colt
+//
+// Every one of those lines is about a COMPANY -- an acquisition, a corporate
+// sale, an ownership change. None is about a gun. But ACTION_FIRST_RULE sees a
+// verb ("sold", "changed hands") and pictures a person physically doing that to
+// the product, and the niche supplies the product. The result is the client's
+// complaint in its purest form: the script talks business, we show another gun.
+//
+// This is a MEANING failure, not a matching failure -- the picture does contain
+// a word from the sentence. So it sits immediately after ACTION_FIRST_RULE: it
+// decides WHAT KIND of thing the sentence is about before the action and object
+// rules decide how to frame it.
+const INSTITUTION_NOT_PRODUCT_RULE =
+  "AN ORGANISATION IS NOT ITS PRODUCT (critical): before choosing the picture, " +
+  "ask WHAT the sentence is actually about — a physical thing someone can hold, " +
+  "or a COMPANY, an industry, an era, a market, a regulation, an ownership " +
+  "change? " +
+  "When the subject is a company or an industry, showing one specimen of what it " +
+  "makes is WRONG. A maker being SOLD is a business changing owners, not someone " +
+  "handling the product. 'Then came the acquisitions' is companies buying " +
+  "companies. 'The consolidations' is an industry shrinking. 'Shareholder " +
+  "pressure' is a boardroom, not a craftsman. This holds in every field: a " +
+  "carmaker, a studio, a bakery chain, a label, a publisher, a factory — when " +
+  "the sentence is about the ORGANISATION, one more photograph of what it sells " +
+  "is the wrong picture. " +
+  "For these lines the picture is the INSTITUTIONAL world, chosen to fit THIS " +
+  "video's own subject: a signed agreement or contract on a desk, a boardroom or " +
+  "office meeting, a factory floor and its workers, a production line, a company " +
+  "building or its gates, an empty or closing plant, ledgers and paperwork, a " +
+  "handshake between people in business clothes, a newspaper business page. Show " +
+  "PEOPLE doing the business wherever you can. " +
+  "Likewise read FIGURES OF SPEECH for their meaning, not their words: someone " +
+  "who 'cleaned out' a cupboard EMPTIED it (they did not wipe it with a cloth); " +
+  "something that 'changed hands' was SOLD; a market that 'dried up' lost its " +
+  "buyers; a person who 'walked away' QUIT. Picture what the sentence MEANS. " +
+  "The examples above are a METHOD, not wording to reuse — the nouns in your " +
+  "prompt must come from THIS video's subject and THIS block's line, never from " +
+  "this rule.";
 
 // THE SUBJECT LIVES SOMEWHERE (client 2026-08-26: "I know the script is about
 // guns, but all we do is show footage about guns ... it's just random showing
@@ -544,6 +595,43 @@ const SHOT_TYPES =
   "extreme close-up / macro detail · close-up · medium shot · wide / " +
   "establishing shot · top-down (overhead) shot · low-angle ground-level shot · " +
   "over-the-shoulder shot · product shot (an object presented on a surface)";
+
+// The SAME list as SHOT_TYPES, as data. shotType is a free-text field in the
+// planner's JSON, and composePrompt puts it in FRONT of the scene as
+// "<shotType>: <scene>" — so whatever Gemini writes there becomes the opening
+// words of the image prompt, unvalidated.
+//
+// MEASURED 2026-08-26 on a Mount Sinai plan: two blocks came back with
+// shotType "aerial views of Mount Sinai" — a phrase lifted from the derived
+// topic's environmentExamples, not a camera framing at all. Those blocks
+// composed to "aerial views of Mount Sinai: A clear, sunny aerial view of
+// Mount Sinai…", which is malformed and duplicates the subject. Any project
+// whose environmentExamples read like a shot description can hit this.
+//
+// A shotType we don't recognise is DROPPED rather than repaired: the scene
+// itself is always well-formed, and losing a framing hint costs far less than
+// prefixing the prompt with a stray phrase.
+const SHOT_TYPE_LIST = [
+  "extreme close-up / macro detail",
+  "close-up",
+  "medium shot",
+  "wide / establishing shot",
+  "top-down (overhead) shot",
+  "low-angle ground-level shot",
+  "over-the-shoulder shot",
+  "product shot",
+] as const;
+
+export function normalizeShotType(raw: string | null | undefined): string | null {
+  const s = (raw ?? "").trim().toLowerCase()
+    // Drop an explanatory parenthetical: the prompt lists "product shot (an
+    // object presented on a surface)" and Gemini sometimes echoes it whole.
+    .replace(/\s*\([^)]*\)\s*$/, "")
+    .replace(/[.:\s]+$/, "")
+    .trim();
+  if (!s) return null;
+  return SHOT_TYPE_LIST.find((t) => t === s) ?? null;
+}
 const SHOT_VARIETY_RULE =
   "SHOT VARIETY (critical, client requirement): vary the FRAMING across blocks so " +
   "the video is not the same shot over and over. For EVERY image/ai_clip block " +
@@ -595,10 +683,20 @@ function productBrandRule(topic: VideoTopic): string {
 
 function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
   // Niche anchor. When we could derive the video's topic from the title +
-  // transcript, we tell Gemini the world up front so EVERY scene stays on-theme
+  // transcript, we tell Gemini the world up front so scenes stay on-theme
   // — the fix for off-topic visuals (a car video that rendered houses & lawns
   // because the planner never knew the niche). When empty, we emit a neutral
   // instruction so nothing regresses to a hardcoded domain.
+  //
+  // PRECEDENCE (client requirement, 2026-08-26): the niche is a FALLBACK, not
+  // a cage. The old wording ("EVERY imagePrompt MUST stay inside this world")
+  // sat at the head of the prompt and overrode SCRIPT_MATCH_RULE: a script
+  // about guns whose middle section narrates the factory process still
+  // rendered wall-to-wall guns, because every off-niche line was pulled back
+  // into the niche. The client's reference product plans each part from that
+  // part's own text — a car digression in an airplane video shows a car. So
+  // the line's own named content outranks the niche; the niche only decides
+  // INVENTED visuals for lines with no concrete scene of their own.
   const topicBlock = hasTopic(topic)
     ? [
         `VIDEO SUBJECT / NICHE: ${topic.niche.trim() || topic.setting.trim()}.`,
@@ -607,11 +705,15 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
         topic.environmentExamples.trim()
           ? `The niche's wider real-world context is ALSO in-world and on-topic: ${topic.environmentExamples.trim()}.`
           : "",
-        "The basePrompt and EVERY imagePrompt MUST stay inside this world. Never",
-        "introduce houses, lawns, offices, or any setting unrelated to the video's",
-        "subject. When a line is abstract or has no literal scene, invent a visual",
-        "from THIS niche (an on-topic object, tool, part, or place), never a",
-        "generic unrelated one.",
+        "This world is the DEFAULT, not a cage. When a block's line names a",
+        "concrete thing, place, process or event OUTSIDE this niche (a car",
+        "digression in an airplane video, a factory floor, a courtroom, a",
+        "different industry), the imagePrompt MUST show THAT — what the line",
+        "says always outranks the niche. Only when a line is abstract or has no",
+        "literal scene do you invent a visual, and an INVENTED visual must come",
+        "from THIS niche (an on-topic object, tool, part, or place) — never",
+        "introduce houses, lawns, offices, or any setting the narration itself",
+        "never brings up.",
         // When the subject's world is a remote / non-filmable place (space, the
         // deep sea, Antarctica, wilderness, ancient history), the visuals live in
         // THAT place, not at a desk. This is the fix for space/Antarctica videos
@@ -626,10 +728,12 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
         "",
       ].filter(Boolean)
     : [
-        "Read the whole transcript and infer the video's SUBJECT / niche, then keep",
-        "the basePrompt and EVERY imagePrompt inside that world. When a line is",
-        "abstract or has no literal scene, invent a visual from the video's own",
-        "subject, never a generic unrelated setting.",
+        "Read the whole transcript and infer the video's SUBJECT / niche, and use",
+        "that world as the DEFAULT. A line that names a concrete thing, place, or",
+        "process outside that world must show what IT says — the line's own",
+        "content always outranks the inferred niche. When a line is abstract or",
+        "has no literal scene, invent a visual from the video's own subject,",
+        "never a generic unrelated setting.",
         "",
       ];
   // Home is not a garden. A line about being 'home' / indoors must render the
@@ -685,13 +789,19 @@ type PlannerPayload =
 // "Completes within the clip" is the load-bearing half: it is the only line
 // that makes an unmoving result WRONG rather than merely cautious.
 const ANIMATION_SPEED_RULE_LINES = [
-  "The motion runs at a STEADY, EVEN, NATURAL pace and must be CLEARLY VISIBLE:",
-  "describe an action that BEGINS AND COMPLETES inside the clip, so there is",
-  "real, continuous movement from the first frame to the last. Never describe a",
-  "frozen, static or barely-moving shot — a clip that looks like the still it",
-  "was made from is a failed clip. Equally, never describe rushed, sudden or",
-  "jerky motion (it renders as a blur), and never ask for a slow-motion EFFECT",
-  "or a speed ramp.",
+  // See the note on ACTION_CLIP_RULE: slow the PACE and shrink the ACTION
+  // together. Slowing the pace alone is what made the 2026-08-22 clips read as
+  // stills and got that wording reverted three days later.
+  "The motion runs SLOWLY and SMOOTHLY, at an unhurried, gentle pace, and must",
+  "still be CLEARLY VISIBLE and CONTINUOUS from the first frame to the last.",
+  "To be both slow and visible, describe a SMALL, SIMPLE movement rather than a",
+  "whole task — one lift, one turn, one pour, one step, one door opening — and",
+  "let it BEGIN AND COMPLETE inside the clip. A small movement given the whole",
+  "clip to travel reads as calm and deliberate; a big one slowed down stops",
+  "looking like it moves at all. Never describe a frozen, static or",
+  "barely-moving shot — a clip that looks like the still it was made from is a",
+  "failed clip. Equally, never describe rushed, sudden or jerky motion (it",
+  "renders as a blur), and never ask for a slow-motion EFFECT or a speed ramp.",
 ];
 
 function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): string {
@@ -877,6 +987,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "",
     ACTION_FIRST_RULE,
     "",
+    INSTITUTION_NOT_PRODUCT_RULE,
+    "",
     SCRIPT_MATCH_RULE,
     "",
     SUBJECT_IN_THE_WORLD_RULE,
@@ -982,6 +1094,21 @@ function buildSingleSegmentPrompt(
   // the same dice — without it the model has no way to know what to avoid and
   // routinely writes back a near-identical prompt that is refused again.
   refusedPrompt?: string,
+  // The neighbouring narration lines. SCRIPT_MATCH_RULE tells the model that an
+  // abstract line's visual should come from "whatever the surrounding sentences
+  // are physically about" — but this single-block path used to see ONE line
+  // only, so a connector like "That is not nostalgia." had no surroundings to
+  // draw from and collapsed to the same modal base-world scene every time (the
+  // duplicate-prompt failure measured on the Old Guns review, 2026-08-26).
+  surroundingScript?: string,
+  // The model's OWN previous answer, when it came back as a duplicate of an
+  // already-used scene. Appending that answer to avoidScenes was not enough:
+  // measured on the list script, a block returned a listed scene VERBATIM twice
+  // in a row (similarity 1.0 on both attempts) because one more line in a list
+  // reads as one more constraint, not as "you already got this wrong". This
+  // mirrors refusedPrompt below, which solved the identical problem for refused
+  // prompts — a dedicated, emphatic block naming the exact failed text.
+  clonedPrompt?: string,
 ): string {
   const wantsAnimation = blockType === "ai_clip";
   const hasAvoid = avoidScenes.filter((s) => s.trim()).length > 0;
@@ -1029,11 +1156,32 @@ function buildSingleSegmentPrompt(
           "picture is beautiful and even when every scene below is avoided. Two",
           "similar shots of the correct subject beat one shot of the wrong one.",
           "",
-          "If you genuinely cannot find another angle on the subject, repeat it",
-          "with a different framing. That is the correct answer, not a substitute",
-          "subject.",
+          "If you genuinely cannot find another angle on the subject, keep the",
+          "subject and change everything else — a different moment, place, scale",
+          "or stage. What you must NEVER do is return one of the scenes below",
+          "word-for-word or with trivial rewording: an answer that reads like a",
+          "listed scene is a wasted generation, because the video already shows",
+          "that exact frame.",
           "ALREADY-USED scene(s) — frame this block's subject differently from these:",
           ...avoidScenes.filter((s) => s.trim()).map((s, i) => `  ${i + 1}. ${s.trim()}`),
+        ]
+      : []),
+    ...((clonedPrompt ?? "").trim()
+      ? [
+          "",
+          "YOUR PREVIOUS ANSWER WAS A DUPLICATE (critical): you were already asked",
+          "for this block and you returned the scene below, which is one of the",
+          "already-used scenes above, or a trivial rewording of one. The video",
+          "would show the SAME PICTURE twice. Do not send it again, and do not send",
+          "a reworded version of it.",
+          "Start from the block's own line instead: name the concrete things IT",
+          "mentions — the specific parts, materials, numbers, places or people in",
+          "these exact words — and build the picture on whichever of them the",
+          "earlier scenes did NOT show. If the line describes a CHANGE, a contrast,",
+          "or a worse/cheaper/later version of something already pictured, then the",
+          "picture is that DIFFERENCE, not another view of the original.",
+          "DUPLICATE answer (do NOT reproduce or reword it):",
+          `  ${(clonedPrompt ?? "").trim()}`,
         ]
       : []),
     "",
@@ -1078,6 +1226,8 @@ function buildSingleSegmentPrompt(
     // re-derive the topic for a single-block regen.
     ACTION_FIRST_RULE,
     "",
+    INSTITUTION_NOT_PRODUCT_RULE,
+    "",
     SCRIPT_MATCH_RULE,
     "",
     SUBJECT_IN_THE_WORLD_RULE,
@@ -1103,13 +1253,24 @@ function buildSingleSegmentPrompt(
       // block goes straight to the clip lane, so wording that drifts from the
       // planner's shows up as a handful of fast, smeared clips scattered through
       // an otherwise slow video -- worse than either setting applied uniformly.
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs at a steady, even, natural pace and COMPLETES within the clip: clearly visible movement, never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. NEVER a product-turntable shot: the object must not spin, rotate or revolve on its own and the camera must not circle it — a thing rotating in space is stock-video filler. No cinematic movement.).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs SLOWLY and SMOOTHLY at an unhurried, gentle pace and COMPLETES within the clip: to be both slow and clearly visible, describe a SMALL, SIMPLE movement (one lift, one turn, one pour, one step) rather than a whole task, and give it the whole clip to travel. Never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. NEVER a product-turntable shot: the object must not spin, rotate or revolve on its own and the camera must not circle it — a thing rotating in space is stock-video filler. No cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,
     "",
     "script:",
     script.trim(),
+    ...((surroundingScript ?? "").trim()
+      ? [
+          "",
+          "surrounding narration (CONTEXT ONLY — these lines are spoken before/after",
+          "this block and get their own visuals; do not depict them directly. But",
+          "when THIS block's script is abstract, a connector, or pure commentary,",
+          "invent the visual from what THESE lines are physically about — a new",
+          "moment of that same story — never from a generic default of the world):",
+          (surroundingScript ?? "").trim(),
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -1190,8 +1351,13 @@ export async function regenerateSegmentPrompt(input: {
   // Set by the CENSORED-recovery path in imageGenProcessor: the exact prompt the
   // provider refused. Makes this a targeted safe rewrite instead of a re-roll.
   refusedPrompt?: string;
+  // Neighbouring narration lines (context only). Lets an abstract connector
+  // line draw its visual from what the surrounding story is physically about
+  // instead of collapsing to the base world's modal scene — see
+  // buildSingleSegmentPrompt.
+  surroundingScript?: string;
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt, surroundingScript } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -1203,11 +1369,11 @@ export async function regenerateSegmentPrompt(input: {
   // instead of a hard "returned non-JSON" throw that never retries. This was the
   // cause of the per-segment Regenerate-prompt button failing on the current
   // gemini-flash-latest while the same call succeeded on the fallback model.
-  const { result: safe, model: usedModel } = await withGeminiModelFallback(
+  const attempt = (avoid: string[], cloned?: string) => withGeminiModelFallback(
     "regenerateSegmentPrompt",
     async (model) => {
       const res = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoidScenes ?? [], language ?? DEFAULT_LANGUAGE, refusedPrompt) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoid, language ?? DEFAULT_LANGUAGE, refusedPrompt, surroundingScript, cloned) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.4,
@@ -1248,6 +1414,42 @@ export async function regenerateSegmentPrompt(input: {
     { attempts: 2, baseMs: 800 },
     { attempts: 4, baseMs: 1500 },
   );
+
+  const avoidList = (avoidScenes ?? []).map((s) => s.trim()).filter(Boolean);
+  let { result: safe, model: usedModel } = await attempt(avoidList);
+
+  // TRUST BUT VERIFY (2026-08-26). Every avoid-list caller in this file used to
+  // accept the regenerated prompt unchecked, and the model DOES return a listed
+  // scene verbatim — measured on the Old Guns review: three of 25 lines came
+  // back word-for-word identical to a scene sitting in their own avoid list
+  // (abstract connector lines, where the base world's modal scene is the
+  // strongest completion). One targeted retry with the clone itself appended to
+  // the avoid list; keep whichever answer is less similar to the avoided
+  // scenes. Same similarity metric and threshold as the dedupe pass that
+  // flagged the block in the first place, so an answer accepted here won't
+  // simply be re-flagged on the next pass.
+  if (avoidList.length > 0) {
+    const stripSetting = (p: string) => p.replace(/\. Setting:[\s\S]*$/i, "");
+    const threshold = getEnv().SYNTHETIC_SCENE_DEDUPE_SIMILARITY;
+    const similarityToAvoided = (p: string) =>
+      Math.max(0, ...avoidList.map((a) => sceneSimilarity(sceneWords(stripSetting(p)), sceneWords(stripSetting(a)))));
+    const firstSim = similarityToAvoided(safe.imagePrompt);
+    if (firstSim >= threshold) {
+      const retry = await attempt([...avoidList, safe.imagePrompt.trim()], safe.imagePrompt.trim());
+      const retrySim = similarityToAvoided(retry.result.imagePrompt);
+      if (retrySim < firstSim) {
+        safe = retry.result;
+        usedModel = retry.model;
+      }
+      await logJob({ projectId, jobId }, "synthetic.prompt_regen.clone_retry", {
+        firstSimilarity: Number(firstSim.toFixed(2)),
+        retrySimilarity: Number(retrySim.toFixed(2)),
+        kept: retrySim < firstSim ? "retry" : "first",
+        stillClone: Math.min(firstSim, retrySim) >= threshold,
+      });
+    }
+  }
+
   if (usedModel !== getEnv().GEMINI_MODEL) {
     await logJob({ projectId, jobId }, "synthetic.prompt_regen.model_fallback", { model: usedModel });
   }
@@ -1672,10 +1874,12 @@ export function blockNamesItsOwnPlace(blockPrompt: string | null | undefined): b
   return PLACE_RE.test(p);
 }
 
-function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?: string | null): string | null {
+export function composePrompt(basePrompt: string, blockPrompt: string | null, shotType?: string | null): string | null {
   const base = basePrompt.trim();
   const block = (blockPrompt ?? "").trim();
-  const shot = (shotType ?? "").trim();
+  // Only a RECOGNISED camera framing may lead the prompt. An unrecognised value
+  // is a stray phrase (see normalizeShotType) and is dropped, not prefixed.
+  const shot = normalizeShotType(shotType) ?? "";
   // Lead with the shot type when present, then the scene-specific subject.
   const lead = [shot, block].filter(Boolean).join(": ");
   if (!base) return lead || null;
@@ -3649,7 +3853,7 @@ const VideoTopicSchema = z.object({
 // image prompt so the visuals stay on-theme for ANY channel. A cheap Gemini call
 // (thinkingBudget:0, tiny output) — on any failure we return EMPTY_TOPIC and the
 // prompt falls back to niche-neutral phrasing (no regression).
-async function deriveVideoTopic(input: {
+export async function deriveVideoTopic(input: {
   projectId: string;
   jobId?: string;
   title: string;
@@ -3771,7 +3975,7 @@ async function deriveVideoTopic(input: {
 // spends its whole output budget on hidden reasoning tokens and truncates the
 // visible JSON. On a truncation we salvage whatever complete segments we got,
 // and surface MAX_TOKENS in the error instead of the misleading "non-JSON".
-async function planTranscriptChunk(
+export async function planTranscriptChunk(
   ctx: { projectId: string; jobId?: string },
   transcript: string,
   chunkLabel: string,
@@ -5029,6 +5233,13 @@ export async function buildSyntheticTimeline(input: {
                   blockType: seg.blockType,
                   language,
                   avoidScenes: avoid,
+                  // Repeat-flagged blocks are disproportionately the abstract
+                  // connector lines; their neighbours' narration is what gives
+                  // the regen something concrete to draw instead of the base
+                  // world's modal scene again.
+                  surroundingScript: [planned[r.index - 1]?.script, planned[r.index + 1]?.script]
+                    .filter(Boolean)
+                    .join(" "),
                 });
                 // Returns a prompt already composed WITH the base in front and
                 // the shot folded in — clear shotType so persist's composePrompt
@@ -5308,6 +5519,29 @@ export async function buildSyntheticTimeline(input: {
   // to see.
   await sb.from("timeline_items").delete().eq("project_id", projectId);
   await sb.from("synthetic_segments").delete().eq("project_id", projectId);
+
+  // THE NARRATOR APPEARS IN THE STORY. Pick the few blocks whose still will be
+  // generated with the project's avatar as an identity reference — narration in
+  // the presenter's own voice, over a scene that already has a person in it.
+  // Chosen across the finished plan so the count and spacing hold for the whole
+  // video; keyed by `position` because that is what the persisted row carries.
+  const characterEnv = getEnv();
+  const characterBlockIndices = new Set<number>(
+    characterEnv.SYNTHETIC_CHARACTER_BLOCKS_ENABLED
+      ? selectCharacterBlocks(
+          planned.map((p) => ({ blockType: p.blockType, script: p.script, imagePrompt: p.imagePrompt })),
+          { max: characterEnv.SYNTHETIC_CHARACTER_BLOCKS_MAX },
+        ).map((i) => planned[i].position)
+      : [],
+  );
+  if (characterBlockIndices.size > 0) {
+    await logJob({ projectId, jobId }, "synthetic.plan.character_blocks", {
+      count: characterBlockIndices.size,
+      max: characterEnv.SYNTHETIC_CHARACTER_BLOCKS_MAX,
+      positions: [...characterBlockIndices].sort((a, b) => a - b),
+    });
+  }
+
   const rows = planned.map((p) => ({
     project_id: projectId,
     position: p.position,
@@ -5342,6 +5576,12 @@ export async function buildSyntheticTimeline(input: {
       // rather than re-deriving the split, so a re-run of a single segment
       // keeps the engine the plan chose for it.
       clip_engine: p.blockType === "ai_clip" ? (p.clipEngine ?? "ltx") : null,
+      // THE NARRATOR APPEARS IN THE STORY. True on the handful of blocks whose
+      // still is generated with the project's avatar photo as an identity
+      // reference. Decided HERE rather than in the image processor because the
+      // count and the spacing are properties of the WHOLE plan — a processor
+      // only ever sees one segment and could not enforce either.
+      character_block: characterBlockIndices.has(p.position) || undefined,
     },
     status: "pending" as const,
   }));

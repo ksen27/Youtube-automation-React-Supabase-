@@ -939,6 +939,30 @@ const ServerEnvSchema = z.object({
   // "gemini.image.budget" log fires from 80% onward. 0 disables the Gemini
   // fallback outright; raise the value (and redeploy) to lift the cap.
   GEMINI_IMAGE_MONTHLY_CAP: z.coerce.number().int().nonnegative().default(300),
+  // THE NARRATOR APPEARS IN THE STORY (client 2026-08-26). A few b-roll shots
+  // per video are generated with the project's uploaded avatar photo as an
+  // IDENTITY REFERENCE, so the presenter's own face turns up as a character in
+  // the story instead of an anonymous stranger. See character-blocks.ts.
+  //
+  // These generations route through Gemini because it is the only configured
+  // model that accepts a reference image at all — the active chain (ai33 /
+  // 69labs, both gpt-image-2) is text-to-image only. They are metered by
+  // SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP below, NOT by the fallback's
+  // GEMINI_IMAGE_MONTHLY_CAP above; see that entry for why the two are split.
+  SYNTHETIC_CHARACTER_BLOCKS_ENABLED: boolish(true),
+  // Deliberately SMALL — the client asked for "the small count", and a large
+  // number would rebuild the every-frame-same-person repetition that
+  // sanitizeBasePrompt exists to prevent. This is a ceiling, not a target: a
+  // video whose narration is never in the presenter's own voice gets none.
+  SYNTHETIC_CHARACTER_BLOCKS_MAX: z.coerce.number().int().nonnegative().default(4),
+  // Monthly ceiling for character-block generations, counted in its OWN Redis
+  // bucket — deliberately NOT shared with GEMINI_IMAGE_MONTHLY_CAP above. That
+  // cap guards against an outage turning into an unbounded Gemini bill; this
+  // one is a planned per-video feature cost. They were briefly shared, and the
+  // first end-to-end run (2026-08-26) found the fallback bucket already at its
+  // 300 ceiling, which would have silently disabled the feature for the rest of
+  // the month. At MAX 4 per video, 400 covers ~100 videos.
+  SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP: z.coerce.number().int().nonnegative().default(400),
   // HeyGen avatar automation (Playwright — NOT the API, per spec).
   HEYGEN_BASE_URL: z.string().url().default("https://app.heygen.com"),
   // 64-hex-char (32-byte) AES-256-GCM key encrypting heygen_accounts secrets

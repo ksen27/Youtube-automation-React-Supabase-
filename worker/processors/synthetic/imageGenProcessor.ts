@@ -12,6 +12,51 @@ import { r2Keys } from "@/lib/synthetic/constants";
 import { findReusableAsset, indexGeneratedAsset } from "@/lib/synthetic/asset-library";
 import { finishSegment, maybeFinalizeSynthetic } from "@/worker/processors/synthetic/_shared";
 import type { JobAttemptInfo } from "@/worker/index";
+import { generateGeminiImage, isGeminiImageConfigured } from "@/lib/synthetic/gemini-image";
+import { characterScenePrompt } from "@/lib/synthetic/character-blocks";
+import { fetchOrThrow } from "@/lib/synthetic/http";
+
+// THE NARRATOR APPEARS IN THE STORY (client 2026-08-26). On the handful of
+// blocks the planner flagged `character_block`, the still is generated with the
+// project's uploaded avatar photo as an IDENTITY REFERENCE, so the presenter's
+// own face shows up as a character in the story rather than an anonymous
+// stranger invented by the image model.
+//
+// This routes through Gemini because it is the ONLY configured model that
+// accepts a reference image at all — the normal chain (ai33 / 69labs, both
+// gpt-image-2) is text-to-image and has no slot for one.
+//
+// Every failure here falls back to the ordinary text-to-image path. A missing
+// avatar, an unconfigured/geo-blocked Gemini, a budget cap, a safety refusal:
+// none of them should cost the video a block. The shot simply shows an
+// anonymous person, exactly as it did before this feature existed.
+async function generateWithAvatarFace(input: {
+  projectId: string;
+  segmentId: string;
+  mediaJobId: string;
+  prompt: string;
+  avatarImageUrl: string;
+}): Promise<{ image: Buffer; contentType: string; provider: "gemini_image" } | null> {
+  const { projectId, segmentId, mediaJobId, prompt, avatarImageUrl } = input;
+  if (!isGeminiImageConfigured()) return null;
+  try {
+    const res = await fetchOrThrow(avatarImageUrl, { timeoutMs: 60_000 });
+    const image = Buffer.from(await res.arrayBuffer());
+    const mimeType = res.headers.get("content-type") || "image/jpeg";
+    const out = await generateGeminiImage(characterScenePrompt(prompt), { image, mimeType });
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.character_block", {
+      provider: out.provider,
+      bytes: out.image.length,
+    });
+    return { image: out.image, contentType: out.contentType, provider: out.provider };
+  } catch (e) {
+    await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.character_block_failed", {
+      err: (e as Error).message?.slice(0, 200),
+      note: "falling back to the normal text-to-image path; the shot loses the avatar's face, not the block",
+    });
+    return null;
+  }
+}
 
 // Image generation for 'image' and 'split_2' blocks (nano-banana, Flux
 // fallback handled inside generateImage). For split_2 the generated still is
@@ -190,6 +235,10 @@ export async function processImageGenJob(
     .single();
   if (error || !seg) throw new Error(`image_gen: segment ${segmentId} not found`);
 
+  // Flagged by the planner (see character-blocks.ts) — this block's still should
+  // show the project's avatar as the person in the scene.
+  const isCharacterBlock = Boolean((seg.metadata as { character_block?: boolean } | null)?.character_block);
+
   // Resolve the picture prompt. NEVER fall back to seg.script — the script is
   // the SPOKEN narration, and drawing it verbatim is what produced literal,
   // off-topic stills (e.g. "Be honest, I read these." rendered as a person
@@ -209,7 +258,11 @@ export async function processImageGenJob(
   // excluded so one video never repeats an asset). On a hit we reuse its
   // permanent R2 url outright — no provider call, no upload. Disabled (or any
   // library error) falls straight through to the normal generate path.
-  const reuse = await findReusableAsset({ prompt, assetType: "image", projectId });
+  // A character block is skipped by the asset library on purpose: library
+  // entries are keyed on the prompt text, and a match would hand back a still of
+  // an ANONYMOUS person generated for some other project. The whole point of
+  // this block is whose face is in it.
+  const reuse = isCharacterBlock ? null : await findReusableAsset({ prompt, assetType: "image", projectId });
   if (reuse) {
     await logJob({ projectId, jobId: mediaJobId, sourceId: segmentId }, "synthetic.image_gen.reused", {
       via: reuse.via,
@@ -241,8 +294,21 @@ export async function processImageGenJob(
     // key and every provider), so it is caught HERE rather than left to BullMQ:
     // the only thing that can change the outcome is the prompt itself.
     let out;
+    // Character blocks try the avatar-conditioned path FIRST. It returns null
+    // on any problem (no avatar on the project, Gemini unconfigured or
+    // geo-blocked, monthly cap reached, safety refusal), and the normal
+    // text-to-image call below then runs exactly as it always has.
+    const faceOut = isCharacterBlock
+      ? await (async () => {
+          const { data: proj } = await sb
+            .from("projects").select("avatar_image_url").eq("id", projectId).single();
+          const avatarImageUrl = (proj?.avatar_image_url as string | null)?.trim();
+          if (!avatarImageUrl) return null;
+          return generateWithAvatarFace({ projectId, segmentId, mediaJobId, prompt, avatarImageUrl });
+        })()
+      : null;
     try {
-      out = await generateImage(prompt, resume);
+      out = faceOut ?? await generateImage(prompt, resume);
     } catch (err) {
       if (!isCensored(err) || jobMeta.promptRewrittenForCensor) throw err;
       out = await recoverFromCensoredPrompt({
@@ -287,14 +353,20 @@ export async function processImageGenJob(
     // videos with a matching prompt can reuse it. Best-effort — never fails
     // the segment (indexGeneratedAsset catches its own errors), and a no-op
     // when ASSET_LIBRARY_ENABLED is off.
-    await indexGeneratedAsset({
-      prompt,
-      assetType: "image",
-      assetUrl: up.publicUrl,
-      provider: out.provider,
-      projectId,
-      segmentId,
-    });
+    // NEVER index a character block. The library is cross-PROJECT and keyed on
+    // prompt text, so indexing this would let another customer's video reuse a
+    // still containing THIS project's avatar's face — a privacy problem, and
+    // wrong for the reusing video too, whose narrator is someone else.
+    if (!isCharacterBlock) {
+      await indexGeneratedAsset({
+        prompt,
+        assetType: "image",
+        assetUrl: up.publicUrl,
+        provider: out.provider,
+        projectId,
+        segmentId,
+      });
+    }
     // Clear the resume pointer on success so a later regenerate of this segment
     // starts a fresh generation instead of re-polling this now-consumed job.
     await setMediaJob(mediaJobId, {

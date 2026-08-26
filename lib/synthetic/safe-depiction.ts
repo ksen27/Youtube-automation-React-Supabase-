@@ -168,6 +168,26 @@ export const NAMED_IP_RULE =
   "This holds EVEN WHEN the narration is entirely about that thing: the filter " +
   "only ever reads the picture description, so a line about a 1977 Kenner Star " +
   "Wars figure is still refused when the prompt calls it one. " +
+  // 2026-08-26: every example above is an entertainment franchise, and on a
+  // collectibles script about MANUFACTURERS the model read the list as
+  // "toys and films" and wrote "a vintage Winchester Model 1944 lever-action
+  // rifle" into seven of twenty-one prompts. A maker's name is a trademark in
+  // exactly the same way Kenner is; naming it risks the same dead block. The
+  // model needs the category spelled out, because the list it was given does
+  // not resemble the thing it is writing about.
+  "A MAKER'S NAME COUNTS, IN EVERY CATEGORY — not only films and toys. Car and " +
+  "motorcycle marques, watch and camera makers, guitar and amplifier names, " +
+  "tool and machinery brands, firearms makers, appliance and phone makers, food " +
+  "and drink labels, sportswear, airlines, publishers — together with their " +
+  "MODEL DESIGNATIONS and model numbers. All are trademarks and all are refused " +
+  "the same way. " +
+  "Write the OBJECT generically and let its era, material and wear identify it: " +
+  "name the type of thing, its age, what it is made of, and the marks a real one " +
+  "carries. A model number stamped into a product is described AS A MARKING ('a " +
+  "faint stamped serial number', 'a worn maker's stamp pressed into the metal', " +
+  "'a small moulded code on the underside') and never spelled out as the brand " +
+  "or model it reads. The viewer recognises the thing; the prompt never names " +
+  "it. " +
   "REMOVING THE NAME IS NOT ENOUGH. Do not describe the CHARACTER either: no " +
   "costume, no robes/tunic/cape/armour/uniform, no helmet, mask, or hairstyle, " +
   "no signature colour scheme, no creature or species, no face. A description " +

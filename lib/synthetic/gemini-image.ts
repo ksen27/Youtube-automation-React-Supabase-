@@ -27,6 +27,14 @@ export interface GenerateGeminiImageResult {
   provider: "gemini_image";
 }
 
+// A face/identity image to condition generation on, as raw bytes plus its MIME
+// type. Bytes rather than a URL because the model takes inline data and the
+// caller (imageGenProcessor) already has to fetch the avatar anyway.
+export interface GeminiImageReference {
+  image: Buffer;
+  mimeType: string;
+}
+
 // Gate: fallback runs on Gemini only when explicitly enabled AND a key is set.
 // When off (or unkeyed), generateImage keeps the fal.ai fallback.
 export function isGeminiImageConfigured(): boolean {
@@ -69,9 +77,20 @@ function resolveProxyUrl(): string | null {
 // budget (a failed call refunds its reservation).
 // ---------------------------------------------------------------------------
 
-function budgetKey(): string {
+function budgetKey(bucket: "fallback" | "character" = "fallback"): string {
   // Calendar-month bucket, e.g. gemini_image:budget:2026-07.
-  return `gemini_image:budget:${new Date().toISOString().slice(0, 7)}`;
+  //
+  // Character-block generations get their OWN bucket. The two uses are
+  // unrelated: the fallback fires when the 69labs pool is dry (an incident,
+  // spiky and unpredictable), while character blocks are a planned feature with
+  // a fixed small per-video cost. Sharing one counter meant a month of heavy
+  // fallback use silently disabled the feature — observed immediately on the
+  // first end-to-end run, 2026-08-26, with the fallback bucket already at its
+  // 300 ceiling. Separate buckets also keep the cost of each visible on its own.
+  const month = new Date().toISOString().slice(0, 7);
+  return bucket === "character"
+    ? `gemini_image:budget:character:${month}`
+    : `gemini_image:budget:${month}`;
 }
 
 export interface GeminiImageBudgetStatus {
@@ -116,8 +135,11 @@ export async function getGeminiImageBudgetStatus(): Promise<GeminiImageBudgetSta
 // when the cap is reached; logs loudly from 80% of the cap onward. Fails OPEN
 // on a Redis error — if Redis is down the queue itself is down, so the guard
 // rather than the pipeline should be the thing that degrades.
-async function reserveGeminiImageBudget(cap: number): Promise<(() => Promise<void>) | null> {
-  const key = budgetKey();
+async function reserveGeminiImageBudget(
+  cap: number,
+  bucket: "fallback" | "character" = "fallback",
+): Promise<(() => Promise<void>) | null> {
+  const key = budgetKey(bucket);
   let used: number;
   try {
     const redis = getRedisConnection();
@@ -127,13 +149,19 @@ async function reserveGeminiImageBudget(cap: number): Promise<(() => Promise<voi
     if (used === 1) await redis.expire(key, 60 * 60 * 24 * 45);
     if (used > cap) {
       await redis.decr(key);
+      const capVar = bucket === "character"
+        ? "SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP"
+        : "GEMINI_IMAGE_MONTHLY_CAP";
       console.error(JSON.stringify({
         msg: "gemini.image.budget_exhausted",
+        bucket,
         cap,
-        note: "monthly Gemini image fallback cap reached — falling through to fal.ai/error; top up 69labs credits or raise GEMINI_IMAGE_MONTHLY_CAP",
+        note: bucket === "character"
+          ? "monthly avatar-character-block cap reached — those shots fall back to an anonymous person; raise SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP"
+          : "monthly Gemini image fallback cap reached — falling through to fal.ai/error; top up 69labs credits or raise GEMINI_IMAGE_MONTHLY_CAP",
       }));
       throw new Error(
-        `gemini image fallback: monthly cap reached (${cap} images) — top up 69labs credits or raise GEMINI_IMAGE_MONTHLY_CAP`,
+        `gemini image (${bucket}): monthly cap reached (${cap} images) — raise ${capVar}`,
       );
     }
     if (used >= Math.ceil(cap * 0.8)) {
@@ -172,14 +200,30 @@ async function reserveGeminiImageBudget(cap: number): Promise<(() => Promise<voi
  * reason. The prompt should already carry the style prompt — this mirrors
  * 69labs' generateNanoBananaImage output.
  */
-export async function generateGeminiImage(prompt: string): Promise<GenerateGeminiImageResult> {
+export async function generateGeminiImage(
+  prompt: string,
+  // Optional IDENTITY reference. This model conditions on image parts, which is
+  // the only mechanism available to us for putting a SPECIFIC person into a
+  // generated scene: the active image chain (ai33 / 69labs, both gpt-image-2)
+  // is text-to-image only and has no slot for a reference at all.
+  //
+  // Used by the character-block feature so the project's avatar can appear as a
+  // character in a few shots (see lib/synthetic/character-blocks.ts). Omitted
+  // for every other call, which keeps the plain text-to-image behaviour byte
+  // identical to before this parameter existed.
+  reference?: GeminiImageReference,
+): Promise<GenerateGeminiImageResult> {
   const env = getEnv();
   if (!env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured (gemini image fallback)");
 
   // Monthly cost guard: throws at the cap (caller falls through to fal.ai or
   // surfaces the 69labs error). The refund puts the reservation back if the
   // generation below fails — only billed successes consume budget.
-  const refund = await reserveGeminiImageBudget(env.GEMINI_IMAGE_MONTHLY_CAP);
+  // A reference call is a character block (the only caller that passes one), so
+  // it draws on the feature's own budget rather than the outage fallback's.
+  const refund = reference
+    ? await reserveGeminiImageBudget(env.SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP, "character")
+    : await reserveGeminiImageBudget(env.GEMINI_IMAGE_MONTHLY_CAP, "fallback");
 
   const ai = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
 
@@ -194,7 +238,18 @@ export async function generateGeminiImage(prompt: string): Promise<GenerateGemin
   try {
     const response = await ai.models.generateContent({
       model: env.GEMINI_IMAGE_MODEL,
-      contents: prompt,
+      // With a reference, the image part must come BEFORE the text so the model
+      // reads the prompt as describing that image's subject. Without one this
+      // stays the bare string it has always been.
+      contents: reference
+        ? [{
+            role: "user",
+            parts: [
+              { inlineData: { data: reference.image.toString("base64"), mimeType: reference.mimeType } },
+              { text: prompt },
+            ],
+          }]
+        : prompt,
       config: {
         // Ask for image bytes back. Some image models also emit a text part
         // (a caption / refusal), so we scan every part for the image below.

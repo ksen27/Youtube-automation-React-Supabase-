@@ -70,9 +70,10 @@ export const AMBIENT_MOTION_ANIMATION_PROMPT =
   "the frame at any point — nothing is added to the scene that is not already " +
   "visible in it. " +
   "NEVER a product-turntable shot: the object must not spin, rotate, revolve or orbit on its own, and the frame must not circle around it. A thing rotating in space is stock-video filler and is rejected on sight. " +
-  "The movement is UNHURRIED but CLEARLY VISIBLE — steady and continuous from " +
-  "the first frame to the last, never rushed or jerky, and never so slight that " +
-  "the shot could be mistaken for a still photograph. " +
+  "The movement is SLOW, GENTLE and UNHURRIED, yet CLEARLY VISIBLE — smooth " +
+  "and continuous from the first frame to the last, drifting or swaying across " +
+  "a real distance rather than trembling in place, never rushed or jerky, and " +
+  "never so slight that the shot could be mistaken for a still photograph. " +
   "The CAMERA IS COMPLETELY STILL AND LOCKED OFF on a tripod — absolutely NO " +
   "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
   "tracking, no orbit, no camera shake; the framing never changes. " +

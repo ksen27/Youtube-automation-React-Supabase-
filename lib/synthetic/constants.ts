@@ -136,11 +136,23 @@ export const ACTION_CLIP_RULE =
   // steady natural pace, plus an explicit requirement that the action READS —
   // it has to start and finish inside the clip.
   "NEVER a product-turntable shot: the object must not spin, rotate, revolve or orbit on its own, and the frame must not circle around it. A thing rotating in space is stock-video filler and is rejected on sight. " +
-  "The action is performed at a STEADY, EVEN, NATURAL pace and is CLEARLY " +
-  "VISIBLE: it begins and completes within the clip, so the movement reads " +
-  "plainly on screen. Not rushed, jerky or sudden; NOT sped up; NOT a " +
-  "slow-motion effect; and NOT a frozen or barely-moving shot — there is real, " +
-  "continuous movement from the first frame to the last. " +
+  // SLOW, take two (client 2026-08-26, repeating the 2026-08-22 ask). The first
+  // attempt failed because it slowed the PACE while leaving the ACTION large:
+  // told to do a whole task slowly inside 4 seconds, the model either rushed it
+  // or moved almost nothing, and the clips read as stills. The fix is to slow
+  // the pace AND shrink the action, so a small movement has the whole clip to
+  // travel a visible distance. "Unhurried but clearly visible" is the wording
+  // that survived on AMBIENT_MOTION_ANIMATION_PROMPT through that revert.
+  "The action is performed SLOWLY and SMOOTHLY, at an unhurried, gentle pace — " +
+  "but it is CLEARLY VISIBLE and CONTINUOUS from the first frame to the last. " +
+  "To be slow AND visible, pick a SMALL, SIMPLE movement rather than a whole " +
+  "task: one lift, one turn, one pour, one step, one door opening. A small " +
+  "movement given the entire clip to travel reads as calm and deliberate; a " +
+  "large one crammed into the same seconds reads as rushed, and a large one " +
+  "slowed down stops looking like it moves at all. " +
+  "So: never rushed, jerky or sudden; NOT sped up; NOT a slow-motion EFFECT or " +
+  "speed ramp; and NOT a frozen or barely-moving shot — a clip that looks like " +
+  "the still it was made from is a failed clip. " +
   "No dramatic or cinematic movement, no motion blur on the camera. " +
   // HAND CONSISTENCY, 2026-08-22. Client: "the hands(right and left) is
   // different with each other". The library's negative prompt already covers
@@ -196,8 +208,12 @@ export const CLIP_NEGATIVE_PROMPT =
 // balance/quota pass). Generic on purpose: it must read as an action on ANY
 // scene, since we don't know what the still shows here.
 export const DEFAULT_ACTION_ANIMATION_PROMPT =
-  "The person in the frame continues the everyday action they are already doing, " +
-  "carrying it through naturally from start to finish. " +
+  // "continues the action" used to invite the whole task. Naming ONE small
+  // beat of it is what lets the slow pace below stay visible — see the SLOW
+  // note on ACTION_CLIP_RULE.
+  "The person in the frame carries on the everyday action they are already " +
+  "doing, but the clip shows just ONE small, simple beat of it — a single " +
+  "unhurried movement carried through from start to finish. " +
   ACTION_CLIP_RULE;
 
 // Output canvas for the synthetic engine (matches the sourced render).
