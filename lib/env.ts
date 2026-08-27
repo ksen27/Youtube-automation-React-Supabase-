@@ -949,6 +949,27 @@ const ServerEnvSchema = z.object({
   // 69labs, both gpt-image-2) is text-to-image only. They are metered by
   // SYNTHETIC_CHARACTER_BLOCKS_MONTHLY_CAP below, NOT by the fallback's
   // GEMINI_IMAGE_MONTHLY_CAP above; see that entry for why the two are split.
+  // MATCH VERIFICATION (client 2026-08-27: "all project should be matched with
+  // script correctly"). Before this, nothing in the pipeline ever checked that
+  // a block's picture belonged to its line — the planner's rules made a wrong
+  // prompt less likely and a bench could measure how much less likely, but a
+  // wrong prompt was still generated, animated and rendered at full cost.
+  //
+  // With this on, every visual block is judged against its own narration before
+  // anything is generated, and MISMATCH blocks are rewritten (keeping the
+  // rewrite only when it judges better). Costs one text call per ~10 blocks
+  // plus a rewrite per failure — cheap against the image and video generations
+  // it prevents being spent on the wrong shot.
+  SYNTHETIC_MATCH_VERIFY_ENABLED: boolish(true),
+  // Ceiling on rewrites per plan, so a bad-day plan cannot turn into hundreds
+  // of extra model calls. Failures are repaired worst-first, so the cap spends
+  // itself on the blocks that read as most broken.
+  SYNTHETIC_MATCH_VERIFY_MAX_REPAIRS: z.coerce.number().int().nonnegative().default(60),
+  // Also rewrite WEAK blocks ("right world, wrong detail"), not just outright
+  // MISMATCH. Off by default: for an abstract line a weak shot is often the
+  // best available answer, and re-rolling it risks trading a sensible picture
+  // for a wrong one. Turn on when a video's weak share is the complaint.
+  SYNTHETIC_MATCH_VERIFY_STRICT: boolish(false),
   SYNTHETIC_CHARACTER_BLOCKS_ENABLED: boolish(true),
   // Deliberately SMALL — the client asked for "the small count", and a large
   // number would rebuild the every-frame-same-person repetition that

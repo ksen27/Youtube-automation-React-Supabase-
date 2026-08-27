@@ -16,7 +16,7 @@
 //
 // Read-only. Gemini text only; no images, no clips.
 import { getServerSupabase } from "@/lib/supabase/server";
-import { judgeAll, score, sceneOnly, type JudgeItem } from "@/scripts/_match-judge";
+import { judgeAll, score, sceneOnly, type JudgeItem } from "@/lib/synthetic/match-verify";
 
 async function main() {
   const needle = process.argv[2];

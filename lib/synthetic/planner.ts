@@ -13,6 +13,7 @@ import {
 } from "@/lib/synthetic/sentence-windows";
 import { NAMED_IP_RULE, SAFE_DEPICTION_RULE } from "@/lib/synthetic/safe-depiction";
 import { selectCharacterBlocks } from "@/lib/synthetic/character-blocks";
+import { verifyAndRepair } from "@/lib/synthetic/match-verify";
 import type { SyntheticBlockType } from "@/lib/types";
 import { type AvatarMarkRange, type AvatarModel } from "@/lib/synthetic/doc-marks";
 import {
@@ -1150,6 +1151,11 @@ function buildSingleSegmentPrompt(
   // Knowing the slot's place in the run lets the prompt ask for a PROGRESSION
   // — successive moments of one process — instead of N independent variations.
   sequence?: { index: number; total: number },
+  // A reviewer's reason for rejecting the previous attempt at THIS block. The
+  // match-verification pass judges every block against its line and feeds the
+  // complaint back here, which is what makes the retry a correction rather than
+  // another roll. Same shape as refusedPrompt below, for the same reason.
+  mismatchReason?: string,
   // The model's OWN previous answer, when it came back as a duplicate of an
   // already-used scene. Appending that answer to avoidScenes was not enough:
   // measured on the list script, a block returned a listed scene VERBATIM twice
@@ -1229,6 +1235,21 @@ function buildSingleSegmentPrompt(
           "If the earlier pictures were all one person at one surface, this one",
           "must leave that surface — a different place, a different scale, or the",
           "consequence of what they were doing.",
+        ]
+      : []),
+    ...((mismatchReason ?? "").trim()
+      ? [
+          "",
+          "A REVIEWER REJECTED THE PREVIOUS PICTURE FOR THIS LINE (critical).",
+          "Their reason, verbatim:",
+          `  "${(mismatchReason ?? "").trim()}"`,
+          "That reason is the thing to fix. Do not simply write another scene and",
+          "hope — read the line below, work out what it is actually about, and",
+          "make THAT the subject of the frame. If the reviewer says the picture",
+          "showed the wrong thing, the new picture shows the right thing. If they",
+          "say the subject was hidden, covered or wrapped, it is now plainly",
+          "visible. If they say the shot was generic where the line was specific,",
+          "name the specific thing the line names.",
         ]
       : []),
     ...((clonedPrompt ?? "").trim()
@@ -1424,8 +1445,12 @@ export async function regenerateSegmentPrompt(input: {
   // This visual's place in a run of visuals covering ONE sentence, so the run
   // reads as a sequence rather than N variations. See buildSingleSegmentPrompt.
   sequence?: { index: number; total: number };
+  // Why a reviewer judged the previous prompt as not belonging to this line.
+  // Set by the match-verification pass so the rewrite is aimed at the actual
+  // complaint instead of being another roll of the same dice.
+  mismatchReason?: string;
 }): Promise<RegeneratedPrompt> {
-  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt, surroundingScript, sequence } = input;
+  const { projectId, jobId, script, basePrompt, blockType, avoidScenes, language, refusedPrompt, surroundingScript, sequence, mismatchReason } = input;
   if (blockType === "avatar") {
     throw new Error("regenerateSegmentPrompt: avatar blocks have no image prompt");
   }
@@ -1441,7 +1466,7 @@ export async function regenerateSegmentPrompt(input: {
     "regenerateSegmentPrompt",
     async (model) => {
       const res = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoid, language ?? DEFAULT_LANGUAGE, refusedPrompt, surroundingScript, sequence, cloned) }] }],
+        contents: [{ role: "user", parts: [{ text: buildSingleSegmentPrompt(script, basePrompt, blockType, avoid, language ?? DEFAULT_LANGUAGE, refusedPrompt, surroundingScript, sequence, mismatchReason, cloned) }] }],
         generationConfig: {
           responseMimeType: "application/json",
           temperature: 0.4,
@@ -5660,6 +5685,83 @@ export async function buildSyntheticTimeline(input: {
         repaired,
         positions: empties.map(({ p }) => p.position),
       });
+    }
+  }
+
+  // MATCH VERIFICATION — the last thing before the plan is written down.
+  //
+  // Every pass above tries to make each block's picture belong to its line.
+  // None of them CHECKED. A block that showed folded blankets for a line about
+  // how some guns looked passed every structural guard — it named a place, it
+  // was not a duplicate, its shot type was valid — and was generated, animated
+  // and rendered anyway. Measured on the bench, ~16% of blocks are still weak
+  // or wrong after all the rules have had their say.
+  //
+  // So: judge each visual block against its own narration, and rewrite the ones
+  // that fail, BEFORE anything is generated. The rewrite is kept only when it
+  // judges better than what it replaces (a regeneration is another roll of the
+  // same dice). Runs last so it sees the FINAL composed prompts — after the
+  // splits, the dedupe regenerations and the empty-scene repair, which are the
+  // passes that introduced the failures in the first place.
+  if (getEnv().SYNTHETIC_MATCH_VERIFY_ENABLED) {
+    const verifiable = planned
+      .map((p, idx) => ({ p, idx }))
+      .filter(({ p }) => p.blockType !== "avatar" && (p.imagePrompt ?? "").trim() && p.script.trim());
+    if (verifiable.length > 0) {
+      try {
+        const { outcomes, judged, failedBatches } = await verifyAndRepair(
+          verifiable.map(({ p, idx }) => ({
+            i: idx,
+            script: p.script,
+            // Judge what will actually be STORED, base prompt and all.
+            imagePrompt: composePrompt(basePrompt, p.imagePrompt, p.shotType) ?? p.imagePrompt ?? "",
+          })),
+          async (t, why) => {
+            const seg = planned[t.i];
+            const r = await regenerateSegmentPrompt({
+              projectId,
+              jobId,
+              script: seg.script,
+              basePrompt,
+              blockType: seg.blockType,
+              language,
+              surroundingScript: [planned[t.i - 1]?.script, planned[t.i + 1]?.script].filter(Boolean).join(" "),
+              // The judge's own complaint, fed back as the thing to fix. This is
+              // the difference between a targeted rewrite and another blind roll.
+              mismatchReason: why,
+            });
+            return r.imagePrompt;
+          },
+          {
+            maxRepairs: getEnv().SYNTHETIC_MATCH_VERIFY_MAX_REPAIRS,
+            alsoWeak: getEnv().SYNTHETIC_MATCH_VERIFY_STRICT,
+          },
+        );
+
+        let repaired = 0;
+        for (const o of outcomes) {
+          if (!o.rewritten?.trim()) continue;
+          planned[o.i].imagePrompt = o.rewritten;
+          planned[o.i].shotType = null;
+          repaired++;
+        }
+        await logJob({ projectId, jobId }, "synthetic.plan.match_verify", {
+          judged: judged.length,
+          failedBatches,
+          flagged: outcomes.length,
+          repaired,
+          // Blocks the judge rejected that we could NOT improve. This is the
+          // honest number to watch: it is what still ships wrong.
+          unrepaired: outcomes.length - repaired,
+          strict: getEnv().SYNTHETIC_MATCH_VERIFY_STRICT,
+        });
+      } catch (e) {
+        // Never fail a plan over verification — an unverified plan is what we
+        // shipped before this pass existed.
+        await logJob({ projectId, jobId }, "synthetic.plan.match_verify.failed", {
+          err: (e as Error).message?.slice(0, 200),
+        });
+      }
     }
   }
 

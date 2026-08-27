@@ -131,3 +131,108 @@ export function score(judged: Judged[]): Score {
 export function sceneOnly(imagePrompt: string): string {
   return imagePrompt.replace(/\.\s*Setting:[\s\S]*$/i, "").trim();
 }
+
+// ---------------------------------------------------------------------------
+// THE GATE
+// ---------------------------------------------------------------------------
+// Everything above is measurement. This is the part that acts on it.
+//
+// Until now nothing in the pipeline checked whether a block's picture belonged
+// to its line. The planner's rules make a wrong prompt less likely and a
+// benchmark can tell us how much less likely, but every prompt still went
+// straight to the image generator and then to the clip generator: a block that
+// showed folded blankets for a line about how some guns looked was generated,
+// animated, rendered and shipped, at full cost, with nothing between it and the
+// viewer.
+//
+// So: judge every block against its own line BEFORE anything is generated, and
+// rewrite the ones that fail. This is the same trust-but-verify shape already
+// used for refused prompts and for duplicate scenes -- ask the model, check the
+// answer, retry the failures -- applied to the thing the client actually
+// complains about.
+//
+// Judging is cheap next to what it protects. One text call covers ten blocks;
+// a 266-block project is ~27 calls plus a rewrite for each failure, against
+// hundreds of image and video generations that would otherwise be spent on
+// shots that do not match.
+
+export interface VerifyTarget {
+  /** Stable id for the caller to map results back (a position or index). */
+  i: number;
+  script: string;
+  /** The composed prompt as it would be stored. */
+  imagePrompt: string;
+}
+
+export interface VerifyOutcome {
+  i: number;
+  verdictBefore: Verdict;
+  verdictAfter: Verdict | null;
+  /** The rewritten prompt, or null when it was kept as-is. */
+  rewritten: string | null;
+  why: string;
+}
+
+/**
+ * Judge every target and rewrite the failures.
+ *
+ * `rewrite` is supplied by the caller (the planner passes a closure over
+ * regenerateSegmentPrompt) so this module stays free of planner imports and
+ * can be unit-tested without a model.
+ *
+ * Only MISMATCH is rewritten by default. WEAK is "right world, wrong detail",
+ * which is often the best available answer for an abstract line -- rewriting
+ * all of them would burn budget re-rolling lines that have no better picture,
+ * and risks trading a weak-but-sensible shot for a wrong one. `alsoWeak` opts
+ * into the stricter behaviour.
+ *
+ * A rewrite is KEPT ONLY IF IT JUDGES BETTER. That matters: a regeneration is
+ * another roll of the same dice, and without the re-check this pass could
+ * replace a weak shot with a worse one and call it progress.
+ */
+export async function verifyAndRepair(
+  targets: VerifyTarget[],
+  rewrite: (t: VerifyTarget, why: string) => Promise<string | null>,
+  opts: { maxRepairs: number; alsoWeak?: boolean } = { maxRepairs: 60 },
+): Promise<{ outcomes: VerifyOutcome[]; judged: Judged[]; failedBatches: number }> {
+  if (targets.length === 0) return { outcomes: [], judged: [], failedBatches: 0 };
+
+  const items: JudgeItem[] = targets.map((t) => ({
+    i: t.i,
+    script: t.script.slice(0, 400),
+    prompt: sceneOnly(t.imagePrompt).slice(0, 400),
+  }));
+  const { judged, failedBatches } = await judgeAll(items);
+
+  const failing = judged
+    .filter((j) => j.verdict === "MISMATCH" || (opts.alsoWeak && j.verdict === "WEAK"))
+    // Worst first, so a maxRepairs cap spends itself on the blocks that read as
+    // most broken rather than on whichever happened to be judged first.
+    .sort((a, b) => (a.verdict === "MISMATCH" ? 0 : 1) - (b.verdict === "MISMATCH" ? 0 : 1))
+    .slice(0, Math.max(0, opts.maxRepairs));
+
+  const outcomes: VerifyOutcome[] = [];
+  for (const f of failing) {
+    const target = targets.find((t) => t.i === f.i);
+    if (!target) continue;
+    let rewritten: string | null = null;
+    let verdictAfter: Verdict | null = null;
+    try {
+      rewritten = await rewrite(target, f.why);
+      if (rewritten?.trim()) {
+        const [recheck] = await judgeBatch([
+          { i: f.i, script: target.script.slice(0, 400), prompt: sceneOnly(rewritten).slice(0, 400) },
+        ]);
+        verdictAfter = recheck?.verdict ?? null;
+        // Keep the rewrite only when it is genuinely better than what it replaces.
+        const rank = (v: Verdict | null) => (v === "MATCH" ? 2 : v === "WEAK" ? 1 : 0);
+        if (rank(verdictAfter) <= rank(f.verdict)) rewritten = null;
+      }
+    } catch {
+      rewritten = null;
+    }
+    outcomes.push({ i: f.i, verdictBefore: f.verdict, verdictAfter, rewritten, why: f.why });
+  }
+
+  return { outcomes, judged, failedBatches };
+}

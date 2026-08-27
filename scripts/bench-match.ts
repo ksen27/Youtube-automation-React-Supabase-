@@ -38,7 +38,7 @@ import {
 } from "@/lib/synthetic/planner";
 import { getEnv } from "@/lib/env";
 import { DEFAULT_LANGUAGE } from "@/lib/i18n/locale";
-import { judgeAll, score, sceneOnly, type Judged, type JudgeItem } from "@/scripts/_match-judge";
+import { judgeAll, score, sceneOnly, verifyAndRepair, type Judged, type JudgeItem } from "@/lib/synthetic/match-verify";
 
 const PROJECT_ID = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_DIR = "scripts/bench-scripts";
@@ -69,7 +69,7 @@ function readScript(path: string): { title: string; transcript: string } {
   return { title, transcript: body };
 }
 
-async function benchOne(name: string, path: string): Promise<{ name: string; judged: Judged[] } | null> {
+async function benchOne(name: string, path: string): Promise<{ name: string; judged: Judged[]; before: Judged[] | null } | null> {
   const { title, transcript } = readScript(path);
   if (!transcript) return null;
 
@@ -152,17 +152,53 @@ async function benchOne(name: string, path: string): Promise<{ name: string; jud
     i = j > i + 1 ? j : i + 1;
   }
 
-  const items: JudgeItem[] = split
-    .filter((s) => (s.imagePrompt ?? "").trim())
-    .map((s, idx) => ({
-      i: idx,
-      script: s.script.trim().slice(0, 400),
-      prompt: sceneOnly(composePrompt(base, s.imagePrompt ?? null, s.shotType ?? null) ?? "").slice(0, 400),
-    }));
+  // MATCH VERIFICATION, the same gate the planner runs before persisting.
+  // Skipped with --no-verify so the bench can show what the plan looks like
+  // WITHOUT it — which is the only way to see what the gate is worth.
+  const usable = split.filter((s) => (s.imagePrompt ?? "").trim());
+  let before: Judged[] | null = null;
+  if (!process.argv.includes("--no-verify")) {
+    const { outcomes, judged } = await verifyAndRepair(
+      usable.map((s, idx) => ({
+        i: idx,
+        script: s.script,
+        imagePrompt: composePrompt(base, s.imagePrompt ?? null, s.shotType ?? null) ?? "",
+      })),
+      async (t, why) => {
+        const seg = usable[t.i];
+        const r = await regenerateSegmentPrompt({
+          projectId: PROJECT_ID,
+          script: seg.script,
+          basePrompt: base,
+          blockType: seg.blockType,
+          surroundingScript: [usable[t.i - 1]?.script, usable[t.i + 1]?.script].filter(Boolean).join(" "),
+          mismatchReason: why,
+        });
+        return r.imagePrompt;
+      },
+      { maxRepairs: env.SYNTHETIC_MATCH_VERIFY_MAX_REPAIRS, alsoWeak: env.SYNTHETIC_MATCH_VERIFY_STRICT },
+    );
+    // The verdicts the gate saw, i.e. this exact plan BEFORE any repair. The
+    // only honest way to price the gate: the planner runs at temperature 0.3,
+    // so two bench runs produce two different plans and comparing them measures
+    // nothing but the weather.
+    before = judged;
+    for (const o of outcomes) {
+      if (!o.rewritten?.trim()) continue;
+      usable[o.i].imagePrompt = o.rewritten;
+      usable[o.i].shotType = null;
+    }
+  }
+
+  const items: JudgeItem[] = usable.map((s, idx) => ({
+    i: idx,
+    script: s.script.trim().slice(0, 400),
+    prompt: sceneOnly(composePrompt(base, s.imagePrompt ?? null, s.shotType ?? null) ?? "").slice(0, 400),
+  }));
 
   const { judged, failedBatches } = await judgeAll(items);
   if (failedBatches) console.log(`    (${failedBatches} judge batch(es) failed)`);
-  return { name, judged };
+  return { name, judged, before };
 }
 
 async function main() {
@@ -175,7 +211,7 @@ async function main() {
   if (!files.length) return console.log(`no .txt scripts in ${dir}`);
 
   console.log(`benching ${files.length} script(s) from ${dir}\n`);
-  const results: Array<{ name: string; judged: Judged[] }> = [];
+  const results: Array<{ name: string; judged: Judged[]; before: Judged[] | null }> = [];
   for (const f of files) {
     const name = f.replace(/\.txt$/, "");
     process.stdout.write(`  ${name.padEnd(22)} planning…`);
@@ -193,7 +229,18 @@ async function main() {
   const all = results.flatMap((r) => r.judged);
   const s = score(all);
   console.log("\n" + "-".repeat(66));
-  console.log(`OVERALL  ${s.n} blocks   MATCH ${s.matchPct}%   WEAK ${s.weak}   MISMATCH ${s.mismatch} (${s.mismatchPct}%)`);
+
+  // BEFORE vs AFTER on the SAME plans. Two bench runs produce two different
+  // plans (the planner is temperature 0.3), so a run-to-run comparison measures
+  // the weather. This is the only comparison that prices the gate.
+  const beforeAll = results.flatMap((r) => r.before ?? []);
+  if (beforeAll.length) {
+    const b = score(beforeAll);
+    console.log(`BEFORE gate  ${b.n} blocks   MATCH ${b.matchPct}%   WEAK ${b.weak}   MISMATCH ${b.mismatch}`);
+    console.log(`AFTER  gate  ${s.n} blocks   MATCH ${s.matchPct}%   WEAK ${s.weak}   MISMATCH ${s.mismatch}`);
+  } else {
+    console.log(`OVERALL  ${s.n} blocks   MATCH ${s.matchPct}%   WEAK ${s.weak}   MISMATCH ${s.mismatch} (${s.mismatchPct}%)`);
+  }
   console.log("-".repeat(66));
 
   // Mismatches are the ones that read as broken on screen; print them all, with
