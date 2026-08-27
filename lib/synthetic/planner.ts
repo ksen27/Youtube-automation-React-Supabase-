@@ -238,6 +238,50 @@ const HANDS_RULE =
   "it rather than a disembodied hand. If you are about to write 'a hand', ask " +
   "what the line is really about and show that instead.";
 
+// A PERSON LOOKING AT THE THING IS NOT A SHOT (client 2026-08-27: "the clip
+// that people seeing gun is appeared at many times", and for a different video
+// "the clip that people seeing computer").
+//
+// MEASURED on the two projects the client watched:
+//
+//   Gun       266 blocks   person EXAMINING a thing   79  (30%)
+//   Mountain  167 blocks   person AT A SCREEN + EXAMINING  45  (27%)
+//
+// This is the "constantly someone holding a computer on a mountain" complaint
+// arriving by a different route, and every guard we have is blind to it. Scene
+// dedupe compares NOUNS and each of these names a different one (rifle,
+// receiver, stock, barrel). The match gate judges each block ALONE, and a
+// person examining a rifle genuinely does match a line about a rifle — so it
+// passes, every time. Contents and SHAPE are different axes.
+//
+// Same treatment that worked on HANDS_RULE: name the over-used composition,
+// forbid it as the default, and say what to do instead. Hands were the
+// dominant shape before that rule and are 5% after it.
+//
+// Not a ban — inspecting IS the event in a line about checking a serial number.
+// The rule is that it must be what the line is about, not the fallback for
+// every line that mentions an object.
+const EXAMINING_RULE =
+  "SOMEONE LOOKING AT THE THING IS NOT A SHOT (critical, client 2026-08-27): " +
+  "a person examining, inspecting, studying, peering at, holding up to the " +
+  "light, or looking at a screen showing the subject is the single most " +
+  "over-used composition in our videos — measured at 30% of one video and 27% " +
+  "of another. The client has now reported it twice, in two unrelated videos. " +
+  "Use it ONLY when the line is genuinely ABOUT inspection: checking a serial " +
+  "number, spotting a fake, reading a mark. Never as the answer to a line that " +
+  "merely mentions an object. " +
+  "When you catch yourself writing 'a person examining X', 'a collector " +
+  "inspecting X', 'looking closely at X', or 'studying a screen showing X', " +
+  "stop and ask what is actually HAPPENING in the line, then show that " +
+  "instead: the thing being used for its purpose, carried, sold, packed, " +
+  "argued over, made, worn out, or in the place it belongs with people going " +
+  "about their business around it. If the line has no event at all, show the " +
+  "thing in its world — not a person peering at it. " +
+  "The same goes for the opposite default: the object ALONE on a workbench, " +
+  "counter or cloth, with nobody present. Between them, a person peering at " +
+  "the subject and the subject lying on a surface accounted for more than half " +
+  "of a recent video. Across any run of five blocks, at most ONE may be either.";
+
 // WHAT HAPPENS OUTRANKS WHAT IS MENTIONED (client 2026-08-26).
 //
 // "The script is saying a collector drove four hours. Why are you showing a gun?
@@ -1030,6 +1074,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "",
     HANDS_RULE,
     "",
+    EXAMINING_RULE,
+    "",
     brollObjectRule(topic),
     "",
     contextVarietyRule(topic),
@@ -1319,6 +1365,8 @@ function buildSingleSegmentPrompt(
     SUBJECT_IN_THE_WORLD_RULE,
     "",
     HANDS_RULE,
+    "",
+    EXAMINING_RULE,
     "",
     brollObjectRule(EMPTY_TOPIC),
     "",

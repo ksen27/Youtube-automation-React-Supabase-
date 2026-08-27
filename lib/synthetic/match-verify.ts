@@ -236,3 +236,48 @@ export async function verifyAndRepair(
 
   return { outcomes, judged, failedBatches };
 }
+
+// ---------------------------------------------------------------------------
+// SHOT SHAPE
+// ---------------------------------------------------------------------------
+// Contents and shape are different axes. Everything above judges CONTENTS —
+// does this picture show what this line is about — and a video can pass that
+// completely while being one shot repeated three hundred times, because each
+// individual block genuinely matches its own line. See scripts/composition-mix.ts
+// for the measurement that first made this visible on the client's projects.
+
+const SHOT_SHAPES: Array<{ name: string; re: RegExp }> = [
+  {
+    name: "person EXAMINING a thing",
+    re: /\b(examin\w*|inspect\w*|scrutin\w*|studying|studies|peering|looking (?:at|over|closely)|holding .{0,30}\bup to (?:the )?light|magnif\w*|loupe)\b/i,
+  },
+  { name: "person WORKING on a thing", re: /\b(clean\w*|polish\w*|oil\w*|assembl\w*|fitting|repair\w*|adjust\w*|wiping|applying)\b/i },
+  { name: "person AT A SCREEN", re: /\b(laptop|computer|monitor|screen|tablet|display panel)\b/i },
+  { name: "person CARRYING / MOVING", re: /\b(carrying|loading|lifting|placing|walking|driving|pushing|hauling)\b/i },
+  { name: "documents / paperwork", re: /\b(document|contract|ledger|paperwork|report|invoice|receipt|catalog|book|map|blueprint)\b/i },
+  { name: "object ALONE on a surface", re: /\b(resting on|sitting on|lying on|laid out|arranged on|displayed on|on a (?:workbench|table|counter|shelf|cloth))\b/i },
+  { name: "wide / place, no person", re: /\b(wide|establishing|aerial|landscape|factory floor|skyline|street)\b/i },
+];
+
+const SHAPE_PERSON_RE =
+  /\b(person|people|man|woman|men|women|collector|worker|craftsperson|craftsman|artisan|gunsmith|researcher|scientist|geophysicist|archaeologist|technician|dealer|seller|buyer|someone|hands?)\b/i;
+
+/** Which recurring composition is this prompt? First match wins. */
+export function shotShape(imagePrompt: string): string {
+  const p = sceneOnly(imagePrompt);
+  const hasPerson = SHAPE_PERSON_RE.test(p);
+  for (const s of SHOT_SHAPES) {
+    if (!s.re.test(p)) continue;
+    if (s.name.startsWith("person ") && !hasPerson) continue;
+    return s.name;
+  }
+  return hasPerson ? "other, with a person" : "other, no person";
+}
+
+/** Shape counts, most common first, with the dominant share. */
+export function shapeMix(prompts: string[]): { rows: Array<[string, number]>; topShare: number } {
+  const counts = new Map<string, number>();
+  for (const p of prompts) counts.set(shotShape(p), (counts.get(shotShape(p)) ?? 0) + 1);
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return { rows, topShare: prompts.length ? (rows[0]?.[1] ?? 0) / prompts.length : 0 };
+}

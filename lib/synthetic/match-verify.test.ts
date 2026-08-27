@@ -55,7 +55,9 @@ describe("verifyAndRepair", () => {
     vi.doMock("@/lib/ai/gemini", () => ({
       withGeminiModelFallback: async (
         _name: string,
-        fn: (m: { generateContent: (a: unknown) => unknown }) => Promise<unknown>,
+        fn: (m: {
+          generateContent: (a: { contents: Array<{ parts: Array<{ text: string }> }> }) => unknown;
+        }) => Promise<unknown>,
       ) => ({
         result: await fn({
           generateContent: (arg: { contents: Array<{ parts: Array<{ text: string }> }> }) => {

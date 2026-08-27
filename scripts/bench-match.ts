@@ -38,7 +38,7 @@ import {
 } from "@/lib/synthetic/planner";
 import { getEnv } from "@/lib/env";
 import { DEFAULT_LANGUAGE } from "@/lib/i18n/locale";
-import { judgeAll, score, sceneOnly, verifyAndRepair, type Judged, type JudgeItem } from "@/lib/synthetic/match-verify";
+import { judgeAll, score, sceneOnly, verifyAndRepair, shapeMix, type Judged, type JudgeItem } from "@/lib/synthetic/match-verify";
 
 const PROJECT_ID = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_DIR = "scripts/bench-scripts";
@@ -242,6 +242,16 @@ async function main() {
     console.log(`OVERALL  ${s.n} blocks   MATCH ${s.matchPct}%   WEAK ${s.weak}   MISMATCH ${s.mismatch} (${s.mismatchPct}%)`);
   }
   console.log("-".repeat(66));
+
+  // THE OTHER AXIS. Every block above can match its own line while the video is
+  // still one picture repeated — "a person examining a rifle" matches a line
+  // about a rifle, and thirty percent of a shipped video was exactly that.
+  // Contents and shape are measured separately because they fail separately.
+  const shapes = shapeMix(all.map((j) => j.prompt));
+  console.log("SHOT SHAPES");
+  for (const [name, n] of shapes.rows.slice(0, 6)) {
+    console.log(`  ${String(Math.round((n / all.length) * 100)).padStart(3)}%  ${String(n).padStart(3)}  ${name}`);
+  }
 
   // Mismatches are the ones that read as broken on screen; print them all, with
   // their script, because a count alone cannot be acted on.
