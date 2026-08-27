@@ -143,16 +143,37 @@ export const ACTION_CLIP_RULE =
   // the pace AND shrink the action, so a small movement has the whole clip to
   // travel a visible distance. "Unhurried but clearly visible" is the wording
   // that survived on AMBIENT_MOTION_ANIMATION_PROMPT through that revert.
-  "The action is performed SLOWLY and SMOOTHLY, at an unhurried, gentle pace — " +
-  "but it is CLEARLY VISIBLE and CONTINUOUS from the first frame to the last. " +
-  "To be slow AND visible, pick a SMALL, SIMPLE movement rather than a whole " +
-  "task: one lift, one turn, one pour, one step, one door opening. A small " +
-  "movement given the entire clip to travel reads as calm and deliberate; a " +
-  "large one crammed into the same seconds reads as rushed, and a large one " +
-  "slowed down stops looking like it moves at all. " +
-  "So: never rushed, jerky or sudden; NOT sped up; NOT a slow-motion EFFECT or " +
-  "speed ramp; and NOT a frozen or barely-moving shot — a clip that looks like " +
-  "the still it was made from is a failed clip. " +
+  // SLOW, take three (client 2026-08-27: scrolling their timeline saying
+  // "Image. Image. Image." at clips that were technically animated).
+  //
+  // Take one (2026-08-22) slowed the PACE and was reverted for producing
+  // stills. Take two (2026-08-26) slowed the pace AND told the model to pick a
+  // SMALL movement, on the theory that a small movement has time to complete.
+  // That was worse, and measurably so: of 78 clips in a shipped project, 97%
+  // carried a dampening word and 59% named no travelling action at all --
+  // "slowly adjusts a dial", "gently places a sample in a bag". A small slow
+  // movement behind a locked-off camera for four seconds is a photograph.
+  //
+  // The mistake both times was treating this as a question of SPEED. It is a
+  // question of DISTANCE: how much of the frame changes between the first
+  // frame and the last. A hand crossing the frame at an ordinary pace reads as
+  // video; a fingertip rotating a dial does not, at any speed.
+  "SOMETHING MUST TRAVEL. The clip has FOUR SECONDS and a camera that never " +
+  "moves, so the only thing that can tell a viewer this is video and not a " +
+  "photograph is a subject that visibly CROSSES THE FRAME. Choose an action " +
+  "with real distance in it: someone walking in or out, a hand carrying " +
+  "something from one side to the other, a lid coming off, a drawer pulled " +
+  "open, liquid pouring, a door swinging, a vehicle moving through, a person " +
+  "turning fully to face the camera, an object being lifted clear and set down " +
+  "somewhere else. " +
+  "THE TEST, and it is the client's own: if the first frame and the last frame " +
+  "could be mistaken for the same photograph, the clip has FAILED. A fingertip " +
+  "turning a dial, a hand resting on a surface, someone shifting their weight, " +
+  "eyes moving, a slight adjustment — all of these fail it. " +
+  "Pace is ORDINARY and natural, the speed a real person does a real thing. " +
+  "Not hurried, not jerky, NOT sped up, and NOT a slow-motion effect — but do " +
+  "NOT describe the action as slow, gentle, careful, deliberate or subtle " +
+  "either. Those words shrink the movement until nothing happens. " +
   "No dramatic or cinematic movement, no motion blur on the camera. " +
   // HAND CONSISTENCY, 2026-08-22. Client: "the hands(right and left) is
   // different with each other". The library's negative prompt already covers

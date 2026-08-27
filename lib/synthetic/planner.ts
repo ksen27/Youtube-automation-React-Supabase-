@@ -854,16 +854,24 @@ const ANIMATION_SPEED_RULE_LINES = [
   // See the note on ACTION_CLIP_RULE: slow the PACE and shrink the ACTION
   // together. Slowing the pace alone is what made the 2026-08-22 clips read as
   // stills and got that wording reverted three days later.
-  "The motion runs SLOWLY and SMOOTHLY, at an unhurried, gentle pace, and must",
-  "still be CLEARLY VISIBLE and CONTINUOUS from the first frame to the last.",
-  "To be both slow and visible, describe a SMALL, SIMPLE movement rather than a",
-  "whole task — one lift, one turn, one pour, one step, one door opening — and",
-  "let it BEGIN AND COMPLETE inside the clip. A small movement given the whole",
-  "clip to travel reads as calm and deliberate; a big one slowed down stops",
-  "looking like it moves at all. Never describe a frozen, static or",
-  "barely-moving shot — a clip that looks like the still it was made from is a",
-  "failed clip. Equally, never describe rushed, sudden or jerky motion (it",
-  "renders as a blur), and never ask for a slow-motion EFFECT or a speed ramp.",
+  // See the SLOW-take-three note on ACTION_CLIP_RULE. This is about DISTANCE,
+  // not speed: 97% of a shipped project's clips were damped to the point that
+  // the client read them as photographs.
+  "SOMETHING MUST TRAVEL. The clip is about four seconds behind a camera that",
+  "never moves, so the only thing that tells a viewer this is video and not a",
+  "photograph is a subject that visibly CROSSES THE FRAME. Describe an action",
+  "with real distance in it — someone walking in or out, a hand carrying",
+  "something from one side to the other, a lid coming off, a drawer pulled",
+  "open, liquid pouring, a door swinging, a vehicle moving through, an object",
+  "lifted clear and set down somewhere else — and let it begin and complete",
+  "inside the clip.",
+  "THE TEST: if the first frame and the last frame could be mistaken for the",
+  "same photograph, the clip has FAILED. A fingertip turning a dial, a hand",
+  "resting on something, a slight adjustment, eyes moving — all fail it.",
+  "Pace is ORDINARY and natural. Never rushed, sudden or jerky (it renders as a",
+  "blur), never a slow-motion EFFECT or speed ramp — and do NOT call the action",
+  "slow, gentle, careful, deliberate or subtle, because those words shrink the",
+  "movement until nothing happens.",
 ];
 
 function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): string {
@@ -1387,7 +1395,7 @@ function buildSingleSegmentPrompt(
       // block goes straight to the clip lane, so wording that drifts from the
       // planner's shows up as a handful of fast, smeared clips scattered through
       // an otherwise slow video -- worse than either setting applied uniformly.
-      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. It runs SLOWLY and SMOOTHLY at an unhurried, gentle pace and COMPLETES within the clip: to be both slow and clearly visible, describe a SMALL, SIMPLE movement (one lift, one turn, one pour, one step) rather than a whole task, and give it the whole clip to travel. Never rushed or jerky, never a slow-motion effect, and never a frozen or barely-moving shot. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. NEVER a product-turntable shot: the object must not spin, rotate or revolve on its own and the camera must not circle it — a thing rotating in space is stock-video filler. No cinematic movement.).'
+      ? 'Respond ONLY with JSON: {"imagePrompt","shotType","animationPrompt"}  (animationPrompt = the motion in THIS block, matching THIS block\'s narration. If the scene has a person in it, that is the action the person performs. If the scene has NO person in it, the motion is what the scene ITSELF does (the object moving, being poured, steaming, swaying, turning, light shifting) and NO hands, fingers, arms or any part of a body may enter the frame at any point — do not write "a hand reaches in", ever, for a scene with no person in it. SOMETHING MUST TRAVEL: with a locked-off camera and about four seconds, the only thing that tells a viewer this is video and not a photograph is a subject that visibly CROSSES THE FRAME. Describe an action with real distance in it (someone walking in or out, a hand carrying something across, a lid coming off, a drawer pulled open, liquid pouring, a door swinging, an object lifted clear and set down elsewhere) and let it complete inside the clip. THE TEST: if the first and last frame could be mistaken for the same photograph, the clip has failed — a fingertip turning a dial or a slight adjustment fails it. Pace is ORDINARY and natural; never rushed or jerky, never a slow-motion effect, and do NOT call the action slow, gentle, careful or subtle, because those words shrink it until nothing happens. Where hands are visible they stay consistent throughout: the same two hands, same shape and skin tone, five fingers each, never swapping or changing. The CAMERA IS LOCKED OFF and NEVER MOVES — no push-in, no zoom, no pan, no tilt, no tracking, no shake; only the SUBJECT moves. NEVER a product-turntable shot: the object must not spin, rotate or revolve on its own and the camera must not circle it — a thing rotating in space is stock-video filler. No cinematic movement.).'
       : 'Respond ONLY with JSON: {"imagePrompt","shotType"}',
     "",
     `basePrompt: ${basePrompt.trim() || "(none)"}`,

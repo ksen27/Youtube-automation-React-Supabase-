@@ -70,10 +70,19 @@ export const AMBIENT_MOTION_ANIMATION_PROMPT =
   "the frame at any point — nothing is added to the scene that is not already " +
   "visible in it. " +
   "NEVER a product-turntable shot: the object must not spin, rotate, revolve or orbit on its own, and the frame must not circle around it. A thing rotating in space is stock-video filler and is rejected on sight. " +
-  "The movement is SLOW, GENTLE and UNHURRIED, yet CLEARLY VISIBLE — smooth " +
-  "and continuous from the first frame to the last, drifting or swaying across " +
-  "a real distance rather than trembling in place, never rushed or jerky, and " +
-  "never so slight that the shot could be mistaken for a still photograph. " +
+  // A person-less scene has only ambient motion available, which is small by
+  // definition — so it has to be the LARGEST ambient motion the scene allows,
+  // travelling across the frame rather than trembling in place. Otherwise this
+  // is the path that produces the photographs the client scrolled past.
+  "The movement must CROSS THE FRAME, not tremble in place: something drifts, " +
+  "sways, pours, falls, rolls or blows THROUGH the shot and visibly changes " +
+  "where it is between the first frame and the last. Pick the biggest movement " +
+  "the scene honestly allows — a curtain lifting in the wind rather than a " +
+  "flicker, steam rolling upward rather than a shimmer. THE TEST: if the first " +
+  "and last frame could be mistaken for the same photograph, the clip has " +
+  "failed. Pace is ordinary and natural, never rushed or jerky, and do NOT " +
+  "call it slow, gentle or subtle — those words shrink it until nothing " +
+  "happens. " +
   "The CAMERA IS COMPLETELY STILL AND LOCKED OFF on a tripod — absolutely NO " +
   "camera movement of any kind: no push-in, no zoom, no pan, no tilt, no " +
   "tracking, no orbit, no camera shake; the framing never changes. " +
