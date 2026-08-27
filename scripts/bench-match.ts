@@ -38,7 +38,7 @@ import {
 } from "@/lib/synthetic/planner";
 import { getEnv } from "@/lib/env";
 import { DEFAULT_LANGUAGE } from "@/lib/i18n/locale";
-import { judgeAll, score, sceneOnly, verifyAndRepair, shapeMix, type Judged, type JudgeItem } from "@/lib/synthetic/match-verify";
+import { judgeAll, score, sceneOnly, verifyAndRepair, shapeMix, shotShape, type Judged, type JudgeItem } from "@/lib/synthetic/match-verify";
 
 const PROJECT_ID = "00000000-0000-0000-0000-000000000000";
 const DEFAULT_DIR = "scripts/bench-scripts";
@@ -249,8 +249,21 @@ async function main() {
   // Contents and shape are measured separately because they fail separately.
   const shapes = shapeMix(all.map((j) => j.prompt));
   console.log("SHOT SHAPES");
-  for (const [name, n] of shapes.rows.slice(0, 6)) {
+  for (const [name, n] of shapes.rows.slice(0, 8)) {
     console.log(`  ${String(Math.round((n / all.length) * 100)).padStart(3)}%  ${String(n).padStart(3)}  ${name}`);
+  }
+
+  // --show-shapes prints the prompts inside each bucket. The point is the
+  // "other" buckets: they are the classifier saying "I have no name for this",
+  // which is NOT the same as saying the shots are varied. A large "other" can
+  // hide a new repeated composition just as easily as it can hold genuine
+  // variety, and the only way to tell is to read them.
+  if (process.argv.includes("--show-shapes")) {
+    for (const [name] of shapes.rows) {
+      const inBucket = all.filter((j) => shotShape(j.prompt) === name);
+      console.log(`\n--- ${name} (${inBucket.length}) ---`);
+      for (const j of inBucket) console.log(`  ${j.prompt.slice(0, 120)}`);
+    }
   }
 
   // Mismatches are the ones that read as broken on screen; print them all, with
