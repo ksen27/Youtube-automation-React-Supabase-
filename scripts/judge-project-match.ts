@@ -7,67 +7,16 @@
 // near-identical pairs). It cannot answer the question the client actually
 // asks, which is whether the shot on screen belongs to the words being spoken.
 //
-// SCORED BY LLM JUDGE, NOT KEYWORDS -- the same reasoning as
-// prompt-match-check.ts: a keyword test scores "a receipt for a lawn mower" as
-// a MATCH for a line about a mower, and showing the receipt instead of the
-// machine is exactly what gets rejected. The judge is asked the client's own
-// question: hearing this line and seeing this picture, do they belong together?
+// Shares its judge with bench-match.ts (scripts/_match-judge.ts) so a score
+// here and a score there mean the same thing — otherwise the bench could not
+// be used to predict what a real project will look like.
 //
 // Blocks are sampled EVENLY across the whole project, not from the opening,
 // because the opening is the part that always looks best.
 //
 // Read-only. Gemini text only; no images, no clips.
 import { getServerSupabase } from "@/lib/supabase/server";
-import { withGeminiModelFallback } from "@/lib/ai/gemini";
-
-type Verdict = "MATCH" | "WEAK" | "MISMATCH";
-interface Judged { i: number; verdict: Verdict; why: string; script: string; prompt: string }
-
-const BATCH = 10;
-
-function buildPrompt(rows: Array<{ i: number; script: string; prompt: string }>): string {
-  return [
-    "You are reviewing a narrated video. For each item you get the NARRATION",
-    "the viewer HEARS and a description of the PICTURE they SEE at that moment.",
-    "",
-    "Answer one question per item: does the picture belong to those words?",
-    "",
-    'Return STRICT JSON ONLY: {"items":[{"i":<number>,"verdict":"MATCH|WEAK|MISMATCH","why":"<=15 words"}]}',
-    "",
-    "MATCH    - a viewer instantly sees the connection. The picture shows the",
-    "           main thing the line is about, or the event it describes.",
-    "WEAK     - same general world, but the picture is not what the line is",
-    "           about: a related object, a detail at the edge, or a generic shot",
-    "           of the topic where the line named something specific.",
-    "MISMATCH - the picture shows something the line is not about at all, or",
-    "           hides/omits the thing the line describes.",
-    "",
-    "Be strict. Being on-topic is NOT a match: a video about guns showing a gun",
-    "while the line is about a factory closing is a MISMATCH. A line describing",
-    "how something LOOKS, illustrated by that thing wrapped, covered or boxed,",
-    "is a MISMATCH -- the viewer cannot see what is being described.",
-    "",
-    "ITEMS:",
-    ...rows.map((r) => `[${r.i}]\nHEARS: ${r.script}\nSEES: ${r.prompt}\n`),
-  ].join("\n");
-}
-
-async function judge(rows: Array<{ i: number; script: string; prompt: string }>): Promise<Judged[]> {
-  const { result } = await withGeminiModelFallback("judgeProjectMatch", async (model) => {
-    const res = await model.generateContent({
-      contents: [{ role: "user", parts: [{ text: buildPrompt(rows) }] }],
-      generationConfig: { responseMimeType: "application/json", temperature: 0 },
-    });
-    const parsed = JSON.parse(res.response.text());
-    if (!parsed?.items?.length) throw new Error("judge returned no items");
-    return parsed as { items: Array<{ i: number; verdict: Verdict; why: string }> };
-  }, { attempts: 2, baseMs: 800 }, { attempts: 3, baseMs: 1500 });
-
-  return result.items.map((it) => {
-    const src = rows.find((r) => r.i === it.i);
-    return { i: it.i, verdict: it.verdict, why: it.why, script: src?.script ?? "", prompt: src?.prompt ?? "" };
-  });
-}
+import { judgeAll, score, sceneOnly, type JudgeItem } from "@/scripts/_match-judge";
 
 async function main() {
   const needle = process.argv[2];
@@ -96,37 +45,27 @@ async function main() {
   if (!visual.length) return console.log("no visual blocks with prompts");
 
   const step = Math.max(1, Math.floor(visual.length / sampleSize));
-  const sample = Array.from({ length: Math.min(sampleSize, visual.length) }, (_, k) => visual[k * step])
+  const sample: JudgeItem[] = Array.from(
+    { length: Math.min(sampleSize, visual.length) },
+    (_, k) => visual[k * step],
+  )
     .filter(Boolean)
     .map((s) => ({
       i: Number(s.position),
       script: String(s.script).trim().slice(0, 400),
-      // Judge the scene, not the recurring world tacked on the end.
-      prompt: String(s.image_prompt).replace(/\.\s*Setting:[\s\S]*$/i, "").trim().slice(0, 400),
+      prompt: sceneOnly(String(s.image_prompt)).slice(0, 400),
     }));
 
   console.log(`${visual.length} visual blocks; judging ${sample.length} sampled evenly\n`);
+  const { judged, failedBatches } = await judgeAll(sample);
+  if (failedBatches) console.log(`(${failedBatches} judge batch(es) failed)\n`);
 
-  const all: Judged[] = [];
-  for (let i = 0; i < sample.length; i += BATCH) {
-    const chunk = sample.slice(i, i + BATCH);
-    try {
-      all.push(...(await judge(chunk)));
-    } catch (e) {
-      console.error(`  batch at ${i} failed: ${(e as Error).message.slice(0, 120)}`);
-    }
-    process.stdout.write(`\r  judged ${all.length}/${sample.length}`);
-  }
-  console.log("\n");
+  const s = score(judged);
+  console.log(`MATCH    ${String(s.match).padStart(3)}  (${s.matchPct}%)`);
+  console.log(`WEAK     ${String(s.weak).padStart(3)}`);
+  console.log(`MISMATCH ${String(s.mismatch).padStart(3)}  (${s.mismatchPct}%)`);
 
-  const n = all.length || 1;
-  const count = (v: Verdict) => all.filter((a) => a.verdict === v).length;
-  const pct = (v: Verdict) => Math.round((count(v) / n) * 100);
-  console.log(`MATCH    ${String(count("MATCH")).padStart(3)}  (${pct("MATCH")}%)`);
-  console.log(`WEAK     ${String(count("WEAK")).padStart(3)}  (${pct("WEAK")}%)`);
-  console.log(`MISMATCH ${String(count("MISMATCH")).padStart(3)}  (${pct("MISMATCH")}%)`);
-
-  const bad = all.filter((a) => a.verdict !== "MATCH");
+  const bad = judged.filter((a) => a.verdict !== "MATCH");
   if (bad.length) {
     console.log(`\nEVERY NON-MATCH (${bad.length}):`);
     for (const b of bad) {
