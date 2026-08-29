@@ -4,9 +4,7 @@ import type { ProjectState } from '../../../domain/project/ProjectStatus';
 
 /** Lightweight read-model row for listing a user's projects (no aggregate load). */
 export interface ProjectListItem {
-  id: string;
-  channelUrl: string;
-  status: ProjectState;
+  id: string;  status: ProjectState;
   createdAt: string;
 }
 
@@ -19,9 +17,7 @@ export interface LandingCandidate {
   projectId: string;
   bookTitle: string;
   /** Storage path of the cover, for the picker's thumbnail. */
-  coverImagePath: string | null;
-  channelUrl: string;
-  createdAt: string;
+  coverImagePath: string | null;  createdAt: string;
   /**
    * The book's OWN commerce settings, so the picker can show what it already
    * sells for the moment it is chosen — and so the seller can tell "this book

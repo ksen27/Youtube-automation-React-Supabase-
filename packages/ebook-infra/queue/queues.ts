@@ -1,13 +1,6 @@
 import type { QueueName } from '@ebook/core';
 
 export const QUEUE_NAMES: QueueName[] = [
-  'channel-ingest',
-  'video-data',
-  'transcript-fetch',
-  'whisper-transcribe',
-  'video-summarize',
-  'analyze-comments',
-  'knowledge-base',
   'book-strategy',
   'outline-generate',
   'chapter-research',
@@ -50,27 +43,14 @@ export interface QueueConfig {
   limiter?: { max: number; duration: number };
 }
 
-export const QUEUE_CONFIG: Record<QueueName, QueueConfig> = {
-  'channel-ingest': { concurrency: 5, attempts: 5 },
-  'video-data': { concurrency: 10, attempts: 5 },
-  // Parallel again: the proxy pool rotates a distinct starting IP per video, so
+export const QUEUE_CONFIG: Record<QueueName, QueueConfig> = {  // Parallel again: the proxy pool rotates a distinct starting IP per video, so
   // concurrent downloads spread across proxies instead of hammering one. Keep
-  // concurrency <= the number of working proxies so each lands on its own IP.
-  'transcript-fetch': { concurrency: 6, attempts: 4 },
-  // Audio download + Whisper transcription, the slowest per-video stage. Bounded
+  // concurrency <= the number of working proxies so each lands on its own IP.  // Audio download + Whisper transcription, the slowest per-video stage. Bounded
   // by the Whisper API and worker CPU/network (not the Anthropic tier), so raised
-  // modestly rather than to the chapter-queue levels.
-  'whisper-transcribe': { concurrency: 4, attempts: 3 },
-  // Per-video summary (Haiku — cheap, fast, high tier limits). Raised so a large
-  // channel's videos summarize in parallel rather than draining at 50/min.
-  'video-summarize': { concurrency: 16, attempts: 4, limiter: { max: 200, duration: 60_000 } },
-  // Per-video comment analysis — fanned out one job per video; raised alongside
-  // summarize so the per-video AI phase isn't the throughput floor on Tier 3+.
-  'analyze-comments': { concurrency: 16, attempts: 4, limiter: { max: 150, duration: 60_000 } },
-  // One call per book (concurrency parallelizes across projects, not within one),
-  // so leave as-is — raising it wouldn't speed a single run.
-  'knowledge-base': { concurrency: 4, attempts: 4 },
-  'book-strategy': { concurrency: 4, attempts: 4 },
+  // modestly rather than to the chapter-queue levels.  // Per-video summary (Haiku — cheap, fast, high tier limits). Raised so a large
+  // channel's videos summarize in parallel rather than draining at 50/min.  // Per-video comment analysis — fanned out one job per video; raised alongside
+  // summarize so the per-video AI phase isn't the throughput floor on Tier 3+.  // One call per book (concurrency parallelizes across projects, not within one),
+  // so leave as-is — raising it wouldn't speed a single run.  'book-strategy': { concurrency: 4, attempts: 4 },
   'outline-generate': { concurrency: 4, attempts: 4 },
   // Per-chapter research (Sonnet) — raised alongside the chapter queues so a
   // whole book's research fans out at once on Tier 3+.

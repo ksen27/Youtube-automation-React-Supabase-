@@ -3,12 +3,10 @@ import { Result } from '../shared/Result';
 import { ProjectId } from './ProjectId';
 import { ProjectStatus, type ProjectState } from './ProjectStatus';
 import { GenerationOptions } from './GenerationOptions';
-import { ChannelUrl } from '../channel/ChannelUrl';
 import { ProjectStatusChanged } from './events/ProjectStatusChanged';
 
 interface ProjectProps {
   ownerId: string;
-  channelUrl: ChannelUrl;
   options: GenerationOptions;
   status: ProjectStatus;
   /** Per-stage fan-in counters, e.g. { GENERATING_CHAPTERS: 12 }. */
@@ -23,7 +21,6 @@ export class Project extends AggregateRoot<ProjectProps, ProjectId> {
   static create(input: {
     id: ProjectId;
     ownerId: string;
-    channelUrl: ChannelUrl;
     options: GenerationOptions;
     now: Date;
   }): Result<Project> {
@@ -32,7 +29,6 @@ export class Project extends AggregateRoot<ProjectProps, ProjectId> {
       new Project(
         {
           ownerId: input.ownerId,
-          channelUrl: input.channelUrl,
           options: input.options,
           status: ProjectStatus.created(),
           pendingCounts: {},
@@ -55,9 +51,6 @@ export class Project extends AggregateRoot<ProjectProps, ProjectId> {
   }
   get ownerId(): string {
     return this.props.ownerId;
-  }
-  get channelUrl(): ChannelUrl {
-    return this.props.channelUrl;
   }
   get options(): GenerationOptions {
     return this.props.options;

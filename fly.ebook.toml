@@ -66,6 +66,24 @@
 #                         Cookies expire; a recurrence of the bot gate on ALL
 #                         videos at once means re-export, not a proxy purchase.
 #
+#   YT_DLP_POT_SCRIPT / YT_DLP_POT_BASE_URL
+#                       — a PO token provider (bgutil), in script or server mode.
+#                         A PO token is the proof-of-browser YouTube's own client
+#                         attaches, and it is the ONLY credential here that
+#                         neither expires nor belongs to a Google account — the
+#                         answer when the cookie jar keeps going stale. Unset =
+#                         no token, which is what the pipeline has always done.
+#   YT_DLP_EXTRACTOR_ARGS
+#                       — raw --extractor-args, semicolon-separated, for a future
+#                         YouTube change that needs a client switch (e.g.
+#                         "youtube:player_client=default,tv_simply") without
+#                         shipping code.
+#   YT_DLP_NO_SELF_UPDATE=1
+#                       — pin a machine to the yt-dlp baked into the image. By
+#                         default every boot runs `yt-dlp -U` (Dockerfile.worker)
+#                         so a restart heals a stale extractor; set this only when
+#                         a fresh yt-dlp release is itself the regression.
+#
 #   YT_DLP_PROXIES      — the residential proxy pool, `host:port:user:pass`
 #                         comma-separated. Verify every entry BEFORE setting it:
 #                         a proxy that 407s is quarantined for 10 minutes and

@@ -113,24 +113,10 @@ export class PipelineOrchestrator {
  * The coarse statuses that make up the per-video fan-in phase. reachStage accepts
  * any of these as the source when converging to the knowledge-base stage.
  */
-const PER_VIDEO_PHASE: ProjectState[] = [
-  'FETCHING_VIDEO_DATA',
-  'FETCHING_TRANSCRIPTS',
-  'TRANSCRIBING_FALLBACK',
-  'SUMMARIZING_VIDEOS',
-  'ANALYZING_COMMENTS',
-];
+const PER_VIDEO_PHASE: ProjectState[] = [];
 
 /** Linear stage progression (conditional branches & fan-outs resolved inside use cases). */
-const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {
-  INGESTING_CHANNEL: 'FETCHING_VIDEO_DATA',
-  FETCHING_VIDEO_DATA: 'FETCHING_TRANSCRIPTS',
-  FETCHING_TRANSCRIPTS: 'SUMMARIZING_VIDEOS',
-  TRANSCRIBING_FALLBACK: 'SUMMARIZING_VIDEOS',
-  SUMMARIZING_VIDEOS: 'ANALYZING_COMMENTS',
-  ANALYZING_COMMENTS: 'BUILDING_KNOWLEDGE_BASE',
-  BUILDING_KNOWLEDGE_BASE: 'GENERATING_BOOK_STRATEGY',
-  GENERATING_BOOK_STRATEGY: 'GENERATING_OUTLINE',
+const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {  GENERATING_BOOK_STRATEGY: 'GENERATING_OUTLINE',
   GENERATING_OUTLINE: 'GENERATING_CHAPTER_RESEARCH',
   GENERATING_CHAPTER_RESEARCH: 'GENERATING_CHAPTERS',
   GENERATING_CHAPTERS: 'POLISHING_BOOK',
@@ -144,9 +130,7 @@ const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {
  * (GENERATING_CHAPTER_RESEARCH, GENERATING_CHAPTERS) are intentionally absent —
  * their producer use cases set the barrier and enqueue the per-item jobs.
  */
-const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {
-  BUILDING_KNOWLEDGE_BASE: 'knowledge-base',
-  GENERATING_BOOK_STRATEGY: 'book-strategy',
+const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {  GENERATING_BOOK_STRATEGY: 'book-strategy',
   GENERATING_OUTLINE: 'outline-generate',
   POLISHING_BOOK: 'polish-book',
   ASSEMBLING: 'ebook-assemble',
@@ -159,15 +143,7 @@ const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {
  * stage, and a failure in one must never rewind a finished book. They are
  * filtered out where this map is read.
  */
-const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {
-  'channel-ingest': 'INGESTING_CHANNEL',
-  'video-data': 'FETCHING_VIDEO_DATA',
-  'transcript-fetch': 'FETCHING_TRANSCRIPTS',
-  'whisper-transcribe': 'TRANSCRIBING_FALLBACK',
-  'video-summarize': 'SUMMARIZING_VIDEOS',
-  'analyze-comments': 'ANALYZING_COMMENTS',
-  'knowledge-base': 'BUILDING_KNOWLEDGE_BASE',
-  'book-strategy': 'GENERATING_BOOK_STRATEGY',
+const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {  'book-strategy': 'GENERATING_BOOK_STRATEGY',
   'outline-generate': 'GENERATING_OUTLINE',
   'chapter-research': 'GENERATING_CHAPTER_RESEARCH',
   'chapter-generate': 'GENERATING_CHAPTERS',
@@ -180,15 +156,7 @@ const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {
 
 /** Linear order of pipeline stages, for picking the earliest among several failures. */
 const STAGE_ORDER: ProjectState[] = [
-  'CREATED',
-  'INGESTING_CHANNEL',
-  'FETCHING_VIDEO_DATA',
-  'FETCHING_TRANSCRIPTS',
-  'TRANSCRIBING_FALLBACK',
-  'SUMMARIZING_VIDEOS',
-  'ANALYZING_COMMENTS',
-  'BUILDING_KNOWLEDGE_BASE',
-  'GENERATING_BOOK_STRATEGY',
+  'CREATED',  'GENERATING_BOOK_STRATEGY',
   'GENERATING_OUTLINE',
   'GENERATING_CHAPTER_RESEARCH',
   'GENERATING_CHAPTERS',

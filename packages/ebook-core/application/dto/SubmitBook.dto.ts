@@ -48,26 +48,35 @@ const LandingOptionFields = {
   landingTemplateId: z.string().uuid().optional().or(z.literal('')),
 };
 
-export const SubmitChannelDto = z.object({
-  channelUrl: z.string().url(),
+/**
+ * Submitting a book for generation.
+ *
+ * The book's source is a REFERENCE BOOK, not a YouTube channel: the user gives
+ * a title and picks one or more reference books (uploaded, or previously
+ * uploaded and kept in the library), and the pipeline writes a new book in
+ * their voice and structure on the title's subject. The channel-ingest path
+ * this replaced — scan a channel, fetch transcripts, summarize — is gone; see
+ * the removal commit for what went with it.
+ */
+export const SubmitBookDto = z.object({
+  /** At least one reference book. Order is meaningful: the first is primary. */
+  referenceBookIds: z.array(z.string().uuid()).min(1).max(5),
   options: z
     .object({
       /** Required user-provided book title; always used as the book's title. */
       bookTitle: z.string().trim().min(1).max(200),
       bookType: z.enum(['normal', 'cooking']).default('normal'),
       targetPages: z.number().int().min(10).max(200).default(100),
-      maxVideos: z.number().int().min(5).max(50).default(30),
       /** Recipe count for cooking books; ignored for normal books. */
       recipeCount: z.number().int().min(10).max(120).default(60),
       tone: z.enum(['educational', 'conversational', 'professional']).default('professional'),
-      includeComments: z.boolean().default(true),
       includeIllustrations: z.boolean().default(true),
       illustrationEveryPages: z.number().int().min(2).max(50).default(5),
       ...LandingOptionFields,
     }),
 });
 
-export type SubmitChannelDto = z.infer<typeof SubmitChannelDto>;
+export type SubmitBookDto = z.infer<typeof SubmitBookDto>;
 
 /** The landing-page settings, shared by the submit DTO and the later PATCH. */
 export const LandingSettingsDto = z.object(LandingOptionFields).partial();

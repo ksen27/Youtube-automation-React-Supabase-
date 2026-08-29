@@ -5,12 +5,10 @@ import { PublishLandingPageUseCase } from './PublishLandingPageUseCase';
 import { Project } from '../../domain/project/Project';
 import { ProjectId } from '../../domain/project/ProjectId';
 import { GenerationOptions } from '../../domain/project/GenerationOptions';
-import { ChannelUrl } from '../../domain/channel/ChannelUrl';
 import { Book } from '../../domain/book/Book';
 import { Chapter } from '../../domain/book/Chapter';
 import { BookId, ChapterId } from '../../domain/book/ids';
 import { BookStrategy } from '../../domain/book/BookStrategy';
-import { Channel } from '../../domain/channel/Channel';
 import { LandingPage } from '../../domain/landing/LandingPage';
 import { Result } from '../../domain/shared/Result';
 import type { LandingPageRepository } from '../ports/repositories/LandingPageRepository';
@@ -33,7 +31,6 @@ function makeProject(landing: Partial<Parameters<typeof GenerationOptions.create
   return Project.create({
     id: ProjectId.from('11111111-1111-4111-8111-111111111111'),
     ownerId: 'owner',
-    channelUrl: ChannelUrl.create('https://www.youtube.com/@example').value,
     options: GenerationOptions.create({ bookTitle: 'The Mechanic Bible', landingPage: true, ...landing }),
     now,
   }).value;
@@ -147,17 +144,6 @@ function buildGenerate(options: {
           inputHash: 'strategy-hash',
         }),
     } as never,
-    {
-      getChannel: async () =>
-        Channel.create({
-          youtubeId: 'y',
-          title: 'Car Care Garage',
-          description: null,
-          subscriberCount: 280_000,
-          videoCount: 100,
-          thumbnailUrl: null,
-        }),
-    } as never,
     { listByProject: async () => [] } as never,
     pages,
     {
@@ -248,7 +234,6 @@ function buildTriple(opts: {
       return Project.create({
         id: ProjectId.from(raw),
         ownerId: foreign ? 'someone-else' : 'owner',
-        channelUrl: ChannelUrl.create('https://www.youtube.com/@example').value,
         options: GenerationOptions.create({ bookTitle: `Sibling ${raw.slice(0, 1)}`, landingPage: true }),
         now,
       }).value;
@@ -269,7 +254,6 @@ function buildTriple(opts: {
     projects as never,
     books as never,
     { getBookStrategy: async () => null } as never,
-    { getChannel: async () => null } as never,
     { listByProject: async () => [] } as never,
     pages,
     { find: async () => null, save: async () => Result.ok() } as never,
@@ -677,7 +661,6 @@ function buildWithReference(
     { findById: async () => project } as never,
     { findByProject: async () => makeBook(), findSummaryByProject: async () => makeBookSummary() } as never,
     { getBookStrategy: async () => null } as never,
-    { getChannel: async () => null } as never,
     { listByProject: async () => [] } as never,
     pages,
     { find: async () => opts.stored ?? null, save: async () => Result.ok() } as never,

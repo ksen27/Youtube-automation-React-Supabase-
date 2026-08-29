@@ -1,138 +1,17 @@
 import type { Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
-import { ProjectJob, VideoJob, WhisperJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, CheckoutProductJob, ExportFormat, ProjectId } from '@ebook/core';
+import { ProjectJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, CheckoutProductJob, ExportFormat, ProjectId } from '@ebook/core';
 import type { Container } from '@ebook/config';
 import { makeWorker } from './runtime/worker-factory';
 import { queueRuntimeConfig } from '@ebook/infra';
 
 /**
- * Builds every stage worker for the full 15-phase pipeline. Each processor stays
+ * Builds every stage worker for the book-generation pipeline. Each processor stays
  * thin: validate (schema in the factory) → call the use case → advance the
  * pipeline / report to the convergence barrier.
  */
 export function buildWorkers(connection: Redis, container: Container): Worker[] {
   const { useCases, orchestrator } = container;
-
-  const channelIngest = makeWorker(connection, container, {
-    name: 'channel-ingest',
-    ...queueRuntimeConfig('channel-ingest'),
-    payloadSchema: ProjectJob,
-    handler: async (p) => {
-      const r = await useCases.ingestChannel.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      return r.value;
-    },
-  });
-
-  const videoData = makeWorker(connection, container, {
-    name: 'video-data',
-    ...queueRuntimeConfig('video-data'),
-    payloadSchema: VideoJob,
-    handler: async (p) => {
-      const r = await useCases.fetchVideoData.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-    },
-  });
-
-  const transcriptFetch = makeWorker(connection, container, {
-    name: 'transcript-fetch',
-    ...queueRuntimeConfig('transcript-fetch'),
-    payloadSchema: VideoJob,
-    handler: async (p) => {
-      const r = await useCases.fetchTranscript.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      // Transcript provenance: captions came straight from the YouTube Data API.
-      // ('pending-whisper' is logged by the whisper worker once it transcribes.)
-      if (r.value.outcome === 'youtube') {
-        container.logger.info('📝 transcript source: YouTube Data API', { projectId: p.projectId, videoId: p.videoId, source: 'youtube-data-api' });
-      }
-      // Captions found (or already present) → summarize. 'pending-whisper'
-      // continues via the whisper worker instead.
-      if (r.value.outcome !== 'pending-whisper') {
-        await enqueueSummarize(container, p.projectId, p.videoId);
-      }
-      return r.value;
-    },
-  });
-
-  const whisper = makeWorker(connection, container, {
-    name: 'whisper-transcribe',
-    ...queueRuntimeConfig('whisper-transcribe'),
-    payloadSchema: WhisperJob,
-    handler: async (p) => {
-      const r = await useCases.transcribeAudio.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      // Transcript provenance: no captions were available, so this was produced
-      // by the Whisper audio-transcription fallback.
-      container.logger.info('📝 transcript source: Whisper (audio fallback)', { projectId: p.projectId, videoId: p.videoId, source: 'whisper' });
-      await enqueueSummarize(container, p.projectId, p.videoId);
-    },
-  });
-
-  const videoSummarize = makeWorker(connection, container, {
-    name: 'video-summarize',
-    ...queueRuntimeConfig('video-summarize'),
-    payloadSchema: VideoJob,
-    handler: async (p) => {
-      const r = await useCases.summarizeVideo.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      if (r.value.outcome === 'skipped-no-transcript') {
-        container.logger.warn('video-summarize skipped — no transcript', { projectId: p.projectId, videoId: p.videoId });
-      }
-      if (r.value.outcome === 'skipped-summary-failed') {
-        container.logger.warn('video-summarize skipped — unusable model output', {
-          projectId: p.projectId,
-          videoId: p.videoId,
-          reason: r.value.reason,
-        });
-      }
-      // Per-video chain continues into comment analysis (the last per-video step)
-      // even when summarization was skipped, so the convergence barrier still
-      // decrements for this video.
-      await container.queue.enqueue(
-        'analyze-comments',
-        { projectId: p.projectId, videoId: p.videoId },
-        { jobId: `analyze-comments:${p.projectId}:${p.videoId}` },
-      );
-    },
-  });
-
-  const analyzeComments = makeWorker(connection, container, {
-    name: 'analyze-comments',
-    ...queueRuntimeConfig('analyze-comments'),
-    payloadSchema: VideoJob,
-    handler: async (p) => {
-      const r = await useCases.analyzeComments.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      // Convergence barrier for the entire per-video chain. The countdown counter
-      // still drives the UI, but the advance decision is DB-authoritative: advance
-      // when every video already has comment insights. That self-heals a drifted
-      // counter (e.g. a decrement lost to a worker restart) that would otherwise
-      // wedge the project forever on the per-video phase.
-      const pid = ProjectId.from(p.projectId);
-      const remaining = await container.repositories.projects.decrementPending(pid, 'VIDEO_PIPELINE');
-      let converged = remaining <= 0;
-      if (!converged) {
-        const [analyzed, total] = await Promise.all([
-          container.repositories.knowledge.countCommentInsights(pid),
-          container.repositories.videos.countByProject(pid),
-        ]);
-        converged = total > 0 && analyzed >= total;
-      }
-      if (converged) await orchestrator.reachStage(p.projectId, 'BUILDING_KNOWLEDGE_BASE');
-    },
-  });
-
-  const knowledgeBase = makeWorker(connection, container, {
-    name: 'knowledge-base',
-    ...queueRuntimeConfig('knowledge-base'),
-    payloadSchema: ProjectJob,
-    handler: async (p) => {
-      const r = await useCases.buildKnowledgeBase.execute(p);
-      if (r.isFail()) throw new Error(r.error);
-      await orchestrator.advance(p.projectId, 'BUILDING_KNOWLEDGE_BASE');
-    },
-  });
 
   const bookStrategy = makeWorker(connection, container, {
     name: 'book-strategy',
@@ -587,15 +466,7 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
     },
   });
 
-  return [
-    channelIngest,
-    videoData,
-    transcriptFetch,
-    whisper,
-    videoSummarize,
-    analyzeComments,
-    knowledgeBase,
-    bookStrategy,
+  return [    bookStrategy,
     outline,
     chapterResearch,
     chapterGenerate,
@@ -621,13 +492,4 @@ async function recordLandingFailure(container: Container, projectId: string, err
   } catch {
     /* best-effort */
   }
-}
-
-/** Enqueue the per-video summarize step (deterministic id → idempotent). */
-async function enqueueSummarize(container: Container, projectId: string, videoId: string): Promise<void> {
-  await container.queue.enqueue(
-    'video-summarize',
-    { projectId, videoId },
-    { jobId: `video-summarize:${projectId}:${videoId}` },
-  );
 }

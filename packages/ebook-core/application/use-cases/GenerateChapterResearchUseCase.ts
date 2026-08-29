@@ -4,7 +4,6 @@ import { ProjectId } from '../../domain/project/ProjectId';
 import { ChapterId } from '../../domain/book/ids';
 import { ChapterResearch } from '../../domain/book/ChapterResearch';
 import type { BookRepository } from '../ports/repositories/BookRepository';
-import type { VideoRepository } from '../ports/repositories/VideoRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
 import type { AiTextGenerator } from '../ports/services/AiTextGenerator';
 import type { ChapterResearchJob } from '../dto/jobs.dto';
@@ -20,17 +19,21 @@ const Schema = z.object({
   supportingPrinciples: z.array(z.string()),
 });
 
-const TOP_VIDEOS_PER_CHAPTER = 8;
+/** How many knowledge-base passages one chapter is researched from. */
+const TOP_PASSAGES_PER_CHAPTER = 12;
 
 /**
- * Phase 10: assemble a chapter research package WITHOUT a vector DB. Relevant
- * videos are retrieved by keyword/theme overlap between the chapter and each
- * video's summary+themes, then Sonnet organizes the material into the package.
+ * Phase 10: assemble a chapter research package WITHOUT a vector DB.
+ *
+ * Retrieval used to rank the project's VIDEOS by keyword overlap with the
+ * chapter. With the channel pipeline gone there are no videos: the corpus is
+ * the project's knowledge base, and the same overlap ranking picks the passages
+ * within it this chapter should be built from. Same shape, same cost, different
+ * source — which is why the knowledge base was worth keeping as the seam.
  */
 export class GenerateChapterResearchUseCase {
   constructor(
     private readonly books: BookRepository,
-    private readonly videos: VideoRepository,
     private readonly knowledge: KnowledgeRepository,
     private readonly ai: AiTextGenerator,
   ) {}
@@ -46,28 +49,36 @@ export class GenerateChapterResearchUseCase {
     const chapter = book?.chapter(chapterId);
     if (!book || !chapter) return Result.fail('Chapter not found');
 
-    // Titles + summaries only. Ranking never reads transcripts or comments, and
-    // this runs once per chapter across concurrent books — pulling the whole
-    // corpus per call is what exhausted the database's statement timeout.
-    const videos = await this.videos.findSummarizedByProject(projectId);
+    // The knowledge base is the corpus. Its fields are already the distilled
+    // material a chapter wants — themes, principles, advice, mistakes — so each
+    // entry is treated as one retrievable passage.
+    const kb = await this.knowledge.getKnowledgeBase(projectId);
+    if (!kb) return Result.fail('No knowledge base for this project');
     const terms = tokenize([chapter.title, chapter.topic, chapter.promise, ...chapter.keyPoints].join(' '));
 
-    // Rank videos by keyword overlap with the chapter (the "retrieval" step).
-    const ranked = videos
-      .map((v) => {
-        const haystack = tokenize(`${v.title} ${v.summary.searchableText()}`);
-        return { v, score: overlap(terms, haystack) };
-      })
+    const passages = [
+      ...kb.coreThemes.map((t) => `Theme: ${t}`),
+      ...kb.corePrinciples.map((t) => `Principle: ${t}`),
+      ...kb.audiencePainPoints.map((t) => `Reader problem: ${t}`),
+      ...kb.audienceGoals.map((t) => `Reader goal: ${t}`),
+    ];
+
+    // Rank passages by keyword overlap with the chapter (the retrieval step).
+    // A zero-overlap passage is dropped rather than padded in: a chapter is
+    // better served by four relevant passages than by twelve where eight are
+    // about a different part of the book.
+    const ranked = passages
+      .map((text) => ({ text, score: overlap(terms, tokenize(text)) }))
+      .filter((p) => p.score > 0)
       .sort((a, b) => b.score - a.score)
-      .slice(0, TOP_VIDEOS_PER_CHAPTER);
+      .slice(0, TOP_PASSAGES_PER_CHAPTER);
 
-    const candidateMaterial = ranked
-      .map(({ v }) => `Video: ${v.title}\n${v.summary.toText()}`)
-      .join('\n\n');
+    // Nothing overlapped — an early chapter phrased in words the knowledge base
+    // does not use. Falling back to the whole base beats researching a chapter
+    // from nothing.
+    const candidateMaterial = (ranked.length > 0 ? ranked.map((p) => p.text) : passages).join('\n');
 
-    const audienceQuestions = (await this.knowledge.listCommentInsights(projectId))
-      .flatMap((i) => i.commonQuestions)
-      .slice(0, 20);
+    const audienceQuestions = kb.audiencePainPoints.slice(0, 20);
 
     const prompt = ChapterResearchPrompt.build({
       chapterTitle: chapter.title,
@@ -98,7 +109,8 @@ export class GenerateChapterResearchUseCase {
       ChapterResearch.create({
         chapterId: cmd.chapterId,
         chapterTitle: chapter.title,
-        relatedVideoIds: ranked.map(({ v }) => v.id),
+        // No videos any more; the field stays on the record for stored history.
+        relatedVideoIds: [],
         audienceQuestions,
         inputHash: cmd.inputHash,
         ...parsed.value,

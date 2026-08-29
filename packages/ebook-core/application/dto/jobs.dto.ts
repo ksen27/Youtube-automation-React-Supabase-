@@ -4,18 +4,6 @@ import { z } from 'zod';
 
 export const ProjectJob = z.object({ projectId: z.string().uuid() });
 
-export const VideoJob = z.object({
-  projectId: z.string().uuid(),
-  videoId: z.string().uuid(),
-  inputHash: z.string().optional(),
-});
-
-export const WhisperJob = z.object({
-  projectId: z.string().uuid(),
-  videoId: z.string().uuid(),
-  audioRef: z.string(),
-});
-
 export const ChapterResearchJob = z.object({
   projectId: z.string().uuid(),
   chapterId: z.string().uuid(),
@@ -61,8 +49,6 @@ export const LandingPageJob = z.object({
 });
 
 export type ProjectJob = z.infer<typeof ProjectJob>;
-export type VideoJob = z.infer<typeof VideoJob>;
-export type WhisperJob = z.infer<typeof WhisperJob>;
 export type ChapterResearchJob = z.infer<typeof ChapterResearchJob>;
 export type ChapterJob = z.infer<typeof ChapterJob>;
 export type PolishChapterJob = z.infer<typeof PolishChapterJob>;

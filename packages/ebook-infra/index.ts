@@ -44,14 +44,6 @@ export * from './integrations/payhip/PayhipBrowser';
 export * from './integrations/payhip/login';
 export * from './integrations/payhip/keepAlive';
 
-// ── YouTube ─────────────────────────────────────────────────────────────────
-export * from './youtube/YouTubeDataApiProvider';
-export * from './youtube/YouTubeTranscriptProvider';
-
-// ── Whisper fallback ────────────────────────────────────────────────────────
-export * from './whisper/WhisperSpeechToText';
-export * from './whisper/YtDlpAudioDownloader';
-
 // ── Storage ─────────────────────────────────────────────────────────────────
 export * from './storage/SupabaseStorageAdapter';
 
@@ -68,8 +60,6 @@ export * from './queue/BullJobQueue';
 // ── Persistence (Supabase) ──────────────────────────────────────────────────
 export * from './persistence/supabase/SupabaseClientFactory';
 export * from './persistence/supabase/SupabaseProjectRepository';
-export * from './persistence/supabase/SupabaseVideoRepository';
-export * from './persistence/supabase/SupabaseChannelRepository';
 export * from './persistence/supabase/SupabaseBookRepository';
 export * from './persistence/supabase/SupabaseKnowledgeRepository';
 export * from './persistence/supabase/SupabaseExportArtifactRepository';

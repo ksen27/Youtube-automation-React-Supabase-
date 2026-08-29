@@ -2,16 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { Project } from './Project';
 import { ProjectId } from './ProjectId';
 import { GenerationOptions } from './GenerationOptions';
-import { ChannelUrl } from '../channel/ChannelUrl';
 
 const now = new Date('2026-01-01T00:00:00Z');
-const url = ChannelUrl.create('https://www.youtube.com/@example');
+const url = 'unused';
 
 function makeProject() {
   return Project.create({
     id: ProjectId.from('p1'),
     ownerId: 'u1',
-    channelUrl: (url as { value: ChannelUrl }).value,
     options: GenerationOptions.create({}),
     now,
   });
@@ -26,8 +24,8 @@ describe('Project state machine', () => {
 
   it('allows CREATED → INGESTING_CHANNEL', () => {
     const p = makeProject().value;
-    expect(p.advanceTo('INGESTING_CHANNEL', now).isOk()).toBe(true);
-    expect(p.status.value).toBe('INGESTING_CHANNEL');
+    expect(p.advanceTo('GENERATING_BOOK_STRATEGY', now).isOk()).toBe(true);
+    expect(p.status.value).toBe('GENERATING_BOOK_STRATEGY');
   });
 
   it('rejects illegal transitions', () => {
@@ -39,7 +37,7 @@ describe('Project state machine', () => {
 
   it('emits a ProjectStatusChanged event on transition', () => {
     const p = makeProject().value;
-    p.advanceTo('INGESTING_CHANNEL', now);
+    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
     const events = p.pullEvents();
     expect(events).toHaveLength(1);
     expect(events[0]?.name).toBe('project.status.changed');
@@ -63,7 +61,7 @@ describe('Project state machine', () => {
 describe('Project cancel', () => {
   it('cancels a running project (terminal FAILED with a cancel reason)', () => {
     const p = makeProject().value;
-    p.advanceTo('INGESTING_CHANNEL', now);
+    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
     expect(p.cancel(now).isOk()).toBe(true);
     expect(p.status.value).toBe('FAILED');
     expect(p.error).toBe('Cancelled by user');
@@ -73,12 +71,6 @@ describe('Project cancel', () => {
     const p = makeProject().value;
     // Walk to COMPLETED through the full pipeline.
     const path = [
-      'INGESTING_CHANNEL',
-      'FETCHING_VIDEO_DATA',
-      'FETCHING_TRANSCRIPTS',
-      'SUMMARIZING_VIDEOS',
-      'ANALYZING_COMMENTS',
-      'BUILDING_KNOWLEDGE_BASE',
       'GENERATING_BOOK_STRATEGY',
       'GENERATING_OUTLINE',
       'GENERATING_CHAPTER_RESEARCH',
@@ -97,7 +89,7 @@ describe('Project cancel', () => {
 describe('Project resumeAt (retry rewind)', () => {
   it('rewinds a FAILED project to a prior stage and clears the error', () => {
     const p = makeProject().value;
-    p.advanceTo('INGESTING_CHANNEL', now);
+    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
     p.markFailed('Stage book-strategy failed', now);
     expect(p.status.value).toBe('FAILED');
 
@@ -109,16 +101,16 @@ describe('Project resumeAt (retry rewind)', () => {
 
   it('refuses to resume a non-terminal project', () => {
     const p = makeProject().value;
-    p.advanceTo('INGESTING_CHANNEL', now);
+    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
     expect(p.resumeAt('GENERATING_OUTLINE', now).isFail()).toBe(true);
-    expect(p.status.value).toBe('INGESTING_CHANNEL');
+    expect(p.status.value).toBe('GENERATING_BOOK_STRATEGY');
   });
 
   it('emits a status-changed event when rewinding', () => {
     const p = makeProject().value;
     p.markFailed('boom', now);
     p.pullEvents(); // drain the failure event
-    p.resumeAt('SUMMARIZING_VIDEOS', now);
+    p.resumeAt('GENERATING_OUTLINE', now);
     const events = p.pullEvents();
     expect(events).toHaveLength(1);
     expect(events[0]?.name).toBe('project.status.changed');

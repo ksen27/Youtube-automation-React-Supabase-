@@ -26,7 +26,6 @@ import { parseJsonCompletion } from '../prompts/parse';
 import type { ProjectRepository } from '../ports/repositories/ProjectRepository';
 import type { BookRepository } from '../ports/repositories/BookRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
-import type { ChannelRepository } from '../ports/repositories/ChannelRepository';
 import type { ExportArtifactRepository } from '../ports/repositories/ExportArtifactRepository';
 import type { LandingPageRepository } from '../ports/repositories/LandingPageRepository';
 import type { LandingTemplateRepository } from '../ports/repositories/LandingTemplateRepository';
@@ -130,7 +129,6 @@ export class GenerateClonedLandingPageUseCase {
     private readonly projects: ProjectRepository,
     private readonly books: BookRepository,
     private readonly knowledge: KnowledgeRepository,
-    private readonly channels: ChannelRepository,
     private readonly artifacts: ExportArtifactRepository,
     private readonly pages: LandingPageRepository,
     private readonly templates: LandingTemplateRepository,
@@ -264,8 +262,6 @@ export class GenerateClonedLandingPageUseCase {
 
     const loaded = await this.store.loadTemplate(template);
     if (loaded.isFail()) return Result.fail(loaded.error);
-
-    const channel = await this.channels.getChannel(input.projectId);
     const artifactList = await this.artifacts.listByProject(input.projectId);
     const pageCount = artifactList.find((a) => a.pageCount > 0)?.pageCount ?? null;
 
@@ -332,7 +328,13 @@ export class GenerateClonedLandingPageUseCase {
     // Audience psychology from phase 6. The landing copy has never seen it —
     // it only ever received the book strategy — and it is the one input that
     // lets a page answer an objection before it costs a sale.
-    const insights = await this.knowledge.listCommentInsights(input.projectId);
+    const insights: Array<{
+      commonQuestions: string[];
+      topPraise: string[];
+      frustrations: string[];
+      recurringProblems: string[];
+      objections: string[];
+    }> = [];
     const audiencePains = unique(insights.flatMap((i) => [...i.frustrations, ...i.recurringProblems])).slice(0, 12);
     const audienceObjections = unique(insights.flatMap((i) => i.objections)).slice(0, 8);
 
@@ -340,7 +342,7 @@ export class GenerateClonedLandingPageUseCase {
       projectId: input.projectId.value,
       bookTitle: title,
       subtitle: strategy?.subtitle ?? '',
-      channelTitle: channel?.title ?? 'this creator',
+      channelTitle: 'this creator',
       author: strategy?.author,
       strategy: strategy?.toText() ?? '',
       chapterTitles: book.chapterTitles,
@@ -373,7 +375,7 @@ export class GenerateClonedLandingPageUseCase {
     const featuredCover = products.value.find((p) => p.featured)?.coverSitePath ?? null;
     const authorPhoto = await this.loadImage(project.options.landingAuthorPhotoPath ?? null, IMAGE_WIDTHS.authorPhoto);
     if (authorPhoto) assets.push({ ...authorPhoto, sitePath: 'assets/author.webp', storagePath: '' });
-    const logo = await this.loadRemoteImage(channel?.thumbnailUrl ?? null, IMAGE_WIDTHS.logo);
+    const logo = await this.loadRemoteImage(null, IMAGE_WIDTHS.logo);
     if (logo) assets.push({ ...logo, sitePath: 'assets/logo.webp', storagePath: '' });
 
     // ── STAGE 6: bind ────────────────────────────────────────────────────────
@@ -408,8 +410,8 @@ export class GenerateClonedLandingPageUseCase {
       // "Get the Book — $37" — silently undoing the strip two lines above,
       // which is exactly the defect it was added to prevent.
       CTA_TEXT: writtenSlots['CTA_TEXT']?.trim() || 'Get the book',
-      BRAND_NAME: channel?.title ?? title,
-      AUTHOR_NAME: strategy?.author ?? channel?.title ?? '',
+      BRAND_NAME: title,
+      AUTHOR_NAME: strategy?.author ?? '',
       PRICE: formatMoney(project.options.landingPriceCents, project.options.landingCurrency),
       COMPARE_AT_PRICE: formatMoney(project.options.landingCompareAtCents, project.options.landingCurrency),
       GUARANTEE_DAYS: String(project.options.landingGuaranteeDays),
@@ -458,7 +460,7 @@ export class GenerateClonedLandingPageUseCase {
     // reads as the author's is the seller's own.
     const withPortrait =
       authorPhoto && !loaded.value.html.includes(token('AUTHOR_IMAGE'))
-        ? placeAuthorPortrait(loaded.value.html, `${strategy?.author ?? channel?.title ?? title}`)
+        ? placeAuthorPortrait(loaded.value.html, `${strategy?.author ?? title}`)
         : { html: loaded.value.html, placed: 'none' as const };
 
     const assembled = this.binder.assemble({
@@ -471,7 +473,7 @@ export class GenerateClonedLandingPageUseCase {
       values: {
         scalars,
         repeats,
-        trustedHtml: { FOOTER_LEGAL: legalMarkup(channel?.title ?? title, this.clock.now().getFullYear()) },
+        trustedHtml: { FOOTER_LEGAL: legalMarkup(title, this.clock.now().getFullYear()) },
       },
       // The checkout URL is deliberately NOT required here: a seller previews
       // the page before the product exists on their store. Publishing is where

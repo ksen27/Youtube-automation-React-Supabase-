@@ -3,7 +3,6 @@ import { CreateCheckoutProductUseCase } from './CreateCheckoutProductUseCase';
 import { Project } from '../../domain/project/Project';
 import { ProjectId } from '../../domain/project/ProjectId';
 import { GenerationOptions } from '../../domain/project/GenerationOptions';
-import { ChannelUrl } from '../../domain/channel/ChannelUrl';
 import { ExportArtifact } from '../../domain/export/ExportArtifact';
 import { BookStrategy } from '../../domain/book/BookStrategy';
 import { Result } from '../../domain/shared/Result';
@@ -29,7 +28,6 @@ function makeProject(options: Partial<Parameters<typeof GenerationOptions.create
   const project = Project.create({
     id: ProjectId.from(PROJECT_ID),
     ownerId: 'owner',
-    channelUrl: ChannelUrl.create('https://www.youtube.com/@example').value,
     options: GenerationOptions.create({
       bookTitle: 'The Mechanic Bible',
       landingPage: true,

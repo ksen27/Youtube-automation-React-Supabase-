@@ -4,7 +4,6 @@ import { ProjectId } from '../../domain/project/ProjectId';
 import { BookStrategy } from '../../domain/book/BookStrategy';
 import type { ProjectRepository } from '../ports/repositories/ProjectRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
-import type { ChannelRepository } from '../ports/repositories/ChannelRepository';
 import type { AiTextGenerator } from '../ports/services/AiTextGenerator';
 import type { Hasher } from '../ports/Hasher';
 import { BookStrategyPrompt } from '../prompts/BookStrategyPrompt';
@@ -33,7 +32,6 @@ export class GenerateBookStrategyUseCase {
   constructor(
     private readonly projects: ProjectRepository,
     private readonly knowledge: KnowledgeRepository,
-    private readonly channels: ChannelRepository,
     private readonly ai: AiTextGenerator,
     private readonly hasher: Hasher,
   ) {}
@@ -54,13 +52,14 @@ export class GenerateBookStrategyUseCase {
     });
     const existing = await this.knowledge.getBookStrategy(projectId);
     if (existing?.inputHash === inputHash) return Result.ok(); // idempotent
-
-    const channel = await this.channels.getChannel(projectId);
     const prompt = BookStrategyPrompt.build({
       knowledgeBase: kb.toText(),
       targetPages: project.options.targetPages,
       tone: project.options.tone,
-      channelTitle: channel?.title ?? 'this channel',
+      // No channel any more: the book's own title is the subject line the
+      // strategy prompt needs. Kept under the prompt's existing field name so
+      // the prompt text and its cached prefix do not change.
+      channelTitle: project.options.bookTitle ?? 'this book',
       bookTitle: project.options.bookTitle,
     });
     const completion = await this.ai.generate({

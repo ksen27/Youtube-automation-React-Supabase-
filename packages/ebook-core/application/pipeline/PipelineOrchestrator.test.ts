@@ -3,7 +3,6 @@ import { PipelineOrchestrator } from './PipelineOrchestrator';
 import { Project } from '../../domain/project/Project';
 import { ProjectId } from '../../domain/project/ProjectId';
 import { GenerationOptions } from '../../domain/project/GenerationOptions';
-import { ChannelUrl } from '../../domain/channel/ChannelUrl';
 import type { ProjectRepository, ProjectListItem, LandingCandidate } from '../ports/repositories/ProjectRepository';
 import type { ProjectState } from '../../domain/project/ProjectStatus';
 import type { JobQueue, QueueName } from '../ports/services/JobQueue';
@@ -12,16 +11,13 @@ import type { Logger } from '../ports/Logger';
 
 const now = new Date('2026-01-01T00:00:00Z');
 
-function failedProject(id = 'p1'): Project {
-  const url = ChannelUrl.create('https://www.youtube.com/@example') as { value: ChannelUrl };
-  const p = Project.create({
+function failedProject(id = 'p1'): Project {  const p = Project.create({
     id: ProjectId.from(id),
     ownerId: 'u1',
-    channelUrl: url.value,
     options: GenerationOptions.create({}),
     now,
   }).value;
-  p.advanceTo('INGESTING_CHANNEL', now);
+  p.advanceTo('GENERATING_BOOK_STRATEGY', now);
   p.markFailed('Stage book-strategy failed', now);
   return p;
 }
@@ -111,25 +107,22 @@ describe('PipelineOrchestrator.resume', () => {
   it('rewinds to the EARLIEST stage when several queues failed', async () => {
     const project = failedProject();
     const repo = new FakeProjectRepo(project);
-    const queue = new FakeQueue(['chapter-generate', 'video-summarize']);
+    const queue = new FakeQueue(['chapter-generate', 'outline-generate']);
     const orch = new PipelineOrchestrator(repo, queue, clock, logger);
 
     const result = await orch.resume('p1');
 
-    expect(result.stage).toBe('SUMMARIZING_VIDEOS');
-    expect(project.status.value).toBe('SUMMARIZING_VIDEOS');
+    expect(result.stage).toBe('GENERATING_OUTLINE');
+    expect(project.status.value).toBe('GENERATING_OUTLINE');
   });
 
-  it('does nothing for a project that is not FAILED', async () => {
-    const url = ChannelUrl.create('https://www.youtube.com/@example') as { value: ChannelUrl };
-    const project = Project.create({
+  it('does nothing for a project that is not FAILED', async () => {    const project = Project.create({
       id: ProjectId.from('p1'),
       ownerId: 'u1',
-      channelUrl: url.value,
       options: GenerationOptions.create({}),
       now,
     }).value;
-    project.advanceTo('INGESTING_CHANNEL', now);
+    project.advanceTo('GENERATING_BOOK_STRATEGY', now);
 
     const repo = new FakeProjectRepo(project);
     const queue = new FakeQueue(['book-strategy']);
@@ -138,7 +131,7 @@ describe('PipelineOrchestrator.resume', () => {
     const result = await orch.resume('p1');
     expect(result.retried).toBe(0);
     expect(queue.retryFailedCalls).toBe(0);
-    expect(project.status.value).toBe('INGESTING_CHANNEL');
+    expect(project.status.value).toBe('GENERATING_BOOK_STRATEGY');
   });
 
   it('does nothing when there are no failed jobs to retry', async () => {

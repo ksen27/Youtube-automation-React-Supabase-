@@ -1,15 +1,5 @@
 import {
-  PipelineOrchestrator,
-  SubmitChannelUseCase,
-  StartQueuedProjectsUseCase,
-  IngestChannelUseCase,
-  FetchVideoDataUseCase,
-  FetchTranscriptUseCase,
-  TranscribeAudioUseCase,
-  SummarizeVideoUseCase,
-  AnalyzeCommentsUseCase,
-  BuildKnowledgeBaseUseCase,
-  GenerateBookStrategyUseCase,
+  PipelineOrchestrator,  StartQueuedProjectsUseCase,  GenerateBookStrategyUseCase,
   GenerateOutlineUseCase,
   GenerateChapterResearchUseCase,
   StartChapterGenerationUseCase,
@@ -54,21 +44,13 @@ import {
   HttpImageFetcher,
   PuppeteerReferenceScreenshotter,
   HttpWebFontFetcher,
-  labs69ProxyRotator,
-  YouTubeDataApiProvider,
-  YouTubeTranscriptProvider,
-  WhisperSpeechToText,
-  YtDlpAudioDownloader,
-  SupabaseStorageAdapter,
+  labs69ProxyRotator,  SupabaseStorageAdapter,
   PuppeteerPdfExporter,
   DocxExporter,
   getRedisConnection,
   BullJobQueue,
   SupabaseClientFactory,
-  SupabaseProjectRepository,
-  SupabaseVideoRepository,
-  SupabaseChannelRepository,
-  SupabaseBookRepository,
+  SupabaseProjectRepository,  SupabaseBookRepository,
   SupabaseKnowledgeRepository,
   SupabaseExportArtifactRepository,
   SupabaseLandingPageRepository,
@@ -195,18 +177,10 @@ export function buildContainer(env: Env = loadEnv()) {
   // database row, so it is resolved once here rather than on every UI request.
   // Fire-and-forget: a container must not block on it, and an unwarmed
   // publisher fails with a precise message rather than a missing button.
-  void checkoutPublisher.warmUp().catch(() => {});
-  const youtube = new YouTubeDataApiProvider(env.YOUTUBE_API_KEY);
-  const transcripts = new YouTubeTranscriptProvider();
-  const audio = new YtDlpAudioDownloader(storage);
-  const stt = WhisperSpeechToText.fromApiKey(env.OPENAI_API_KEY ?? '', storage);
-  const exporters: DocumentExporter[] = [new PuppeteerPdfExporter(), new DocxExporter()];
+  void checkoutPublisher.warmUp().catch(() => {});  const exporters: DocumentExporter[] = [new PuppeteerPdfExporter(), new DocxExporter()];
 
   // ── repositories ──
-  const projects = new SupabaseProjectRepository(supabase);
-  const videos = new SupabaseVideoRepository(supabase);
-  const channels = new SupabaseChannelRepository(supabase);
-  const books = new SupabaseBookRepository(supabase);
+  const projects = new SupabaseProjectRepository(supabase);  const books = new SupabaseBookRepository(supabase);
   const knowledge = new SupabaseKnowledgeRepository(supabase);
   const artifacts = new SupabaseExportArtifactRepository(supabase);
   const landingPages = new SupabaseLandingPageRepository(supabase);
@@ -225,19 +199,9 @@ export function buildContainer(env: Env = loadEnv()) {
   const orchestrator = new PipelineOrchestrator(projects, queue, clock, logger, startQueuedProjects);
 
   // ── use cases ──
-  const useCases = {
-    submitChannel: new SubmitChannelUseCase(projects, queue, ids, clock, env.MAX_ACTIVE_PROJECTS_PER_USER),
-    startQueuedProjects,
-    ingestChannel: new IngestChannelUseCase(projects, videos, channels, youtube, queue, ids, clock),
-    fetchVideoData: new FetchVideoDataUseCase(videos, youtube, queue),
-    fetchTranscript: new FetchTranscriptUseCase(videos, transcripts, audio, queue, hasher),
-    transcribeAudio: new TranscribeAudioUseCase(videos, stt, storage, hasher, audio),
-    summarizeVideo: new SummarizeVideoUseCase(videos, ai, hasher),
-    analyzeComments: new AnalyzeCommentsUseCase(videos, knowledge, ai, hasher),
-    buildKnowledgeBase: new BuildKnowledgeBaseUseCase(channels, knowledge, ai, hasher),
-    generateBookStrategy: new GenerateBookStrategyUseCase(projects, knowledge, channels, ai, hasher),
+  const useCases = {    startQueuedProjects,    generateBookStrategy: new GenerateBookStrategyUseCase(projects, knowledge, ai, hasher),
     generateOutline: new GenerateOutlineUseCase(projects, books, knowledge, ai, queue, ids, clock, hasher),
-    generateChapterResearch: new GenerateChapterResearchUseCase(books, videos, knowledge, ai),
+    generateChapterResearch: new GenerateChapterResearchUseCase(books, knowledge, ai),
     startChapterGeneration: new StartChapterGenerationUseCase(projects, books, queue, clock, hasher),
     generateChapter: new GenerateChapterUseCase(books, knowledge, ai, clock),
     startBookPolish: new StartBookPolishUseCase(projects, books, queue),
@@ -256,9 +220,7 @@ export function buildContainer(env: Env = loadEnv()) {
     generateLandingPage: new GenerateLandingPageUseCase(
       projects,
       books,
-      knowledge,
-      channels,
-      artifacts,
+      knowledge,      artifacts,
       landingPages,
       landingLayouts,
       ai,
@@ -283,9 +245,7 @@ export function buildContainer(env: Env = loadEnv()) {
     generateClonedLandingPage: new GenerateClonedLandingPageUseCase(
       projects,
       books,
-      knowledge,
-      channels,
-      artifacts,
+      knowledge,      artifacts,
       landingPages,
       landingTemplates,
       templateArtifacts,
@@ -352,10 +312,7 @@ export function buildContainer(env: Env = loadEnv()) {
     checkoutPublisher,
     payhipSessions,
     repositories: {
-      projects,
-      videos,
-      channels,
-      books,
+      projects,      books,
       knowledge,
       artifacts,
       landingPages,

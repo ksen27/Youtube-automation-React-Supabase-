@@ -8,7 +8,6 @@ import { siblingCommerce } from '../landing/siblingCommerce';
 import type { ProjectRepository } from '../ports/repositories/ProjectRepository';
 import type { BookRepository } from '../ports/repositories/BookRepository';
 import type { KnowledgeRepository } from '../ports/repositories/KnowledgeRepository';
-import type { ChannelRepository } from '../ports/repositories/ChannelRepository';
 import type { ExportArtifactRepository } from '../ports/repositories/ExportArtifactRepository';
 import type { LandingPageRepository } from '../ports/repositories/LandingPageRepository';
 import type { AiTextGenerator } from '../ports/services/AiTextGenerator';
@@ -410,7 +409,6 @@ export class GenerateLandingPageUseCase {
     private readonly projects: ProjectRepository,
     private readonly books: BookRepository,
     private readonly knowledge: KnowledgeRepository,
-    private readonly channels: ChannelRepository,
     private readonly artifacts: ExportArtifactRepository,
     private readonly pages: LandingPageRepository,
     private readonly layouts: LandingLayoutRepository,
@@ -565,7 +563,6 @@ export class GenerateLandingPageUseCase {
         : Palette.neutral();
 
     // ── copy, from Claude ──
-    const channel = await this.channels.getChannel(projectId);
     const artifactList = await this.artifacts.listByProject(projectId);
     const pageCount = artifactList.find((a) => a.pageCount > 0)?.pageCount ?? null;
 
@@ -574,7 +571,7 @@ export class GenerateLandingPageUseCase {
     // not merely configured: a channel whose thumbnail URL is dead produces the
     // same empty header as one with no avatar at all, so the fetch is the only
     // honest signal.
-    const logoDataUri = await this.loadLogo(channel?.thumbnailUrl ?? null);
+    const logoDataUri = await this.loadLogo(null);
 
     // ── the stored layout for this template ──
     // Captured once per reference and reused by every book that follows it.
@@ -621,7 +618,7 @@ export class GenerateLandingPageUseCase {
           layout,
           bookTitle: title,
           subtitle: strategy?.subtitle ?? '',
-          channelTitle: channel?.title ?? 'this creator',
+          channelTitle: 'this creator',
           author: strategy?.author,
           strategy: strategy?.toText() ?? '',
           chapterTitles,
@@ -633,7 +630,7 @@ export class GenerateLandingPageUseCase {
           projectId: input.projectId,
           bookTitle: title,
           subtitle: strategy?.subtitle ?? '',
-          channelTitle: channel?.title ?? 'this creator',
+          channelTitle: 'this creator',
           author: strategy?.author,
           strategy: strategy?.toText() ?? '',
           chapterTitles,
@@ -722,8 +719,8 @@ export class GenerateLandingPageUseCase {
       currency: project.options.landingCurrency,
       guaranteeDays: project.options.landingGuaranteeDays,
       author: strategy?.author ?? null,
-      channelTitle: channel?.title ?? null,
-      subscriberCount: channel?.subscriberCount ?? null,
+      channelTitle: null,
+      subscriberCount: null,
       // Only ever real quotes, supplied by the user. None exist yet, so the
       // section is omitted rather than invented.
       testimonials: [],
@@ -731,21 +728,21 @@ export class GenerateLandingPageUseCase {
       // A three-book page is the creator's storefront, not one book's page, so
       // it is named after the channel rather than after whichever book the user
       // happened to generate from.
-      siteName: (project.options.isTripleLanding ? (channel?.title ?? title) : title),
+      siteName: title,
       logoDataUri,
       // Every stat is a fact the system already holds — never a figure the
       // model wrote. A fabricated "4,200 readers" is a false claim about real
       // people, so a stat with no source simply doesn't render.
       stats: buildStats({
         pageCount,
-        subscriberCount: channel?.subscriberCount ?? null,
+        subscriberCount: null,
         guaranteeDays: project.options.landingGuaranteeDays,
       }),
       // Still no UI for a separate hero image; the portrait doubles as one when
       // the layout wants a photographic hero.
       heroImageDataUri: null,
       authorPhotoDataUri: authorPhoto,
-      authorCredential: buildCredential(strategy?.author, channel?.title ?? null),
+      authorCredential: buildCredential(strategy?.author, null),
       // The commercial furniture the reference page carries. Every one of these
       // is a factual claim — a real deadline, real reviewers, products that
       // exist, money a reader will actually save — so none is model-generated

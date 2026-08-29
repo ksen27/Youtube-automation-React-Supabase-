@@ -1,12 +1,4 @@
-export type QueueName =
-  | 'channel-ingest'
-  | 'video-data'
-  | 'transcript-fetch'
-  | 'whisper-transcribe'
-  | 'video-summarize'
-  | 'analyze-comments'
-  | 'knowledge-base'
-  | 'book-strategy'
+export type QueueName =  | 'book-strategy'
   | 'outline-generate'
   | 'chapter-research'
   | 'chapter-generate'

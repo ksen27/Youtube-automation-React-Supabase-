@@ -20,9 +20,7 @@ export const dynamic = "force-dynamic";
 // 15-phase pipeline in packages/ebook-core.
 
 interface BookRow {
-  id: string;
-  channelUrl: string;
-  status: string;
+  id: string;  status: string;
   createdAt: string;
 }
 
@@ -35,9 +33,7 @@ async function loadBooks(): Promise<{ books: BookRow[]; maxActive: number; runni
     const owner = ownerId();
     const rows = await c.repositories.projects.listByOwner(owner);
     const books: BookRow[] = rows.map((r) => ({
-      id: r.id,
-      channelUrl: r.channelUrl,
-      status: r.status,
+      id: r.id,      status: r.status,
       createdAt: r.createdAt,
     }));
     return {
@@ -111,10 +107,8 @@ export default async function BooksPage() {
                 <Link href={`/books/${b.id}`} className="block">
                   <CardHeader>
                     <CardTitle className="truncate text-fg group-hover:text-brand-300 transition-colors">
-                      {channelLabel(b.channelUrl)}
                     </CardTitle>
                     <CardDescription className="text-xs truncate">
-                      {b.channelUrl}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-2">

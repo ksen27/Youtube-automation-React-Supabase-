@@ -125,7 +125,23 @@ ENV NODE_ENV=production \
 # stray password secret on a consumer app would silently start a second Redis.
 # 'sourced' and 'all' both host it; 'synthetic' and 'ebook' never do. Defaults
 # to starting Redis when WORKER_ROLE is unset, which is the local/dev case.
+# Refresh yt-dlp at BOOT, not only at build.
+#
+# The baked binary is pinned for reproducibility (see YT_DLP_VERSION above), but
+# YouTube changes its player on its own schedule and an extractor that was
+# current at build time starts failing weeks later with "No title found in
+# player responses" followed by a bot-gate error — a symptom that reads as a
+# proxy problem and is not. A machine that restarts therefore heals itself
+# instead of waiting for someone to notice and redeploy.
+#
+# Deliberately non-fatal (`|| echo`): GitHub being unreachable at boot must not
+# stop the worker from starting on the binary it already has. Set
+# YT_DLP_NO_SELF_UPDATE=1 to pin a machine to the built-in version — the right
+# move when a fresh yt-dlp release is itself the regression.
 CMD mkdir -p /data \
+ && if [ -z "$YT_DLP_NO_SELF_UPDATE" ]; then \
+      yt-dlp -U --update-to stable || echo "yt-dlp self-update skipped; using $(yt-dlp --version)"; \
+    fi \
  && if [ "$WORKER_ROLE" = "sourced" ] || [ "$WORKER_ROLE" = "all" ] || [ -z "$WORKER_ROLE" ]; then \
       redis-server --daemonize yes \
         --dir /data \

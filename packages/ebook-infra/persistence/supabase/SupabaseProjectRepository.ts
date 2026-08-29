@@ -3,9 +3,7 @@ import {
   Project,
   ProjectId,
   ProjectStatus,
-  GenerationOptions,
-  ChannelUrl,
-  NOT_RUNNING_STATES,
+  GenerationOptions,  NOT_RUNNING_STATES,
   type ProjectRepository,
   type ProjectListItem,
   type LandingCandidate,
@@ -64,9 +62,7 @@ export class SupabaseProjectRepository implements ProjectRepository {
     // Optimistic concurrency on version; row trigger bumps version on write.
     const { error } = await this.db.from('projects').upsert({
       id: project.id.value,
-      owner_id: project.ownerId,
-      channel_url: project.channelUrl.raw,
-      status: project.status.value,
+      owner_id: project.ownerId,      status: project.status.value,
       options: {
         ...(project.options.bookTitle ? { bookTitle: project.options.bookTitle } : {}),
         bookType: project.options.bookType,
@@ -127,9 +123,7 @@ export class SupabaseProjectRepository implements ProjectRepository {
       .order('created_at', { ascending: false });
     if (error) throw new Error(error.message);
     return (data ?? []).map((r) => ({
-      id: r.id as string,
-      channelUrl: r.channel_url as string,
-      status: r.status as ProjectState,
+      id: r.id as string,      status: r.status as ProjectState,
       createdAt: r.created_at as string,
     }));
   }
@@ -156,9 +150,7 @@ export class SupabaseProjectRepository implements ProjectRepository {
       .order('created_at', { ascending: true });
     if (error) throw new Error(error.message);
     return (data ?? []).map((r) => ({
-      id: r.id as string,
-      channelUrl: r.channel_url as string,
-      status: r.status as ProjectState,
+      id: r.id as string,      status: r.status as ProjectState,
       createdAt: r.created_at as string,
     }));
   }
@@ -190,9 +182,7 @@ export class SupabaseProjectRepository implements ProjectRepository {
         // The book's own title wins; the requested title is the fallback for
         // older rows where it was never written back.
         bookTitle: book?.title ?? options?.bookTitle ?? 'Untitled',
-        coverImagePath: book?.cover_image_path ?? null,
-        channelUrl: r.channel_url as string,
-        createdAt: r.created_at as string,
+        coverImagePath: book?.cover_image_path ?? null,        createdAt: r.created_at as string,
         priceCents: options?.landingPriceCents ?? null,
         compareAtCents: options?.landingCompareAtCents ?? null,
         checkoutUrl: options?.landingCheckoutUrl ?? null,
@@ -220,13 +210,9 @@ export class SupabaseProjectRepository implements ProjectRepository {
     return (data?.length ?? 0) > 0;
   }
 
-  private toDomain(row: ProjectRow): Project {
-    const url = ChannelUrl.create(row.channel_url);
-    return Project.rehydrate(
+  private toDomain(row: ProjectRow): Project {    return Project.rehydrate(
       {
-        ownerId: row.owner_id,
-        channelUrl: url.isOk() ? url.value : ChannelUrl.create('https://youtube.com/@unknown').value,
-        options: GenerationOptions.create(row.options),
+        ownerId: row.owner_id,        options: GenerationOptions.create(row.options),
         status: ProjectStatus.of(row.status),
         pendingCounts: row.pending_counts ?? {},
         version: row.version,
