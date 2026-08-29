@@ -3,6 +3,7 @@ import {
   ReferenceBook,
   ReferenceBookId,
   ReferenceSection,
+  ReferenceStyleProfile,
   ProjectId,
   type ReferenceBookRepository,
   type ReferenceBookSummary,
@@ -29,6 +30,8 @@ interface BookRow {
   error: string | null;
   created_at: string;
   updated_at: string;
+  style_profile: Parameters<typeof ReferenceStyleProfile.create>[0] | null;
+  style_input_hash: string | null;
   reference_sections?: SectionRow[] | null;
 }
 
@@ -50,6 +53,8 @@ export class SupabaseReferenceBookRepository implements ReferenceBookRepository 
       status: book.status,
       error: book.error,
       word_count: book.wordCount,
+      style_profile: book.styleProfile?.toJSON() ?? null,
+      style_input_hash: book.styleProfile?.inputHash ?? null,
       updated_at: book.updatedAt.toISOString(),
     });
     if (error) throw queryError('reference_books', 'save', error);
@@ -197,6 +202,7 @@ export class SupabaseReferenceBookRepository implements ReferenceBookRepository 
         status: row.status,
         error: row.error,
         sections,
+        styleProfile: row.style_profile ? ReferenceStyleProfile.create(row.style_profile) : null,
         createdAt: new Date(row.created_at),
         updatedAt: new Date(row.updated_at),
       },

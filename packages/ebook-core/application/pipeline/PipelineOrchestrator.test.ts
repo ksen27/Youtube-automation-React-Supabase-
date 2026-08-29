@@ -17,7 +17,7 @@ function failedProject(id = 'p1'): Project {  const p = Project.create({
     options: GenerationOptions.create({}),
     now,
   }).value;
-  p.advanceTo('GENERATING_BOOK_STRATEGY', now);
+  p.advanceTo('GENERATING_BOOK_BRIEF', now);
   p.markFailed('Stage book-strategy failed', now);
   return p;
 }
@@ -122,7 +122,7 @@ describe('PipelineOrchestrator.resume', () => {
       options: GenerationOptions.create({}),
       now,
     }).value;
-    project.advanceTo('GENERATING_BOOK_STRATEGY', now);
+    project.advanceTo('GENERATING_BOOK_BRIEF', now);
 
     const repo = new FakeProjectRepo(project);
     const queue = new FakeQueue(['book-strategy']);
@@ -131,7 +131,7 @@ describe('PipelineOrchestrator.resume', () => {
     const result = await orch.resume('p1');
     expect(result.retried).toBe(0);
     expect(queue.retryFailedCalls).toBe(0);
-    expect(project.status.value).toBe('GENERATING_BOOK_STRATEGY');
+    expect(project.status.value).toBe('GENERATING_BOOK_BRIEF');
   });
 
   it('does nothing when there are no failed jobs to retry', async () => {

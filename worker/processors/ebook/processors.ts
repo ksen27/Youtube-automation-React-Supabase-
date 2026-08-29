@@ -1,6 +1,6 @@
 import type { Worker } from 'bullmq';
 import type { Redis } from 'ioredis';
-import { ProjectJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, CheckoutProductJob, ExportFormat, ProjectId } from '@ebook/core';
+import { ProjectJob, ReferenceJob, ChapterResearchJob, ChapterJob, PolishChapterJob, ExportJob, ExtraContentJob, LandingPageJob, LandingTemplateJob, CheckoutProductJob, ExportFormat, ProjectId } from '@ebook/core';
 import type { Container } from '@ebook/config';
 import { makeWorker } from './runtime/worker-factory';
 import { queueRuntimeConfig } from '@ebook/infra';
@@ -12,6 +12,33 @@ import { queueRuntimeConfig } from '@ebook/infra';
  */
 export function buildWorkers(connection: Redis, container: Container): Worker[] {
   const { useCases, orchestrator } = container;
+
+  // Reads a reference book once and caches HOW it is written. Outside the
+  // project pipeline entirely: it is keyed by the reference, shared by every
+  // book made from it, and advances no project state.
+  const referenceExtract = makeWorker(connection, container, {
+    name: 'reference-extract',
+    ...queueRuntimeConfig('reference-extract'),
+    payloadSchema: ReferenceJob,
+    handler: async (p) => {
+      const r = await useCases.extractReferenceStyle.execute(p);
+      if (r.isFail()) throw new Error(r.error);
+      return r.value;
+    },
+  });
+
+  // The pipeline's entry stage: the title becomes the knowledge base every
+  // later stage reads.
+  const bookBrief = makeWorker(connection, container, {
+    name: 'book-brief',
+    ...queueRuntimeConfig('book-brief'),
+    payloadSchema: ProjectJob,
+    handler: async (p) => {
+      const r = await useCases.generateBookBrief.execute(p);
+      if (r.isFail()) throw new Error(r.error);
+      await orchestrator.advance(p.projectId, 'GENERATING_BOOK_BRIEF');
+    },
+  });
 
   const bookStrategy = makeWorker(connection, container, {
     name: 'book-strategy',
@@ -466,7 +493,10 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
     },
   });
 
-  return [    bookStrategy,
+  return [
+    referenceExtract,
+    bookBrief,
+    bookStrategy,
     outline,
     chapterResearch,
     chapterGenerate,

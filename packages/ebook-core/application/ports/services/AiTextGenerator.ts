@@ -43,7 +43,12 @@ export interface AiGenerateInput {
   maxTokens: number;
   /** Mark the system prefix as cacheable so shared context is reused across calls. */
   cacheControl?: { systemPrefix?: boolean };
-  metadata?: { projectId: string; stage: string };
+  /**
+   * Who this call was for. `projectId` is absent for work that belongs to no
+   * project — reference-style extraction is shared across every book made from
+   * that reference, so charging it to one project would misattribute the cost.
+   */
+  metadata?: { projectId?: string; referenceBookId?: string; stage: string };
 }
 
 export type AiError =

@@ -1,4 +1,10 @@
-export type QueueName =  | 'book-strategy'
+export type QueueName =
+  // Reads a reference book and caches HOW it is written. Once per reference,
+  // not once per book, and outside the project pipeline entirely.
+  | 'reference-extract'
+  // Turns a title into the knowledge base the book is written from.
+  | 'book-brief'
+  | 'book-strategy'
   | 'outline-generate'
   | 'chapter-research'
   | 'chapter-generate'

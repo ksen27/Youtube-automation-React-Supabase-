@@ -1,6 +1,8 @@
 import {
   PipelineOrchestrator,  StartQueuedProjectsUseCase,
-  ImportGeneratedBookUseCase,  GenerateBookStrategyUseCase,
+  ImportGeneratedBookUseCase,
+  ExtractReferenceStyleUseCase,
+  GenerateBookBriefUseCase,  GenerateBookStrategyUseCase,
   GenerateOutlineUseCase,
   GenerateChapterResearchUseCase,
   StartChapterGenerationUseCase,
@@ -203,7 +205,12 @@ export function buildContainer(env: Env = loadEnv()) {
   const orchestrator = new PipelineOrchestrator(projects, queue, clock, logger, startQueuedProjects);
 
   // ── use cases ──
-  const useCases = {    startQueuedProjects,    generateBookStrategy: new GenerateBookStrategyUseCase(projects, knowledge, ai, hasher),
+  const useCases = {
+    startQueuedProjects,
+    importGeneratedBook: new ImportGeneratedBookUseCase(books, references, ids, clock),
+    extractReferenceStyle: new ExtractReferenceStyleUseCase(references, ai, hasher),
+    generateBookBrief: new GenerateBookBriefUseCase(projects, knowledge, references, ai, hasher),
+    generateBookStrategy: new GenerateBookStrategyUseCase(projects, knowledge, ai, hasher),
     generateOutline: new GenerateOutlineUseCase(projects, books, knowledge, ai, queue, ids, clock, hasher),
     generateChapterResearch: new GenerateChapterResearchUseCase(books, knowledge, ai),
     startChapterGeneration: new StartChapterGenerationUseCase(projects, books, queue, clock, hasher),

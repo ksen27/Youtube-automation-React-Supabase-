@@ -17,6 +17,7 @@ export * from './domain/channel/ChannelKnowledgeBase';
 
 export * from './domain/reference/ReferenceBookId';
 export * from './domain/reference/ReferenceSection';
+export * from './domain/reference/ReferenceStyleProfile';
 export * from './domain/reference/ReferenceBook';
 export * from './domain/book/Book';
 export * from './domain/book/ids';
@@ -89,6 +90,8 @@ export * from './application/landing/bindTemplate';
 // ── Application: use cases ──────────────────────────────────────────────────
 export * from './application/use-cases/StartQueuedProjectsUseCase';
 export * from './application/use-cases/ImportGeneratedBookUseCase';
+export * from './application/use-cases/ExtractReferenceStyleUseCase';
+export * from './application/use-cases/GenerateBookBriefUseCase';
 export * from './application/use-cases/GenerateBookStrategyUseCase';
 export * from './application/use-cases/GenerateOutlineUseCase';
 export * from './application/use-cases/GenerateChapterResearchUseCase';

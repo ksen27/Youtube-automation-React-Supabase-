@@ -4,6 +4,9 @@ import { z } from 'zod';
 
 export const ProjectJob = z.object({ projectId: z.string().uuid() });
 
+/** Keyed by the reference, not a project: extraction is shared across books. */
+export const ReferenceJob = z.object({ referenceBookId: z.string().uuid() });
+
 export const ChapterResearchJob = z.object({
   projectId: z.string().uuid(),
   chapterId: z.string().uuid(),
@@ -49,6 +52,7 @@ export const LandingPageJob = z.object({
 });
 
 export type ProjectJob = z.infer<typeof ProjectJob>;
+export type ReferenceJob = z.infer<typeof ReferenceJob>;
 export type ChapterResearchJob = z.infer<typeof ChapterResearchJob>;
 export type ChapterJob = z.infer<typeof ChapterJob>;
 export type PolishChapterJob = z.infer<typeof PolishChapterJob>;

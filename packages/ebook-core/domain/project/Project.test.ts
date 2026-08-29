@@ -22,10 +22,10 @@ describe('Project state machine', () => {
     expect(p.value.status.value).toBe('CREATED');
   });
 
-  it('allows CREATED → INGESTING_CHANNEL', () => {
+  it('allows CREATED → GENERATING_BOOK_BRIEF', () => {
     const p = makeProject().value;
-    expect(p.advanceTo('GENERATING_BOOK_STRATEGY', now).isOk()).toBe(true);
-    expect(p.status.value).toBe('GENERATING_BOOK_STRATEGY');
+    expect(p.advanceTo('GENERATING_BOOK_BRIEF', now).isOk()).toBe(true);
+    expect(p.status.value).toBe('GENERATING_BOOK_BRIEF');
   });
 
   it('rejects illegal transitions', () => {
@@ -37,7 +37,7 @@ describe('Project state machine', () => {
 
   it('emits a ProjectStatusChanged event on transition', () => {
     const p = makeProject().value;
-    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
+    p.advanceTo('GENERATING_BOOK_BRIEF', now);
     const events = p.pullEvents();
     expect(events).toHaveLength(1);
     expect(events[0]?.name).toBe('project.status.changed');
@@ -61,7 +61,7 @@ describe('Project state machine', () => {
 describe('Project cancel', () => {
   it('cancels a running project (terminal FAILED with a cancel reason)', () => {
     const p = makeProject().value;
-    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
+    p.advanceTo('GENERATING_BOOK_BRIEF', now);
     expect(p.cancel(now).isOk()).toBe(true);
     expect(p.status.value).toBe('FAILED');
     expect(p.error).toBe('Cancelled by user');
@@ -71,6 +71,7 @@ describe('Project cancel', () => {
     const p = makeProject().value;
     // Walk to COMPLETED through the full pipeline.
     const path = [
+      'GENERATING_BOOK_BRIEF',
       'GENERATING_BOOK_STRATEGY',
       'GENERATING_OUTLINE',
       'GENERATING_CHAPTER_RESEARCH',
@@ -89,21 +90,21 @@ describe('Project cancel', () => {
 describe('Project resumeAt (retry rewind)', () => {
   it('rewinds a FAILED project to a prior stage and clears the error', () => {
     const p = makeProject().value;
-    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
+    p.advanceTo('GENERATING_BOOK_BRIEF', now);
     p.markFailed('Stage book-strategy failed', now);
     expect(p.status.value).toBe('FAILED');
 
-    const r = p.resumeAt('GENERATING_BOOK_STRATEGY', now);
+    const r = p.resumeAt('GENERATING_BOOK_BRIEF', now);
     expect(r.isOk()).toBe(true);
-    expect(p.status.value).toBe('GENERATING_BOOK_STRATEGY');
+    expect(p.status.value).toBe('GENERATING_BOOK_BRIEF');
     expect(p.error).toBeUndefined();
   });
 
   it('refuses to resume a non-terminal project', () => {
     const p = makeProject().value;
-    p.advanceTo('GENERATING_BOOK_STRATEGY', now);
+    p.advanceTo('GENERATING_BOOK_BRIEF', now);
     expect(p.resumeAt('GENERATING_OUTLINE', now).isFail()).toBe(true);
-    expect(p.status.value).toBe('GENERATING_BOOK_STRATEGY');
+    expect(p.status.value).toBe('GENERATING_BOOK_BRIEF');
   });
 
   it('emits a status-changed event when rewinding', () => {

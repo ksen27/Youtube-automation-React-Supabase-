@@ -3,7 +3,10 @@ import { ValueObject } from '../shared/ValueObject';
 export type ProjectState =
   | 'CREATED'
   /** Accepted but deliberately not started — waiting for a concurrency slot. */
-  | 'QUEUED'  | 'GENERATING_BOOK_STRATEGY'
+  | 'QUEUED'
+  /** Turning the title into the knowledge base. The pipeline's entry stage. */
+  | 'GENERATING_BOOK_BRIEF'
+  | 'GENERATING_BOOK_STRATEGY'
   | 'GENERATING_OUTLINE'
   | 'GENERATING_CHAPTER_RESEARCH'
   | 'GENERATING_CHAPTERS'
@@ -30,9 +33,11 @@ export const NOT_RUNNING_STATES: readonly ProjectState[] = [...TERMINAL_STATES, 
 
 /** Explicit transition table — the full 15-phase pipeline contract lives here. */
 const TRANSITIONS: Record<ProjectState, ProjectState[]> = {
-  CREATED: ['GENERATING_BOOK_STRATEGY', 'QUEUED', 'FAILED'],
+  CREATED: ['GENERATING_BOOK_BRIEF', 'QUEUED', 'FAILED'],
   // Held back at submit time; the admission controller starts it when a slot frees.
-  QUEUED: ['GENERATING_BOOK_STRATEGY', 'FAILED'],  GENERATING_BOOK_STRATEGY: ['GENERATING_OUTLINE', 'FAILED'],
+  QUEUED: ['GENERATING_BOOK_BRIEF', 'FAILED'],
+  GENERATING_BOOK_BRIEF: ['GENERATING_BOOK_STRATEGY', 'FAILED'],
+  GENERATING_BOOK_STRATEGY: ['GENERATING_OUTLINE', 'FAILED'],
   GENERATING_OUTLINE: ['GENERATING_CHAPTER_RESEARCH', 'FAILED'],
   GENERATING_CHAPTER_RESEARCH: ['GENERATING_CHAPTERS', 'FAILED'],
   GENERATING_CHAPTERS: ['POLISHING_BOOK', 'FAILED'],

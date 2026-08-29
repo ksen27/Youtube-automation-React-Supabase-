@@ -35,9 +35,9 @@ export class StartQueuedProjectsUseCase {
     for (const candidate of queued) {
       if (slots <= 0) break;
       const id = ProjectId.from(candidate.id);
-      const won = await this.projects.advanceStatusAtomic(id, ['QUEUED'], 'GENERATING_BOOK_STRATEGY');
+      const won = await this.projects.advanceStatusAtomic(id, ['QUEUED'], 'GENERATING_BOOK_BRIEF');
       if (!won) continue; // another caller already claimed this one
-      await this.queue.enqueue('book-strategy', { projectId: id.value }, { jobId: `channel-ingest:${id.value}` });
+      await this.queue.enqueue('book-brief', { projectId: id.value }, { jobId: `channel-ingest:${id.value}` });
       slots -= 1;
       started += 1;
     }

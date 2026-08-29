@@ -116,7 +116,9 @@ export class PipelineOrchestrator {
 const PER_VIDEO_PHASE: ProjectState[] = [];
 
 /** Linear stage progression (conditional branches & fan-outs resolved inside use cases). */
-const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {  GENERATING_BOOK_STRATEGY: 'GENERATING_OUTLINE',
+const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {
+  GENERATING_BOOK_BRIEF: 'GENERATING_BOOK_STRATEGY',
+  GENERATING_BOOK_STRATEGY: 'GENERATING_OUTLINE',
   GENERATING_OUTLINE: 'GENERATING_CHAPTER_RESEARCH',
   GENERATING_CHAPTER_RESEARCH: 'GENERATING_CHAPTERS',
   GENERATING_CHAPTERS: 'POLISHING_BOOK',
@@ -130,7 +132,9 @@ const NEXT_STAGE: Partial<Record<ProjectState, ProjectState>> = {  GENERATING_B
  * (GENERATING_CHAPTER_RESEARCH, GENERATING_CHAPTERS) are intentionally absent —
  * their producer use cases set the barrier and enqueue the per-item jobs.
  */
-const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {  GENERATING_BOOK_STRATEGY: 'book-strategy',
+const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {
+  GENERATING_BOOK_BRIEF: 'book-brief',
+  GENERATING_BOOK_STRATEGY: 'book-strategy',
   GENERATING_OUTLINE: 'outline-generate',
   POLISHING_BOOK: 'polish-book',
   ASSEMBLING: 'ebook-assemble',
@@ -143,7 +147,9 @@ const STAGE_ENTRY_QUEUE: Partial<Record<ProjectState, QueueName>> = {  GENERATI
  * stage, and a failure in one must never rewind a finished book. They are
  * filtered out where this map is read.
  */
-const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {  'book-strategy': 'GENERATING_BOOK_STRATEGY',
+const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {
+  'book-brief': 'GENERATING_BOOK_BRIEF',
+  'book-strategy': 'GENERATING_BOOK_STRATEGY',
   'outline-generate': 'GENERATING_OUTLINE',
   'chapter-research': 'GENERATING_CHAPTER_RESEARCH',
   'chapter-generate': 'GENERATING_CHAPTERS',
@@ -156,7 +162,9 @@ const QUEUE_TO_STAGE: Partial<Record<QueueName, ProjectState>> = {  'book-strat
 
 /** Linear order of pipeline stages, for picking the earliest among several failures. */
 const STAGE_ORDER: ProjectState[] = [
-  'CREATED',  'GENERATING_BOOK_STRATEGY',
+  'CREATED',
+  'GENERATING_BOOK_BRIEF',
+  'GENERATING_BOOK_STRATEGY',
   'GENERATING_OUTLINE',
   'GENERATING_CHAPTER_RESEARCH',
   'GENERATING_CHAPTERS',

@@ -50,7 +50,10 @@ export const QUEUE_CONFIG: Record<QueueName, QueueConfig> = {  // Parallel agai
   // modestly rather than to the chapter-queue levels.  // Per-video summary (Haiku — cheap, fast, high tier limits). Raised so a large
   // channel's videos summarize in parallel rather than draining at 50/min.  // Per-video comment analysis — fanned out one job per video; raised alongside
   // summarize so the per-video AI phase isn't the throughput floor on Tier 3+.  // One call per book (concurrency parallelizes across projects, not within one),
-  // so leave as-is — raising it wouldn't speed a single run.  'book-strategy': { concurrency: 4, attempts: 4 },
+  // so leave as-is — raising it wouldn't speed a single run.  // One model call each, no fan-out; the defaults elsewhere in this table.
+  'reference-extract': { concurrency: 4, attempts: 3 },
+  'book-brief': { concurrency: 6, attempts: 4 },
+  'book-strategy': { concurrency: 4, attempts: 4 },
   'outline-generate': { concurrency: 4, attempts: 4 },
   // Per-chapter research (Sonnet) — raised alongside the chapter queues so a
   // whole book's research fans out at once on Tier 3+.

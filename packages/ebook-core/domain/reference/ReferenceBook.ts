@@ -2,6 +2,7 @@ import { AggregateRoot } from '../shared/AggregateRoot';
 import { Result } from '../shared/Result';
 import { ReferenceBookId } from './ReferenceBookId';
 import { ReferenceSection } from './ReferenceSection';
+import type { ReferenceStyleProfile } from './ReferenceStyleProfile';
 
 /** Where a reference came from. See migration 0041 for why one table holds both. */
 export type ReferenceSource = 'upload' | 'generated';
@@ -32,6 +33,8 @@ interface ReferenceBookProps {
   status: ReferenceStatus;
   error: string | null;
   sections: ReferenceSection[];
+  /** HOW this book is written. Extracted once, reused by every book made from it. */
+  styleProfile: ReferenceStyleProfile | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -72,6 +75,7 @@ export class ReferenceBook extends AggregateRoot<ReferenceBookProps, ReferenceBo
           status: 'PENDING',
           error: null,
           sections: [],
+          styleProfile: null,
           createdAt: input.now,
           updatedAt: input.now,
         },
@@ -109,6 +113,7 @@ export class ReferenceBook extends AggregateRoot<ReferenceBookProps, ReferenceBo
           status: 'DONE',
           error: null,
           sections: [...input.sections].sort((a, b) => a.position - b.position),
+          styleProfile: null,
           createdAt: input.now,
           updatedAt: input.now,
         },
@@ -150,6 +155,9 @@ export class ReferenceBook extends AggregateRoot<ReferenceBookProps, ReferenceBo
   }
   get error(): string | null {
     return this.props.error;
+  }
+  get styleProfile(): ReferenceStyleProfile | null {
+    return this.props.styleProfile;
   }
   get sections(): readonly ReferenceSection[] {
     return this.props.sections;
@@ -195,6 +203,10 @@ export class ReferenceBook extends AggregateRoot<ReferenceBookProps, ReferenceBo
     this.props.error = null;
     this.props.updatedAt = now;
     return Result.ok();
+  }
+
+  attachStyleProfile(profile: ReferenceStyleProfile): void {
+    this.props.styleProfile = profile;
   }
 
   markFailed(error: string, now: Date): void {
