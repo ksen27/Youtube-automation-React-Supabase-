@@ -1,6 +1,10 @@
 export type QueueName =
   // Reads a reference book and caches HOW it is written. Once per reference,
   // not once per book, and outside the project pipeline entirely.
+  // Parses an uploaded reference file into sections. Separate from
+  // reference-extract because parsing is CPU and extraction is a model call —
+  // they fail for different reasons and retry on different budgets.
+  | 'reference-ingest'
   | 'reference-extract'
   // Turns a title into the knowledge base the book is written from.
   | 'book-brief'

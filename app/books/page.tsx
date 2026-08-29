@@ -27,6 +27,16 @@ interface BookRow {
 // NOTE: ProjectListItem carries no book title — the title is decided by the
 // pipeline (book strategy) and lives on the book aggregate, not the project row.
 // The list therefore identifies a book by its channel until it is opened.
+async function loadReferences() {
+  try {
+    return await container().repositories.references.list(ownerId());
+  } catch {
+    // Same reasoning as loadBooks below: an unconfigured env or an unapplied
+    // migration renders an empty picker, not a 500.
+    return [];
+  }
+}
+
 async function loadBooks(): Promise<{ books: BookRow[]; maxActive: number; running: number }> {
   try {
     const c = container();
@@ -49,19 +59,8 @@ async function loadBooks(): Promise<{ books: BookRow[]; maxActive: number; runni
   }
 }
 
-/** '@SomeChannel' or the last path segment — a readable stand-in for a title. */
-function channelLabel(url: string): string {
-  try {
-    const path = new URL(url).pathname.replace(/\/$/, "");
-    const last = path.split("/").filter(Boolean).pop();
-    return last ? decodeURIComponent(last) : url;
-  } catch {
-    return url;
-  }
-}
-
 export default async function BooksPage() {
-  const { books, maxActive, running } = await loadBooks();
+  const [{ books, maxActive, running }, references] = await Promise.all([loadBooks(), loadReferences()]);
 
   return (
     <div className="px-6 lg:px-8 py-8 max-w-7xl mx-auto space-y-10">
@@ -88,7 +87,7 @@ export default async function BooksPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <NewBookForm />
+          <NewBookForm references={references} />
         </CardContent>
       </Card>
 

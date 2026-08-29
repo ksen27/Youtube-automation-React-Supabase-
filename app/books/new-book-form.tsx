@@ -1,27 +1,16 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { BookOpen, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { clampInt, estimateChapters } from "./_shared";
+import { ReferencePicker, type ReferenceBook } from "./reference-picker";
 
 type BookType = "normal" | "cooking";
-
-/** A row of the reference library, as returned by GET /api/books/references. */
-interface ReferenceBook {
-  id: string;
-  title: string;
-  author: string | null;
-  source: "upload" | "generated";
-  status: "PENDING" | "GENERATING" | "DONE" | "FAILED";
-  wordCount: number;
-  sectionCount: number;
-  error: string | null;
-}
 
 /**
  * Submit a book for generation: a TITLE and a REFERENCE BOOK.
@@ -34,10 +23,9 @@ interface ReferenceBook {
  * book: books run in parallel up to the server-side cap, so the common next
  * action is queueing another one. The confirmation links through instead.
  */
-export function NewBookForm() {
+export function NewBookForm({ references }: { references: ReferenceBook[] }) {
   const router = useRouter();
   const [referenceId, setReferenceId] = useState("");
-  const [references, setReferences] = useState<ReferenceBook[] | null>(null);
   const [title, setTitle] = useState("");
   const [bookType, setBookType] = useState<BookType>("normal");
   const [recipeCount, setRecipeCount] = useState(60);
@@ -53,27 +41,6 @@ export function NewBookForm() {
     mismatch?: string;
   } | null>(null);
 
-  // The library is small (one owner, a handful of books), so it loads whole
-  // rather than paging. `null` is "still loading" and distinguishes an empty
-  // library from an unfetched one — they need different messages.
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/books/references")
-      .then((r) => r.json())
-      .then((d) => {
-        if (!cancelled) setReferences(d.references ?? []);
-      })
-      .catch(() => {
-        if (!cancelled) setReferences([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Only a fully extracted reference can supply a voice; a PENDING one is still
-  // being read. Shown but not selectable, so its absence is not a mystery.
-  const usable = (references ?? []).filter((r) => r.status === "DONE");
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -134,26 +101,12 @@ export function NewBookForm() {
   return (
     <form onSubmit={onSubmit} className="space-y-6">
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-1.5">
-          <Label htmlFor="referenceBook">Reference book</Label>
-          <select
-            id="referenceBook"
-            value={referenceId}
-            onChange={(e) => setReferenceId(e.target.value)}
-            className="flex h-9 w-full rounded-md border border-border bg-surface px-3 text-sm text-fg outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40"
-          >
-            <option value="">
-              {references === null ? "Loading…" : usable.length === 0 ? "No reference books yet" : "Choose one…"}
-            </option>
-            {usable.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.title}
-                {r.source === "generated" ? " (generated)" : ""}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-fg-subtle">The new book is written in this book&rsquo;s voice.</p>
-        </div>
+        <ReferencePicker
+          value={referenceId}
+          onChange={setReferenceId}
+          disabled={submitting}
+          initial={references}
+        />
         <div className="space-y-1.5">
           <Label htmlFor="bookTitle">Book title</Label>
           <Input

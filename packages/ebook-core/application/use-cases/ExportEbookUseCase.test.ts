@@ -24,6 +24,7 @@ function exporter(byteLength: number): DocumentExporter {
 function storage(putResult: Result<{ path: string }>): ObjectStorage {
   return {
     put: async () => putResult,
+    signedUploadUrl: async () => Result.ok({ url: '', token: '' }),
     signedUrl: async () => Result.ok(''),
     getDataUri: async () => Result.fail('unused'),
     getBytes: async () => Result.fail('unused'),

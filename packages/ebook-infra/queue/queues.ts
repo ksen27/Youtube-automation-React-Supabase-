@@ -51,6 +51,9 @@ export const QUEUE_CONFIG: Record<QueueName, QueueConfig> = {  // Parallel agai
   // channel's videos summarize in parallel rather than draining at 50/min.  // Per-video comment analysis — fanned out one job per video; raised alongside
   // summarize so the per-video AI phase isn't the throughput floor on Tier 3+.  // One call per book (concurrency parallelizes across projects, not within one),
   // so leave as-is — raising it wouldn't speed a single run.  // One model call each, no fan-out; the defaults elsewhere in this table.
+  // Low concurrency: parsing a large PDF is CPU-bound, and this worker shares
+  // a machine with Chromium doing PDF exports.
+  'reference-ingest': { concurrency: 2, attempts: 3 },
   'reference-extract': { concurrency: 4, attempts: 3 },
   'book-brief': { concurrency: 6, attempts: 4 },
   'book-strategy': { concurrency: 4, attempts: 4 },

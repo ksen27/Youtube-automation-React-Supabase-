@@ -2,6 +2,8 @@ import {
   PipelineOrchestrator,  StartQueuedProjectsUseCase,
   ImportGeneratedBookUseCase,
   SubmitBookUseCase,
+  StartReferenceUploadUseCase,
+  IngestReferenceUploadUseCase,
   ExtractReferenceStyleUseCase,
   GenerateBookBriefUseCase,  GenerateBookStrategyUseCase,
   GenerateOutlineUseCase,
@@ -57,6 +59,7 @@ import {
   SupabaseProjectRepository,  SupabaseBookRepository,
   SupabaseKnowledgeRepository,
   SupabaseReferenceBookRepository,
+  FileTextExtractor,
   SupabaseExportArtifactRepository,
   SupabaseLandingPageRepository,
   SupabaseLandingLayoutRepository,
@@ -189,6 +192,8 @@ export function buildContainer(env: Env = loadEnv()) {
   const knowledge = new SupabaseKnowledgeRepository(supabase);
   // The reference-book library a new book is generated from (migration 0041).
   const references = new SupabaseReferenceBookRepository(supabase);
+  // Reads uploaded PDF/DOCX/text reference books.
+  const referenceText = new FileTextExtractor();
   const artifacts = new SupabaseExportArtifactRepository(supabase);
   const landingPages = new SupabaseLandingPageRepository(supabase);
   // Layouts are captured once per reference template and reused by every book
@@ -208,6 +213,8 @@ export function buildContainer(env: Env = loadEnv()) {
   // ── use cases ──
   const useCases = {
     startQueuedProjects,
+    startReferenceUpload: new StartReferenceUploadUseCase(references, storage, ids, clock),
+    ingestReferenceUpload: new IngestReferenceUploadUseCase(references, storage, referenceText, queue, clock),
     submitBook: new SubmitBookUseCase(projects, references, queue, ids, clock, env.MAX_ACTIVE_PROJECTS_PER_USER),
     importGeneratedBook: new ImportGeneratedBookUseCase(books, references, queue, ids, clock),
     extractReferenceStyle: new ExtractReferenceStyleUseCase(references, ai, hasher),

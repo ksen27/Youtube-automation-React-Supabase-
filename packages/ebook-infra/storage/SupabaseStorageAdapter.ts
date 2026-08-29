@@ -9,6 +9,12 @@ export class SupabaseStorageAdapter implements ObjectStorage {
     return error ? Result.fail(error.message) : Result.ok({ path });
   }
 
+  async signedUploadUrl(bucket: string, path: string): Promise<Result<{ url: string; token: string }>> {
+    const { data, error } = await this.client.storage.from(bucket).createSignedUploadUrl(path);
+    if (error || !data) return Result.fail(error?.message ?? 'could not create an upload URL');
+    return Result.ok({ url: data.signedUrl, token: data.token });
+  }
+
   async signedUrl(bucket: string, path: string, expiresInSeconds: number): Promise<Result<string>> {
     const { data, error } = await this.client.storage.from(bucket).createSignedUrl(path, expiresInSeconds);
     if (error || !data) return Result.fail(error?.message ?? 'Failed to sign URL');

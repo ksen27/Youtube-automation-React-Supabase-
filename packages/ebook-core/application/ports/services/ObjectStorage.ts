@@ -2,6 +2,14 @@ import type { Result } from '../../../domain/shared/Result';
 
 export interface ObjectStorage {
   put(bucket: string, path: string, data: Uint8Array, contentType: string): Promise<Result<{ path: string }>>;
+  /**
+   * Time-limited URL the BROWSER uploads directly to, bypassing the app server.
+   *
+   * Reference books are whole books — routinely tens of megabytes, well past
+   * the ~4.5MB request-body limit a serverless route can accept. The bytes must
+   * never pass through the app.
+   */
+  signedUploadUrl(bucket: string, path: string): Promise<Result<{ url: string; token: string }>>;
   /** Time-limited signed URL for client download. */
   signedUrl(bucket: string, path: string, expiresInSeconds: number): Promise<Result<string>>;
   /**

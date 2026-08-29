@@ -13,6 +13,19 @@ import { queueRuntimeConfig } from '@ebook/infra';
 export function buildWorkers(connection: Redis, container: Container): Worker[] {
   const { useCases, orchestrator } = container;
 
+  // Parses an uploaded reference file into sections. Like reference-extract it
+  // is keyed by the reference and advances no project state.
+  const referenceIngest = makeWorker(connection, container, {
+    name: 'reference-ingest',
+    ...queueRuntimeConfig('reference-ingest'),
+    payloadSchema: ReferenceJob,
+    handler: async (p) => {
+      const r = await useCases.ingestReferenceUpload.execute(p);
+      if (r.isFail()) throw new Error(r.error);
+      return r.value;
+    },
+  });
+
   // Reads a reference book once and caches HOW it is written. Outside the
   // project pipeline entirely: it is keyed by the reference, shared by every
   // book made from it, and advances no project state.
@@ -494,6 +507,7 @@ export function buildWorkers(connection: Redis, container: Container): Worker[] 
   });
 
   return [
+    referenceIngest,
     referenceExtract,
     bookBrief,
     bookStrategy,

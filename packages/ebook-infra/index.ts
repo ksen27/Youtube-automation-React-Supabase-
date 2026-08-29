@@ -45,6 +45,7 @@ export * from './integrations/payhip/login';
 export * from './integrations/payhip/keepAlive';
 
 // ── Storage ─────────────────────────────────────────────────────────────────
+export * from './reference/FileTextExtractor';
 export * from './storage/SupabaseStorageAdapter';
 
 // ── Export (PDF / DOCX) ─────────────────────────────────────────────────────
