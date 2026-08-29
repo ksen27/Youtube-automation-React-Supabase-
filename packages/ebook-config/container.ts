@@ -1,5 +1,6 @@
 import {
-  PipelineOrchestrator,  StartQueuedProjectsUseCase,  GenerateBookStrategyUseCase,
+  PipelineOrchestrator,  StartQueuedProjectsUseCase,
+  ImportGeneratedBookUseCase,  GenerateBookStrategyUseCase,
   GenerateOutlineUseCase,
   GenerateChapterResearchUseCase,
   StartChapterGenerationUseCase,
@@ -52,6 +53,7 @@ import {
   SupabaseClientFactory,
   SupabaseProjectRepository,  SupabaseBookRepository,
   SupabaseKnowledgeRepository,
+  SupabaseReferenceBookRepository,
   SupabaseExportArtifactRepository,
   SupabaseLandingPageRepository,
   SupabaseLandingLayoutRepository,
@@ -182,6 +184,8 @@ export function buildContainer(env: Env = loadEnv()) {
   // ── repositories ──
   const projects = new SupabaseProjectRepository(supabase);  const books = new SupabaseBookRepository(supabase);
   const knowledge = new SupabaseKnowledgeRepository(supabase);
+  // The reference-book library a new book is generated from (migration 0041).
+  const references = new SupabaseReferenceBookRepository(supabase);
   const artifacts = new SupabaseExportArtifactRepository(supabase);
   const landingPages = new SupabaseLandingPageRepository(supabase);
   // Layouts are captured once per reference template and reused by every book
@@ -220,7 +224,8 @@ export function buildContainer(env: Env = loadEnv()) {
     generateLandingPage: new GenerateLandingPageUseCase(
       projects,
       books,
-      knowledge,      artifacts,
+      knowledge,
+      artifacts,
       landingPages,
       landingLayouts,
       ai,
@@ -312,7 +317,9 @@ export function buildContainer(env: Env = loadEnv()) {
     checkoutPublisher,
     payhipSessions,
     repositories: {
-      projects,      books,
+      projects,
+      books,
+      references,
       knowledge,
       artifacts,
       landingPages,

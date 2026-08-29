@@ -14,6 +14,10 @@ export * from './domain/project/ProjectStatus';
 export * from './domain/project/GenerationOptions';
 export * from './domain/project/events/ProjectStatusChanged';
 export * from './domain/channel/ChannelKnowledgeBase';
+
+export * from './domain/reference/ReferenceBookId';
+export * from './domain/reference/ReferenceSection';
+export * from './domain/reference/ReferenceBook';
 export * from './domain/book/Book';
 export * from './domain/book/ids';
 export * from './domain/book/Chapter';
@@ -45,6 +49,7 @@ export * from './application/ports/repositories/UnitOfWork';
 export * from './application/ports/repositories/ProjectRepository';
 export * from './application/ports/repositories/BookRepository';
 export * from './application/ports/repositories/KnowledgeRepository';
+export * from './application/ports/repositories/ReferenceBookRepository';
 export * from './application/ports/repositories/ExportArtifactRepository';
 export * from './application/ports/repositories/LandingPageRepository';
 export * from './application/ports/repositories/LandingLayoutRepository';
@@ -83,6 +88,7 @@ export * from './application/landing/bindTemplate';
 
 // ── Application: use cases ──────────────────────────────────────────────────
 export * from './application/use-cases/StartQueuedProjectsUseCase';
+export * from './application/use-cases/ImportGeneratedBookUseCase';
 export * from './application/use-cases/GenerateBookStrategyUseCase';
 export * from './application/use-cases/GenerateOutlineUseCase';
 export * from './application/use-cases/GenerateChapterResearchUseCase';

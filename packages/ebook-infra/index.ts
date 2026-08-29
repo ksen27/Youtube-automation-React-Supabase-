@@ -62,6 +62,7 @@ export * from './persistence/supabase/SupabaseClientFactory';
 export * from './persistence/supabase/SupabaseProjectRepository';
 export * from './persistence/supabase/SupabaseBookRepository';
 export * from './persistence/supabase/SupabaseKnowledgeRepository';
+export * from './persistence/supabase/SupabaseReferenceBookRepository';
 export * from './persistence/supabase/SupabaseExportArtifactRepository';
 export * from './persistence/supabase/SupabaseLandingPageRepository';
 export * from './persistence/supabase/SupabaseLandingTemplateRepository';
