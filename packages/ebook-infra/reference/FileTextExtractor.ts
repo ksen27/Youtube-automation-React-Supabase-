@@ -1,5 +1,3 @@
-import { PDFParse } from 'pdf-parse';
-import mammoth from 'mammoth';
 import {
   Result,
   splitIntoSections,
@@ -11,8 +9,20 @@ import {
 /**
  * Reads PDF, DOCX, plain-text and Markdown reference books.
  *
+ * WHY THE PARSERS ARE IMPORTED LAZILY, not at the top of this file: the DI
+ * container constructs this extractor, and the Next.js app calls that container
+ * on every page that touches ebook data. A top-level `import 'pdf-parse'` therefore
+ * pulled a PDF engine — with its own worker files and runtime asset loading —
+ * into the serverless bundle of pages that never parse anything, and a module
+ * that fails to load there throws BEFORE any request handler runs, which is a
+ * 500 no try/catch in the page can absorb.
+ *
+ * Deferring the import to the moment a file is actually parsed keeps the parsers
+ * in the worker, where the parsing happens. `next.config.ts` also lists them in
+ * serverExternalPackages so Next never tries to bundle them at all.
+ *
  * WHAT THIS CANNOT DO, and why it fails loudly rather than quietly: a scanned
- * book is images of text, and no text extractor can read it — pdf-parse returns
+ * book is images of text, and no text extractor can read it — the parser returns
  * an empty string and reports success. Left alone that becomes a reference with
  * no words, which the domain's minimum-length check rejects with a message
  * naming the likely cause. Both layers matter: this one explains WHY nothing
@@ -44,9 +54,10 @@ export class FileTextExtractor implements ReferenceTextExtractor {
 
   private async readText(bytes: Uint8Array, contentType: string): Promise<string> {
     if (contentType === 'application/pdf') {
-      // pdf-parse v2: a class, and the instance holds an open document, so it is
-      // destroyed rather than left to the GC — this runs on a long-lived worker
-      // where a leaked document per upload accumulates.
+      const { PDFParse } = await import('pdf-parse');
+      // pdf-parse v2 is a class, and the instance holds an open document, so it
+      // is destroyed rather than left to the GC — this runs on a long-lived
+      // worker where a leaked document per upload accumulates.
       const parser = new PDFParse({ data: bytes });
       try {
         const result = await parser.getText();
@@ -56,6 +67,7 @@ export class FileTextExtractor implements ReferenceTextExtractor {
       }
     }
     if (contentType.endsWith('wordprocessingml.document')) {
+      const mammoth = await import('mammoth');
       // Raw text, not HTML: the sectioner works on blank-line structure, and
       // mammoth's raw extraction preserves paragraph breaks as newlines.
       const result = await mammoth.extractRawText({ buffer: Buffer.from(bytes) });
