@@ -118,12 +118,14 @@ export class SupabaseProjectRepository implements ProjectRepository {
   async listByOwner(ownerId: string): Promise<ProjectListItem[]> {
     const { data, error } = await this.db
       .from('projects')
-      .select('id, channel_url, status, created_at')
+      .select('id, options, status, created_at')
       .eq('owner_id', ownerId)
       .order('created_at', { ascending: false });
     if (error) throw new Error(error.message);
     return (data ?? []).map((r) => ({
-      id: r.id as string,      status: r.status as ProjectState,
+      id: r.id as string,
+      bookTitle: (r.options as { bookTitle?: string } | null)?.bookTitle ?? null,
+      status: r.status as ProjectState,
       createdAt: r.created_at as string,
     }));
   }
@@ -144,13 +146,15 @@ export class SupabaseProjectRepository implements ProjectRepository {
     // Oldest first — queued books start in submission order.
     const { data, error } = await this.db
       .from('projects')
-      .select('id, channel_url, status, created_at')
+      .select('id, options, status, created_at')
       .eq('owner_id', ownerId)
       .eq('status', 'QUEUED')
       .order('created_at', { ascending: true });
     if (error) throw new Error(error.message);
     return (data ?? []).map((r) => ({
-      id: r.id as string,      status: r.status as ProjectState,
+      id: r.id as string,
+      bookTitle: (r.options as { bookTitle?: string } | null)?.bookTitle ?? null,
+      status: r.status as ProjectState,
       createdAt: r.created_at as string,
     }));
   }

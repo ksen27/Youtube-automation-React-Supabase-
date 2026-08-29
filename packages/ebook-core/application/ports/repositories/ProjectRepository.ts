@@ -4,7 +4,13 @@ import type { ProjectState } from '../../../domain/project/ProjectStatus';
 
 /** Lightweight read-model row for listing a user's projects (no aggregate load). */
 export interface ProjectListItem {
-  id: string;  status: ProjectState;
+  id: string;
+  /**
+   * The title the user gave at submit. Null only for books created before the
+   * title became a required input.
+   */
+  bookTitle: string | null;
+  status: ProjectState;
   createdAt: string;
 }
 

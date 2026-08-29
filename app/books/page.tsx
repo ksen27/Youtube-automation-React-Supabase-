@@ -16,17 +16,16 @@ import { NewBookForm } from "./new-book-form";
 export const dynamic = "force-dynamic";
 
 // Ebooks — the third product, alongside Celebrity Videos (/dashboard) and AI
-// Avatar (/avatar). Turns a YouTube channel into a ~100-page book through the
-// 15-phase pipeline in packages/ebook-core.
+// Avatar (/avatar). Turns a title plus a reference book into a ~100-page book
+// through the pipeline in packages/ebook-core.
 
 interface BookRow {
-  id: string;  status: string;
+  id: string;
+  title: string | null;
+  status: string;
   createdAt: string;
 }
 
-// NOTE: ProjectListItem carries no book title — the title is decided by the
-// pipeline (book strategy) and lives on the book aggregate, not the project row.
-// The list therefore identifies a book by its channel until it is opened.
 async function loadReferences() {
   try {
     return await container().repositories.references.list(ownerId());
@@ -43,7 +42,9 @@ async function loadBooks(): Promise<{ books: BookRow[]; maxActive: number; runni
     const owner = ownerId();
     const rows = await c.repositories.projects.listByOwner(owner);
     const books: BookRow[] = rows.map((r) => ({
-      id: r.id,      status: r.status,
+      id: r.id,
+      title: r.bookTitle,
+      status: r.status,
       createdAt: r.createdAt,
     }));
     return {
@@ -67,8 +68,8 @@ export default async function BooksPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-fg">Ebooks</h1>
         <p className="mt-1 text-sm text-fg-muted">
-          Turn a YouTube channel into a finished book — researched from its videos
-          and its audience&apos;s comments, then exported as PDF and DOCX.
+          Give a title and a reference book — the pipeline writes it in that book&apos;s
+          voice and exports it as PDF and DOCX.
         </p>
       </div>
 
@@ -76,7 +77,7 @@ export default async function BooksPage() {
         <CardHeader>
           <CardTitle>Start a new book</CardTitle>
           <CardDescription>
-            Point it at a channel and give the book a title.
+            Give the book a title and choose a reference book to write it like.
             {maxActive > 0 && (
               <>
                 {" "}
@@ -97,7 +98,7 @@ export default async function BooksPage() {
           <EmptyState
             icon={<BookOpen className="h-5 w-5" />}
             title="No books yet"
-            description="Submit a YouTube channel above and the pipeline will research it, outline a book, write every chapter, and export it."
+            description="Give a title and a reference book above, and the pipeline will outline it, write every chapter, and export it."
           />
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -106,9 +107,8 @@ export default async function BooksPage() {
                 <Link href={`/books/${b.id}`} className="block">
                   <CardHeader>
                     <CardTitle className="truncate text-fg group-hover:text-brand-300 transition-colors">
+                      {b.title ?? "Untitled book"}
                     </CardTitle>
-                    <CardDescription className="text-xs truncate">
-                    </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-2">
                     <Badge variant={badgeVariantFor(b.status)}>
