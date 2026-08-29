@@ -1,19 +1,5 @@
 import type { QueueName } from '@ebook/core';
 
-export const QUEUE_NAMES: QueueName[] = [
-  'book-strategy',
-  'outline-generate',
-  'chapter-research',
-  'chapter-generate',
-  'polish-book',
-  'polish-chapter',
-  'extra-content',
-  'ebook-assemble',
-  'export',
-  'landing-page',
-  'landing-template',
-  'checkout-product',
-];
 
 /**
  * Prefix applied to the BullMQ/Redis queue name — NOT to the domain `QueueName`.
@@ -118,6 +104,21 @@ function concurrencyScale(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 0.25;
 }
 
+/**
+ * Every queue, derived from QUEUE_CONFIG rather than written out a second time.
+ *
+ * This WAS its own hand-maintained array, and it drifted. Adding a queue to the
+ * QueueName union and to QUEUE_CONFIG left this list untouched, because a
+ * `QueueName[]` annotation happily accepts a SUBSET of the names — so the new
+ * queues type-checked everywhere, and threw "Unknown queue" at runtime the
+ * first time anything enqueued to one. In production, from a route that had
+ * never been exercised.
+ *
+ * QUEUE_CONFIG is Record<QueueName, QueueConfig>, so the compiler already
+ * forces it to cover every name. Deriving from it extends that guarantee here
+ * and removes the only place the two could disagree.
+ */
+export const QUEUE_NAMES: QueueName[] = Object.keys(QUEUE_CONFIG) as QueueName[];
 /**
  * The per-queue settings a worker should actually boot with — QUEUE_CONFIG with
  * the scale factor applied. Workers must use THIS, not QUEUE_CONFIG directly.
