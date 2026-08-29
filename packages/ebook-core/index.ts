@@ -90,6 +90,7 @@ export * from './application/landing/bindTemplate';
 // ── Application: use cases ──────────────────────────────────────────────────
 export * from './application/use-cases/StartQueuedProjectsUseCase';
 export * from './application/use-cases/ImportGeneratedBookUseCase';
+export * from './application/use-cases/SubmitBookUseCase';
 export * from './application/use-cases/ExtractReferenceStyleUseCase';
 export * from './application/use-cases/GenerateBookBriefUseCase';
 export * from './application/use-cases/GenerateBookStrategyUseCase';

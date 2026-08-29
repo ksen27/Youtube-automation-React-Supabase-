@@ -5,6 +5,7 @@ import { ReferenceBookId } from '../../domain/reference/ReferenceBookId';
 import { ReferenceSection } from '../../domain/reference/ReferenceSection';
 import type { BookRepository } from '../ports/repositories/BookRepository';
 import type { ReferenceBookRepository } from '../ports/repositories/ReferenceBookRepository';
+import type { JobQueue } from '../ports/services/JobQueue';
 import type { IdGenerator } from '../ports/IdGenerator';
 import type { Clock } from '../ports/Clock';
 
@@ -26,6 +27,7 @@ export class ImportGeneratedBookUseCase {
   constructor(
     private readonly books: BookRepository,
     private readonly references: ReferenceBookRepository,
+    private readonly queue: JobQueue,
     private readonly ids: IdGenerator,
     private readonly clock: Clock,
   ) {}
@@ -63,6 +65,14 @@ export class ImportGeneratedBookUseCase {
     if (reference.isFail()) return Result.fail(reference.error);
 
     await this.references.save(reference.value);
+    // Style extraction is what makes a reference usable as a VOICE, and it is a
+    // model call — so it runs as a job rather than inline in a request. The
+    // reference is already selectable for material; the profile arrives shortly.
+    await this.queue.enqueue(
+      'reference-extract',
+      { referenceBookId: reference.value.id.value },
+      { jobId: `reference-extract:${reference.value.id.value}` },
+    );
     return Result.ok({ referenceBookId: reference.value.id.value });
   }
 }
