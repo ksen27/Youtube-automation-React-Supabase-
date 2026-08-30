@@ -137,13 +137,32 @@ kill_timeout = "300s"
   # exist in the image, and every PDF export fails with "Could not find Chrome".
   PUPPETEER_CACHE_DIR = "/root/.cache/puppeteer"
 
-  # Cover-art spend control. gpt-image-1 bills roughly an order of magnitude more
-  # per image at "high" than at "low", and leaving the field unset bills at the
-  # model default rather than the cheap end. Client direction 2026-08-24 is the
-  # lowest quality; the cover is composited under HTML-typeset title text, so the
-  # extra fidelity buys nothing a reader sees. Raise to "medium" here — no code
-  # change needed — if the art ever looks too rough.
+  # Illustration spend control. gpt-image-1 bills roughly an order of magnitude
+  # more per image at "high" than at "low", and leaving the field unset bills at
+  # the model default rather than the cheap end. Client direction 2026-08-24 is
+  # the lowest quality, and for ILLUSTRATIONS that is right: a book can burn
+  # dozens of them, they sit inside chapters at modest size, and this is only the
+  # fallback for when 69labs fails.
   OPENAI_IMAGE_QUALITY = "low"
+
+  # The COVER is the other half of that trade, and used to share the setting
+  # above. It must not.
+  #
+  # Every word of the cover — title, deck, subtitle — is drawn BY the image
+  # model; there is no HTML overlay any more (see export/html.ts). Small text is
+  # the first thing "low" destroys. Measured on one book, same prompt and inputs
+  # each time: three generations at "low" produced a garbled deck and an invented
+  # paragraph of noise, and the same call at "high" rendered every line correctly.
+  #
+  # The old justification here — "the cover is composited under HTML-typeset
+  # title text, so the extra fidelity buys nothing" — was true when it was
+  # written and stopped being true when the text moved into the artwork. The
+  # setting outlived its reason.
+  #
+  # One image per book, against a hundred pages of Claude: the cost difference is
+  # noise next to an unsellable cover. Drop to "medium" if that ever stops being
+  # true — but check a real cover's small text before going back to "low".
+  OPENAI_COVER_QUALITY = "high"
 
   # Deno, installed to this path in Dockerfile.worker. yt-dlp uses it to solve
   # YouTube's player challenge; WITHOUT a JS runtime YouTube rejects every

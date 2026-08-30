@@ -101,7 +101,10 @@ export const CoverImagePrompt = {
   build(input: CoverImageInput): string {
     const subject = compact(input.subject, 900);
     const title = compact(input.title, 200);
-    const subtitle = compact(input.subtitle, 180);
+    // 180 overran the space even at high quality — the last word rendered as
+    // "OF EVERY NEGO". The deck is set in letterspaced capitals across three
+    // short lines, and that is what actually fits.
+    const subtitle = compact(input.subtitle, 120);
     const variant = pickVariant(NONFICTION_VARIANTS, input.variantKey);
     // Half-empty bars look broken, so render the foot bar only with enough labels.
     const labels = (input.featureLabels ?? []).map((l) => compact(l, 24).toUpperCase()).filter(Boolean).slice(0, 5);

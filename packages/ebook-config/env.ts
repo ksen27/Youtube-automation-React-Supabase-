@@ -66,9 +66,26 @@ const EnvSchema = z.object({
   // gpt-image-1 exposes low|medium|high|auto. LOW is the default on client
   // direction 2026-08-24 ("its very important to use the lowest quality,
   // otherwise its very expensive") — high is roughly an order of magnitude
-  // dearer per image, and the cover is composited under HTML-typeset text
-  // anyway, so the extra fidelity buys nothing a reader sees.
+  // dearer per image. This setting governs the in-chapter ILLUSTRATION
+  // fallback, where a book can burn dozens of images and low is the right
+  // trade.
   OPENAI_IMAGE_QUALITY: z.enum(['low', 'medium', 'high', 'auto']).default('low'),
+
+  // The COVER is a different trade, and had been sharing the setting above.
+  //
+  // Every word of the cover — title, deck, subtitle — is drawn by the image
+  // model (see html.ts: "no overlay at all, the artwork IS the cover"), and
+  // small text is the first thing `low` destroys. Measured on one book, same
+  // prompt and inputs each time: three generations at `low` came back with a
+  // garbled deck and an invented paragraph of noise; the same call at `high`
+  // rendered every line correctly.
+  //
+  // The comment that justified `low` for covers said the artwork sat under
+  // HTML-typeset title text, so fidelity bought nothing. That stopped being
+  // true when the text moved into the image, and the setting outlived its
+  // reason. It is ONE image per book, against a hundred pages of Claude — the
+  // cost difference is noise, and an unreadable cover is unsellable.
+  OPENAI_COVER_QUALITY: z.enum(['low', 'medium', 'high', 'auto']).default('high'),
 
   // 69labs — generates ONLY the in-chapter illustrations. If unset, books carry
   // no illustrations.

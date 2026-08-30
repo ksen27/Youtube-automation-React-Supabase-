@@ -97,6 +97,11 @@ export function buildContainer(env: Env = loadEnv()) {
   const ai = ClaudeTextGenerator.fromApiKey(env.ANTHROPIC_API_KEY, telemetry);
   // OpenAI gpt-image-1 powers the COVER art.
   const images = OpenAIImageGenerator.fromApiKey(env.OPENAI_API_KEY ?? '', env.OPENAI_IMAGE_QUALITY);
+  // The cover carries its own typography, so it gets its own quality — see
+  // OPENAI_COVER_QUALITY. Deliberately a SECOND instance: `images` above is
+  // also the illustration fallback, and raising that would make every fallback
+  // illustration expensive to fix one image per book.
+  const coverImages = OpenAIImageGenerator.fromApiKey(env.OPENAI_API_KEY ?? '', env.OPENAI_COVER_QUALITY);
   // 69labs (img-flux) powers the in-chapter ILLUSTRATIONS — cheap and fast — but
   // its jobs fail intermittently, so OpenAI gpt-image-1 is a reliable fallback:
   // FallbackImageGenerator only pays for OpenAI when a 69labs job fails.
@@ -227,7 +232,7 @@ export function buildContainer(env: Env = loadEnv()) {
     startBookPolish: new StartBookPolishUseCase(projects, books, queue),
     polishChapter: new PolishChapterUseCase(books, knowledge, ai, clock),
     generateFrontBackMatter: new GenerateFrontBackMatterUseCase(books, ai, ids),
-    generateCoverImage: new GenerateCoverImageUseCase(books, knowledge, images, storage, imageProcessor, logger.child({ useCase: 'cover-image' })),
+    generateCoverImage: new GenerateCoverImageUseCase(books, knowledge, coverImages, storage, imageProcessor, logger.child({ useCase: 'cover-image' })),
     generateIllustrations: new GenerateIllustrationsUseCase(books, projects, illustrationImages, imageProcessor, storage, ids, logger.child({ useCase: 'illustrations' })),
     assembleEbook: new AssembleEbookUseCase(books, knowledge, clock, storage, projects),
     exportEbook: new ExportEbookUseCase(exporters, storage, artifacts),
