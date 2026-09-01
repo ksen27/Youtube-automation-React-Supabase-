@@ -1742,6 +1742,28 @@ const ServerEnvSchema = z.object({
   // 3840×2160 canvas upscales them. "4k" stays in the enum because the API accepts
   // it for OTHER engines (Avatar IV) — do not set it on this path.
   HEYGEN_API_RESOLUTION: z.enum(["720p", "1080p", "4k"]).default("1080p"),
+  // RENDER ENGINE for the API path. Was hardcoded to avatar_iii; made
+  // configurable 2026-09-01 when the client asked for Avatar IV clips.
+  //
+  // PROBED LIVE 2026-09-01 against api.heygen.com — this SUPERSEDES the
+  // 2026-07-21 note below. A saved photo-avatar look now reports
+  // supported_api_engines ["avatar_v","avatar_iv","avatar_iii"], and POST
+  // /v3/videos with type:"avatar" + engine:{type:"avatar_iv"} returns 200. So
+  // Avatar IV no longer requires the one-shot type:"image" path, and engine
+  // selection on a SAVED avatar works for all three.
+  //
+  // RESOLUTION INTERACTION (also probed 2026-09-01): avatar_iii rejects "4k"
+  // with a 400 ("Photo Avatar ... does not support 4K output"), but avatar_iv
+  // and avatar_v ACCEPT it (200). So Avatar IV is the only way to lift avatar
+  // blocks off the 1080p ceiling — relevant to the client's 4K-only export
+  // preference.
+  //
+  // COST: Avatar IV bills ~20 credits/min vs Avatar III's ~3 (~6-7x). The
+  // client rejected IV on 2026-07-20 for exactly this reason and asked for it
+  // again on 2026-09-01; keep the two facts together so the trade is explicit
+  // whenever this is changed. avatar_v is accepted by the API but has NOT been
+  // priced or rendered by us — treat it as unverified.
+  HEYGEN_API_ENGINE: z.enum(["avatar_iii", "avatar_iv", "avatar_v"]).default("avatar_iii"),
   // NOTE on the render ENGINE (client 2026-07-20: Avatar IV too expensive, wants
   // Avatar III everywhere): probed live 2026-07-21 — POST /v3/videos with
   // type:"image" (one-shot uploaded photo) REJECTS an `engine` field and always

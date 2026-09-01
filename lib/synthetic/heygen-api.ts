@@ -35,13 +35,22 @@ import type { GenerateAvatarInput, GenerateAvatarResult } from "@/lib/synthetic/
 //   5. upload the mp4 to R2 and return its public URL (same shape the browser path
 //      returns, so callers are agnostic to which path produced the clip).
 //
-// ENGINE = AVATAR III (client 2026-07-20: Avatar IV is too expensive — ~20
-// credits/min vs Avatar III's ~3). The engine field exists ONLY on type:"avatar"
-// (a saved avatar_id) — type:"image" (fresh uploaded photo) rejects it with a
-// 400 and always renders Avatar IV, which is why this module goes through a
-// saved photo avatar rather than the one-shot image path. There is NO silent
-// Avatar IV fallback: if the look can't be resolved or doesn't support
-// avatar_iii, the clip fails loudly instead of billing 6-7x.
+// ENGINE = HEYGEN_API_ENGINE (default avatar_iii). The engine field exists ONLY
+// on type:"avatar" (a saved avatar_id) — type:"image" (fresh uploaded photo)
+// rejects it with a 400, which is why this module goes through a saved photo
+// avatar rather than the one-shot image path.
+//
+// Probed live 2026-09-01: a saved photo-avatar look reports
+// supported_api_engines ["avatar_v","avatar_iv","avatar_iii"] and POST
+// /v3/videos accepts any of them (200). Resolution interacts with the choice —
+// avatar_iii 400s on "4k" ("Photo Avatar ... does not support 4K output") while
+// avatar_iv / avatar_v accept it, so Avatar IV is the only route to 4K avatars.
+//
+// COST: Avatar IV bills ~20 credits/min vs Avatar III's ~3 (~6-7x). The client
+// rejected IV on 2026-07-20 over cost and asked for it again on 2026-09-01.
+// There is NO silent engine downgrade or upgrade: whatever the env names is what
+// renders, and a look that can't serve it fails loudly rather than quietly
+// billing a different rate.
 // REQUIRES the sliced audio: like the browser path, we never speak HeyGen's own
 // TTS (wrong audio is unusable), so a missing audio slice means no API fallback.
 
@@ -258,9 +267,12 @@ async function createAvatarIiiVideo(
     ...("url" in audio ? { audio_url: audio.url } : { audio_asset_id: audio.assetId }),
     aspect_ratio: aspectRatio === "portrait" ? "9:16" : "16:9",
     resolution: e.HEYGEN_API_RESOLUTION,
-    // The whole point of the saved-avatar route: without this HeyGen defaults to
-    // Avatar IV (~6-7x the credits). Only valid on type:"avatar".
-    engine: { type: "avatar_iii" },
+    // Engine is explicit and configurable (HEYGEN_API_ENGINE, default
+    // avatar_iii). Only valid on type:"avatar" — which is why this module goes
+    // through a saved photo-avatar look. Probed 2026-09-01: a saved look accepts
+    // avatar_iii / avatar_iv / avatar_v, and only iv/v accept resolution "4k".
+    // Avatar IV bills ~6-7x Avatar III, so never change the default silently.
+    engine: { type: e.HEYGEN_API_ENGINE },
   };
   const res = await withHttpRetry("heygen-api.create_video", () =>
     fetchOrThrow(url, {
@@ -428,7 +440,9 @@ export async function generateAvatarViaApi(
       videoId,
       aspect,
       resolution: getEnv().HEYGEN_API_RESOLUTION,
-      engine: "avatar_iii",
+      // Record the engine that ACTUALLY billed — Avatar IV costs ~6-7x Avatar
+      // III, so a cost review needs this from the DB, not from env at read time.
+      engine: getEnv().HEYGEN_API_ENGINE,
       avatarName,
       lookId,
       createdAvatar, // false = reused an existing (usually browser-created) avatar
