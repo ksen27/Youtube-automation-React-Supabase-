@@ -124,7 +124,28 @@ kill_timeout = "300s"
   # Covers the loaded tail (363s measured at high concurrency); 300s was
   # abandoning healthy generations mid-render.
   AI33_IMAGE_POLL_TIMEOUT_SECONDS = "600"
-  # Headless Chromium for HeyGen automation.
+  # API-FIRST avatar generation (client 2026-09-01: "this is working with headless
+  # browser automation but this is not needed now — change this to API so the
+  # avatar clip can be generated with API"). Every avatar clip goes straight to
+  # the official HeyGen API: no account claim, no Cloudflare surface, no Chromium
+  # for avatar work. The browser stack below is left fully configured and acts
+  # only as a fallback if an API render fails, so setting this to "false"
+  # restores the previous behaviour with no code change.
+  #
+  # REQUIRES the API key as a SECRET (never [env]):
+  #   fly secrets set -c fly.avatar.toml HEYGEN_API_KEY=...
+  # Without that key this flag is inert and the browser path still runs.
+  #
+  # Aspect ratio is explicit on this path — 16:9 for full-frame avatar blocks,
+  # 9:16 for split_2 (heygen-api.ts createAvatarIiiVideo). Resolution is capped
+  # at 1080p by the Avatar III photo-avatar engine, same as the browser path.
+  #
+  # COST: API renders bill HeyGen API credits rather than the accounts'
+  # interactive-plan renders. That trade was accepted by the client 2026-09-01.
+  HEYGEN_API_FIRST = "true"
+  HEYGEN_API_RESOLUTION = "1080p"
+  # Headless Chromium for HeyGen automation (fallback path only while
+  # HEYGEN_API_FIRST is on).
   HEYGEN_HEADLESS = "true"
   # How long the warm HeyGen session is trusted before the worker re-verifies it
   # by loading /home. That /home hit is a fresh Cloudflare challenge, and in a

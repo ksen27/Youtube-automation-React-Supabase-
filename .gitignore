@@ -68,3 +68,6 @@ scripts/.spike-out/
 
 # Local clip-quality comparison output (scripts/clip-quality-sample.ts)
 clip-quality-sample/
+
+# Local archives (too large for GitHub)
+*.rar

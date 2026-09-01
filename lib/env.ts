@@ -1781,6 +1781,23 @@ const ServerEnvSchema = z.object({
   // switches to the API. Set MAX_CYCLES to 0 to wait purely on the 30-min timer.
   HEYGEN_POOL_WAIT_INTERVAL_SECONDS: z.coerce.number().int().positive().default(90),
   HEYGEN_POOL_WAIT_MAX_CYCLES: z.coerce.number().int().nonnegative().default(2),
+  // API-FIRST (client 2026-09-01: "the headless browser automation is not needed
+  // now — generate the avatar clip with the API"). Inverts the routing: every
+  // avatar clip goes STRAIGHT to the official HeyGen API, and the browser pool
+  // becomes the fallback used only if the API attempt fails. Nothing about the
+  // browser stack is deleted, so clearing this flag restores the previous
+  // behaviour exactly (one env var, no deploy of new code).
+  //
+  // Requires HEYGEN_API_KEY. It does NOT require HEYGEN_API_FALLBACK: that flag
+  // gates the *fallback* triggers (speed switch / pool exhaustion), whereas this
+  // one is the primary route — heygenApiFirstEnabled() checks the key directly so
+  // the client's "use the API" instruction can't be silently no-op'd by the older
+  // flag being left off.
+  //
+  // Aspect ratio is explicit on this path (16:9 full-frame, 9:16 split_2 — see
+  // heygen-api.ts createAvatarIiiVideo); resolution is capped at 1080p by the
+  // Avatar III photo-avatar engine (HEYGEN_API_RESOLUTION above).
+  HEYGEN_API_FIRST: boolish(false),
   // Hard timeout (seconds) for one Pikzels generation request. The image
   // endpoint responds synchronously (~<30s per Pikzels), so this is a
   // fetch-abort backstop, not a poll loop.

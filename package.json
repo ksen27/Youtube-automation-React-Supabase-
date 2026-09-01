@@ -16,6 +16,7 @@
     "heygen:reactivate": "tsx scripts/heygen-reactivate.ts",
     "heygen:status": "tsx scripts/heygen-status.ts",
     "heygen:api-test": "tsx scripts/heygen-api-test.ts",
+    "heygen:api-aspect-verify": "tsx scripts/heygen-api-aspect-verify.ts",
     "heygen:v3-list-probe": "tsx scripts/heygen-v3-list-probe.ts",
     "heygen:v3-title-probe": "tsx scripts/heygen-v3-title-probe.ts",
     "heygen:stop": "tsx scripts/heygen-stop.ts",

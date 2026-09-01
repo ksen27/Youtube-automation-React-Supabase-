@@ -30,10 +30,17 @@
 -- same survivor the application-side de-dupe picks, so the two agree. The rows
 -- are interchangeable by construction (identical payload written from the same
 -- projects columns), so which one survives only has to be deterministic.
+--
+-- Compared as TEXT, not as uuid, for two reasons. Postgres has no min(uuid)
+-- aggregate at all (`function min(uuid) does not exist`), so the uuid form does
+-- not even parse. And the survivor has to match planPitchDedupe
+-- (lib/synthetic/pitch-timeline.ts), which sorts with String.localeCompare over
+-- the uuid's canonical text. Text order and uuid byte order agree on canonical
+-- lowercase uuids, but ::text is what the application actually means, so say it.
 delete from public.timeline_items t
  where t.metadata->>'kind' = 'pitch_video'
-   and t.id > (
-     select min(o.id)
+   and t.id::text > (
+     select min(o.id::text)
        from public.timeline_items o
       where o.project_id = t.project_id
         and o.metadata->>'kind' = 'pitch_video'

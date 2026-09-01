@@ -86,6 +86,15 @@ export function heygenApiFallbackEnabled(): boolean {
   return e.HEYGEN_API_FALLBACK && !!e.HEYGEN_API_KEY;
 }
 
+// True when the API is the PRIMARY route for every avatar clip (client 2026-09-01)
+// rather than a fallback. Deliberately does NOT require HEYGEN_API_FALLBACK — that
+// flag gates the fallback triggers, and requiring it here would let a stale
+// deployment silently keep driving the browser. Only the key is needed.
+export function heygenApiFirstEnabled(): boolean {
+  const e = getEnv();
+  return e.HEYGEN_API_FIRST && !!e.HEYGEN_API_KEY;
+}
+
 // Upload a file buffer to /v3/assets and return its asset_id. HeyGen uses the
 // SAME endpoint for images and audio; the mime type tells it apart.
 async function uploadAsset(

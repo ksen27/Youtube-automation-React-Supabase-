@@ -29,7 +29,11 @@ import {
   endRender,
 } from "@/lib/synthetic/heygen-session";
 import { inspectPage } from "@/lib/synthetic/heygen-health";
-import { generateAvatarViaApi, heygenApiFallbackEnabled } from "@/lib/synthetic/heygen-api";
+import {
+  generateAvatarViaApi,
+  heygenApiFallbackEnabled,
+  heygenApiFirstEnabled,
+} from "@/lib/synthetic/heygen-api";
 import { projectAvatarName } from "@/lib/synthetic/avatar-name";
 import {
   HeygenError,
@@ -2768,7 +2772,7 @@ async function tryApiFallback(
   // type:"image" path is not used — it has no engine choice and bills Avatar IV;
   // probed live 2026-07-21, see heygen-api.ts).
   if (
-    !heygenApiFallbackEnabled() ||
+    (!heygenApiFallbackEnabled() && !heygenApiFirstEnabled()) ||
     (!input.audioUrl && !input.audioFilePath)
   ) {
     return null;
@@ -2836,6 +2840,63 @@ export async function generateAvatar(
     );
   }
 
+  // API-FIRST (client 2026-09-01: the headless-browser automation "is not needed
+  // now" — render avatar clips through the official API). The API becomes the
+  // PRIMARY route: no account claim, no anti-bot spacing, no Chromium. The browser
+  // pool is kept intact behind it purely as a safety net, so clearing
+  // HEYGEN_API_FIRST restores the old behaviour with no code change.
+  //
+  // Aspect ratio is honoured explicitly by this path — heygen-api.ts maps
+  // input.aspectRatio to aspect_ratio 16:9 (full-frame) / 9:16 (split_2) in the
+  // create-video body, which is stricter than the browser path's reliance on
+  // HeyGen's UI defaults.
+  //
+  // Records that the API was already tried as the PRIMARY route, so the
+  // last-resort block at the end of this function doesn't bill a second render,
+  // and so an API-only deployment reports the real API error.
+  let apiFirstAttempted = false;
+  let apiFirstError: Error | null = null;
+
+  // (forceApi is necessarily falsy here — the block above always returns or throws.)
+  if (heygenApiFirstEnabled()) {
+    // Audio-driven only, exactly as everywhere else: a clip with no sliced
+    // voiceover would render HeyGen's own TTS = wrong audio, which the client has
+    // called worse than no render. Such a clip falls through to the browser path
+    // rather than being spoken by the wrong voice.
+    if (input.audioUrl || input.audioFilePath) {
+      apiFirstAttempted = true;
+      try {
+        return await generateAvatarViaApi(input, imageBytes);
+      } catch (apiErr) {
+        apiFirstError = apiErr as Error;
+        // The API is primary, so its failure is NOT swallowed the way
+        // tryApiFallback swallows a last-resort failure. Log it, then let the
+        // browser pool below try to rescue the clip; if the pool also fails, the
+        // error thrown at the end of this function reports the browser failure and
+        // this one is preserved here in the logs for diagnosis.
+        console.error(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            msg: "heygen.api_first.failed",
+            projectId: input.projectId,
+            segmentId: input.segmentId,
+            aspectRatio: input.aspectRatio ?? "landscape",
+            err: (apiErr as Error)?.message?.slice(0, 300),
+          }),
+        );
+      }
+    } else {
+      console.warn(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          msg: "heygen.api_first.skipped_no_audio",
+          projectId: input.projectId,
+          segmentId: input.segmentId,
+        }),
+      );
+    }
+  }
+
   // Default the rotation cap to the full usable pool so we never stop short of an
   // account that WOULD succeed (the "only 3 of 4 tried" gap). An explicit
   // maxAccounts (e.g. the debug script's 1) still wins.
@@ -2865,6 +2926,20 @@ export async function generateAvatar(
     // one usually frees within a wait cycle → the clip then renders on the cheap
     // browser path). The worker switches the clip to the API only after the
     // client's threshold (2 wait cycles / 30 min). See avatarProcessor.
+    //
+    // EXCEPT under API-FIRST: the API was already the primary route and it FAILED,
+    // so no browser account is going to help and the pool-wait cycle would just
+    // re-delay the clip (and eventually set forceApi, re-billing the same failing
+    // render) instead of surfacing the real cause. This also covers the
+    // decommissioned-pool case, where countUsableAccounts()'s floor of 1 means we
+    // reach here with no accounts configured at all. Fail with the API's error.
+    if (apiFirstAttempted) {
+      throw new Error(
+        `heygen: API render failed and no browser account was available — ${
+          apiFirstError?.message ?? "unknown"
+        }`,
+      );
+    }
     throw new PoolBusyError(
       "heygen: all accounts are busy rendering — waiting for one to free up",
     );
@@ -2967,11 +3042,24 @@ export async function generateAvatar(
   // Both bill API credits (pricier than the browser renders), so tryApiFallback is
   // a no-op unless enabled + configured and audio-driven. On an API
   // failure it returns null and we fall through to the original error below.
-  const apiReason =
-    earlySwitchReason ??
-    `pool exhausted: ${(lastErr as Error)?.message?.slice(0, 200) ?? "unknown"}`;
-  const apiResult = await tryApiFallback(input, imageBytes, apiReason);
-  if (apiResult) return apiResult;
+  // When API-FIRST already attempted (and failed) the API at the top of this
+  // function, re-running it here would bill a second render for the same clip and
+  // almost certainly fail the same way. Skip straight to the error.
+  if (!apiFirstAttempted) {
+    const apiReason =
+      earlySwitchReason ??
+      `pool exhausted: ${(lastErr as Error)?.message?.slice(0, 200) ?? "unknown"}`;
+    const apiResult = await tryApiFallback(input, imageBytes, apiReason);
+    if (apiResult) return apiResult;
+  }
+
+  // Report the API error when that was the primary route and the browser pool
+  // never produced a real attempt of its own — otherwise an API-only deployment
+  // (no browser accounts configured) would surface a confusing "failed across 1
+  // account(s): all accounts are busy" instead of the actual API failure.
+  if (apiFirstAttempted && apiFirstError && !lastErr) {
+    throw new Error(`heygen: API render failed — ${apiFirstError.message}`);
+  }
 
   throw new Error(
     `heygen: avatar generation failed across ${rotationCap} account(s): ${(lastErr as Error)?.message ?? "unknown"}`,
