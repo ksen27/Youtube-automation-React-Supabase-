@@ -202,10 +202,32 @@ const SCRIPT_MATCH_RULE =
   "This rule outranks the VIDEO SUBJECT / NICHE: when the line's concrete thing " +
   "is OUTSIDE the video's niche (a car in an airplane video, a factory process " +
   "in a product video), show the line's thing, not the niche's subject. " +
-  "Only when a line names NO concrete thing at all (pure commentary, a " +
-  "transition, an abstract claim) may you invent an on-topic visual from the " +
-  "video's world — and even then, prefer whatever the surrounding sentences are " +
-  "physically about.";
+  // A LINE CAN NAME A PROCESS INSTEAD OF AN OBJECT (client, 2026-09-01: "like
+  // enzymes, you can show a footage that enzymes are killing something or
+  // scientists have studied this, then you show footage of like scientists
+  // studying food"). The old wording sorted every line into "names a concrete
+  // thing" or "abstract -> invent from the niche", and a line about enzymes
+  // degrading flavour compounds fell in the second bucket, so it rendered
+  // another static niche object. But that line is not abstract at all: it
+  // describes something that HAPPENS, and what happens is filmable. Naming the
+  // process, the mechanism, or the people who study it as depictable subjects
+  // is what turns those lines into footage instead of another product shot.
+  "A PROCESS IS A CONCRETE THING. When the line describes something HAPPENING " +
+  "rather than an object sitting still — a reaction, a mechanism, decay, " +
+  "ripening, absorption, a change over time — or describes research, testing or " +
+  "measurement, that IS the shot: show the process ITSELF (the food visibly " +
+  "breaking down, mould spreading, a tomato going soft, ice crystals forming, " +
+  "starch turning sugary, steam or condensation) or the PEOPLE doing the work " +
+  "(a researcher examining produce in a lab, a technician measuring a sample, " +
+  "hands testing a piece of fruit). Do NOT fall back to a static shot of the " +
+  "object the process acts on — that is the same picture the video has already " +
+  "shown, and it is why footage repeats. " +
+  "Only when a line names NO depictable thing OR process at all (pure " +
+  "commentary, a transition, a rhetorical aside) may you invent a visual — and " +
+  "then prefer whatever the surrounding sentences are physically about, or the " +
+  "wider real-world context the narration invokes (where the thing comes from, " +
+  "who handles it, where it is grown, sold, made or studied), not another " +
+  "close-up of the niche's main object.";
 
 // HANDS ARE NOT A SUBJECT (client, repeatedly: "What is this hand movement?
 // Every time it like uses it on the hand movement, it doesn't make any sense",
@@ -773,9 +795,25 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
         "different industry), the imagePrompt MUST show THAT — what the line",
         "says always outranks the niche. Only when a line is abstract or has no",
         "literal scene do you invent a visual, and an INVENTED visual must come",
-        "from THIS niche (an on-topic object, tool, part, or place) — never",
-        "introduce houses, lawns, offices, or any setting the narration itself",
-        "never brings up.",
+        "from THIS niche — never introduce houses, lawns, offices, or any",
+        "setting the narration itself never brings up.",
+        // "an on-topic object, tool, part, or place" used to be the whole of
+        // what could be invented, which quietly made every abstract line
+        // another product shot of the same few nouns. The niche's world is
+        // bigger than its objects: it includes the processes the narration
+        // describes, the places the things come from, and the people who grow,
+        // sell, handle or study them. Client 2026-09-01 asked for exactly that
+        // ("we can even show people, like people holding a tomato" / "scientists
+        // studying food"), and it is also the cheapest source of visual variety
+        // in a video whose objects repeat by design.
+        "THIS NICHE MEANS ITS WHOLE WORLD, not just its objects: the processes",
+        "the narration describes (things ripening, breaking down, reacting,",
+        "spoiling, being preserved), the places its subjects come from or end up",
+        "(a field, a market, a shop, a pantry, a kitchen counter, a lab), and the",
+        "PEOPLE who grow, sell, carry, prepare, handle or study them. Prefer one",
+        "of those over another close-up of the same object the video has already",
+        "shown repeatedly — a video whose every shot is the same few nouns is the",
+        "failure this instruction exists to prevent.",
         // When the subject's world is a remote / non-filmable place (space, the
         // deep sea, Antarctica, wilderness, ancient history), the visuals live in
         // THAT place, not at a desk. This is the fix for space/Antarctica videos
@@ -795,7 +833,10 @@ function buildTopicBlock(topic: VideoTopic = EMPTY_TOPIC): string[] {
         "process outside that world must show what IT says — the line's own",
         "content always outranks the inferred niche. When a line is abstract or",
         "has no literal scene, invent a visual from the video's own subject,",
-        "never a generic unrelated setting.",
+        "never a generic unrelated setting — and read 'the video's own subject'",
+        "as its whole world (the processes it describes, the places its subjects",
+        "come from, and the people who handle or study them), not just a repeat",
+        "close-up of its main object.",
         "",
       ];
   // Home is not a garden. A line about being 'home' / indoors must render the
