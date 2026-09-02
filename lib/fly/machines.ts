@@ -54,7 +54,35 @@ export function flyAppName(app: SleepableApp): string | undefined {
  * degrades to "costs money" rather than "generation is broken".
  */
 export function isMachineControlEnabled(app: SleepableApp): boolean {
-  return Boolean(getEnv().FLY_API_TOKEN) && Boolean(flyAppName(app));
+  // sanitizeToken, not the raw value: a var holding only a BOM or stray quotes
+  // is not a configured token, and must not switch the feature on only to fail
+  // on the first request.
+  return Boolean(sanitizeToken(getEnv().FLY_API_TOKEN)) && Boolean(flyAppName(app));
+}
+
+/**
+ * Strip characters an HTTP header cannot carry from a pasted secret.
+ *
+ * THE BUG THIS FIXES: a token set through a shell pipeline arrived with a UTF-8
+ * BOM (U+FEFF) wedged after "FlyV1 ", because PowerShell's `echo`/`Out-File`
+ * writes one by default. fetch() then rejected the whole request with
+ * "Cannot convert argument to a ByteString because the character at index 7 has
+ * a value of 65279", which reads as a bug in this client and is really an
+ * invisible character in the environment variable — the kind of thing you can
+ * stare at in a dashboard and never see.
+ *
+ * Also trims surrounding whitespace/newlines (a trailing \n from a heredoc or a
+ * copied line does the same damage) and any stray quotes, which a value pasted
+ * WITH its shell quotes would otherwise carry into the header.
+ */
+function sanitizeToken(raw: string | undefined): string | undefined {
+  if (!raw) return raw;
+  const cleaned = raw
+    .replace(/[\uFEFF\u200B-\u200D\u2060]/g, "") // BOM + zero-width chars
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .trim();
+  return cleaned || undefined;
 }
 
 class FlyApiError extends Error {
@@ -65,7 +93,7 @@ class FlyApiError extends Error {
 }
 
 async function flyFetch(path: string, init?: RequestInit): Promise<unknown> {
-  const token = getEnv().FLY_API_TOKEN;
+  const token = sanitizeToken(getEnv().FLY_API_TOKEN);
   if (!token) throw new FlyApiError("FLY_API_TOKEN is not set");
 
   // Short timeout: this sits on the enqueue path, which a user is waiting on.
