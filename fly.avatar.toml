@@ -390,3 +390,20 @@ kill_timeout = "300s"
 #       (Or wire the generate-synthetic API route to call the Fly Machines API
 #        to start the machine — a future enhancement.)
 # No [[services]] block: this worker exposes nothing and hosts no Redis.
+
+# ── ON-DEMAND START/STOP (cost control) ──────────────────────────────────────
+# This machine no longer needs to run 24/7. lib/jobs/queue.ts starts it from the
+# enqueue path (and FAILS the request if it cannot, rather than parking a job
+# with no consumer), and lib/fly/idle-monitor.ts on the always-on celebrity
+# worker stops it once both Redis and Postgres show no live work for
+# FLY_IDLE_CHECKS_BEFORE_STOP consecutive checks (default 30 min).
+#
+# Uses `machine start/stop`, NOT `scale count 0/1`: scaling destroys the machine
+# and drops its volume, and this app's volume holds the render resume cache.
+#
+# REQUIRED SECRETS on the CELEBRITY worker (video-automation-worker) and in
+# Vercel — the two places that enqueue and monitor. Not needed here:
+#   fly secrets set FLY_API_TOKEN=<fly tokens create deploy> #     FLY_AVATAR_APP_NAME=video-automation-avatar-worker #     FLY_EBOOK_APP_NAME=video-automation-ebook-worker #     --app video-automation-worker
+# Until BOTH the token and the app name are set, everything below is INERT and
+# the machine stays up exactly as before — a missing secret must never turn
+# into a silently-hanging generate.

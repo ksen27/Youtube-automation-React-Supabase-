@@ -93,7 +93,14 @@ export function buildContainer(env: Env = loadEnv()) {
 
   // ── adapters (implement core ports) ──
   const storage = new SupabaseStorageAdapter(supabase);
-  const queue = new BullJobQueue(redis);
+  // Wake the (sleepable) ebook Fly machine before any enqueue. Injected as a
+  // callback so this package keeps knowing nothing about the host app; it
+  // THROWS if the machine cannot be started, which fails the enqueue rather
+  // than parking a book in Redis with no consumer. See lib/fly/machines.ts.
+  const queue = new BullJobQueue(redis, async () => {
+    const { wakeEbookWorker } = await import('@/lib/jobs/queue');
+    await wakeEbookWorker();
+  });
   const ai = ClaudeTextGenerator.fromApiKey(env.ANTHROPIC_API_KEY, telemetry);
   // OpenAI gpt-image-1 powers the COVER art.
   const images = OpenAIImageGenerator.fromApiKey(env.OPENAI_API_KEY ?? '', env.OPENAI_IMAGE_QUALITY);

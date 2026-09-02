@@ -1131,9 +1131,55 @@ const ServerEnvSchema = z.object({
   //                 so it can share a machine — but `whisper-transcribe` and
   //                 `export` (Puppeteer) are memory-hungry, which is why it can
   //                 also be pinned to its own app.
-  // The synthetic worker can be a separate Fly app with auto_stop (scales to
-  // zero when idle) since avatar generation is bursty, not 24/7.
+  // The synthetic and ebook workers run as separate Fly apps so they can be
+  // STOPPED when idle. Note they cannot use Fly's own auto_stop/auto_start:
+  // auto_start fires on inbound HTTP to a [[services]] block and neither app
+  // exposes one, so Fly can stop them but could never wake them again. The
+  // start/stop signal is supplied by lib/fly/machines.ts instead — see the
+  // FLY_* vars below.
   WORKER_ROLE: z.enum(["all", "sourced", "synthetic", "ebook"]).default("all"),
+
+  // --- on-demand worker machines (cost control) ---
+  //
+  // The avatar (performance-8x/16gb) and ebook (shared-cpu-4x/8gb) workers used
+  // to run 24/7 and billed the same on a zero-video day as on a busy one. With
+  // these set, the enqueue path starts the machine on demand and an idle
+  // monitor stops it again once nothing is queued OR running.
+  //
+  // ALL OF THIS IS OFF UNLESS BOTH THE TOKEN AND THE APP NAME ARE SET. The
+  // always-on behaviour is the safe default: a missing secret must degrade to
+  // "still costs money", never to "generation silently hangs".
+  //
+  // Create the token with `fly tokens create deploy` (or an org token scoped to
+  // the two apps). It is a SECRET — set it via `fly secrets set` and in Vercel,
+  // never in a fly.toml [env] block.
+  FLY_API_TOKEN: z.string().optional(),
+  // Fly app names, exactly as in each fly.*.toml `app = ...` line. The
+  // celebrity app is deliberately absent: it hosts Redis in-container
+  // (Dockerfile.worker), so stopping it would destroy the queue that the wake
+  // signal itself has to be read from.
+  FLY_AVATAR_APP_NAME: z.string().optional(),
+  FLY_EBOOK_APP_NAME: z.string().optional(),
+  // Budget for a single Fly API call. Kept short because the start path runs
+  // inside a user's "Generate" request.
+  FLY_API_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  // How long to wait for a stopped machine to report 'started'. A cold boot
+  // runs `yt-dlp -U` (Dockerfile.worker CMD) before the worker process even
+  // begins, so this needs real headroom.
+  FLY_START_WAIT_MS: z.coerce.number().int().positive().default(60_000),
+  // Idle-shutdown tuning, read by lib/fly/idle-monitor.ts on the always-on
+  // celebrity worker. A machine is stopped only after this many CONSECUTIVE
+  // clear checks, so the default 5min x 6 = 30 minutes of proven quiet.
+  //
+  // Do not tighten these without reading the comments in lib/fly/idle-monitor.ts.
+  // An in-flight job is NOT in the waiting list, and SWEEP_STALE_MS in
+  // worker/index.ts is 45 minutes precisely because a legitimately-alive job
+  // can go quiet for a long time.
+  FLY_IDLE_CHECK_INTERVAL_MS: z.coerce.number().int().positive().default(5 * 60_000),
+  FLY_IDLE_CHECKS_BEFORE_STOP: z.coerce.number().int().positive().default(6),
+  // Master switch for the idle monitor, independent of the wake path: set false
+  // to keep on-demand STARTS working while leaving machines up.
+  FLY_IDLE_STOP_ENABLED: boolish(true),
 
   // Scales EVERY ebook queue's concurrency (packages/ebook-infra/queue/queues.ts).
   // The upstream table was tuned for dedicated pods and sums to ~135 concurrent

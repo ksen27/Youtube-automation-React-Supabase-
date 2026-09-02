@@ -1,6 +1,7 @@
 import { Queue, QueueEvents } from "bullmq";
 import IORedis, { type Redis } from "ioredis";
 import { getEnv } from "@/lib/env";
+import { isMachineControlEnabled, startMachines, type SleepableApp } from "@/lib/fly/machines";
 
 export const QUEUE_NAMES = {
   search: "video-automation-search",
@@ -173,6 +174,43 @@ export async function closeAllQueues(): Promise<void> {
   events.clear();
 }
 
+/**
+ * Start the sleepable worker machine that serves this queue, before enqueueing.
+ *
+ * WHY IT LIVES HERE rather than in the ~20 API routes that enqueue: this is the
+ * single choke point every caller already goes through, so a route added later
+ * cannot forget it. The alternative — an explicit call per route — drifted in
+ * exactly this codebase before (see the QUEUE_NAMES-derived-from-QUEUE_CONFIG
+ * note in packages/ebook-infra/queue/queues.ts, where a hand-maintained second
+ * list silently lost entries and threw at runtime in production).
+ *
+ * THROWS on failure, by design. If the machine cannot be started the job must
+ * NOT be enqueued: it would sit in Redis with no consumer and no error, and the
+ * user would watch a spinner that never resolves. That silent-hang shape is the
+ * same one worker/index.ts already carries scar tissue for (the re-delivered
+ * avatar render, "the never-clearing-spinner bug"). A loud 5xx that says "could
+ * not start the worker" is recoverable; a stranded job is not.
+ *
+ * No-ops when machine control is not configured, which is the default — see the
+ * FLY_* block in lib/env.ts.
+ */
+async function wakeWorkerFor(app: SleepableApp): Promise<void> {
+  if (!isMachineControlEnabled(app)) return;
+  const t0 = Date.now();
+  const r = await startMachines(app);
+  if (r.started.length > 0) {
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(), msg: "fly.machine.started",
+      app, machines: r.started, ms: Date.now() - t0,
+    }));
+  }
+}
+
+/** Public wake entry point for the ebook pipeline (see BullJobQueue). */
+export async function wakeEbookWorker(): Promise<void> {
+  return wakeWorkerFor("ebook");
+}
+
 // Convenience enqueue helpers
 export async function enqueueSearch(data: SearchJobData) {
   return getQueue<SearchJobData>(QUEUE_NAMES.search).add("search", data, { jobId: data.mediaJobId });
@@ -193,6 +231,9 @@ export async function enqueueMatch(data: MatchJobData) {
 // to the sourced queue when omitted (the caller passes project.engine).
 export async function enqueueRender(data: RenderJobData, opts?: { synthetic?: boolean }) {
   const queue = opts?.synthetic ? QUEUE_NAMES.renderSynthetic : QUEUE_NAMES.render;
+  // Only the SYNTHETIC render runs on the sleepable avatar machine; the sourced
+  // render runs on the always-on celebrity worker and needs no wake.
+  if (opts?.synthetic) await wakeWorkerFor("avatar");
   return getQueue<RenderJobData>(queue).add("render", data, { jobId: data.mediaJobId });
 }
 export async function enqueueScriptClip(data: ScriptClipJobData) {
@@ -205,6 +246,7 @@ export async function enqueueScriptClip(data: ScriptClipJobData) {
 // straight back to its media_jobs row. Each synthetic asset job owns its own
 // media_job, so segment-level jobs are still uniquely keyed.
 export async function enqueueTts(data: TtsJobData) {
+  await wakeWorkerFor("avatar");
   return getQueue<TtsJobData>(QUEUE_NAMES.tts).add("tts", data, { jobId: data.mediaJobId });
 }
 
@@ -227,9 +269,11 @@ export async function removeQueuedJob(queue: keyof typeof QUEUE_NAMES, mediaJobI
   }
 }
 export async function enqueueSyntheticPlanner(data: SyntheticPlannerJobData) {
+  await wakeWorkerFor("avatar");
   return getQueue<SyntheticPlannerJobData>(QUEUE_NAMES.syntheticPlanner).add("plan_synthetic", data, { jobId: data.mediaJobId });
 }
 export async function enqueueImageGeneration(data: ImageGenerationJobData) {
+  await wakeWorkerFor("avatar");
   return getQueue<ImageGenerationJobData>(QUEUE_NAMES.imageGeneration).add("image_gen", data, { jobId: data.mediaJobId });
 }
 // BullMQ priority bounds. Lower value = served earlier; 0 means "unprioritized"
@@ -280,6 +324,7 @@ export async function enqueueImageToVideo(
   data: ImageToVideoJobData,
   opts: { priority?: number } = {},
 ) {
+  await wakeWorkerFor("avatar");
   return getQueue<ImageToVideoJobData>(QUEUE_NAMES.imageToVideo).add("image_to_video", data, {
     jobId: data.mediaJobId,
     // Omitted rather than passed as 0: an explicit 0 is BullMQ's "no priority"
@@ -288,10 +333,12 @@ export async function enqueueImageToVideo(
   });
 }
 export async function enqueueAvatar(data: AvatarJobData) {
+  await wakeWorkerFor("avatar");
   return getQueue<AvatarJobData>(QUEUE_NAMES.avatar).add("avatar", data, { jobId: data.mediaJobId });
 }
 export async function enqueuePitchGen(data: PitchGenJobData) {
   // jobId = the pitch_videos row id (the standalone tool has no media_job): it
   // dedupes double-enqueues and maps a BullMQ job straight back to its row.
+  await wakeWorkerFor("avatar");
   return getQueue<PitchGenJobData>(QUEUE_NAMES.pitchGen).add("pitch_gen", data, { jobId: data.pitchVideoId });
 }

@@ -26,7 +26,22 @@ const FAIRNESS_TTL_SECONDS = 172_800; // 48h
 export class BullJobQueue implements JobQueue {
   private readonly queues = new Map<QueueName, Queue>();
 
-  constructor(private readonly redis: Redis) {
+  /**
+   * @param onBeforeEnqueue Optional hook awaited before EVERY enqueue. The app
+   *   passes the Fly machine wake here (see lib/jobs/queue.ts wakeEbookWorker):
+   *   the ebook worker is a sleepable Fly app, and a job enqueued while its
+   *   machine is stopped would wait in Redis with no consumer and no error.
+   *
+   *   Injected rather than imported because this package has its own env schema
+   *   and deliberately knows nothing about the host app — the same reason
+   *   buildEbookWorkers is imported lazily in worker/index.ts. It THROWS on
+   *   failure, which propagates out of enqueue() and fails the request, so a
+   *   book is never accepted against a worker that could not be started.
+   */
+  constructor(
+    private readonly redis: Redis,
+    private readonly onBeforeEnqueue?: () => Promise<void>,
+  ) {
     for (const name of QUEUE_NAMES) {
       // Keyed by the DOMAIN name, constructed with the PREFIXED Redis name —
       // see redisQueueName() for why the two differ.
@@ -67,6 +82,10 @@ export class BullJobQueue implements JobQueue {
   ): Promise<void> {
     const q = this.queues.get(queue);
     if (!q) throw new Error(`Unknown queue: ${queue}`);
+    // Before the queue write, not after: if the worker machine cannot be
+    // started we want the caller to see the failure INSTEAD of a queued job,
+    // not in addition to one.
+    if (this.onBeforeEnqueue) await this.onBeforeEnqueue();
     const projectId = typeof payload.projectId === 'string' ? payload.projectId : undefined;
     await q.add(queue, payload, {
       jobId: toBullJobId(options.jobId), // deterministic → dedup (`:` → `-` for BullMQ)

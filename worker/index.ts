@@ -28,6 +28,7 @@ import { processPitchGenJob }         from "./processors/synthetic/pitchGenProce
 import { markJobFailedIfExhausted, sweepStalledJobs, sweepOrphanedSegments, sweepUndispatchedSegments, sweepZombieRenderJobs, sweepAdmissionSlots } from "./reconcile";
 import { sweepRenderCache } from "./processors/renderCache";
 import { sweepKeepAlive } from "@/lib/synthetic/heygen-auth";
+import { startIdleMonitor } from "@/lib/fly/idle-monitor";
 import { closeWarmSession, warmAccountIds, activeAccountIds } from "@/lib/synthetic/heygen-session";
 import { claimedAccountIds } from "@/lib/synthetic/heygen-accounts";
 
@@ -516,10 +517,23 @@ if (runSynthetic) {
   keepAliveTimer.unref?.();
 }
 
+// Idle monitor for the SLEEPABLE worker machines (avatar, ebook), which are
+// stopped when idle to cut Fly cost and started again from the enqueue path.
+//
+// Runs ONLY on the celebrity worker, and only there because that app hosts
+// Redis in-container (see the WORKER_ROLE gate in Dockerfile.worker) and so is
+// the one process guaranteed to be awake. It also must not run on the machines
+// it stops — a worker shutting down its own machine races with an arriving job.
+//
+// No-ops unless FLY_API_TOKEN and the app-name vars are set, so an unconfigured
+// deploy keeps the previous always-on behaviour.
+const stopIdleMonitor = runSourced ? startIdleMonitor() : undefined;
+
 async function shutdown(signal: string) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg: "worker.shutdown", signal }));
   clearInterval(sweepTimer);
   if (keepAliveTimer) clearInterval(keepAliveTimer);
+  stopIdleMonitor?.();
   // Order matters: close workers first so they finish their current job and
   // stop polling, then close the Queue/QueueEvents objects, then quit the
   // shared Redis connection. Quitting Redis first would race in-flight
