@@ -4022,6 +4022,92 @@ const VideoTopicSchema = z.object({
 // image prompt so the visuals stay on-theme for ANY channel. A cheap Gemini call
 // (thinkingBudget:0, tiny output) — on any failure we return EMPTY_TOPIC and the
 // prompt falls back to niche-neutral phrasing (no regression).
+// What deriveVideoTopic actually reads of the transcript.
+//
+// WHY NOT slice(0, 1500). It used to be the opening 1500 characters, which is
+// the WORST window for the format the client sends most often: a numbered list
+// ("15 foods you should never refrigerate"). The intro of such a script names
+// only the framing device — the fridge — and every real subject (tomatoes,
+// bread, honey, coffee, eggs) lives in the body, past the cutoff. The derived
+// niche came back as "refrigerator / food storage", buildTopicBlock stamped
+// that world onto all 541 blocks, and the client watched the same fridge door
+// open and close for twenty minutes (feedback 2026-09-01: "it's not only about
+// fridge ... the logic right now it's focusing too much on the fridge").
+//
+// Note this is NOT the niche-as-a-cage bug fixed on 2026-08-26 (see the
+// PRECEDENCE note in buildTopicBlock). That rule lets a line override the niche
+// when it names something OUTSIDE it — but a tomato is not outside a fridge
+// video, it is food, so the override never fires and the model picks the most
+// on-niche framing available: the tomato, at the fridge. The topic itself has
+// to be right; precedence cannot rescue a topic derived from the intro alone.
+//
+// So: spread the same budget across the WHOLE transcript. Evenly-spaced windows
+// see the enumerated items wherever they fall, and the joined sample stays small
+// enough to keep this a cheap flash call.
+const TOPIC_SAMPLE_TOTAL_CHARS = 4000;
+const TOPIC_SAMPLE_WINDOWS = 8;
+const TOPIC_SAMPLE_MAX_HEADINGS = 30;
+
+// A list/countdown item heading, in any supported narration language:
+//   "Number 15." · "Número quince." · "Nummer fünfzehn." · "#3" · "Tip 4:"
+// Anchored to a sentence or line start so a bare year or quantity mid-sentence
+// ("In 1950...", "15 grams") cannot masquerade as a heading. The capture keeps
+// the marker plus the short text that follows it — which is the item's NAME,
+// the thing the visuals actually need.
+const LIST_HEADING_RE =
+  /(?:^|[.\n])\s*((?:number|n[uú]mero|nummer|no\.?|#|tip|step|paso|schritt)?\s*#?\s*(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece|catorce|quince|eins|zwei|drei|vier|f[uü]nf|sechs|sieben|acht|neun|zehn|elf|zw[oö]lf)\s*[.:)\-–]\s*[^.\n]{0,80})/gi;
+
+function listHeadings(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of text.matchAll(LIST_HEADING_RE)) {
+    const h = m[1].trim().replace(/\s+/g, " ");
+    // "3." alone carries no subject; require the item's name to follow.
+    if (h.length < 6) continue;
+    const key = h.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(h);
+    if (out.length >= TOPIC_SAMPLE_MAX_HEADINGS) break;
+  }
+  return out;
+}
+
+export function topicSample(transcript: string): string {
+  const text = transcript.trim();
+  if (text.length <= TOPIC_SAMPLE_TOTAL_CHARS) return text;
+
+  const per = Math.floor(TOPIC_SAMPLE_TOTAL_CHARS / TOPIC_SAMPLE_WINDOWS);
+  // Last window starts `per` from the end, so the closing section (often where a
+  // list video summarises what it covered) is always represented.
+  const span = text.length - per;
+  const parts: string[] = [];
+  for (let i = 0; i < TOPIC_SAMPLE_WINDOWS; i++) {
+    const start = Math.floor((span * i) / (TOPIC_SAMPLE_WINDOWS - 1));
+    parts.push(text.slice(start, start + per).trim());
+  }
+  // The gaps are real and must be visible: without a marker the model reads the
+  // joined windows as continuous prose and can invent a through-line across a
+  // cut that does not exist in the script.
+  const windows = parts.join("\n[...]\n");
+
+  // Evenly-spaced windows alone are not enough for the format that caused this
+  // bug. A 15-item list gives each item ~1500 characters, so eight windows land
+  // mid-item far more often than on the heading that NAMES it — measured on a
+  // fixture of the client's script, windows alone surfaced 1 of 15 items. The
+  // headings are the one place every item is named in full, so pull them out
+  // explicitly instead of hoping a window lands on one.
+  const headings = listHeadings(text);
+  if (headings.length < 3) return windows; // not a list script; windows are fine
+  return [
+    "LIST ITEMS (every numbered item in this video, in order):",
+    ...headings.map((h) => `- ${h}`),
+    "",
+    "EXCERPTS:",
+    windows,
+  ].join("\n");
+}
+
 export async function deriveVideoTopic(input: {
   projectId: string;
   jobId?: string;
@@ -4035,7 +4121,7 @@ export async function deriveVideoTopic(input: {
   // may be underivable, but the video is still German, and buildTopicBlock
   // reads the region off this object.
   const emptyTopic: VideoTopic = { ...EMPTY_TOPIC, language };
-  const sample = transcript.trim().slice(0, 1500);
+  const sample = topicSample(transcript);
   if (!title.trim() && !sample) return emptyTopic;
   const prompt = [
     // The title and sample below are in the narration language; the four fields
@@ -4087,11 +4173,36 @@ export async function deriveVideoTopic(input: {
     "its habitat\". Do NOT fall back to \"a man talking at a desk / on a computer /",
     "in an office\" as the setting for these subjects — an office is only correct",
     "when the video is genuinely about office/desk work.",
+    // LIST / COUNTDOWN SCRIPTS (client feedback 2026-09-01). A "15 foods you
+    // should never refrigerate" script names its framing device (the fridge) in
+    // the title and the intro, and its ACTUAL subjects — the fifteen foods — one
+    // at a time through the body. Derived from the framing device alone the
+    // niche came back "refrigerator / food storage", and because every item is
+    // still plausibly IN that world, buildTopicBlock's precedence escape never
+    // fired and the video showed the same fridge over and over.
+    "LIST / COUNTDOWN VIDEOS (important): when the narration works through an",
+    "enumerated list — \"15 foods…\", \"10 mistakes…\", \"7 signs…\" — the ITEMS are",
+    "the video's real subjects and the thing named in the title is usually just",
+    "the FRAMING DEVICE. `subjectExamples` MUST name the actual items drawn from",
+    "across the sample (for a fridge-storage list: \"tomatoes, potatoes, garlic,",
+    "bread, honey, coffee beans, bananas, eggs\"), NOT the framing device and its",
+    "parts (\"fridge shelves, crisper drawer\"). Naming only the framing device",
+    "makes every shot in the finished video look identical, which is the exact",
+    "failure this instruction exists to prevent.",
+    "Likewise `environmentExamples` should cover the WIDER world the narration",
+    "touches — where these things come from, who handles them, and the processes",
+    "or science it describes (e.g. \"produce on a kitchen counter, a market stall,",
+    "someone slicing a tomato, a researcher examining food in a lab\") — not the",
+    "framing device being used over and over.",
     "Keep each field short (a phrase, not a sentence). No commentary.",
     "",
     `TITLE: ${title.trim() || "(none)"}`,
     "",
-    "TRANSCRIPT SAMPLE:",
+    // Windows sampled from across the whole transcript (see topicSample), joined
+    // with [...] where text was skipped — say so, or the model reads the joins as
+    // continuous prose.
+    "TRANSCRIPT SAMPLE (excerpts from THROUGHOUT the video; [...] marks skipped",
+    "text — infer the subject from ALL of them, not just the first):",
     sample || "(none)",
   ].join("\n");
   try {
