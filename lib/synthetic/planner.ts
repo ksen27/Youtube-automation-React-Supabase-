@@ -79,6 +79,27 @@ const GeminiSegmentSchema = z.object({
   // Shot type for the SECOND visual — different from shotType so the two frames
   // of a split sentence differ in framing as well as subject.
   shotType2: optString(),
+  // EXTRA SCENES for a long sentence, one per remaining time slot (client
+  // "Joey" 2026-09-03). imagePrompt/imagePrompt2 cover at most TWO slots; a
+  // 14s sentence splits into four, and slots 3+ used to re-render slot 1's
+  // prompt with a "different angle" nudge — which is literally the same shot
+  // again, and is what he was pointing at ("the same footage over and over
+  // again ... it doesn't match the script very well").
+  //
+  // The reference video he sent cuts on PHRASES, not sentences: "grocery
+  // store" -> a grocery store, "the bacon, the chicken" -> bacon, chicken,
+  // "my barn" -> a barn, "saves money" -> a wallet. One sentence carries
+  // several DIFFERENT shots, each bound to its own clause. That is only
+  // possible if the planner emits a prompt per SLOT rather than per sentence.
+  //
+  // Each entry is {imagePrompt, shotType} for one further slot, in order, and
+  // must describe a DIFFERENT concrete thing named in the sentence — not
+  // another angle on the same one. Empty/absent falls back to the old
+  // secondVisual behaviour, so an older model response still plans.
+  extraScenes: z
+    .array(z.object({ imagePrompt: optString(), shotType: optString() }))
+    .nullish()
+    .transform((v) => v ?? []),
   animationPrompt: optString(),
 });
 // Align-first block. Identical creative fields to GeminiSegmentSchema, except
@@ -95,6 +116,11 @@ const SentenceBlockSchema = z.object({
   shotType: optString(),
   imagePrompt2: optString(),
   shotType2: optString(),
+  // Per-slot scenes for a long sentence; see the note on GeminiSegmentSchema.
+  extraScenes: z
+    .array(z.object({ imagePrompt: optString(), shotType: optString() }))
+    .nullish()
+    .transform((v) => v ?? []),
   animationPrompt: optString(),
 });
 // NOTE the array key is `segments`, matching the legacy schema, so
@@ -133,6 +159,12 @@ export interface PlannedSegment {
   imagePrompt2?: string | null;
   // Shot type for the SECOND visual (paired with imagePrompt2).
   shotType2?: string | null;
+  // Further per-slot scenes for a long sentence, in slot order, each a
+  // DIFFERENT concrete thing the sentence names. Consumed by splitByDuration
+  // for slots 3+ (slot 1 uses imagePrompt, slot 2 imagePrompt2). Empty means
+  // fall back to the secondVisual "different angle" nudge — which is what made
+  // long sentences render the same shot repeatedly. See GeminiSegmentSchema.
+  extraScenes?: Array<{ imagePrompt: string; shotType: string }>;
   animationPrompt: string | null;
   // WHICH CLIP ENGINE renders this block, set by assignClipDurationQuota.
   // Meaningful only on ai_clip blocks; null everywhere else. "ltx" is the
@@ -971,8 +1003,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
 
   const responseShape =
     payload.mode === "text"
-      ? 'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}'
-      : 'Respond ONLY with JSON: {"basePrompt","segments":[{"startSentence","endSentence","blockType","imagePrompt","shotType","imagePrompt2","shotType2","animationPrompt"}]}';
+      ? 'Respond ONLY with JSON: {"basePrompt","segments":[{"blockType","script","imagePrompt","shotType","imagePrompt2","shotType2","extraScenes":[{"imagePrompt","shotType"}],"animationPrompt"}]}'
+      : 'Respond ONLY with JSON: {"basePrompt","segments":[{"startSentence","endSentence","blockType","imagePrompt","shotType","imagePrompt2","shotType2","extraScenes":[{"imagePrompt","shotType"}],"animationPrompt"}]}';
 
   const tail =
     payload.mode === "text"
@@ -1099,6 +1131,39 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "amateur look) and gets its own `shotType2` with a DIFFERENT framing than",
     "shotType. If you genuinely cannot think of a second distinct on-topic scene,",
     "you may leave it empty and the system will vary the first one.",
+    "",
+    // CUT ON PHRASES, NOT SENTENCES (client "Joey", 2026-09-03, comparing our
+    // output against a reference video he sent). His whole complaint reduces to
+    // one observation: in the reference, EVERY named thing gets its own shot —
+    // "grocery store" -> a grocery store, "the bacon, the chicken" -> bacon and
+    // chicken, "my barn" -> a barn, "saves money" -> a wallet of cash. In ours a
+    // long sentence held ONE subject for its whole run, because imagePrompt /
+    // imagePrompt2 cover at most two slots and every slot after that re-rendered
+    // slot 1 with a "different angle" nudge. Four slots, one idea, so the video
+    // reads as the same footage repeating.
+    //
+    // His words: "The logic is based on the context of the script, but it should
+    // go into the details of the script more."
+    //
+    // A sentence is split into ceil(duration / ~4s) slots downstream, so a 14s
+    // sentence needs FOUR scenes and gets four only if they are asked for here.
+    "EXTRA SCENES — for a LONG sentence (roughly 10 seconds or more, or one that",
+    "names three or more different concrete things), also write `extraScenes`: an",
+    "ordered array of {imagePrompt, shotType} for the REMAINING visuals of that",
+    "same sentence, after imagePrompt and imagePrompt2. Aim for about one scene",
+    "per 4 seconds of narration: a 12-second sentence wants imagePrompt +",
+    "imagePrompt2 + ONE extraScenes entry; a 20-second sentence wants about three.",
+    "Short sentences need none — leave it out.",
+    "WALK THE SENTENCE AND SHOW WHAT IT NAMES, IN ORDER. Each scene takes the",
+    "NEXT concrete thing the narration mentions, so the picture changes as the",
+    "narration moves. If the line is \"it is not spoiling, not growing mould, it is",
+    "just losing the flavour and texture you paid for at the store\", the scenes",
+    "are: the food looking fine -> MOULD on food -> the flavour/texture (a cut",
+    "surface, a bitten piece) -> the STORE where it was bought. Not four angles on",
+    "one fridge.",
+    "Every entry follows ALL the same rules as imagePrompt and must be a",
+    "DIFFERENT thing from every earlier scene of this block — a re-framing of an",
+    "earlier scene is exactly the repetition this exists to remove.",
     "",
     SINGLE_SUBJECT_RULE,
     "",
@@ -2133,6 +2198,14 @@ function mk(
     shotType: isVisual ? (s.shotType?.trim() || null) : null,
     imagePrompt2: isVisual ? (s.imagePrompt2?.trim() || null) : null,
     shotType2: isVisual ? (s.shotType2?.trim() || null) : null,
+    // Per-slot scenes for slots 3+ of a long sentence (see splitByDuration).
+    // Entries with no prompt are dropped here so the splitter's fallback runs
+    // instead of setting an empty imagePrompt.
+    extraScenes: isVisual
+      ? (s.extraScenes ?? [])
+          .map((e) => ({ imagePrompt: (e.imagePrompt ?? "").trim(), shotType: (e.shotType ?? "").trim() }))
+          .filter((e) => e.imagePrompt.length > 0)
+      : [],
     animationPrompt: s.blockType === "ai_clip" ? (s.animationPrompt?.trim() || null) : null,
   };
 }
@@ -3746,11 +3819,31 @@ export function splitByDuration(
       piece.blockType = "image";
       piece.animationPrompt = null;
     }
+    // Slot k takes the k-th scene the planner wrote for this sentence:
+    //   k = 0  -> imagePrompt
+    //   k = 1  -> imagePrompt2      (via applySecondScene, which rejects a
+    //                                near-clone of imagePrompt)
+    //   k >= 2 -> extraScenes[k - 2]
+    // Each is a DIFFERENT concrete thing the sentence names, so a long
+    // sentence cuts on its own phrases the way the client's reference video
+    // does, instead of holding one subject for 14 seconds.
     if (k === 1) piece = applySecondScene(piece);
-    // Slots 3+ reuse slot 1's prompt for now; the distinct-scene pass
-    // regenerates each into a genuinely different composition (avoiding the
-    // earlier slots' scenes) via the secondVisual flag.
-    else if (k > 1) piece = { ...piece, secondVisual: true };
+    else if (k > 1) {
+      const extra = seg.extraScenes?.[k - 2];
+      const text = (extra?.imagePrompt ?? "").trim();
+      // Guard the same way applySecondScene does: a model that echoes an
+      // earlier slot's wording would put us straight back to duplicate frames,
+      // and the secondVisual path already exists to regenerate those.
+      const prior = [seg.imagePrompt ?? "", seg.imagePrompt2 ?? "", ...(seg.extraScenes ?? []).slice(0, k - 2).map((e) => e.imagePrompt)]
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      const distinct =
+        text.length > 0 &&
+        prior.every((p) => sceneSimilarity(sceneWords(text), sceneWords(p)) < 0.85);
+      piece = distinct
+        ? { ...piece, imagePrompt: text, shotType: extra?.shotType || seg.shotType, secondVisual: false }
+        : { ...piece, secondVisual: true };
+    }
     pieces.push(piece);
   }
   return pieces;
@@ -4469,6 +4562,12 @@ function segmentsFromSentenceBlocks(
       shotType: isVisual ? (b.shotType?.trim() || null) : null,
       imagePrompt2: isVisual ? (b.imagePrompt2?.trim() || null) : null,
       shotType2: isVisual ? (b.shotType2?.trim() || null) : null,
+      // See the note on the legacy path above: per-slot scenes for slots 3+.
+      extraScenes: isVisual
+        ? (b.extraScenes ?? [])
+            .map((e) => ({ imagePrompt: (e.imagePrompt ?? "").trim(), shotType: (e.shotType ?? "").trim() }))
+            .filter((e) => e.imagePrompt.length > 0)
+        : [],
       animationPrompt: b.blockType === "ai_clip" ? (b.animationPrompt?.trim() || null) : null,
     });
   }
