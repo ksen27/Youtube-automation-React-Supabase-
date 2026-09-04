@@ -2677,11 +2677,36 @@ function mergeOrphansIntoAvatar(segs: PlannedSegment[], minHoldSeconds: number):
 // Only blocks flagged needsPromptRegen (i.e. blocks this pass's merge actually
 // combined) are re-split here; a naturally-long Gemini block was already carved
 // by the earlier duration-split pass. Slot 1 keeps the merged block's
-// (regenerated, combined) prompt; slots 2+ are flagged secondVisual so persist
-// appends the "different angle" variation — distinct compositions of the same
-// combined thought. Each slot inherits the merged blockType (an ai_clip stays an
-// ai_clip; each slot < maxHold so it's inside LTX's range, motion preserved).
+// (regenerated, combined) prompt; slots 2+ take the NEXT scene the planner wrote
+// for this sentence, exactly as splitByDuration does. Each slot inherits the
+// merged blockType (an ai_clip stays an ai_clip; each slot < maxHold so it's
+// inside LTX's range, motion preserved).
 // Returns a new array; positions are renumbered by the caller.
+//
+// WHY SLOTS 2+ ARE NOT JUST `secondVisual` (client "Joey", 2026-09-03, second
+// round). d59a222 taught splitByDuration to walk imagePrompt -> imagePrompt2 ->
+// extraScenes so a long sentence cuts on its own phrases. This function was left
+// on the old behaviour — a blanket `secondVisual: k > 0`, which reuses slot 1's
+// prompt with a "different angle" nudge — and it is the path a MERGED block
+// takes. So the fix did not reach the blocks the client was actually looking at:
+// a 4-slot fridge sentence still rendered as four framings of one open fridge.
+//
+// The distinct-scene pass at the end of the planner was supposed to rescue these,
+// but it groups slots into runs by IDENTICAL script, and a merged block carries
+// the COMBINED script of both sentences it absorbed. So the merged slots never
+// joined the un-merged slots' run, the avoid-chaining never spanned all four, and
+// each pair independently re-derived the same fridge imagery.
+//
+// Walking the planner's own scene list here fixes both halves: the slots get
+// genuinely different subjects, and they no longer depend on a rescue pass that
+// cannot see across a script boundary.
+//
+// NOTE on staleness: the merge pass regenerates slot 1's imagePrompt for the
+// COMBINED thought, but leaves imagePrompt2/extraScenes as Gemini wrote them for
+// the FIRST sentence alone. They are still concrete on-topic scenes of this
+// video's world and still better than a re-framing of slot 1 — but they are
+// compared against the regenerated prompt below, so a scene that has drifted into
+// slot 1's territory falls back to secondVisual rather than shipping a near-clone.
 export function splitMergedVisuals(
   segs: PlannedSegment[],
   minHoldSeconds: number,
@@ -2696,18 +2721,48 @@ export function splitMergedVisuals(
       continue;
     }
     const slots = Math.max(2, Math.round(dur / minHoldSeconds));
+    // The scenes Gemini wrote for this sentence, in the order the narration
+    // names them: slot 1 keeps the merged block's own (regenerated) prompt, and
+    // each later slot takes the next one. Same walk as splitByDuration.
+    const laterScenes: { imagePrompt: string; shotType: string | null }[] = [
+      { imagePrompt: (seg.imagePrompt2 ?? "").trim(), shotType: seg.shotType2 ?? seg.shotType ?? null },
+      ...(seg.extraScenes ?? []).map((e) => ({
+        imagePrompt: (e.imagePrompt ?? "").trim(),
+        shotType: e.shotType || seg.shotType || null,
+      })),
+    ];
     for (let k = 0; k < slots; k++) {
       const startTime = seg.startTime + (k * dur) / slots;
       const endTime = seg.startTime + ((k + 1) * dur) / slots;
-      out.push({
+      const piece: PlannedSegment = {
         ...seg,
         startTime,
         endTime,
         duration: Math.max(0.5, endTime - startTime),
-        // Slot 1 carries the combined prompt as-is; later slots show a different
-        // angle/composition of the same combined thought.
-        secondVisual: k > 0,
-      });
+        secondVisual: false,
+      };
+      if (k > 0) {
+        const next = laterScenes[k - 1];
+        const text = next?.imagePrompt ?? "";
+        // Guard exactly as splitByDuration does: a scene that merely rewords an
+        // earlier slot puts us back to duplicate frames, so fall through to the
+        // secondVisual path (persist's angle nudge + the distinct-scene regen)
+        // rather than shipping a near-clone.
+        const prior = [
+          (seg.imagePrompt ?? "").trim(),
+          ...laterScenes.slice(0, k - 1).map((s) => s.imagePrompt),
+        ].filter((p) => p.length > 0);
+        const distinct =
+          text.length > 0 &&
+          prior.every((p) => sceneSimilarity(sceneWords(text), sceneWords(p)) < 0.85);
+        if (distinct) {
+          piece.imagePrompt = text;
+          piece.shotType = next.shotType;
+        } else {
+          piece.secondVisual = true;
+        }
+      }
+      out.push(piece);
     }
     split++;
   }
