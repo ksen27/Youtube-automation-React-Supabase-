@@ -261,6 +261,65 @@ const SCRIPT_MATCH_RULE =
   "who handles it, where it is grown, sold, made or studied), not another " +
   "close-up of the niche's main object.";
 
+// THE EXTRA SCENES CHANGE THE SUBJECT, NOT THE ANGLE (client "Joey", 2026-09-03,
+// third round, with four frames from his reference video for ONE fridge line:
+//   1. a dark kitchen at night, wide
+//   2. a SUPERMARKET meat cooler
+//   3. a home CHEST FREEZER full of frozen cuts
+//   4. macro on ground beef going brown at the edges
+// Only the first frame contains a fridge at all. The other three are the things
+// a fridge ACTS ON, in the places they pass through.)
+//
+// WHY THE EXISTING RULES COULD NOT PRODUCE THIS. All three variety rules vary the
+// CAMERA and hold the SUBJECT fixed: SHOT_VARIETY_RULE is framing-only ("never
+// put subject words in it"), contextVarietyRule's STRICT LIMIT says it "NEVER
+// changes WHAT is in the frame", and SUBJECT_IN_THE_WORLD_RULE says "the subject
+// never changes; the situation always does". Given "refrigerator" each one
+// faithfully returns another refrigerator from another angle. They were working.
+// Nothing had ever asked for the subject itself to move along the chain the
+// narration implies.
+//
+// The client's words: "it is the most important to change the subjects with the
+// things that are related to the main subjects" -- for a fridge line, "frozen
+// meat, saved vegetables in refrigerator, and the refrigerator, and not-saved
+// food without refrigerator".
+//
+// SCOPE. This governs the EXTRA scenes only (imagePrompt2 and extraScenes), never
+// imagePrompt itself. Slot 1 still answers the line literally under
+// SCRIPT_MATCH_RULE -- a line that says refrigerator opens on a refrigerator. The
+// substitution is how the REST of a long sentence is covered, which is the only
+// place the repetition ever appeared.
+//
+// THE LEASH. "Related" means causally related along the chain the line itself
+// implies, not associated by vibe. Every substituted subject must be a thing the
+// line's own subject acts on, comes from, is kept in, or ends up as -- so a
+// viewer reads it as the same story continuing. Without that bound this rule
+// would re-open the "merely in the same WORLD as the line" failure that
+// SCRIPT_MATCH_RULE calls the thing the client rejects hardest.
+const RELATED_SUBJECT_RULE =
+  "CHANGE THE SUBJECT, NOT THE ANGLE (critical, client requirement): the extra " +
+  "scenes of one sentence must show DIFFERENT THINGS, not the same thing from " +
+  "new camera positions. Four framings of one object is the single failure the " +
+  "client rejects hardest in our output — he calls it 'the same footage over and " +
+  "over again'. " +
+  "WALK THE CHAIN THE LINE IMPLIES. Every subject sits in a chain: where it " +
+  "comes from, where it is kept, what it acts on, what happens to the thing it " +
+  "acts on, who handles it, what it costs. Each extra scene takes the NEXT link, " +
+  "so the picture keeps changing while the story stays the same. For a line " +
+  "about a REFRIGERATOR the scenes are: the refrigerator -> the FROZEN MEAT " +
+  "inside it -> VEGETABLES keeping fresh on its shelves -> the same food LEFT " +
+  "OUT and going soft — not four views of one appliance. For a line about a TOOL: " +
+  "the tool -> the work it does -> the finished piece -> the person who uses it. " +
+  "For a line about a PLACE: the place -> what is made or kept there -> the " +
+  "people who work there -> what leaves it. " +
+  "THE LEASH — RELATED MEANS CAUSALLY RELATED: each substituted subject must be " +
+  "something the line's own subject acts on, comes from, is kept in, or turns " +
+  "into. A viewer must read it instantly as the same story continuing. A thing " +
+  "that is merely nearby, merely in the same room, or merely the same general " +
+  "topic is NOT related and is the failure SHOW WHAT THE LINE IS ABOUT forbids. " +
+  "THIS DOES NOT APPLY TO imagePrompt: the FIRST scene of a block always shows " +
+  "what the line literally names. Only the scenes AFTER it walk the chain.";
+
 // HANDS ARE NOT A SUBJECT (client, repeatedly: "What is this hand movement?
 // Every time it like uses it on the hand movement, it doesn't make any sense",
 // and "why the all clip is ther hands?").
@@ -1165,6 +1224,8 @@ function composePlannerPrompt(topic: VideoTopic, payload: PlannerPayload): strin
     "DIFFERENT thing from every earlier scene of this block — a re-framing of an",
     "earlier scene is exactly the repetition this exists to remove.",
     "",
+    RELATED_SUBJECT_RULE,
+    "",
     SINGLE_SUBJECT_RULE,
     "",
     // A prompt that breaks this rule is REFUSED by the provider (CENSORED),
@@ -1353,30 +1414,41 @@ function buildSingleSegmentPrompt(
     ...(hasAvoid
       ? [
           "",
-          "SAME SUBJECT, DIFFERENT SHOT (critical — read this before anything else):",
-          "some scenes below have already been used in this video. You must write a",
-          "DIFFERENT PICTURE. You must NOT write a different SUBJECT.",
+          "A DIFFERENT PICTURE, STILL THIS LINE'S STORY (critical — read this",
+          "before anything else): some scenes below have already been used in this",
+          "video. You must write a DIFFERENT PICTURE.",
           "",
-          "If this block's line is about the same thing an earlier line was about,",
-          "that thing STAYS in the frame. Change the shot instead: a different",
-          "moment in the same process, a different stage, a different part or",
-          "detail, a different scale, the same thing in a different place, someone",
-          "using it, the result of using it.",
+          // Until 2026-09-03 this block said "You must NOT write a different
+          // SUBJECT" and listed changing the subject as FORBIDDEN. That was the
+          // right guard against a scene drifting to whatever shares the line's
+          // world, but it also forbade the thing the client actually wants: for a
+          // fridge line his reference video shows a supermarket cooler, a chest
+          // freezer and browning beef -- the things the fridge ACTS ON. So the
+          // rule now distinguishes the two cases instead of banning both.
+          "Two ways to make it different, in this order of preference:",
+          "  1. WALK THE CHAIN. Show the NEXT link in the line's own story — what",
+          "     its subject acts on, holds, comes from, is kept in, or turns into.",
+          "     For a refrigerator line: the frozen meat inside it, the vegetables",
+          "     keeping fresh on its shelves, the same food left out and going",
+          "     soft. This is preferred, because it moves the story forward.",
+          "  2. RE-FRAME. Keep the same thing and change the shot — a different",
+          "     moment in the process, a different stage, part, detail or scale,",
+          "     the same thing elsewhere, someone using it, the result of using it.",
           "",
-          "FORBIDDEN, and this is the failure the client rejects: dropping the",
-          "line's own subject in order to avoid repeating. Showing a different",
-          "object that merely belongs to the same world — the receipt instead of",
-          "the machine, the tool instead of the thing it was used on, someone's",
-          "hands instead of the person the line is about — is WRONG even when the",
-          "picture is beautiful and even when every scene below is avoided. Two",
-          "similar shots of the correct subject beat one shot of the wrong one.",
+          "THE LEASH — RELATED MEANS CAUSALLY RELATED: a substituted subject must",
+          "be something the line's own subject acts on, comes from, is kept in, or",
+          "turns into, so a viewer reads it instantly as the same story continuing.",
+          "FORBIDDEN, and this is the failure the client rejects: swapping in a",
+          "thing that is merely nearby, merely in the same room, or merely the same",
+          "general topic — the receipt instead of the machine, the tool instead of",
+          "the thing it was used on, someone's hands instead of the person the line",
+          "is about. That is WRONG even when the picture is beautiful and even when",
+          "every scene below is avoided. A related link in the chain beats a",
+          "re-framing; a re-framing beats an unrelated object.",
           "",
-          "If you genuinely cannot find another angle on the subject, keep the",
-          "subject and change everything else — a different moment, place, scale",
-          "or stage. What you must NEVER do is return one of the scenes below",
-          "word-for-word or with trivial rewording: an answer that reads like a",
-          "listed scene is a wasted generation, because the video already shows",
-          "that exact frame.",
+          "What you must NEVER do is return one of the scenes below word-for-word",
+          "or with trivial rewording: an answer that reads like a listed scene is a",
+          "wasted generation, because the video already shows that exact frame.",
           "ALREADY-USED scene(s) — frame this block's subject differently from these:",
           ...avoidScenes.filter((s) => s.trim()).map((s, i) => `  ${i + 1}. ${s.trim()}`),
         ]
